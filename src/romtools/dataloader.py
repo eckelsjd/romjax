@@ -434,7 +434,7 @@ def save_h5(data_dict: dict, filename: str | Path, overwrite: bool = False):
                 num_nodes, num_cells = None, None
 
                 for (t, frame) in zip(data_dict['time'], data_dict[FRAME_KEY]):
-                    t_str = f"t={t:.2E}"
+                    t_str = f"t={t:.6E}"
                     frame_group = data_group[t_str] if t_str in data_group else data_group.create_group(t_str, track_order=True)
                     frame_group.attrs['time'] = t
 
