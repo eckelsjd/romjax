@@ -20,7 +20,7 @@ repos:
       - id: pytest-status
         name: pytest-status
         description: "Make sure all tests have passed since last source code change."
-        entry: pdm run python _pre_commit_checks.py
+        entry: uv run python _pre_commit_checks.py
         args: [ --pytest-status ]
         language: system
         pass_filenames: false
