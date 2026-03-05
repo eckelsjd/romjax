@@ -17,23 +17,23 @@ Pull requests are the best way to propose changes to the codebase (bug fixes, ne
 1. If you are adding a feature or making major changes, first create the issue in Github.
 1. If you've added code that should be tested, add to `/tests`.
 1. If you've made major changes, update the `/docs`.
-1. Ensure the test suite passes (`pdm run test`).
+1. Ensure the test suite passes (`uv run dev.py test`).
 1. Follow [Conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) guidelines when adding a commit message.
-1. Ensure all `pre-commit` checks pass. Pro tip: use `pdm lint` to help.
+1. Ensure all `pre-commit` checks pass. Pro tip: use `uv run dev.py lint` to help.
 1. Issue the pull request!
 
-Use [pdm](https://github.com/pdm-project/pdm) to set up your development environment. An example contribution workflow is shown here:
+An example contribution workflow is shown here:
 
 ```shell
 # Fork the repo on Github
 git clone https://github.com/<your-user-name>/romtools.git
 cd romtools
-pdm install
+uv sync
 git checkout -b <your-branch-name>
 
 # Make local changes
 
-pdm run test  # make sure tests pass
+uv run dev.py test  # make sure tests pass
 git add -A
 git commit -m "fix: adding a bugfix"
 git push -u origin <your-branch-name>

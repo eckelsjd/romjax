@@ -3,7 +3,7 @@
 ALWAYS run this through `pre-commit run` rather than directly as `python pre_commit_checks.py`.
 
 Options:
-- `--pytest-status` - Ensures that all new source code has been tested with `pdm run test`
+- `--pytest-status` - Ensures that all new source code has been tested
 """
 from pathlib import Path
 import subprocess
@@ -47,7 +47,7 @@ def check_pytest_status():
 
     if status_code > 0:
         sys.exit(f'Pytest status file {PYTEST_STATUS_FILE.name} contains non-zero status code: {status_code}. '
-                 f'Please pass all tests via `pdm run test`.')
+                 f'Please pass all tests via `uv run test`.')
 
     pytest_timestamp = PYTEST_STATUS_FILE.lstat().st_mtime
     most_recent_timestamp = 0
@@ -57,7 +57,7 @@ def check_pytest_status():
 
     if most_recent_timestamp > pytest_timestamp:
         sys.exit(f'Most recently edited files in src/ or test/ have not been tested yet. '
-                 f'Please pass all tests via `pdm run test`.')
+                 f'Please pass all tests via `uv run test`.')
 
     sys.exit(SUCCESS)  # Congrats
 

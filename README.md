@@ -1,6 +1,4 @@
-# romtools
-
-[![pdm-managed](https://img.shields.io/badge/pdm-managed-blueviolet)](https://pdm-project.org)
+# romtools[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Python version](https://img.shields.io/badge/python-3.11+-blue.svg?logo=python&logoColor=cccccc)](https://www.python.org/downloads/)
 [![Copier](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/copier-org/copier/master/img/badge/badge-grayscale-inverted-border-orange.json)](https://github.com/eckelsjd/copier-numpy)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -27,13 +25,14 @@ Some ideas for the future:
 - Volume and line integrals
 - Actual ROM implementations (lol)
 
- ## ⚙️ Installation
+## ⚙️ Installation
 ```shell
 git clone https://github.com/eckelsjd/romtools.git
 pip install -e romtools
 ```
 
- ## 🏗️ Contributing
+
+## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romtools/blob/main/CONTRIBUTING.md) guidelines.
 
 <sup><sub>Made with the [copier-numpy](https://github.com/eckelsjd/copier-numpy.git) template.</sub></sup>
