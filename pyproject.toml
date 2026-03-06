@@ -9,7 +9,7 @@ dependencies = [
     "numpy>=2.0",
     "scipy>=1.14",
     "matplotlib>=3.9",
-    "h5py>=3.14"
+    "h5py>=3.14",
 ]
 requires-python = ">=3.11"
 readme = "README.md"
@@ -33,6 +33,20 @@ cu128 = [
     "torch>=2.9.1",
     "torchvision>=0.24.1",
 ]
+cu130 = [
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+]
+jaxcpu = [
+    "jax>=0.9.1 ; sys_platform == 'linux'",
+    "flax>=0.12.5 ; sys_platform == 'linux'",
+    "optax>=0.2.6",
+]
+jaxgpu = [
+    "jax[cuda13]>=0.9.1 ; sys_platform == 'linux'",
+    "flax>=0.12.5 ; sys_platform == 'linux'",
+    "optax>=0.2.6",
+]
 
 [build_system]
 requires = ["uv_build>=0.10.8,<0.11.0"]
@@ -55,6 +69,7 @@ conflicts = [
   [
     { extra = "cpu" },
     { extra = "cu128" },
+    { extra = "cu130" },
   ],
 ]
 
@@ -62,10 +77,12 @@ conflicts = [
 torch = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 torchvision = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 [[tool.uv.index]]
@@ -76,6 +93,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.ruff.lint]
