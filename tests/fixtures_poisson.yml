@@ -1,0 +1,2 @@
+solver: !model:romtools.solvers.poisson.Poisson2D
+  forcing: !!python/name:tests.test_loader.example_forcing

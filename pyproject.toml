@@ -10,6 +10,8 @@ dependencies = [
     "scipy>=1.14",
     "matplotlib>=3.9",
     "h5py>=3.14",
+    "pydantic>=2.12.5",
+    "pyyaml>=6.0.3",
 ]
 requires-python = ">=3.11"
 readme = "README.md"
