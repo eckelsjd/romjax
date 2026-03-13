@@ -7,7 +7,6 @@ authors = [
 ]
 dependencies = [
     "numpy>=2.0",
-    "scipy>=1.14",
     "matplotlib>=3.9",
     "h5py>=3.14",
     "pydantic>=2.12.5",
@@ -28,26 +27,10 @@ Repository = "https://github.com/eckelsjd/romtools.git"
 
 [project.optional-dependencies]
 cpu = [
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
+    "jax>=0.9.1"
 ]
-cu128 = [
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-]
-cu130 = [
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-]
-jaxcpu = [
-    "jax>=0.9.1 ; sys_platform == 'linux'",
-    "flax>=0.12.5 ; sys_platform == 'linux'",
-    "optax>=0.2.6",
-]
-jaxgpu = [
-    "jax[cuda13]>=0.9.1 ; sys_platform == 'linux'",
-    "flax>=0.12.5 ; sys_platform == 'linux'",
-    "optax>=0.2.6",
+gpu = [
+    "jax[cuda13]>=0.9.1"
 ]
 
 [build_system]
@@ -67,40 +50,6 @@ test = [
 
 [tool.uv]
 package = true
-conflicts = [
-  [
-    { extra = "cpu" },
-    { extra = "cu128" },
-    { extra = "cu130" },
-  ],
-]
-
-[tool.uv.sources]
-torch = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu128", extra = "cu128" },
-  { index = "pytorch-cu130", extra = "cu130" },
-]
-torchvision = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu128", extra = "cu128" },
-  { index = "pytorch-cu130", extra = "cu130" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
 
 [tool.ruff.lint]
 select = ['E', 'F', 'I']
