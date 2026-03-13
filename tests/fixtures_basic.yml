@@ -1,0 +1,3 @@
+solver: !model:tests.test_loader.CustomModel
+  opts: {a: 1, b: 2}
+  detail: hello
