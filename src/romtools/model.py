@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 class Model(BaseModel, ABC):
     """A function that maps inputs/outputs to residuals."""
-    model_config = ConfigDict(validate_assignment=True, validate_default=True)
+    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
 
     @abstractmethod
     def evaluate(self, *args: Any, **kwargs: Any) -> Any:
