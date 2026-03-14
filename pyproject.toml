@@ -27,10 +27,13 @@ Repository = "https://github.com/eckelsjd/romtools.git"
 
 [project.optional-dependencies]
 cpu = [
-    "jax>=0.9.1"
+    "jax>=0.9.1",
 ]
-gpu = [
-    "jax[cuda13]>=0.9.1"
+cu12 = [
+    "jax[cuda12]>=0.9.1",
+]
+cu13 = [
+    "jax[cuda13]>=0.9.1",
 ]
 
 [build_system]

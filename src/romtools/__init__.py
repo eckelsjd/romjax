@@ -16,8 +16,9 @@ from typing import Any as _Any, IO as _IO, Optional as _Optional, Type as _Type,
 import yaml as _yaml
 
 from romtools.model import Model as _Model
+from romtools.typing import DictModel
 
-__all__ = ['ConfigLoader', 'YamlLoader']
+__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel']
 
 
 class ConfigLoader(_ABC):
@@ -40,7 +41,7 @@ class YamlLoader(ConfigLoader):
     """YAML configs. 
     
     **Models**
-    - Represent `Model` objects with `!model:path.to.Subclass` tag.
+    - Represent `Model` or `DictModel` objects with `!model:path.to.Subclass` tag.
     - Supports basic Pydantic model_dump() to dictionary.
     - Supports !!python/name tag for functions.
     """
@@ -76,8 +77,8 @@ class YamlLoader(ConfigLoader):
             cls_obj = getattr(module, class_name, None)
             if cls_obj is None:
                 raise ValueError(f"Model class not found: {tag_suffix!r}")
-            if not isinstance(cls_obj, type) or not issubclass(cls_obj, _Model):
-                raise TypeError(f"Tagged class is not a Model: {tag_suffix!r}")
+            if not isinstance(cls_obj, type) or not issubclass(cls_obj, _Model | DictModel):
+                raise TypeError(f"Tagged class is not a Model or DictModel: {tag_suffix!r}")
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
                 return cls_obj(**data)
@@ -117,7 +118,7 @@ class YamlLoader(ConfigLoader):
         """Load a configuration from a yaml-like stream.
         
         :param stream: A string, path, file-stream, byte-stream, or similar.
-        :return config: the configuration
+        :return: the configuration
         """
         loader = cls._yaml_loader()
         if isinstance(stream, (_PathLike, _Path)):

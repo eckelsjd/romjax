@@ -1,26 +1,17 @@
-from typing import Callable, Literal, Mapping, TypedDict, TypeAlias, Union
+from typing import Callable, Literal, Mapping, TypedDict
 
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import Field, field_validator
 
 from romtools.model import Model
-from romtools.typing import PyTree
+from romtools.typing import PyTree, DictModel
 
-ForcingName: TypeAlias = Literal["gaussian"]
-ConductivityName: TypeAlias = Literal["nonlinear"]
-ForcingCallable: TypeAlias = Callable[[PyTree, PyTree], ArrayLike]
-
-
-def _get(inputs: object, name: str) -> ArrayLike:
-    if hasattr(inputs, name):
-        return getattr(inputs, name)
-    if isinstance(inputs, Mapping):
-        return inputs[name]
-    raise TypeError(f"Expected inputs to be a mapping or object with attribute {name!r}.")
+type ForcingName = Literal["gaussian", "nonlinear"]
+type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
 
 
-class GaussianForcingInputs(BaseModel):
+class GaussianForcingInputs(DictModel):
     """Inputs for Gaussian forcing function.
 
     :ivar A0: amplitude
@@ -30,8 +21,6 @@ class GaussianForcingInputs(BaseModel):
     :ivar x: the x coordinates
     :ivar y: the y coordinates
     """
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True, validate_default=True)
-
     A0: ArrayLike = Field(default=1.0, description="Amplitude.")
     sigma: ArrayLike = Field(default=1.0, description="Symmetric width of the Gaussian.")
     mu_x: ArrayLike = Field(default=0.0, description="Center of Gaussian in x-direction.")
@@ -40,16 +29,24 @@ class GaussianForcingInputs(BaseModel):
     y: ArrayLike = Field(default=0.0, description="y-coordinates.")
 
 
-class NonlinearConductivityInputs(BaseModel):
+class NonlinearConductivityInputs(DictModel):
     """Inputs for nonlinear conductivity function.
     
     :ivar k0: the background random field conductivity (2D)
     :ivar alpha: the strength of the nonlinearity
     """
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True, validate_default=True)
-
     k0: ArrayLike = Field(default=1.0, description="Background random field conductivity (2D).")
     alpha: ArrayLike = Field(default=1.0, description="Strength of the nonlinearity.")
+
+
+class DirichletInputs(DictModel):
+    pass # TODO: dirichlet boundary conditions
+
+
+class PoissonInputs(DictModel):
+    forcing: DictModel = Field(default_factory=GaussianForcingInputs)
+    conductivity: DictModel = Field(default_factory=NonlinearConductivityInputs)
+    boundary: DictModel = Field(default_factory=DirichletInputs)
 
 
 class PoissonOutputs(TypedDict):
@@ -60,6 +57,7 @@ class PoissonOutputs(TypedDict):
     phi: ArrayLike
 
 
+# TODO: coerce inputs to match pydantic schemas in jax grad friendly way
 def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
     """Symmetric Gaussian bump.
 
@@ -69,19 +67,12 @@ def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> 
     :param outputs: the scalar potential on the grid (not used)
     :return: the forcing on the grid
     """
-    # TODO: should work with numpy, jax, plain floats, broadcasting, etc.
-    x = _get(inputs, "x")
-    y = _get(inputs, "y")
-    mu_x = _get(inputs, "mu_x")
-    mu_y = _get(inputs, "mu_y")
-    dx = x - mu_x
-    dy = y - mu_y
-    r2 = dx * dx + dy * dy
-    A0 = _get(inputs, "A0")
-    sigma = _get(inputs, "sigma")
-    return A0 * jnp.exp(-r2 / (2 * sigma))
+    dx = inputs['x'] - inputs['mu_x']
+    dy = inputs['y'] - inputs['mu_y']
+    return inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
 
 
+# TODO: coerce inputs to match pydantic schemas in jax grad friendly way
 def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: PoissonOutputs) -> ArrayLike:
     """Nonlinear conductivity.
 
@@ -91,60 +82,63 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
     :param outputs: the scalar potential on the grid
     :return: the conductivity on the grid
     """
-    # TODO: should work with numpy, jax, floats, broadcasting, xarray, etc.
-    phi = _get(outputs, "phi")
-    k0 = _get(inputs, "k0")
-    alpha = _get(inputs, "alpha")
-    return k0 * (1 + alpha * (phi * phi))
+    phi = outputs['phi']
+    return inputs['k0'] * (1 + inputs['alpha'] * (phi * phi))
+
+
+def dirichlet():
+    pass  # TODO: dirichlet boundary conditions
+
+
+def neumann():
+    pass # TODO: neumann boundary conditions
 
 
 class Poisson2D(Model):
 
-    forcing: Union[ForcingCallable, ForcingName] = gaussian_forcing
-    forcing_defaults: PyTree = Field(
+    forcing: ForcingCallable | ForcingName = gaussian_forcing
+    forcing_defaults: DictModel = Field(
         default_factory=GaussianForcingInputs,
         description="Default inputs for the forcing function (any PyTree).",
     )
-    conductivity: Union[ForcingCallable, ConductivityName] = nonlinear_conductivity
-    conductivity_defaults: PyTree = Field(
+    conductivity: ForcingCallable | ForcingName = nonlinear_conductivity
+    conductivity_defaults: DictModel = Field(
         default_factory=NonlinearConductivityInputs,
         description="Default inputs for the conductivity function (any PyTree).",
     )
 
-    @field_validator("forcing", mode="before")
+    @field_validator("forcing", "conductivity", mode="before")
     @classmethod
     def _coerce_forcing(cls, value: object) -> ForcingCallable:
         if isinstance(value, str):
             mapping: Mapping[str, ForcingCallable] = {
                 "gaussian": gaussian_forcing,
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown forcing function: {value!r}")
-            return mapping[value]
-        if callable(value):
-            return value
-        raise TypeError("forcing must be a callable or a supported string literal.")
-
-    @field_validator("conductivity", mode="before")
-    @classmethod
-    def _coerce_conductivity(cls, value: object) -> ForcingCallable:
-        if isinstance(value, str):
-            mapping: Mapping[str, ForcingCallable] = {
                 "nonlinear": nonlinear_conductivity,
             }
             if value not in mapping:
-                raise ValueError(f"Unknown conductivity function: {value!r}")
+                raise ValueError(f"Unknown function: {value!r}")
             return mapping[value]
         if callable(value):
             return value
-        raise TypeError("conductivity must be a callable or a supported string literal.")
+        raise TypeError("forcing and conductivity must be a callable or a supported string literal.")
 
-    def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
-        """Evalute the Poisson residual on a 2D grid.
+    @field_validator("forcing_defaults", "conductivity_defaults", mode="before")
+    @classmethod
+    def _coerce_defaults(cls, value: object) -> DictModel:
+        if isinstance(value, DictModel):
+            return value
+        if isinstance(value, type) and issubclass(value, DictModel):
+            return value()
+        if isinstance(value, Mapping):
+            return DictModel.model_validate(value)
+        raise TypeError("forcing_defaults and conductivity_defaults must be a DictModel or a dict-like mapping.")
+
+    def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> ArrayLike:
+        """Evalute the Poisson residual on a 2D domain.
         
-        :param inputs: boundary conditions, params for forcing and conductivity
-        :param outputs: the scalar potential on a 2D grid
-        :return: the scalar residual on the 2D grid.
+        :param inputs: params for forcing, conductivity, and boundary conditions
+        :param outputs: the scalar potential on a 2D domain
+        :return: the scalar residual on the 2D domain
         """
         pass
 
