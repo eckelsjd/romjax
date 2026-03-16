@@ -1,8 +1,7 @@
-from typing import Any, Iterator, MutableMapping, Callable
+from typing import Any, Callable, Iterator, MutableMapping
 
-from pydantic import BaseModel, ConfigDict
 from jax.typing import ArrayLike
-
+from pydantic import BaseModel, ConfigDict
 
 type PyTree = Any  # Python containers for use with jax
 

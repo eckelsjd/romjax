@@ -3,8 +3,8 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-from coverage import Coverage
 import coverage
+from coverage import Coverage
 
 PROJECT_DIR = Path(__file__).parent.parent
 PYTEST_STATUS_FILE = PROJECT_DIR / '.pytest_status'

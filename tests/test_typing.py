@@ -25,7 +25,7 @@ def test_custom_settings():
     del settings['one']
     
     with pytest.raises(KeyError):
-        a = settings['one']
+        _ = settings['one']
     
     settings['one'] = '1'
 

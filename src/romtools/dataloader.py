@@ -66,13 +66,14 @@ Includes:
   - load_numpy - load numpy data from .npz
   - save_numpy - save numpy data to .npz
 """
+# ruff: noqa
+import copy
 import re
 from pathlib import Path
-from typing import Literal, Iterable
-import copy
+from typing import Iterable, Literal
 
-import numpy as np
 import h5py
+import numpy as np
 from numpy.typing import ArrayLike
 
 __all__ = ['load_tecplot', 'save_tecplot', 'load_h5', 'save_h5', 'load_numpy', 'save_numpy', 'filter_data', 'to_numpy', 'from_numpy', 'FRAME_KEY']

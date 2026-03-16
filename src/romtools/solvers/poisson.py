@@ -1,18 +1,16 @@
-from typing import Mapping, TypedDict, Literal
+from typing import Literal, Mapping, TypedDict
 
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 from pydantic import Field, ValidationInfo, field_validator
 
 from romtools.model import Model
-from romtools.typing import DictModel, Coordinates, PyTree, ForcingCallable, BoundaryCallable
 from romtools.solvers.utils import UniformGrid, boundary_pass_through, homogeneous_boundary
-from romtools.utils import to_pytree, merge_pytrees
-
+from romtools.typing import BoundaryCallable, Coordinates, DictModel, ForcingCallable, PyTree
+from romtools.utils import merge_pytrees, to_pytree
 
 type ForcingName = Literal["gaussian", "nonlinear"]
 
-# Other: functional boundaries, non-uniform grid, unstructured mesh/boundaries
 
 class GaussianForcingInputs(DictModel):
     """Inputs for Gaussian forcing function.
@@ -49,7 +47,7 @@ class PoissonInputs(DictModel):
     """
     forcing: DictModel = Field(default_factory=lambda: GaussianForcingInputs(A0=0.))
     conductivity: DictModel = Field(default_factory=NonlinearConductivityInputs)
-    boundary: DictModel = Field(default_factory=homogeneous_boundary)
+    boundary: DictModel = Field(default_factory=lambda: homogeneous_boundary(ndim=2))
 
 
 class PoissonOutputs(TypedDict):
@@ -58,6 +56,14 @@ class PoissonOutputs(TypedDict):
     :ivar phi: the scalar potential on the grid
     """
     phi: ArrayLike
+
+
+class PoissonResiduals(TypedDict):
+    """Outputs of the Poisson residual.
+    
+    :ivar phi_residual: the residual of the scalar potential on the grid
+    """
+    phi_residual: ArrayLike
 
 
 class PoissonConfig(DictModel):
@@ -131,7 +137,7 @@ class Poisson2D(Model):
         description="Default inputs for the conductivity function (any PyTree).",
     )
     boundary_defaults: DictModel = Field(
-        default_factory=homogeneous_boundary,
+        default_factory=lambda: homogeneous_boundary(ndim=2),
         description="Default inputs for the boundary condition (any PyTree).",
     )
     
@@ -163,7 +169,7 @@ class Poisson2D(Model):
                 return NonlinearConductivityInputs(**value)
         return value
 
-    def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> ArrayLike:
+    def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Evalute the Poisson residual on a 2D grid.
         
         :param inputs: params for forcing, conductivity, and boundary conditions
@@ -182,50 +188,43 @@ class Poisson2D(Model):
         forcing = jnp.asarray(self.forcing(forcing_inputs, outputs))
         conductivity = jnp.asarray(self.conductivity(conductivity_inputs, outputs))
 
-        # TODO: fix boundaries to work on case-by-case basis with GridBoundaryInputs and BoundarySpec
-        # For example, we can have periodic in x or y, then two different dirichlets in the other dim
-        # Or even one dirichlet and one neumann, etc. etc.
-        # Keep using the ghost cells, and assume x is the first dim, y is the second (ij matrix ordering)
-        if self.boundary is dirichlet:
-            boundary_kind = "dirichlet"
-        elif self.boundary is neumann:
-            boundary_kind = "neumann"
-        elif self.boundary is periodic:
-            boundary_kind = "periodic"
-        else:
-            raise ValueError("Unsupported boundary condition callable.")
+        # 'ij' matrix ordering, so row=x, col=y
+        boundary_values = self.boundary(boundary_inputs)
+        xbds = boundary_values["boundary"][0]
+        ybds = boundary_values["boundary"][1]
 
-        # Setup ghost cells using boundary conditions
-        if boundary_kind == "periodic":
-            phi_w = phi[:, -1]
-            phi_e = phi[:, 0]
-            phi_s = phi[-1, :]
-            phi_n = phi[0, :]
+        def _ghost_for_side(
+            spec: DictModel,
+            interior: ArrayLike,
+            opposite: ArrayLike,
+            interior_k: ArrayLike,
+            opposite_k: ArrayLike,
+            spacing: ArrayLike,
+        ) -> tuple[ArrayLike, ArrayLike]:
+            """Get ghost cell values at each of the 4 sides, depending on BC type."""
+            b_type = spec["type"]
+            if b_type == "periodic":
+                return opposite, opposite_k
+            if b_type == "dirichlet":
+                value = jnp.asarray(spec["value"])
+                return 2.0 * value - interior, interior_k
+            if b_type == "neumann":
+                value = jnp.asarray(spec["value"])
+                return interior + spacing * value, interior_k
+            raise ValueError(f"Unsupported boundary type: {b_type!r}")
 
-            k_w = conductivity[:, -1]
-            k_e = conductivity[:, 0]
-            k_s = conductivity[-1, :]
-            k_n = conductivity[0, :]
-        else:
-            boundary_values = self.boundary(boundary_inputs, outputs)  # just pass-through for dirichlet/neumann
-            xbds = boundary_values['boundary'][0]
-            ybds = boundary_values['boundary'][1]
-
-            if boundary_kind == "dirichlet":
-                phi_w = 2.0 * left - phi[:, 0]
-                phi_e = 2.0 * right - phi[:, -1]
-                phi_s = 2.0 * bottom - phi[0, :]
-                phi_n = 2.0 * top - phi[-1, :]
-            else:
-                phi_w = phi[:, 0] + dx * left
-                phi_e = phi[:, -1] + dx * right
-                phi_s = phi[0, :] + dy * bottom
-                phi_n = phi[-1, :] + dy * top
-
-            k_w = conductivity[:, 0]  # ghost cells for dirichlet/neumann are equal to borders
-            k_e = conductivity[:, -1]
-            k_s = conductivity[0, :]
-            k_n = conductivity[-1, :]
+        phi_s, k_s = _ghost_for_side(
+            xbds[0], phi[0, :], phi[-1, :], conductivity[0, :], conductivity[-1, :], dx
+        )
+        phi_n, k_n = _ghost_for_side(
+            xbds[1], phi[-1, :], phi[0, :], conductivity[-1, :], conductivity[0, :], dx
+        )
+        phi_w, k_w = _ghost_for_side(
+            ybds[0], phi[:, 0], phi[:, -1], conductivity[:, 0], conductivity[:, -1], dy
+        )
+        phi_e, k_e = _ghost_for_side(
+            ybds[1], phi[:, -1], phi[:, 0], conductivity[:, -1], conductivity[:, 0], dy
+        )
 
         phi_west = jnp.concatenate([phi_w[:, None], phi[:, :-1]], axis=1)
         phi_east = jnp.concatenate([phi[:, 1:], phi_e[:, None]], axis=1)
@@ -242,14 +241,29 @@ class Poisson2D(Model):
         k_face_s = 0.5 * (conductivity + k_south)
         k_face_n = 0.5 * (conductivity + k_north)
 
-        flux_e = k_face_e * (phi_east - phi) / dy  # 'ij' matrix ordering, so row=x, col=y
+        flux_e = k_face_e * (phi_east - phi) / dy  
         flux_w = k_face_w * (phi - phi_west) / dy
         flux_n = k_face_n * (phi_north - phi) / dx
         flux_s = k_face_s * (phi - phi_south) / dx
 
-        return (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
+        phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
+        return {'phi_residual': phi_residual}
 
-    def solve(self):
+    def solve(self, inputs: PoissonInputs, residuals: PoissonResiduals) -> PoissonOutputs:
+        """Solve the Poisson equation for a target residual.
+        
+        :param inputs: params for forcing, conductivity, and boundary conditions
+        :param residuals: the target scalar residual on the 2D grid
+        :return: the scalar potential solution on the 2D grid
+        """
+        # TODO: implement a differentiable iterative solver for the Poisson equation.
+        # This essentially acts as an "inverse" function for evaluate(), i.e. given some inputs and a target residual,
+        # what is the scalar potential "phi" on the grid, i.e. the solution when residuals~0.
+        # This should work generally for residuals != 0 as well.
+        # It should also be agnostic to the particular iteration scheme, and jax grad should work via an adjoint method
+        # rather than differentiating through the iterations.
+        # All extra solver-specific configurations should go in Poisson2D.config with appropriate pydantic validation.
+        # All "common" PDE-type solver utilities should go in solvers.utils.py.
         pass
     

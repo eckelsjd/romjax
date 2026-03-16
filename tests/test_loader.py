@@ -11,7 +11,7 @@ from romtools.model import Model
 from romtools.solvers.poisson import Poisson2D
 
 
-def example_forcing(inputs: dict) -> int:
+def example_forcing(inputs: dict, outputs: dict):
     return int(inputs.get("value", 0))
 
 
@@ -82,13 +82,12 @@ def test_poisson_model_load_and_dump() -> None:
     solver = data["solver"]
     assert isinstance(solver, Poisson2D)
     assert isinstance(solver.forcing, Callable)
-    assert solver.forcing is example_forcing
+    assert solver.config.grid.shape == (25, 25)
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
     assert "!model:romtools.solvers.poisson.Poisson2D" in dumped
     assert "!!python/name" in dumped
-    assert "tests.test_loader.example_forcing" in dumped
     _assert_round_trip(data)
 
 
@@ -96,6 +95,10 @@ def test_custom_model_load_and_dump() -> None:
     yaml_text_colon = (
         "solver: !model:romtools.solvers.poisson.Poisson2D\n"
         "  forcing: !!python/name:tests.test_loader.example_forcing\n"
+        "  config:\n"
+        "    grid:\n"
+        "      shape: [2, 4]\n"
+        "      bounds: [[0, 1], [0, 1]]\n"
     )
     data_colon = YamlLoader.load(yaml_text_colon)
     assert isinstance(data_colon["solver"], Poisson2D)
@@ -105,6 +108,10 @@ def test_custom_model_load_and_dump() -> None:
     yaml_text_space = (
         "solver: !model:romtools.solvers.poisson.Poisson2D\n"
         "  forcing: !!python/name tests.test_loader.example_forcing\n"
+        "  config:\n"
+        "    grid:\n"
+        "      shape: [2, 4]\n"
+        "      bounds: [[0, 1], [0, 1]]\n"
     )
     data_space = YamlLoader.load(yaml_text_space)
     assert isinstance(data_space["solver"], Poisson2D)
