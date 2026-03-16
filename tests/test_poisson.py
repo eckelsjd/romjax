@@ -1,12 +1,20 @@
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from romtools import YamlLoader
+from romtools.solvers.poisson import (
+    GaussianForcingInputs,
+    Poisson2D,
+    PoissonConfig,
+    gaussian_forcing,
+    nonlinear_conductivity,
+)
+from romtools.solvers.utils import homogeneous_boundary
 from romtools.typing import DictModel
-from romtools.solvers.poisson import Poisson2D, gaussian_forcing, nonlinear_conductivity
-from romtools.solvers.poisson import PoissonConfig, GaussianForcingInputs
 
-# TODO: update these and test_loader and make sure full poisson config loads from file
 
 def test_gaussian_forcing_jit_and_grad() -> None:
     x = jnp.array([0.0, 1.0, 2.0])
@@ -18,8 +26,7 @@ def test_gaussian_forcing_jit_and_grad() -> None:
             "sigma": 1.5,
             "mu_x": 0.0,
             "mu_y": 0.0,
-            "x": x,
-            "y": y,
+            "coords": (x, y),
         }
         return jnp.sum(gaussian_forcing(inputs, {"phi": 0.0}))
 
@@ -48,8 +55,8 @@ def test_nonlinear_conductivity_jit_vmap_and_grad() -> None:
 
     assert vmap_out.shape == phis.shape
     assert jnp.isfinite(vmap_out).all()
-    assert jnp.isfinite(jit_out).all()
-    assert jnp.isfinite(grad)
+    assert jnp.allclose(jnp.array([2, 3, 6]), jit_out)
+    assert jnp.allclose(jnp.array([10]), grad)
 
 
 def test_poisson_coercion() -> None:
@@ -72,3 +79,64 @@ def test_poisson_coercion() -> None:
     assert model.boundary_defaults.boundary[0][1]['literally'] == 'whatever'
     assert model.forcing_defaults['sigma'] == 1.0
     assert model.conductivity_defaults['k0'] == 1.0
+
+
+def test_poisson_evaluate():
+    # Homogeneous dirichlet BCs, no conductivity, simple centered Gaussian bump forcing
+    fixture_path = Path("tests/fixtures_poisson.yml")
+    model = YamlLoader.load(fixture_path)['solver']
+
+    grid = model.config.grid
+    coords = grid.coords
+    x, y = coords
+
+    # Manufactured solution verification
+    phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
+
+    def forcing_manufactured(inputs: DictModel, outputs: DictModel) -> jnp.ndarray:
+        return -2.0 * (jnp.pi**2) * outputs['phi']
+
+    manufactured = Poisson2D(
+        config=model.config,
+        forcing=forcing_manufactured
+    )
+
+    inputs_exact = {
+        "conductivity": {"k0": 1.0, "alpha": 0.0},
+        "boundary": homogeneous_boundary(ndim=2),
+    }
+    residual = manufactured.evaluate(inputs_exact, {"phi": phi_exact})['phi_residual']
+    assert jnp.max(jnp.abs(residual)) < 5e-2
+
+    # JIT, VMAP, and GRAD compatibility with Gaussian forcing
+    inputs = {
+        "forcing": {
+            "A0": 0.5,
+            "sigma": 0.1,
+            "mu_x": 0.5,
+            "mu_y": 0.5,
+        },
+        "conductivity": {"k0": 1.0, "alpha": 0.0},
+        "boundary": homogeneous_boundary(ndim=2),
+    }
+    phi0 = jnp.ones_like(x)
+
+    def eval_sum(forcing_amp: jnp.ndarray, phi: jnp.ndarray) -> jnp.ndarray:
+        local_inputs = {
+            **inputs,
+            "forcing": {**inputs["forcing"], "A0": forcing_amp},
+        }
+        return jnp.sum(model.evaluate(local_inputs, {"phi": phi})['phi_residual'])
+
+    jit_out = jax.jit(eval_sum)(inputs["forcing"]["A0"], phi0)
+    vmap_out = jax.vmap(lambda p: eval_sum(inputs["forcing"]["A0"], p))(
+        jnp.stack([phi0, 0.5 * phi0])
+    )
+    grad_forcing = jax.grad(lambda a0: eval_sum(a0, phi0))(inputs["forcing"]["A0"])
+    grad_phi = jax.grad(lambda p: eval_sum(inputs["forcing"]["A0"], p))(phi0)
+
+    assert jnp.allclose(jit_out, vmap_out[0])
+    assert jnp.all(jit_out <= vmap_out[1])  # negative forcing is halved
+    assert jnp.isfinite(grad_forcing)
+    assert jnp.isfinite(grad_phi).all()
+    assert grad_phi.shape == phi0.shape

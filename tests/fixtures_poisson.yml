@@ -1,11 +1,15 @@
-solver: !model:romtools.solvers.poisson.Poisson2D
+solver: !model:romtools.solvers.Poisson2D
+  config:
+    grid:
+      shape: [25, 25]
+      bounds: [[0, 1], [0, 1]]
   forcing: gaussian
   conductivity: nonlinear
   forcing_defaults:
     mu_x: 0.5
     mu_y: 0.5
-    sigma: 0.2
-    A0: 0.1
+    sigma: 0.1
+    A0: 0.5
   conductivity_defaults:
-    alpha: 0.5
-    k0: 0.1
+    alpha: 0.0
+    k0: 1.0

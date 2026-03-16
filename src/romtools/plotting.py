@@ -4,21 +4,21 @@ Includes:
   - gridplot - Plot simulation data (1d or 2d) in a grid (with animation utilities)
   - compare  - Helper to compare two sets of simulation data in a 3-column (truth, rom, error) plot
 """
-from typing import Literal, NotRequired, TypedDict, Optional, Callable
-from pathlib import Path
-from abc import ABC
-from dataclasses import dataclass, field, asdict
+# ruff: noqa
 import copy
+from abc import ABC
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Literal, NotRequired, Optional, TypedDict
 
-import numpy as np
 import matplotlib.pyplot as plt
-
-from numpy.typing import ArrayLike
+import numpy as np
+from matplotlib.animation import FuncAnimation
 from matplotlib.collections import PolyCollection, TriMesh
 from matplotlib.tri import Triangulation
-from matplotlib.animation import FuncAnimation
+from numpy.typing import ArrayLike
 
-from romtools.utils import get_boundary, edge_normal, relative_error
+from romtools.utils import edge_normal, get_boundary, relative_error
 
 __all__ = ['gridplot', 'compare']
 

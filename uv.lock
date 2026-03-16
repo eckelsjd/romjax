@@ -108,6 +108,18 @@ wheels = [
 ]
 
 [[package]]
+name = "click"
+version = "8.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/fa/656b739db8587d7b5dfa22e22ed02566950fbfbcdc20311993483657a5c0/click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a", size = 295065, upload-time = "2025-11-15T20:45:42.706Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/78/01c019cdb5d6498122777c1a43056ebb3ebfeef2076d9d026bfe15583b2b/click-8.3.1-py3-none-any.whl", hash = "sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6", size = 108274, upload-time = "2025-11-15T20:45:41.139Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1605,6 +1617,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pyproject-runner"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c3/36/e8e1f0742978f07ddbdc347ffd8fa87287d161e8e3eac91fc29403d16786/pyproject_runner-0.3.0.tar.gz", hash = "sha256:f65e1c66c03d50db6244df21c80471f3b5d78fd5bdc22cae22cb381592efaf05", size = 39496, upload-time = "2025-01-27T22:59:16.573Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/c0/f10dcc0f5a535a7cdd761e61ee08d4842f04329f4898aed5710813248499/pyproject_runner-0.3.0-py3-none-any.whl", hash = "sha256:c47855c5a98f06fbfe2e06051b2c42a7042c099a928d08eaf4c1b52ec75b2ee3", size = 23427, upload-time = "2025-01-27T22:59:15.359Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1753,6 +1777,7 @@ cu13 = [
 dev = [
     { name = "commitizen" },
     { name = "pre-commit" },
+    { name = "pyproject-runner" },
     { name = "ruff" },
 ]
 test = [
@@ -1777,6 +1802,7 @@ provides-extras = ["cpu", "cu12", "cu13"]
 dev = [
     { name = "commitizen", specifier = ">=3.29" },
     { name = "pre-commit", specifier = ">=3.8" },
+    { name = "pyproject-runner", specifier = ">=0.3.0" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 test = [

@@ -3,10 +3,9 @@ from typing import Literal
 
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-from pydantic import model_validator, PositiveInt, PositiveFloat, Field
+from pydantic import Field, PositiveFloat, PositiveInt, model_validator
 
-from romtools.typing import DictModel, Coordinates, PyTree
-
+from romtools.typing import Coordinates, DictModel, PyTree
 
 type BoundaryName = Literal["dirichlet", "neumann", "periodic"]
 
@@ -26,6 +25,20 @@ class GridBoundaryInputs(DictModel):
     Each tuple is the left/right boundary conditions for a given dimension.
     """
     boundary: tuple[tuple[BoundarySpec, BoundarySpec], ...]
+
+    @model_validator(mode='after')
+    def _check_periodic(self) -> 'GridBoundaryInputs':
+        """Make sure both sides are periodic for any dimension with at least one periodic."""
+        for left_b, right_b in self.boundary:
+            if left_b.type == 'periodic':
+                if right_b.type != 'periodic':
+                    raise ValueError("Must use matching periodic boundaries")
+            
+            if right_b.type == 'periodic':
+                if left_b.type != 'periodic':
+                    raise ValueError("Must use matching periodic boundaries")
+        
+        return self
 
 
 def homogeneous_boundary(type: BoundaryName = 'dirichlet', 
@@ -71,7 +84,7 @@ class UniformGrid(DictModel):
     coords: Coordinates | None = Field(default=None, exclude=True)  # don't serialize
 
     @model_validator(mode='after')
-    def _coerce_grid(self) -> UniformGrid:
+    def _coerce_grid(self) -> 'UniformGrid':
         """Ultimately, we need coords to be defined. Also check everything is consistent."""
         spacing_provided = self.spacing is not None and len(self.spacing) > 0
         shape_provided = self.shape is not None and len(self.shape) > 0
@@ -81,7 +94,7 @@ class UniformGrid(DictModel):
             
             lengths = tuple(b[1] - b[0] for b in self.bounds)
                 
-            if any([l <= 0 for l in lengths]):
+            if any([L <= 0 for L in lengths]):
                 raise ValueError("Grid bounds must be ordered as (lower, upper).")
             
             # Try to construct from spacing and shape
@@ -89,16 +102,16 @@ class UniformGrid(DictModel):
                 raise ValueError("Can't construct grid without either spacing or shape.")
             
             if shape_provided and spacing_provided:
-                expected_spacing = tuple(l/Nl for l, Nl in zip(lengths, self.shape))
+                expected_spacing = tuple(L/Nl for L, Nl in zip(lengths, self.shape))
                 spacing_check = all([jnp.allclose(s1, s2) for s1, s2 in zip(expected_spacing, self.spacing)])
                 if not spacing_check:
                     raise ValueError("Specified spacing is not consistent with bounds and shape.")
                 
             if not shape_provided:
-                self.shape = tuple(l/dl for l, dl in zip(lengths, self.spacing))
+                self.shape = tuple(L/dl for L, dl in zip(lengths, self.spacing))
 
             if not spacing_provided:
-                self.spacing = tuple(l/Nl for l, Nl in zip(lengths, self.shape))
+                self.spacing = tuple(L/Nl for L, Nl in zip(lengths, self.shape))
 
             grids = [jnp.linspace(b[0]+dl/2, b[1]-dl/2, Nl) for b, dl, Nl in 
                      zip(self.bounds, self.spacing, self.shape)]
@@ -122,7 +135,7 @@ class UniformGrid(DictModel):
 
             bounds = tuple((float(jnp.min(arr)), float(jnp.max(arr))) for arr in self.coords)
             lengths = tuple(b[1] - b[0] for b in bounds)
-            spacing = tuple(l / (Nl - 1) if Nl > 1 else 0.0 for l, Nl in zip(lengths, shape))  # cell-centered
+            spacing = tuple(L / (Nl - 1) if Nl > 1 else 0.0 for L, Nl in zip(lengths, shape))  # cell-centered
             edge_bounds = tuple((b[0] - dl / 2, b[1] + dl / 2) for b, dl in zip(bounds, spacing))
 
             if self.shape is None:

@@ -3,9 +3,9 @@ import jax.numpy as jnp
 import pytest
 from jax.typing import ArrayLike
 
-from romtools.utils import to_pytree, merge_pytrees
-from romtools.solvers.utils import homogeneous_boundary, UniformGrid
+from romtools.solvers.utils import UniformGrid, homogeneous_boundary
 from romtools.typing import DictModel
+from romtools.utils import merge_pytrees, to_pytree
 
 
 def test_to_pytree():

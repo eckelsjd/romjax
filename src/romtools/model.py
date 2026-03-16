@@ -3,20 +3,23 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from romtools.typing import PyTree
+
 # Logging
 # file save/load (h5, abstract, common format across solvers)
+# output pytree or array from evaluate (wrapping inputs for PDE solvers?)
 
 class Model(BaseModel, ABC):
     """A function that maps inputs/outputs to residuals."""
     model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
 
     @abstractmethod
-    def evaluate(self, *args: Any, **kwargs: Any) -> Any:
+    def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
         """Evaluate forward residual function."""
         raise NotImplementedError
 
     @abstractmethod
-    def solve(self, *args: Any, **kwargs: Any) -> Any:
+    def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
         """Solve inverse residual function."""
         raise NotImplementedError
 

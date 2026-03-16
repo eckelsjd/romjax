@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 readme = "README.md"
 license = {text = "MIT"}
 keywords = []
@@ -45,11 +45,21 @@ dev = [
     "ruff>=0.6",
     "pre-commit>=3.8",
     "commitizen>=3.29",
+    "pyproject-runner>=0.3.0",  # Usage: rr <task> <args>
 ]
 test = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
 ]
+
+[tool.pyproject-runner.tasks]
+test = { cmd = "pytest --cov=romtools --cov-report html:htmlcov tests", cwd = "!" }
+lint = { cmd = "ruff check src tests", cwd = "!" }
+sync = { cmd = "uv sync --all-groups --extra", help = "Choose a jax extra [cpu, cu12, cu13]." }
+bump = "cz bump"
+docs = "mkdocs serve"
+setup = "pre-commit install --allow-missing-config"
+echo = "echo"
 
 [tool.uv]
 package = true
