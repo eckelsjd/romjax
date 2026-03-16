@@ -1,9 +1,15 @@
-from typing import Any, Iterator, MutableMapping
+from typing import Any, Iterator, MutableMapping, Callable
 
 from pydantic import BaseModel, ConfigDict
+from jax.typing import ArrayLike
 
 
 type PyTree = Any  # Python containers for use with jax
+
+# For PDEs
+type Coordinates = tuple[ArrayLike, ...]
+type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
+type BoundaryCallable = Callable[[PyTree], PyTree]
 
 
 class DictModel(BaseModel, MutableMapping):
