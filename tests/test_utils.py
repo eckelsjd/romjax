@@ -3,7 +3,14 @@ import jax.numpy as jnp
 import pytest
 from jax.typing import ArrayLike
 
-from romtools.solvers.utils import UniformGrid, homogeneous_boundary
+from romtools.solvers.utils import (
+    UniformGrid,
+    adjoint_vjp_solve,
+    damped_jacobi_step,
+    fixed_point_solve,
+    gmres_solve,
+    homogeneous_boundary,
+)
 from romtools.typing import DictModel
 from romtools.utils import merge_pytrees, to_pytree
 
@@ -158,3 +165,68 @@ def test_uniform_grid():
     # 6) Make sure we don't serialize big coords array
     d = grid.model_dump()
     assert 'coords' not in d
+
+
+def test_damped_jacobi_fixed_point():
+    class Cfg(DictModel):
+        max_iters: int = 50
+        min_iters: int = 0
+        tol: float = 1e-8
+
+    A = jnp.array([[2.0, 0.0], [0.0, 4.0]])
+    b = jnp.array([2.0, 8.0])
+
+    def residual_fn(x: jnp.ndarray) -> jnp.ndarray:
+        return A @ x - b
+
+    def diag_fn(_: jnp.ndarray) -> jnp.ndarray:
+        return jnp.diag(A)
+
+    inputs = {"residual_fn": residual_fn, "diag_fn": diag_fn, "damping": 1.0}
+    init_state = {"phi": jnp.zeros_like(b), "residual": residual_fn(jnp.zeros_like(b)), "diag": diag_fn(b)}
+    step_fn = lambda state: damped_jacobi_step(inputs, state)
+
+    state = fixed_point_solve(step_fn, init_state, Cfg())
+    assert jnp.allclose(state["phi"], jnp.array([1.0, 2.0]), atol=1e-6)
+
+    jit_state = jax.jit(lambda: fixed_point_solve(step_fn, init_state, Cfg()))()
+    assert jnp.allclose(jit_state["phi"], jnp.array([1.0, 2.0]), atol=1e-6)
+
+
+def test_gmres_solve_matrix_free():
+    class Cfg(DictModel):
+        adjoint_max_iters: int = 8
+        adjoint_restart: int = 8
+
+    A = jnp.array([[3.0, 1.0], [0.0, 2.0]])
+    b = jnp.array([4.0, 2.0])
+
+    def op(x: jnp.ndarray) -> jnp.ndarray:
+        return A @ x
+
+    x = gmres_solve(op, b, Cfg(), DictModel())
+    x_true = jnp.linalg.solve(A, b)
+    assert jnp.allclose(x, x_true, atol=1e-5)
+
+
+def test_adjoint_vjp_solve():
+    class Cfg(DictModel):
+        adjoint_max_iters: int = 8
+        adjoint_restart: int = 8
+
+    phi = jnp.array([1.0, 2.0])
+    inputs = {"a": jnp.array(3.0)}
+    target = jnp.array([0.5, 0.25])
+    cot_phi = jnp.array([1.0, -1.0])
+
+    def F(phi_: jnp.ndarray, inputs_: dict, target_: jnp.ndarray) -> jnp.ndarray:
+        return phi_ * phi_ + inputs_["a"] * phi_ - target_
+
+    dinputs, dtarget = adjoint_vjp_solve(F, phi, inputs, target, cot_phi, gmres_solve, Cfg(), DictModel())
+
+    lam = cot_phi / (2.0 * phi + inputs["a"])
+    expected_dinputs = {"a": -(phi @ lam)}
+    expected_dtarget = lam
+
+    assert jnp.allclose(dinputs["a"], expected_dinputs["a"])
+    assert jnp.allclose(dtarget, expected_dtarget)

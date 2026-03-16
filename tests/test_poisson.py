@@ -12,7 +12,7 @@ from romtools.solvers.poisson import (
     gaussian_forcing,
     nonlinear_conductivity,
 )
-from romtools.solvers.utils import homogeneous_boundary
+from romtools.solvers.utils import UniformGrid, homogeneous_boundary
 from romtools.typing import DictModel
 
 
@@ -140,3 +140,38 @@ def test_poisson_evaluate():
     assert jnp.isfinite(grad_forcing)
     assert jnp.isfinite(grad_phi).all()
     assert grad_phi.shape == phi0.shape
+
+
+def test_poisson_solve_zero_residual():
+    grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4))
+    model = Poisson2D(config={"grid": grid, "solver": {"max_iters": 200, "tol": 1e-6}})
+
+    inputs = {
+        "forcing": {"A0": 0.0},
+        "conductivity": {"k0": 1.0, "alpha": 0.0},
+        "boundary": homogeneous_boundary(ndim=2),
+    }
+    target = {"phi_residual": jnp.zeros_like(grid.coords[0])}
+
+    out = model.solve(inputs, target)
+    assert jnp.max(jnp.abs(out["phi"])) < 1e-4
+
+
+def test_poisson_solve_grad():
+    grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(3, 3))
+    model = Poisson2D(config={"grid": grid, "solver": {"max_iters": 200, "tol": 1e-6}})
+
+    def solve_sum(A0: jnp.ndarray) -> jnp.ndarray:
+        inputs = {
+            "forcing": {"A0": A0, "sigma": 0.2, "mu_x": 0.5, "mu_y": 0.5},
+            "conductivity": {"k0": 1.0, "alpha": 0.0},
+            "boundary": homogeneous_boundary(ndim=2),
+        }
+        target = {"phi_residual": jnp.zeros_like(grid.coords[0])}
+        phi = model.solve(inputs, target)["phi"]
+        return jnp.sum(phi)
+
+    grad = jax.grad(solve_sum)(jnp.array(0.1))
+    eps = 1e-3
+    fd = (solve_sum(0.1 + eps) - solve_sum(0.1 - eps)) / (2 * eps)
+    assert jnp.allclose(grad, fd, atol=1e-2, rtol=1e-2)
