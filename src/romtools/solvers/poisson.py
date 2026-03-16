@@ -1,15 +1,18 @@
-from typing import Callable, Literal, Mapping, TypedDict
+from typing import Mapping, TypedDict, Literal
 
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 
 from romtools.model import Model
-from romtools.typing import PyTree, DictModel
+from romtools.typing import DictModel, Coordinates, PyTree, ForcingCallable, BoundaryCallable
+from romtools.solvers.utils import UniformGrid, boundary_pass_through, homogeneous_boundary
+from romtools.utils import to_pytree, merge_pytrees
+
 
 type ForcingName = Literal["gaussian", "nonlinear"]
-type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
 
+# Other: functional boundaries, non-uniform grid, unstructured mesh/boundaries
 
 class GaussianForcingInputs(DictModel):
     """Inputs for Gaussian forcing function.
@@ -18,15 +21,13 @@ class GaussianForcingInputs(DictModel):
     :ivar sigma: symmetric width of Gaussian
     :ivar mu_x: center of Gaussian in x-direction
     :ivar mu_y: center of Gaussian in y-direction
-    :ivar x: the x coordinates
-    :ivar y: the y coordinates
+    :ivar coords: (x,y) coordinates to evaluate at
     """
-    A0: ArrayLike = Field(default=1.0, description="Amplitude.")
-    sigma: ArrayLike = Field(default=1.0, description="Symmetric width of the Gaussian.")
-    mu_x: ArrayLike = Field(default=0.0, description="Center of Gaussian in x-direction.")
-    mu_y: ArrayLike = Field(default=0.0, description="Center of Gaussian in y-direction.")
-    x: ArrayLike = Field(default=0.0, description="x-coordinates.")
-    y: ArrayLike = Field(default=0.0, description="y-coordinates.")
+    A0: ArrayLike = 1.0
+    sigma: ArrayLike = 1.0
+    mu_x: ArrayLike = 0.0
+    mu_y: ArrayLike = 0.0
+    coords: Coordinates = (0., 0.)
 
 
 class NonlinearConductivityInputs(DictModel):
@@ -35,18 +36,20 @@ class NonlinearConductivityInputs(DictModel):
     :ivar k0: the background random field conductivity (2D)
     :ivar alpha: the strength of the nonlinearity
     """
-    k0: ArrayLike = Field(default=1.0, description="Background random field conductivity (2D).")
-    alpha: ArrayLike = Field(default=1.0, description="Strength of the nonlinearity.")
-
-
-class DirichletInputs(DictModel):
-    pass # TODO: dirichlet boundary conditions
+    k0: ArrayLike = 1.0
+    alpha: ArrayLike = 1.0
 
 
 class PoissonInputs(DictModel):
-    forcing: DictModel = Field(default_factory=GaussianForcingInputs)
+    """Inputs for the Poisson equation.
+    
+    :ivar forcing: forcing inputs
+    :ivar conductivity: conductivity inputs
+    :ivar boundary: boundary condition parameters
+    """
+    forcing: DictModel = Field(default_factory=lambda: GaussianForcingInputs(A0=0.))
     conductivity: DictModel = Field(default_factory=NonlinearConductivityInputs)
-    boundary: DictModel = Field(default_factory=DirichletInputs)
+    boundary: DictModel = Field(default_factory=homogeneous_boundary)
 
 
 class PoissonOutputs(TypedDict):
@@ -57,7 +60,22 @@ class PoissonOutputs(TypedDict):
     phi: ArrayLike
 
 
-# TODO: coerce inputs to match pydantic schemas in jax grad friendly way
+class PoissonConfig(DictModel):
+    """Numerical configs for solving the Poisson PDE on a 2D grid.
+    
+    :ivar grid: the uniform 2D Cartesian grid
+    """
+    grid: UniformGrid
+
+    @field_validator("grid", mode="after")
+    @classmethod
+    def _check_2d_grid(cls, value: UniformGrid) -> UniformGrid:
+        if len(value.shape) != 2:
+            raise ValueError("Only 2D grid supported for Poisson")
+        
+        return value
+
+
 def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
     """Symmetric Gaussian bump.
 
@@ -67,12 +85,11 @@ def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> 
     :param outputs: the scalar potential on the grid (not used)
     :return: the forcing on the grid
     """
-    dx = inputs['x'] - inputs['mu_x']
-    dy = inputs['y'] - inputs['mu_y']
+    dx = inputs['coords'][0] - inputs['mu_x']
+    dy = inputs['coords'][1] - inputs['mu_y']
     return inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
 
 
-# TODO: coerce inputs to match pydantic schemas in jax grad friendly way
 def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: PoissonOutputs) -> ArrayLike:
     """Nonlinear conductivity.
 
@@ -86,32 +103,43 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
     return inputs['k0'] * (1 + inputs['alpha'] * (phi * phi))
 
 
-def dirichlet():
-    pass  # TODO: dirichlet boundary conditions
-
-
-def neumann():
-    pass # TODO: neumann boundary conditions
+def _merge_inputs(defaults: DictModel, *overrides: PyTree | None) -> dict:
+    merged = to_pytree(defaults)
+    for override in overrides:
+        if override is None:
+            continue
+        merged = merge_pytrees(merged, to_pytree(override))
+    return merged
 
 
 class Poisson2D(Model):
 
-    forcing: ForcingCallable | ForcingName = gaussian_forcing
+    # Required
+    config: PoissonConfig
+
+    # Optional/default
+    forcing: ForcingCallable = gaussian_forcing
+    conductivity: ForcingCallable = nonlinear_conductivity
+    boundary: BoundaryCallable = boundary_pass_through
+
     forcing_defaults: DictModel = Field(
-        default_factory=GaussianForcingInputs,
+        default_factory=lambda: GaussianForcingInputs(A0=0.),
         description="Default inputs for the forcing function (any PyTree).",
     )
-    conductivity: ForcingCallable | ForcingName = nonlinear_conductivity
     conductivity_defaults: DictModel = Field(
         default_factory=NonlinearConductivityInputs,
         description="Default inputs for the conductivity function (any PyTree).",
     )
-
+    boundary_defaults: DictModel = Field(
+        default_factory=homogeneous_boundary,
+        description="Default inputs for the boundary condition (any PyTree).",
+    )
+    
     @field_validator("forcing", "conductivity", mode="before")
     @classmethod
-    def _coerce_forcing(cls, value: object) -> ForcingCallable:
+    def _coerce_forcing(cls, value: ForcingCallable | ForcingName, info: ValidationInfo) -> ForcingCallable:
         if isinstance(value, str):
-            mapping: Mapping[str, ForcingCallable] = {
+            mapping: Mapping[ForcingName, ForcingCallable] = {
                 "gaussian": gaussian_forcing,
                 "nonlinear": nonlinear_conductivity,
             }
@@ -124,23 +152,103 @@ class Poisson2D(Model):
 
     @field_validator("forcing_defaults", "conductivity_defaults", mode="before")
     @classmethod
-    def _coerce_defaults(cls, value: object) -> DictModel:
-        if isinstance(value, DictModel):
-            return value
-        if isinstance(value, type) and issubclass(value, DictModel):
-            return value()
-        if isinstance(value, Mapping):
-            return DictModel.model_validate(value)
-        raise TypeError("forcing_defaults and conductivity_defaults must be a DictModel or a dict-like mapping.")
+    def _coerce_defaults(cls, value: object, info: ValidationInfo) -> DictModel:
+        """Just provides default values for known forcing functions params."""
+        if info.field_name == 'forcing_defaults':
+            if info.data['forcing'] is gaussian_forcing:
+                return GaussianForcingInputs(**value)
+        
+        if info.field_name == 'conductivity_defaults':
+            if info.data['conductivity'] is nonlinear_conductivity:
+                return NonlinearConductivityInputs(**value)
+        return value
 
     def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> ArrayLike:
-        """Evalute the Poisson residual on a 2D domain.
+        """Evalute the Poisson residual on a 2D grid.
         
         :param inputs: params for forcing, conductivity, and boundary conditions
-        :param outputs: the scalar potential on a 2D domain
-        :return: the scalar residual on the 2D domain
+        :param outputs: the scalar potential on a 2D grid
+        :return: the scalar residual on the 2D grid
         """
-        pass
+        phi = jnp.asarray(outputs["phi"])
+        
+        coords = self.config['grid']['coords']
+        dx, dy = self.config['grid']['spacing']
+
+        forcing_inputs = _merge_inputs(self.forcing_defaults, {'coords': coords}, inputs.get("forcing"))
+        conductivity_inputs = _merge_inputs(self.conductivity_defaults, {'coords': coords}, inputs.get("conductivity"))
+        boundary_inputs = _merge_inputs(self.boundary_defaults, {'coords': coords}, inputs.get("boundary"))
+
+        forcing = jnp.asarray(self.forcing(forcing_inputs, outputs))
+        conductivity = jnp.asarray(self.conductivity(conductivity_inputs, outputs))
+
+        # TODO: fix boundaries to work on case-by-case basis with GridBoundaryInputs and BoundarySpec
+        # For example, we can have periodic in x or y, then two different dirichlets in the other dim
+        # Or even one dirichlet and one neumann, etc. etc.
+        # Keep using the ghost cells, and assume x is the first dim, y is the second (ij matrix ordering)
+        if self.boundary is dirichlet:
+            boundary_kind = "dirichlet"
+        elif self.boundary is neumann:
+            boundary_kind = "neumann"
+        elif self.boundary is periodic:
+            boundary_kind = "periodic"
+        else:
+            raise ValueError("Unsupported boundary condition callable.")
+
+        # Setup ghost cells using boundary conditions
+        if boundary_kind == "periodic":
+            phi_w = phi[:, -1]
+            phi_e = phi[:, 0]
+            phi_s = phi[-1, :]
+            phi_n = phi[0, :]
+
+            k_w = conductivity[:, -1]
+            k_e = conductivity[:, 0]
+            k_s = conductivity[-1, :]
+            k_n = conductivity[0, :]
+        else:
+            boundary_values = self.boundary(boundary_inputs, outputs)  # just pass-through for dirichlet/neumann
+            xbds = boundary_values['boundary'][0]
+            ybds = boundary_values['boundary'][1]
+
+            if boundary_kind == "dirichlet":
+                phi_w = 2.0 * left - phi[:, 0]
+                phi_e = 2.0 * right - phi[:, -1]
+                phi_s = 2.0 * bottom - phi[0, :]
+                phi_n = 2.0 * top - phi[-1, :]
+            else:
+                phi_w = phi[:, 0] + dx * left
+                phi_e = phi[:, -1] + dx * right
+                phi_s = phi[0, :] + dy * bottom
+                phi_n = phi[-1, :] + dy * top
+
+            k_w = conductivity[:, 0]  # ghost cells for dirichlet/neumann are equal to borders
+            k_e = conductivity[:, -1]
+            k_s = conductivity[0, :]
+            k_n = conductivity[-1, :]
+
+        phi_west = jnp.concatenate([phi_w[:, None], phi[:, :-1]], axis=1)
+        phi_east = jnp.concatenate([phi[:, 1:], phi_e[:, None]], axis=1)
+        phi_south = jnp.concatenate([phi_s[None, :], phi[:-1, :]], axis=0)
+        phi_north = jnp.concatenate([phi[1:, :], phi_n[None, :]], axis=0)
+
+        k_west = jnp.concatenate([k_w[:, None], conductivity[:, :-1]], axis=1)
+        k_east = jnp.concatenate([conductivity[:, 1:], k_e[:, None]], axis=1)
+        k_south = jnp.concatenate([k_s[None, :], conductivity[:-1, :]], axis=0)
+        k_north = jnp.concatenate([conductivity[1:, :], k_n[None, :]], axis=0)
+
+        k_face_w = 0.5 * (conductivity + k_west)
+        k_face_e = 0.5 * (conductivity + k_east)
+        k_face_s = 0.5 * (conductivity + k_south)
+        k_face_n = 0.5 * (conductivity + k_north)
+
+        flux_e = k_face_e * (phi_east - phi) / dy  # 'ij' matrix ordering, so row=x, col=y
+        flux_w = k_face_w * (phi - phi_west) / dy
+        flux_n = k_face_n * (phi_north - phi) / dx
+        flux_s = k_face_s * (phi - phi_south) / dx
+
+        return (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
+
 
     def solve(self):
         pass
