@@ -1,6 +1,7 @@
 """Utilites for PDE-based solvers."""
-from typing import Literal
+from typing import Callable, Literal
 
+import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 from pydantic import Field, PositiveFloat, PositiveInt, model_validator
@@ -66,6 +67,124 @@ def boundary_pass_through(inputs: PyTree) -> PyTree:
     return inputs
 
 
+def damped_jacobi_step(inputs: PyTree, state: PyTree) -> PyTree:
+    """Single damped Jacobi iteration step.
+
+    Expects inputs to provide:
+    - residual_fn(phi): residual at current phi
+    - diag_fn(phi): diagonal approximation for Jacobian
+    - damping: relaxation parameter
+    - diag_eps: diagonal stabilization
+    """
+    phi = state["phi"]
+    residual = inputs["residual_fn"](phi)
+    diag = inputs["diag_fn"](phi)
+    denom = diag + inputs.get("diag_eps", 1e-12)
+    phi_next = phi - inputs.get("damping", 1.0) * residual / denom
+    return {"phi": phi_next, "residual": residual, "diag": diag}
+
+
+def fixed_point_solve(step_fn: Callable[[PyTree], PyTree], init_state: PyTree, cfg: PyTree) -> PyTree:
+    """Fixed-point iteration with stopping criteria."""
+    max_iters = int(getattr(cfg, "max_iters", 100))
+    min_iters = int(getattr(cfg, "min_iters", 0))
+    tol = float(getattr(cfg, "tol", 1e-6))
+
+    def cond(carry: tuple[jnp.ndarray, PyTree]) -> jnp.ndarray:
+        it, state = carry
+        res_norm = jnp.linalg.norm(state["residual"])
+        return jnp.logical_or(it < min_iters, jnp.logical_and(it < max_iters, res_norm > tol))
+
+    def body(carry: tuple[jnp.ndarray, PyTree]) -> tuple[jnp.ndarray, PyTree]:
+        it, state = carry
+        return it + 1, step_fn(state)
+
+    it0 = jnp.asarray(0)
+    _, state = jax.lax.while_loop(cond, body, (it0, init_state))
+    return state
+
+
+def gmres_solve(op: Callable[[ArrayLike], ArrayLike], rhs: ArrayLike, cfg: PyTree, method_inputs: PyTree) -> ArrayLike:
+    """Matrix-free GMRES solve using Arnoldi + least squares."""
+    max_iters = int(getattr(cfg, "adjoint_max_iters", 50))
+    restart = int(getattr(cfg, "adjoint_restart", max_iters))
+    if isinstance(method_inputs, DictModel) and "restart" in method_inputs:
+        restart = int(method_inputs["restart"])
+    m = max(1, min(max_iters, restart))
+
+    rhs_arr = jnp.asarray(rhs)
+    rhs_flat = rhs_arr.reshape(-1)
+    n = rhs_flat.shape[0]
+
+    x0 = jnp.zeros_like(rhs_flat)
+    r0 = rhs_flat
+    beta = jnp.linalg.norm(r0)
+
+    def solve_system() -> ArrayLike:
+        v0 = r0 / beta
+        V = jnp.zeros((m + 1, n), dtype=rhs_flat.dtype).at[0].set(v0)
+        H = jnp.zeros((m + 1, m), dtype=rhs_flat.dtype)
+
+        def arnoldi(j: int, carry: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
+            V, H = carry
+            w = op(V[j].reshape(rhs_arr.shape)).reshape(-1)
+
+            def orth(i: int, inner: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
+                w_local, H_local = inner
+                hij = jnp.vdot(V[i], w_local)
+                w_local = w_local - hij * V[i]
+                H_local = H_local.at[i, j].set(hij)
+                return w_local, H_local
+
+            w, H = jax.lax.fori_loop(0, j + 1, orth, (w, H))
+            h_next = jnp.linalg.norm(w)
+            H = H.at[j + 1, j].set(h_next)
+            v_next = jnp.where(h_next > 0, w / h_next, w)
+            V = V.at[j + 1].set(v_next)
+            return V, H
+
+        V, H = jax.lax.fori_loop(0, m, arnoldi, (V, H))
+
+        e1 = jnp.zeros((m + 1,), dtype=rhs_flat.dtype).at[0].set(beta)
+        y, *_ = jnp.linalg.lstsq(H, e1, rcond=None)
+        x = x0 + V[:-1].T @ y
+        return x.reshape(rhs_arr.shape)
+
+    x = solve_system()
+    return jnp.where(beta > 0, x, jnp.zeros_like(rhs_arr))
+
+
+def adjoint_vjp_solve(
+    F: Callable[[ArrayLike, PyTree, PyTree], ArrayLike],
+    phi: ArrayLike,
+    inputs: PyTree,
+    target: PyTree,
+    cot_phi: ArrayLike,
+    linear_solve: Callable[[Callable[[ArrayLike], ArrayLike], ArrayLike, PyTree, PyTree], ArrayLike],
+    cfg: PyTree,
+    method_inputs: PyTree,
+) -> tuple[PyTree, PyTree]:
+    """Solve adjoint system for implicit differentiation."""
+    def F_all(phi_: ArrayLike, inputs_: PyTree, target_: PyTree) -> ArrayLike:
+        return F(phi_, inputs_, target_)
+
+    _, vjp_all = jax.vjp(F_all, phi, inputs, target)
+
+    def op(v: ArrayLike) -> ArrayLike:
+        dphi, _, _ = vjp_all(v)
+        return dphi
+
+    lam = linear_solve(op, cot_phi, cfg, method_inputs)
+    _, dinputs, dtarget = vjp_all(lam)
+
+    def safe_neg(x: ArrayLike) -> ArrayLike:
+        if hasattr(x, "dtype") and x.dtype == jax.dtypes.float0:
+            return x
+        return -x
+
+    return jax.tree_util.tree_map(safe_neg, dinputs), jax.tree_util.tree_map(safe_neg, dtarget)
+
+
 class UniformGrid(DictModel):
     """Uniformly-spaced Cartesian grid (cell-centered). Either provide coords or some consistent 
        combination of shape, spacing, and bounds. If coords is not specified, then you must have
@@ -103,8 +222,10 @@ class UniformGrid(DictModel):
             
             if shape_provided and spacing_provided:
                 expected_spacing = tuple(L/Nl for L, Nl in zip(lengths, self.shape))
-                spacing_check = all([jnp.allclose(s1, s2) for s1, s2 in zip(expected_spacing, self.spacing)])
-                if not spacing_check:
+                spacing_checks = jnp.array(
+                    [jnp.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(expected_spacing, self.spacing)]
+                )
+                if not bool(jnp.all(spacing_checks)):
                     raise ValueError("Specified spacing is not consistent with bounds and shape.")
                 
             if not shape_provided:
@@ -147,17 +268,22 @@ class UniformGrid(DictModel):
             if self.bounds is None:
                 self.bounds = edge_bounds
             else:
-                bounds_check = all(
-                    [jnp.allclose(jnp.asarray(b1), jnp.asarray(b2)) for b1, b2 in zip(edge_bounds, self.bounds)]
+                bounds_checks = jnp.array(
+                    [
+                        jnp.allclose(jnp.asarray(b1), jnp.asarray(b2), atol=1e-6, rtol=1e-6)
+                        for b1, b2 in zip(edge_bounds, self.bounds)
+                    ]
                 )
-                if not bounds_check:
+                if not bool(jnp.all(bounds_checks)):
                     raise ValueError("Specified bounds are not consistent with provided coords")
             
             if self.spacing is None:
                 self.spacing = spacing
             else:
-                spacing_check = all([jnp.allclose(s1, s2) for s1, s2 in zip(spacing, self.spacing)])
-                if not spacing_check:
+                spacing_checks = jnp.array(
+                    [jnp.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(spacing, self.spacing)]
+                )
+                if not bool(jnp.all(spacing_checks)):
                     raise ValueError("Specified spacings are not consistent with provided coords")
             
         return self
