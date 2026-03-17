@@ -1,8 +1,13 @@
 solver: !model:romtools.solvers.Poisson2D
   config:
     grid:
-      shape: [25, 25]
+      shape: [50, 50]
       bounds: [[0, 1], [0, 1]]
+    solver:
+      name: Newton
+      opts:
+        rtol: 1.0e-2
+        atol: 1.0e-6
   forcing: gaussian
   conductivity: nonlinear
   forcing_defaults:

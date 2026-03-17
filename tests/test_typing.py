@@ -129,9 +129,7 @@ def test_module_object_external_serialization():
     assert isinstance(dumped["solver"]["opts"], dict)
     if "linear_solver" in dumped["solver"]["opts"]:
         assert dumped["solver"]["opts"]["linear_solver"]["name"] == "CG"
-
-
-def test_module_object_external_serialization_lx():
+    
     solver = lx.CG(rtol=1e-2, atol=1e4)
     cfg = LinearSolverConfig(solver=solver)
     dumped = cfg.model_dump()
@@ -140,3 +138,4 @@ def test_module_object_external_serialization_lx():
     assert isinstance(dumped["solver"]["opts"], dict)
     assert "rtol" in dumped["solver"]["opts"]
     assert "atol" in dumped["solver"]["opts"]
+    
