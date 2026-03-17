@@ -1,28 +1,36 @@
-from typing import Callable, Literal, Mapping, TypedDict
+from typing import Literal, Mapping, TypedDict, Any
 
-import jax
 import jax.numpy as jnp
+import lineax as lx
+import optimistix as optx
 from jax.typing import ArrayLike
-from pydantic import Field, PositiveFloat, PositiveInt, ValidationInfo, field_validator
+from pydantic import (
+    Field, 
+    PositiveFloat, 
+    PositiveInt, 
+    ValidationInfo, 
+    field_validator, 
+    model_validator,
+)
 
 from romtools.model import Model
 from romtools.solvers.utils import (
-    adjoint_vjp_solve,
     boundary_pass_through,
-    damped_jacobi_step,
-    fixed_point_solve,
-    gmres_solve,
     homogeneous_boundary,
     UniformGrid,
 )
-from romtools.typing import BoundaryCallable, Coordinates, DictModel, ForcingCallable, PyTree
+from romtools.typing import (
+    BoundaryCallable, 
+    Coordinates, 
+    DictModel, 
+    ForcingCallable, 
+    PyTree,
+    OptxObject,
+)
 from romtools.utils import merge_pytrees, to_pytree
 
+
 type ForcingName = Literal["gaussian", "nonlinear"]
-type IterName = Literal["damped_jacobi"]
-type AdjointName = Literal["gmres"]
-type IterCallable = Callable[[PyTree, PyTree], PyTree]
-type AdjointCallable = Callable[[Callable[[ArrayLike], ArrayLike], ArrayLike, PyTree, PyTree], ArrayLike]
 
 
 class GaussianForcingInputs(DictModel):
@@ -81,12 +89,22 @@ class PoissonResiduals(TypedDict):
 
 class PoissonConfig(DictModel):
     """Numerical configs for solving the Poisson PDE on a 2D grid.
+
+    See Optimistix docs for `root_find()` method.
     
     :ivar grid: the uniform 2D Cartesian grid
-    :ivar solver: iteration and adjoint solver configuration
+    :ivar solver: Optimistix nonlinear root finding solver (name+opts or instance), default is Newton
+    :ivar options: runtime options for the nonlinear solver
+    :ivar max_steps: maximum number of solver steps
+    :ivar adjoint: Optimistix adjoint method
+    :ivar throw: whether to throw failures as errors (default True)
     """
     grid: UniformGrid
-    solver: 'PoissonSolverConfig' = Field(default_factory=lambda: PoissonSolverConfig())
+    solver: OptxObject = Field(default_factory=dict(name='Newton', opts={'rtol': 1e-3, 'atol': 1e-6}))
+    adjoint: OptxObject = Field(default_factory=dict(name='ImplicitAdjoint'))
+    options: dict[str, Any] = Field(default_factory=dict)
+    max_steps: PositiveInt = 256
+    throw: bool = True
 
     @field_validator("grid", mode="after")
     @classmethod
@@ -95,62 +113,6 @@ class PoissonConfig(DictModel):
             raise ValueError("Only 2D grid supported for Poisson")
         
         return value
-
-
-class DampedJacobiInputs(DictModel):
-    """Inputs for damped Jacobi iteration."""
-    damping: PositiveFloat = 0.1
-    diag_eps: PositiveFloat = 1e-12
-
-
-class GMRESInputs(DictModel):
-    """Inputs for GMRES."""
-    restart: PositiveInt = 20
-
-
-class PoissonSolverConfig(DictModel):
-    """Solver configuration for iteration and adjoint solves."""
-    iter_method: IterCallable | IterName = "damped_jacobi"
-    iter_defaults: DictModel = Field(default_factory=DampedJacobiInputs)
-    adjoint_method: AdjointCallable | AdjointName = "gmres"
-    adjoint_defaults: DictModel = Field(default_factory=GMRESInputs)
-
-    max_iters: PositiveInt = 200
-    min_iters: PositiveInt = 0
-    tol: PositiveFloat = 1e-6
-    damping: PositiveFloat = 0.1
-
-    adjoint_max_iters: PositiveInt = 200
-    adjoint_tol: PositiveFloat = 1e-6
-    adjoint_restart: PositiveInt = 20
-
-    @field_validator("iter_method", mode="before")
-    @classmethod
-    def _coerce_iter_method(cls, value: IterCallable | IterName) -> IterCallable:
-        if isinstance(value, str):
-            mapping: Mapping[IterName, IterCallable] = {
-                "damped_jacobi": damped_jacobi_step,
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown iteration method: {value!r}")
-            return mapping[value]
-        if callable(value):
-            return value
-        raise TypeError("iter_method must be a callable or a supported string literal.")
-
-    @field_validator("adjoint_method", mode="before")
-    @classmethod
-    def _coerce_adjoint_method(cls, value: AdjointCallable | AdjointName) -> AdjointCallable:
-        if isinstance(value, str):
-            mapping: Mapping[AdjointName, AdjointCallable] = {
-                "gmres": gmres_solve,
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown adjoint method: {value!r}")
-            return mapping[value]
-        if callable(value):
-            return value
-        raise TypeError("adjoint_method must be a callable or a supported string literal.")
 
 
 def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
@@ -187,6 +149,116 @@ def _merge_inputs(defaults: DictModel, *overrides: PyTree | None) -> dict:
             continue
         merged = merge_pytrees(merged, to_pytree(override))
     return merged
+
+
+# def _split_boundary_tree(tree: PyTree) -> tuple[PyTree, PyTree]:
+#     """Split boundary tree into (types, values), keeping values as JAX arrays."""
+#     if isinstance(tree, dict) and "type" in tree and "value" in tree:
+#         return tree["type"], jnp.asarray(tree["value"])
+#     if isinstance(tree, dict):
+#         types: dict = {}
+#         values: dict = {}
+#         for key, val in tree.items():
+#             t_child, v_child = _split_boundary_tree(val)
+#             types[key] = t_child
+#             values[key] = v_child
+#         return types, values
+#     if isinstance(tree, tuple):
+#         types_list = []
+#         values_list = []
+#         for val in tree:
+#             t_child, v_child = _split_boundary_tree(val)
+#             types_list.append(t_child)
+#             values_list.append(v_child)
+#         return tuple(types_list), tuple(values_list)
+#     if isinstance(tree, list):
+#         types_list = []
+#         values_list = []
+#         for val in tree:
+#             t_child, v_child = _split_boundary_tree(val)
+#             types_list.append(t_child)
+#             values_list.append(v_child)
+#         return types_list, values_list
+#     return tree, tree
+
+
+def _poisson_residual_and_diag(
+    phi: ArrayLike,
+    forcing: ArrayLike,
+    conductivity: ArrayLike,
+    boundary_types: PyTree,
+    boundary_values: PyTree,
+    dx: ArrayLike,
+    dy: ArrayLike,
+    *,
+    compute_diag: bool = True,
+) -> tuple[ArrayLike, ArrayLike | None]:
+    """Compute residual (and optional diagonal) for 2D Poisson."""
+    boundary_types = boundary_types["boundary"]
+    boundary_values = boundary_values["boundary"]
+    xbds_types = boundary_types[0]
+    ybds_types = boundary_types[1]
+    xbds_values = boundary_values[0]
+    ybds_values = boundary_values[1]
+
+    def _ghost_for_side(
+        b_type: str,
+        value: ArrayLike,
+        interior: ArrayLike,
+        opposite: ArrayLike,
+        interior_k: ArrayLike,
+        opposite_k: ArrayLike,
+        spacing: ArrayLike,
+    ) -> tuple[ArrayLike, ArrayLike]:
+        if b_type == "periodic":
+            return opposite, opposite_k
+        if b_type == "dirichlet":
+            value = jnp.asarray(value)
+            return 2.0 * value - interior, interior_k
+        if b_type == "neumann":
+            value = jnp.asarray(value)
+            return interior + spacing * value, interior_k
+        raise ValueError(f"Unsupported boundary type: {b_type!r}")
+
+    phi_s, k_s = _ghost_for_side(
+        xbds_types[0], xbds_values[0], phi[0, :], phi[-1, :], conductivity[0, :], conductivity[-1, :], dx
+    )
+    phi_n, k_n = _ghost_for_side(
+        xbds_types[1], xbds_values[1], phi[-1, :], phi[0, :], conductivity[-1, :], conductivity[0, :], dx
+    )
+    phi_w, k_w = _ghost_for_side(
+        ybds_types[0], ybds_values[0], phi[:, 0], phi[:, -1], conductivity[:, 0], conductivity[:, -1], dy
+    )
+    phi_e, k_e = _ghost_for_side(
+        ybds_types[1], ybds_values[1], phi[:, -1], phi[:, 0], conductivity[:, -1], conductivity[:, 0], dy
+    )
+
+    phi_west = jnp.concatenate([phi_w[:, None], phi[:, :-1]], axis=1)
+    phi_east = jnp.concatenate([phi[:, 1:], phi_e[:, None]], axis=1)
+    phi_south = jnp.concatenate([phi_s[None, :], phi[:-1, :]], axis=0)
+    phi_north = jnp.concatenate([phi[1:, :], phi_n[None, :]], axis=0)
+
+    k_west = jnp.concatenate([k_w[:, None], conductivity[:, :-1]], axis=1)
+    k_east = jnp.concatenate([conductivity[:, 1:], k_e[:, None]], axis=1)
+    k_south = jnp.concatenate([k_s[None, :], conductivity[:-1, :]], axis=0)
+    k_north = jnp.concatenate([conductivity[1:, :], k_n[None, :]], axis=0)
+
+    k_face_w = 0.5 * (conductivity + k_west)
+    k_face_e = 0.5 * (conductivity + k_east)
+    k_face_s = 0.5 * (conductivity + k_south)
+    k_face_n = 0.5 * (conductivity + k_north)
+
+    flux_e = k_face_e * (phi_east - phi) / dy
+    flux_w = k_face_w * (phi - phi_west) / dy
+    flux_n = k_face_n * (phi_north - phi) / dx
+    flux_s = k_face_s * (phi - phi_south) / dx
+
+    residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
+    if not compute_diag:
+        return residual, None
+
+    diag = (k_face_e + k_face_w) / (dy * dy) + (k_face_n + k_face_s) / (dx * dx)
+    return residual, diag
 
 
 class Poisson2D(Model):
@@ -259,65 +331,19 @@ class Poisson2D(Model):
         forcing = jnp.asarray(self.forcing(forcing_inputs, outputs))
         conductivity = jnp.asarray(self.conductivity(conductivity_inputs, outputs))
 
-        # 'ij' matrix ordering, so row=x, col=y
-        boundary_values = self.boundary(boundary_inputs)
-        xbds = boundary_values["boundary"][0]
-        ybds = boundary_values["boundary"][1]
+        boundary_tree = to_pytree(self.boundary(boundary_inputs))
+        boundary_types, boundary_values = _split_boundary_tree(boundary_tree)
 
-        def _ghost_for_side(
-            spec: DictModel,
-            interior: ArrayLike,
-            opposite: ArrayLike,
-            interior_k: ArrayLike,
-            opposite_k: ArrayLike,
-            spacing: ArrayLike,
-        ) -> tuple[ArrayLike, ArrayLike]:
-            """Get ghost cell values at each of the 4 sides, depending on BC type."""
-            b_type = spec["type"]
-            if b_type == "periodic":
-                return opposite, opposite_k
-            if b_type == "dirichlet":
-                value = jnp.asarray(spec["value"])
-                return 2.0 * value - interior, interior_k
-            if b_type == "neumann":
-                value = jnp.asarray(spec["value"])
-                return interior + spacing * value, interior_k
-            raise ValueError(f"Unsupported boundary type: {b_type!r}")
-
-        phi_s, k_s = _ghost_for_side(
-            xbds[0], phi[0, :], phi[-1, :], conductivity[0, :], conductivity[-1, :], dx
+        phi_residual, _ = _poisson_residual_and_diag(
+            phi,
+            forcing,
+            conductivity,
+            boundary_types,
+            boundary_values,
+            dx,
+            dy,
+            compute_diag=False,
         )
-        phi_n, k_n = _ghost_for_side(
-            xbds[1], phi[-1, :], phi[0, :], conductivity[-1, :], conductivity[0, :], dx
-        )
-        phi_w, k_w = _ghost_for_side(
-            ybds[0], phi[:, 0], phi[:, -1], conductivity[:, 0], conductivity[:, -1], dy
-        )
-        phi_e, k_e = _ghost_for_side(
-            ybds[1], phi[:, -1], phi[:, 0], conductivity[:, -1], conductivity[:, 0], dy
-        )
-
-        phi_west = jnp.concatenate([phi_w[:, None], phi[:, :-1]], axis=1)
-        phi_east = jnp.concatenate([phi[:, 1:], phi_e[:, None]], axis=1)
-        phi_south = jnp.concatenate([phi_s[None, :], phi[:-1, :]], axis=0)
-        phi_north = jnp.concatenate([phi[1:, :], phi_n[None, :]], axis=0)
-
-        k_west = jnp.concatenate([k_w[:, None], conductivity[:, :-1]], axis=1)
-        k_east = jnp.concatenate([conductivity[:, 1:], k_e[:, None]], axis=1)
-        k_south = jnp.concatenate([k_s[None, :], conductivity[:-1, :]], axis=0)
-        k_north = jnp.concatenate([conductivity[1:, :], k_n[None, :]], axis=0)
-
-        k_face_w = 0.5 * (conductivity + k_west)
-        k_face_e = 0.5 * (conductivity + k_east)
-        k_face_s = 0.5 * (conductivity + k_south)
-        k_face_n = 0.5 * (conductivity + k_north)
-
-        flux_e = k_face_e * (phi_east - phi) / dy  
-        flux_w = k_face_w * (phi - phi_west) / dy
-        flux_n = k_face_n * (phi_north - phi) / dx
-        flux_s = k_face_s * (phi - phi_south) / dx
-
-        phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
         return {'phi_residual': phi_residual}
 
@@ -328,208 +354,80 @@ class Poisson2D(Model):
         :param residuals: the target scalar residual on the 2D grid
         :return: the scalar potential solution on the 2D grid
         """
-        # TODO: implement a differentiable iterative solver for the Poisson equation.
-        # This essentially acts as an "inverse" function for evaluate(), i.e. given some inputs and a target residual,
-        # what is the scalar potential "phi" on the grid, i.e. the solution when residuals~0.
-        # This should work generally for residuals != 0 as well.
-        # It should also be agnostic to the particular iteration scheme, and jax grad should work via an adjoint method
-        # rather than differentiating through the iterations.
-        # All extra solver-specific configurations should go in Poisson2D.config with appropriate pydantic validation.
-        # All "common" PDE-type solver utilities should go in solvers.utils.py.
         solver_cfg = self.config.solver
-        iter_method = solver_cfg.iter_method if callable(solver_cfg.iter_method) else damped_jacobi_step
-        adjoint_method = solver_cfg.adjoint_method if callable(solver_cfg.adjoint_method) else gmres_solve
         coords = self.config.grid.coords
         dx, dy = self.config.grid.spacing
 
-        boundary_type_map = {"dirichlet": 0, "neumann": 1, "periodic": 2}
-
-        def encode_boundary_types(tree: PyTree) -> PyTree:
-            if isinstance(tree, dict):
-                encoded = {k: encode_boundary_types(v) for k, v in tree.items()}
-                if "type" in encoded and isinstance(encoded["type"], str):
-                    encoded["type"] = boundary_type_map[encoded["type"]]
-                return encoded
-            if isinstance(tree, tuple):
-                return tuple(encode_boundary_types(v) for v in tree)
-            if isinstance(tree, list):
-                return [encode_boundary_types(v) for v in tree]
-            return tree
-
-        def compute_residual(phi: ArrayLike, inputs_tree: PyTree, target: ArrayLike) -> ArrayLike:
-            forcing_inputs = _merge_inputs(self.forcing_defaults, {"coords": coords}, inputs_tree.get("forcing"))
-            conductivity_inputs = _merge_inputs(self.conductivity_defaults, {"coords": coords}, inputs_tree.get("conductivity"))
-            boundary_defaults = encode_boundary_types(to_pytree(self.boundary_defaults))
-            boundary_inputs = merge_pytrees(boundary_defaults, {"coords": coords})
-            if inputs_tree.get("boundary") is not None:
-                boundary_inputs = merge_pytrees(boundary_inputs, inputs_tree.get("boundary"))
-
-            boundary_values = self.boundary(boundary_inputs)
-            xbds = boundary_values["boundary"][0]
-            ybds = boundary_values["boundary"][1]
-
-            def _ghost_for_side(
-                spec: DictModel,
-                interior: ArrayLike,
-                opposite: ArrayLike,
-                interior_k: ArrayLike,
-                opposite_k: ArrayLike,
-                spacing: ArrayLike,
-            ) -> tuple[ArrayLike, ArrayLike]:
-                b_type = spec["type"]
-                if b_type == 2:
-                    return opposite, opposite_k
-                if b_type == 0:
-                    value = jnp.asarray(spec["value"])
-                    return 2.0 * value - interior, interior_k
-                if b_type == 1:
-                    value = jnp.asarray(spec["value"])
-                    return interior + spacing * value, interior_k
-                raise ValueError(f"Unsupported boundary type: {b_type!r}")
-            forcing = jnp.asarray(self.forcing(forcing_inputs, {"phi": phi}))
-            conductivity = jnp.asarray(self.conductivity(conductivity_inputs, {"phi": phi}))
-            phi_s, k_s = _ghost_for_side(
-                xbds[0], phi[0, :], phi[-1, :], conductivity[0, :], conductivity[-1, :], dx
-            )
-            phi_n, k_n = _ghost_for_side(
-                xbds[1], phi[-1, :], phi[0, :], conductivity[-1, :], conductivity[0, :], dx
-            )
-            phi_w, k_w = _ghost_for_side(
-                ybds[0], phi[:, 0], phi[:, -1], conductivity[:, 0], conductivity[:, -1], dy
-            )
-            phi_e, k_e = _ghost_for_side(
-                ybds[1], phi[:, -1], phi[:, 0], conductivity[:, -1], conductivity[:, 0], dy
-            )
-
-            phi_west = jnp.concatenate([phi_w[:, None], phi[:, :-1]], axis=1)
-            phi_east = jnp.concatenate([phi[:, 1:], phi_e[:, None]], axis=1)
-            phi_south = jnp.concatenate([phi_s[None, :], phi[:-1, :]], axis=0)
-            phi_north = jnp.concatenate([phi[1:, :], phi_n[None, :]], axis=0)
-
-            k_west = jnp.concatenate([k_w[:, None], conductivity[:, :-1]], axis=1)
-            k_east = jnp.concatenate([conductivity[:, 1:], k_e[:, None]], axis=1)
-            k_south = jnp.concatenate([k_s[None, :], conductivity[:-1, :]], axis=0)
-            k_north = jnp.concatenate([conductivity[1:, :], k_n[None, :]], axis=0)
-
-            k_face_w = 0.5 * (conductivity + k_west)
-            k_face_e = 0.5 * (conductivity + k_east)
-            k_face_s = 0.5 * (conductivity + k_south)
-            k_face_n = 0.5 * (conductivity + k_north)
-
-            flux_e = k_face_e * (phi_east - phi) / dy
-            flux_w = k_face_w * (phi - phi_west) / dy
-            flux_n = k_face_n * (phi_north - phi) / dx
-            flux_s = k_face_s * (phi - phi_south) / dx
-
-            phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
-            return phi_residual - target
-
-        def compute_diag(phi: ArrayLike, inputs_tree: PyTree) -> ArrayLike:
-            forcing_inputs = _merge_inputs(self.forcing_defaults, {"coords": coords}, inputs_tree.get("forcing"))
-            conductivity_inputs = _merge_inputs(self.conductivity_defaults, {"coords": coords}, inputs_tree.get("conductivity"))
-            boundary_defaults = encode_boundary_types(to_pytree(self.boundary_defaults))
-            boundary_inputs = merge_pytrees(boundary_defaults, {"coords": coords})
-            if inputs_tree.get("boundary") is not None:
-                boundary_inputs = merge_pytrees(boundary_inputs, inputs_tree.get("boundary"))
-
-            boundary_values = self.boundary(boundary_inputs)
-            xbds = boundary_values["boundary"][0]
-            ybds = boundary_values["boundary"][1]
-
-            def _ghost_for_side(
-                spec: DictModel,
-                interior: ArrayLike,
-                opposite: ArrayLike,
-                interior_k: ArrayLike,
-                opposite_k: ArrayLike,
-                spacing: ArrayLike,
-            ) -> tuple[ArrayLike, ArrayLike]:
-                b_type = spec["type"]
-                if b_type == 2:
-                    return opposite, opposite_k
-                if b_type == 0:
-                    value = jnp.asarray(spec["value"])
-                    return 2.0 * value - interior, interior_k
-                if b_type == 1:
-                    value = jnp.asarray(spec["value"])
-                    return interior + spacing * value, interior_k
-                raise ValueError(f"Unsupported boundary type: {b_type!r}")
-
-            conductivity = jnp.asarray(self.conductivity(conductivity_inputs, {"phi": phi}))
-            phi_s, k_s = _ghost_for_side(
-                xbds[0], phi[0, :], phi[-1, :], conductivity[0, :], conductivity[-1, :], dx
-            )
-            phi_n, k_n = _ghost_for_side(
-                xbds[1], phi[-1, :], phi[0, :], conductivity[-1, :], conductivity[0, :], dx
-            )
-            phi_w, k_w = _ghost_for_side(
-                ybds[0], phi[:, 0], phi[:, -1], conductivity[:, 0], conductivity[:, -1], dy
-            )
-            phi_e, k_e = _ghost_for_side(
-                ybds[1], phi[:, -1], phi[:, 0], conductivity[:, -1], conductivity[:, 0], dy
-            )
-
-            k_west = jnp.concatenate([k_w[:, None], conductivity[:, :-1]], axis=1)
-            k_east = jnp.concatenate([conductivity[:, 1:], k_e[:, None]], axis=1)
-            k_south = jnp.concatenate([k_s[None, :], conductivity[:-1, :]], axis=0)
-            k_north = jnp.concatenate([conductivity[1:, :], k_n[None, :]], axis=0)
-
-            k_face_w = 0.5 * (conductivity + k_west)
-            k_face_e = 0.5 * (conductivity + k_east)
-            k_face_s = 0.5 * (conductivity + k_south)
-            k_face_n = 0.5 * (conductivity + k_north)
-
-            return (k_face_e + k_face_w) / (dy * dy) + (k_face_n + k_face_s) / (dx * dx)
-
-        def solve_impl(inputs_tree: PyTree, residuals_tree: PyTree) -> ArrayLike:
-            target = jnp.asarray(residuals_tree["phi_residual"])
-
-            residual_fn = lambda phi: compute_residual(phi, inputs_tree, target)
-            diag_fn = lambda phi: compute_diag(phi, inputs_tree)
-
-            phi0 = inputs_tree.get("phi0", jnp.zeros_like(target))
-            iter_inputs = merge_pytrees(
-                to_pytree(solver_cfg.iter_defaults),
-                {"residual_fn": residual_fn, "diag_fn": diag_fn, "damping": solver_cfg.damping},
-            )
-            init_state = {"phi": phi0, "residual": residual_fn(phi0), "diag": diag_fn(phi0)}
-            step_fn = lambda state: iter_method(iter_inputs, state)
-            state = fixed_point_solve(step_fn, init_state, solver_cfg)
-            return state["phi"]
-
-        @jax.custom_vjp
-        def solve_with_adjoint(inputs_tree: PyTree, residuals_tree: PyTree) -> ArrayLike:
-            return solve_impl(inputs_tree, residuals_tree)
-
-        def fwd(inputs_tree: PyTree, residuals_tree: PyTree) -> tuple[ArrayLike, tuple[ArrayLike, PyTree, PyTree]]:
-            phi = solve_impl(inputs_tree, residuals_tree)
-            return phi, (phi, inputs_tree, residuals_tree)
-
-        def bwd(
-            res: tuple[ArrayLike, PyTree, PyTree], cot_phi: ArrayLike
-        ) -> tuple[PyTree, PyTree]:
-            phi, inputs_tree, residuals_tree = res
-            target = jnp.asarray(residuals_tree["phi_residual"])
-
-            def F(phi_: ArrayLike, inputs_: PyTree, target_: PyTree) -> ArrayLike:
-                return compute_residual(phi_, inputs_, target_)
-
-            method_inputs = to_pytree(solver_cfg.adjoint_defaults)
-            dinputs, dtarget = adjoint_vjp_solve(
-                F,
-                phi,
-                inputs_tree,
-                target,
-                cot_phi,
-                adjoint_method,
-                solver_cfg,
-                method_inputs,
-            )
-            return dinputs, {"phi_residual": dtarget}
-
-        solve_with_adjoint.defvjp(fwd, bwd)
-        inputs_tree = encode_boundary_types(to_pytree(inputs))
+        inputs_tree = to_pytree(inputs)
         residuals_tree = to_pytree(residuals)
-        phi = solve_with_adjoint(inputs_tree, residuals_tree)
-        return {"phi": phi}
+        target = jnp.asarray(residuals_tree["phi_residual"])
+
+        forcing_inputs = _merge_inputs(self.forcing_defaults, {"coords": coords}, inputs_tree.get("forcing"))
+        conductivity_inputs = _merge_inputs(self.conductivity_defaults, {"coords": coords}, inputs_tree.get("conductivity"))
+        boundary_inputs = _merge_inputs(self.boundary_defaults, {"coords": coords}, inputs_tree.get("boundary"))
+
+        boundary_tree = to_pytree(self.boundary(boundary_inputs))
+        boundary_types, boundary_values = _split_boundary_tree(boundary_tree)
+
+        args = {
+            "forcing": forcing_inputs,
+            "conductivity": conductivity_inputs,
+            "boundary": boundary_values,
+        }
+
+        phi0 = inputs_tree.get("phi0", jnp.zeros_like(target))
+        root_solver = _build_root_solver(solver_cfg)
+        adjoint_solver = _build_linear_solver(solver_cfg)
+        adjoint = optx.ImplicitAdjoint(linear_solver=adjoint_solver)
+        options = solver_cfg.solver_options or None
+
+        def _forcing_cond(phi: ArrayLike, args_: PyTree) -> tuple[ArrayLike, ArrayLike]:
+            forcing = jnp.asarray(self.forcing(args_["forcing"], {"phi": phi}))
+            conductivity = jnp.asarray(self.conductivity(args_["conductivity"], {"phi": phi}))
+            return forcing, conductivity
+
+        def residual_fn(phi: ArrayLike, args_: PyTree) -> ArrayLike:
+            forcing, conductivity = _forcing_cond(phi, args_)
+            residual, _ = _poisson_residual_and_diag(
+                phi,
+                forcing,
+                conductivity,
+                boundary_types,
+                args_["boundary"],
+                dx,
+                dy,
+                compute_diag=False,
+            )
+            return residual - target
+
+        def fixed_point_fn(phi: ArrayLike, args_: PyTree) -> ArrayLike:
+            forcing, conductivity = _forcing_cond(phi, args_)
+            residual, diag = _poisson_residual_and_diag(
+                phi,
+                forcing,
+                conductivity,
+                boundary_types,
+                args_["boundary"],
+                dx,
+                dy,
+                compute_diag=True,
+            )
+            denom = diag + solver_cfg.diag_eps
+            return phi - solver_cfg.damping * (residual - target) / denom
+
+        if isinstance(root_solver, optx.AbstractFixedPointSolver):
+            fn = fixed_point_fn
+        else:
+            fn = residual_fn
+
+        solution = optx.root_find(
+            fn,
+            solver=root_solver,
+            y0=phi0,
+            args=args,
+            options=options,
+            max_steps=solver_cfg.max_steps,
+            adjoint=adjoint,
+        )
+        return {"phi": solution.value}
     

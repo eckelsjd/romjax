@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import lineax as lx
+import optimistix as optx
 import pytest
-from pydantic import ValidationError
+from pydantic import ValidationError, BaseModel
 
 from romtools import YamlLoader
-from romtools.typing import DictModel
+from romtools.typing import DictModel, LxObject, OptxObject
 
 
 class CustomSettings(DictModel, extra='forbid'):
@@ -77,3 +79,64 @@ def test_from_yaml():
 
     with pytest.raises(ValidationError):
         data['settings']['3'] = 'three'  # extras are forbidden
+
+
+class SolverConfig(BaseModel):
+    solver: OptxObject
+
+
+class LinearSolverConfig(BaseModel):
+    solver: LxObject
+
+
+def test_module_object_nested_validation():
+    data = {
+        "name": "Newton",
+        "opts": {
+            "rtol": 1e-3,
+            "atol": 1e-6,
+            "linear_solver": {
+                "name": "CG",
+                "opts": {
+                    "rtol": 1e-2,
+                    "atol": 1e4,
+                },
+            },
+        },
+    }
+
+    cfg = SolverConfig.model_validate({"solver": data})
+
+    assert cfg.solver.__class__.__name__ == "Newton"
+    assert cfg.solver.linear_solver.__class__.__name__ == "CG"
+
+    dumped = cfg.model_dump()
+    assert dumped["solver"]["name"] == "Newton"
+    assert dumped["solver"]["opts"]["linear_solver"]["name"] == "CG"
+    assert dumped["solver"]["opts"]["linear_solver"]["opts"]["rtol"] == 1e-2
+
+
+def test_module_object_external_serialization():
+    solver = optx.Newton(
+        rtol=1e-3,
+        atol=1e-6,
+        linear_solver=lx.CG(rtol=1e-2, atol=1e4),
+    )
+    cfg = SolverConfig(solver=solver)
+    dumped = cfg.model_dump()
+
+    assert dumped["solver"]["name"] == "Newton"
+    assert isinstance(dumped["solver"]["opts"], dict)
+    if "linear_solver" in dumped["solver"]["opts"]:
+        assert dumped["solver"]["opts"]["linear_solver"]["name"] == "CG"
+
+
+def test_module_object_external_serialization_lx():
+    solver = lx.CG(rtol=1e-2, atol=1e4)
+    cfg = LinearSolverConfig(solver=solver)
+    dumped = cfg.model_dump()
+
+    assert dumped["solver"]["name"] == "CG"
+    assert isinstance(dumped["solver"]["opts"], dict)
+    assert "rtol" in dumped["solver"]["opts"]
+    assert "atol" in dumped["solver"]["opts"]

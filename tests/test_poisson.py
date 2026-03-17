@@ -2,6 +2,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import lineax as lx
 import numpy as np
 
 from romtools import YamlLoader
@@ -144,7 +145,16 @@ def test_poisson_evaluate():
 
 def test_poisson_solve_zero_residual():
     grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4))
-    model = Poisson2D(config={"grid": grid, "solver": {"max_iters": 200, "tol": 1e-6}})
+    model = Poisson2D(
+        config={
+            "grid": grid,
+            "solver": {
+                "max_steps": 50,
+                "solver": {"name": "newton", "rtol": 1e-6, "atol": 1e-6, "linear_solver": lx.QR()},
+                "adjoint_solver": lx.QR(),
+            },
+        }
+    )
 
     inputs = {
         "forcing": {"A0": 0.0},
@@ -159,7 +169,16 @@ def test_poisson_solve_zero_residual():
 
 def test_poisson_solve_grad():
     grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(3, 3))
-    model = Poisson2D(config={"grid": grid, "solver": {"max_iters": 200, "tol": 1e-6}})
+    model = Poisson2D(
+        config={
+            "grid": grid,
+            "solver": {
+                "max_steps": 50,
+                "solver": {"name": "newton", "rtol": 1e-6, "atol": 1e-6, "linear_solver": lx.QR()},
+                "adjoint_solver": lx.QR(),
+            },
+        }
+    )
 
     def solve_sum(A0: jnp.ndarray) -> jnp.ndarray:
         inputs = {
