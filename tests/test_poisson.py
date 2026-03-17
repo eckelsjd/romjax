@@ -83,7 +83,7 @@ def test_poisson_coercion() -> None:
 
 
 def test_poisson_evaluate():
-    # Homogeneous dirichlet BCs, no conductivity, simple centered Gaussian bump forcing
+    # Homogeneous dirichlet BCs, no conductivity, sinusoidal manufactured solution
     fixture_path = Path("tests/fixtures_poisson.yml")
     model = YamlLoader.load(fixture_path)['solver']
 
@@ -94,12 +94,9 @@ def test_poisson_evaluate():
     # Manufactured solution verification
     phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
 
-    def forcing_manufactured(inputs: DictModel, outputs: DictModel) -> jnp.ndarray:
-        return -2.0 * (jnp.pi**2) * outputs['phi']
-
     manufactured = Poisson2D(
         config=model.config,
-        forcing=forcing_manufactured
+        forcing='sinusoid'
     )
 
     inputs_exact = {
@@ -107,7 +104,7 @@ def test_poisson_evaluate():
         "boundary": homogeneous_boundary(ndim=2),
     }
     residual = manufactured.evaluate(inputs_exact, {"phi": phi_exact})['phi_residual']
-    assert jnp.max(jnp.abs(residual)) < 5e-2
+    assert jnp.max(jnp.abs(residual)) < 1e-2
 
     # JIT, VMAP, and GRAD compatibility with Gaussian forcing
     inputs = {
@@ -143,54 +140,95 @@ def test_poisson_evaluate():
     assert grad_phi.shape == phi0.shape
 
 
-def test_poisson_solve_zero_residual():
-    grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4))
-    model = Poisson2D(
+def get_laplace_solver():
+    """Basic laplace solver on unit square."""
+    def initial_guess(coords):
+        p = {'sigma': 0.2, 'A0': 0.5, 'mu_x': 0.5, 'mu_y': 0.5, 'coords': coords}
+        return gaussian_forcing(p, {})
+    
+    laplace = Poisson2D(
         config={
-            "grid": grid,
+            "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(50, 50)),
             "solver": {
-                "max_steps": 50,
-                "solver": {"name": "newton", "rtol": 1e-6, "atol": 1e-6, "linear_solver": lx.QR()},
-                "adjoint_solver": lx.QR(),
+                "name": "Newton", 
+                "opts": {"rtol": 1e-10, "atol": 1e-10}
             },
-        }
+            "adjoint": {
+                "name": "ImplicitAdjoint", 
+                "opts": {}
+            },
+            "max_steps": 20,
+            "initial_guess": initial_guess
+        },
+        conductivity_defaults={'alpha': 0.0}
     )
+
+    return laplace
+
+
+def test_laplace_solve():
+    """Run Poisson with no forcing and unity conductivity. Initial Gaussian bump should smooth to 0."""
+    laplace = get_laplace_solver()
 
     inputs = {
-        "forcing": {"A0": 0.0},
         "conductivity": {"k0": 1.0, "alpha": 0.0},
-        "boundary": homogeneous_boundary(ndim=2),
     }
-    target = {"phi_residual": jnp.zeros_like(grid.coords[0])}
+    target = {"phi_residual": jnp.zeros_like(laplace.config.grid.coords[0])}
 
-    out = model.solve(inputs, target)
-    assert jnp.max(jnp.abs(out["phi"])) < 1e-4
+    out = laplace.solve(inputs, target)
+    assert jnp.max(jnp.abs(out["phi"])) < 1e-10
 
 
-def test_poisson_solve_grad():
-    grid = UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(3, 3))
-    model = Poisson2D(
+def test_poisson_manufactured_solve():
+    """Test analytical solution of manufactured sinusoid forcing."""
+    shape = (100, 100)
+    dx_error = (1/shape[0]) ** 2  # TODO: Not sure what a good convergence is here
+    mms = Poisson2D(
         config={
-            "grid": grid,
-            "solver": {
-                "max_steps": 50,
-                "solver": {"name": "newton", "rtol": 1e-6, "atol": 1e-6, "linear_solver": lx.QR()},
-                "adjoint_solver": lx.QR(),
-            },
-        }
+            "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
+            "max_steps": 50,
+            "solver": dict(name='Newton', opts={'rtol': 1e-3, 'atol': dx_error*1.5}),
+            "initial_guess": jnp.ones(shape),
+            "throw": False
+        }, 
+        forcing="sinusoid", 
+        conductivity_defaults={"alpha": 0.0}
     )
+
+    x, y = mms.config.grid.coords
+    inputs = {}
+    target = {"phi_residual": jnp.zeros_like(x)}
+    phi = mms.solve(inputs, target)["phi"]
+    phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
+    res = jnp.max(jnp.abs(phi - phi_exact))
+
+    assert res < dx_error*2
+
+
+def test_poisson_solve_jit_and_grad():
+    """Add constant forcing and take gradients of the sum over the grid."""
+    laplace = get_laplace_solver()
 
     def solve_sum(A0: jnp.ndarray) -> jnp.ndarray:
         inputs = {
-            "forcing": {"A0": A0, "sigma": 0.2, "mu_x": 0.5, "mu_y": 0.5},
+            "forcing": {"const": A0},
             "conductivity": {"k0": 1.0, "alpha": 0.0},
             "boundary": homogeneous_boundary(ndim=2),
         }
-        target = {"phi_residual": jnp.zeros_like(grid.coords[0])}
-        phi = model.solve(inputs, target)["phi"]
+        target = {"phi_residual": jnp.zeros_like(laplace.config.grid.coords[0])}
+        phi = laplace.solve(inputs, target)["phi"]
         return jnp.sum(phi)
 
-    grad = jax.grad(solve_sum)(jnp.array(0.1))
-    eps = 1e-3
-    fd = (solve_sum(0.1 + eps) - solve_sum(0.1 - eps)) / (2 * eps)
+    center = 0.5
+    grad = jax.grad(solve_sum)(jnp.array(center))
+    eps = 1e-2
+    fd = (solve_sum(center + eps) - solve_sum(center - eps)) / (2 * eps)
     assert jnp.allclose(grad, fd, atol=1e-2, rtol=1e-2)
+
+
+def test_poisson_nontrivial_solve():
+    # TODO: Implement a nontrivial poisson problem (either by changing the forcing or conductivity params or BCs).
+    # Try to use a standard numerical benchmark example if applicable.
+    # Optionally generate plots so that we can visually verify the solution matches the benchmark.
+    # Tune the solver params as necessary to get reasonable convergence.
+    pass

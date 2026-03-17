@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Callable, Iterator, MutableMapping, Protocol
+from typing import Any, Callable, Iterator, MutableMapping, Protocol, Annotated, TypeAlias
 from weakref import WeakKeyDictionary
 
 import lineax as lx
 import optimistix as optx
 from jax.typing import ArrayLike
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, AfterValidator
 from pydantic_core import core_schema
 
-__all__ = ['PyTree', 'Coordinates', 'ForcingCallable', 'BoundaryCallable', 'DictModel', 'LxObject', 'OptxObject']
+__all__ = ['PyTree', 'Coordinates', 'ForcingCallable', 'BoundaryCallable', 'DictModel', 
+           'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 type PyTree = Any  # Python containers for use with jax
 
@@ -18,6 +19,7 @@ type PyTree = Any  # Python containers for use with jax
 type Coordinates = tuple[ArrayLike, ...]
 type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
 type BoundaryCallable = Callable[[PyTree], PyTree]
+type InitialCallable = Callable[[Coordinates], ArrayLike]
 
 
 class DictModel(BaseModel, MutableMapping):
@@ -191,5 +193,15 @@ def module_object_type(builder: ModuleObjectBuilder, *, opts_adapter: TypeAdapte
     return ModuleObject
 
 
+def _require_type(value: Any, required_type: type):
+    if not isinstance(value, required_type):
+        raise TypeError(f"Expected {required_type}, got {type(value).__name__}")
+    return value
+
+
+# Probably a thousand better ways to do this, but here we are
+# Essentially I just wanted custom pydantic validation/serialization for third-party objects
 type LxObject = module_object_type(build_from_module(lx))
-type OptxObject = module_object_type(build_from_module(optx), opts_adapter=TypeAdapter(dict[str, LxObject | Any]))
+type OptxObject = module_object_type(build_from_module(optx), opts_adapter=TypeAdapter(dict[str, LxObject | Any]))    
+type IterativeSolver = Annotated[OptxObject, AfterValidator(lambda v: _require_type(v, optx.AbstractIterativeSolver))]
+type AdjointMethod = Annotated[OptxObject, AfterValidator(lambda v: _require_type(v, optx.AbstractAdjoint))]

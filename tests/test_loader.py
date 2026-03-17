@@ -82,7 +82,7 @@ def test_poisson_model_load_and_dump() -> None:
     solver = data["solver"]
     assert isinstance(solver, Poisson2D)
     assert isinstance(solver.forcing, Callable)
-    assert solver.config.grid.shape == (25, 25)
+    assert solver.config.grid.shape == (50, 50)
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
