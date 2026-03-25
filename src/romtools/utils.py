@@ -1,11 +1,16 @@
 """Module for assorted processing utilities."""
 from typing import Mapping
+import logging
+import sys
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from romtools.typing import PyTree
 
-__all__ = ['to_pytree', 'merge_pytrees']
+__all__ = ['to_pytree', 'merge_pytrees', 'get_logger']
+
+LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-15s — %(message)s")
 
 
 def to_pytree(value: PyTree) -> PyTree:
@@ -68,3 +73,29 @@ def merge_pytrees(defaults: PyTree, overrides: PyTree) -> PyTree:
         return merged_list
     
     return overrides
+
+
+def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,
+               level: int = logging.INFO) -> logging.Logger:
+    """Return a file/stdout logger with the given name.
+
+    :param name: the name of the logger to return
+    :param stdout: whether to add a stdout stream handler to the logger
+    :param log_file: add file logging to this file (optional)
+    :param level: the logging level to set
+    :returns: the logger
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
+    if stdout:
+        std_handler = logging.StreamHandler(sys.stdout)
+        std_handler.setFormatter(LOG_FORMATTER)
+        logger.addHandler(std_handler)
+    if log_file is not None:
+        f_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        f_handler.setLevel(level)
+        f_handler.setFormatter(LOG_FORMATTER)
+        logger.addHandler(f_handler)
+
+    return logger
