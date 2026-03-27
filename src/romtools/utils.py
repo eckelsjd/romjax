@@ -4,13 +4,20 @@ import logging
 import sys
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 from pydantic import BaseModel
 
 from romtools.typing import PyTree
 
-__all__ = ['to_pytree', 'merge_pytrees', 'get_logger']
+__all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm']
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-15s — %(message)s")
+
+
+@jax.jit
+def tree_l2_norm(tree: PyTree):
+    return jnp.sqrt(jax.tree.reduce(lambda acc, x: acc + jnp.sum(x**2), tree, 0.0))
 
 
 def to_pytree(value: PyTree) -> PyTree:

@@ -68,9 +68,6 @@ echo = "echo"
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-optimistix = { git = "https://github.com/ASKabalan/optimistix", branch = "add-progress" }
-
 [tool.ruff.lint]
 select = ['E', 'F', 'I']
 ignore = ['E731']  # allow lambda definitions
