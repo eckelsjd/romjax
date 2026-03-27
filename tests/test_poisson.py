@@ -2,7 +2,6 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import lineax as lx
 import numpy as np
 
 from romtools import YamlLoader

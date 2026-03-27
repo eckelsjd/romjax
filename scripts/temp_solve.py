@@ -9,11 +9,15 @@ import optax
 from pydantic import Field
 
 from romtools.model import Model
-from romtools.optimization import Optimizer
+from romtools.optimization import Optimizer, NewtonDebug
+from romtools.utils import tree_l2_norm
+from romtools.typing import PyTree
 
 import os
 from pathlib import Path
 
+jax.config.update("jax_platforms", "cpu")
+jax.config.update("jax_enable_x64", True)
 
 if (Path(os.getcwd()).name) != "scripts":
     os.chdir("scripts")
@@ -230,11 +234,103 @@ def optimize_linear_parameter_with_logging() -> None:
     print("Optimized linear alpha:", alpha_hat, "target:", alpha_true)
 
 
+def optimize_newton_debug():
+    def residual_callback(residual: PyTree) -> None:
+        err = tree_l2_norm(residual).astype(float)
+        # print(f"Residual norm: {err:.3e}")
+        return
+    
+    # alpha = jnp.array([1., 1.2, 3., 3.2])
+    # A = jnp.array([[3., 10., 30.], [0.1, 10, 35], [3, 10, 30], [0.1, 10, 35]])
+    # P = 1e-4 * jnp.array([[3689, 1170, 2673], [4699, 4387, 7470], [1091, 8732, 5547], [381, 5743, 8828]])
+    # def hartmann_fn(params):
+    #     x = params
+    #     sum = jnp.array(0.0)
+    #     for i in range(4):
+    #         for j in range(3):
+    #             sum = sum - alpha[i] * jnp.exp(-(A[i, j] * (x[j] - P[i, j])**2))
+    #     return sum
+    # params0 = jnp.array([0.5, 0.5, 0.5])
+    # expected = jnp.array([0.114614, 0.555649, 0.852547])
+
+    def rosenbrock(params, *args):
+        x = params
+        sum = jnp.array(0.0)
+        for i in range(len(x) - 1):
+            sum = sum + 100 * (x[i+1] - x[i]**2)**2 + (x[i] - 1)**2
+        return sum
+
+    # params0 = jnp.array([0.5, 0.5])
+    # expected = jnp.ones_like(params0)
+    # init_residual = rosenbrock(params0)
+
+    def bohachevsky(params, *args):
+        x1 = params[0]
+        x2 = params[1]
+        f1 = x1**2 + 2*x2**2 - 0.3*jnp.cos(3*jnp.pi*x1) - 0.4*jnp.cos(4*jnp.pi*x2) + 0.7
+        f2 = x1**2 + 2*x2**2 - 0.3*jnp.cos(3*jnp.pi*x1)*jnp.cos(4*jnp.pi*x2) + 0.3
+        f3 = x1**2 + 2*x2**2 - 0.3*jnp.cos(3*jnp.pi*x1 + 4*jnp.pi*x2) + 0.3
+        res = {'f1': f1, 'f2': f2, 'f3': f3}
+        return res
+
+    params0 = jnp.array([-25, 57])
+    init_residual = bohachevsky(params0)
+    expected = jnp.array([0.0, 0.0])
+    # solver = NewtonDebug(rtol=1e-3, atol=1e-5, callback=residual_callback)
+    solver = optx.Newton(rtol=1e10, atol=1e-17)
+
+    solution = optx.root_find(
+        bohachevsky,
+        solver=solver,
+        y0=params0,
+        max_steps=800,
+        throw=False
+    )
+    # print(solution)
+    print(f"Result: {optx.RESULTS[solution.result]}")
+    print(f"Stats: {solution.stats}")
+    print(f"Initial residual: {init_residual}")
+    print(f"Final residual: {solution.state.f}")
+    # print(f"Reduction final/init: {solution.state.f / init_residual}")
+    print(f"Diff: {solution.state.diff}")
+    print(f"Diff size: {solution.state.diffsize}")
+    # error = tree_l2_norm(jax.tree.map(lambda x, y: x - y, solution.value, expected)) / tree_l2_norm(expected)
+    error = jnp.linalg.norm(solution.value - expected) / max(1., jnp.linalg.norm(expected))
+    print(f"Solution: {solution.value}, Expected: {expected}, Error: {error}")
+
+
+def optimize_poisson():
+    from romtools.solvers import Poisson2D
+
+    poisson = Poisson2D(
+        config={
+            "solver": optx.Newton(rtol=1e10, atol=1e-6),
+            "grid": {"shape": (100, 100), "bounds": ((0, 1), (0, 1))},
+            "throw": False,
+            "max_steps": 800
+        },
+        forcing='constant',
+        conductivity='nonlinear',
+        forcing_defaults={"const": 1.},
+        conductivity_defaults={"alpha": 0., "k0": 1.}
+    )
+
+    init_residual = poisson.evaluate({}, {"phi": jnp.zeros_like(poisson.config.grid.coords[0])})["phi_residual"]
+    solution = poisson.solve(return_sol=True)
+    print(f"Result: {optx.RESULTS[solution.result]}")
+    print(f"Stats: {solution.stats}")
+    print(f"Diff: {solution.state.diff}")
+    print(f"Diff size: {solution.state.diffsize}")
+    print(f"Initial residual: {jnp.linalg.norm(init_residual)}")
+    print(f"Final residual: {jnp.linalg.norm(solution.state.f)}")
+
 def main() -> None:
     # solve_known_systems()
     # optimize_linear_parameter()
-    optimize_linear_parameter_with_logging()
+    # optimize_linear_parameter_with_logging()
     # optimize_nonlinear_parameter()
+    # optimize_newton_debug()
+    optimize_poisson()
 
 
 if __name__ == "__main__":

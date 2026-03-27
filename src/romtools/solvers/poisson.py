@@ -1,7 +1,6 @@
 from typing import Literal, Mapping, TypedDict, Any
 
 import jax.numpy as jnp
-import lineax as lx
 import optimistix as optx
 from jax.typing import ArrayLike
 from pydantic import (
@@ -328,7 +327,11 @@ class Poisson2D(Model):
 
         return {"phi_residual": phi_residual}
 
-    def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
+    def evaluate(
+            self, 
+            inputs: PoissonInputs, 
+            outputs: PoissonOutputs
+        ) -> PoissonResiduals:
         """Evalute the Poisson residual on a 2D grid.
         
         :param inputs: params for forcing, conductivity, and boundary conditions
@@ -337,14 +340,25 @@ class Poisson2D(Model):
         """
         return self._compute_residual(self._merge_inputs(inputs), outputs)
 
-    def solve(self, inputs: PoissonInputs, residuals: PoissonResiduals) -> PoissonOutputs:
+    def solve(
+            self, 
+            inputs: PoissonInputs | None = None, 
+            residuals: PoissonResiduals | None = None,
+            return_sol: bool = False
+        ) -> PoissonOutputs | optx.Solution:
         """Solve the Poisson equation for a target residual.
         
-        :param inputs: params for forcing, conductivity, and boundary conditions
-        :param residuals: the target scalar residual on the 2D grid
+        :param inputs: params for forcing, conductivity, and boundary conditions (use defaults if None)
+        :param residuals: the target scalar residual on the 2D grid (defaults to zeros with same shape as grid)
+        :param return_sol: return the full Solution object (default False)
         :return: the scalar potential solution on the 2D grid
         """
-        target = jnp.asarray(residuals["phi_residual"])
+        inputs = {} if inputs is None else inputs
+        residuals = {} if residuals is None else residuals
+        if "phi_residual" in residuals:
+            target = jnp.asarray(residuals["phi_residual"])
+        else:
+            target = jnp.zeros_like(self.config.grid.coords[0])
         merged_inputs = self._merge_inputs(inputs)
         args = {'inputs': merged_inputs, 'target': target}
 
@@ -361,8 +375,8 @@ class Poisson2D(Model):
             max_steps=self.config.max_steps,
             adjoint=self.config.adjoint,
             throw=self.config.throw,
-            progress_meter=optx.TextProgressMeter()  # TODO: make this configurable/extendable
         )
 
-        return {"phi": solution.value}
+        ret = solution if return_sol else {"phi": solution.value} 
+        return ret
     

@@ -6,16 +6,27 @@ from typing import Callable
 
 import jax
 import optax
+import optimistix as optx
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 from pydantic import BaseModel, Field, ConfigDict
 
-from romtools.utils import get_logger
+from romtools.utils import get_logger, tree_l2_norm
 from romtools.typing import PyTree
 
 
-# 
+class NewtonDebug(optx.Newton):
+    callback: Callable[[PyTree], None] | None = None  # Takes just the residual at the current step
+
+    # Override step so we can access the current residual for debugging
+    def step(self, *args):
+        new_y, new_state, aux = super().step(*args)
+        residual = new_state.f
+        if self.callback is not None:
+            self.callback(residual)
+        return new_y, new_state, aux
+
 
 class Optimizer(BaseModel):
     """Minimize scalar loss function with plotting and logging options."""
@@ -50,10 +61,6 @@ class Optimizer(BaseModel):
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return params, opt_state, loss, grads
-        
-        @jax.jit
-        def tree_l2_norm(tree: PyTree):
-            return jnp.sqrt(jax.tree.reduce(lambda acc, x: acc + jnp.sum(x**2), tree, 0.0))
 
         # Initialize
         params = params0

@@ -5,7 +5,7 @@ import optimistix as optx
 import pytest
 from jax.typing import ArrayLike
 
-from romtools.solvers.utils import UniformGrid, homogeneous_boundary
+from romtools.solvers.utils import UniformGrid, homogeneous_boundary, BoundaryType
 from romtools.typing import DictModel
 from romtools.utils import merge_pytrees, to_pytree
 
@@ -77,7 +77,7 @@ def test_merge_boundary_conditions():
                 {"value": jnp.array(2.0)},
             ),
             (
-                {"type": "neumann", "value": jnp.array(0.5)},
+                {"type": BoundaryType.neumann, "value": jnp.array(0.5)},
                 {"value": jnp.array(3.0)},
             ),
         )
@@ -85,8 +85,8 @@ def test_merge_boundary_conditions():
 
     merged = merge_pytrees(defaults, overrides)
 
-    assert merged["boundary"][0][0]["type"] == "dirichlet"
-    assert merged["boundary"][1][0]["type"] == "neumann"
+    assert merged["boundary"][0][0]["type"] == BoundaryType.dirichlet
+    assert merged["boundary"][1][0]["type"] == BoundaryType.neumann
     assert float(merged["boundary"][0][1]["value"]) == 2.0
 
 
