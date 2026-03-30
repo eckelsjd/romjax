@@ -160,7 +160,7 @@ def get_scheme(scheme: Literal['white', 'dark']):
     return text_color, bg_color
 
 
-type SupportedPlots = Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d", "quad", "tri"]
+type SupportedPlots = Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
 type PlotName = str  # just a short, memorable key name
 
 @dataclass
@@ -304,7 +304,7 @@ def gridplot(
     global_plot_opts: PlotOpts | None = None,
     global_plot_kwargs: dict[str, Any] | None = None,
     **subplot_kwargs
-):
+) -> tuple[Figure, Axes, Optional[FuncAnimation]]:
     """Generate a grid of plt subplots with easy formatting and animation.
     
     All you need to specify are plot specs (the data, colors, linestyles, etc.). The plots will be arranged nicely
@@ -345,7 +345,7 @@ def gridplot(
     :param global_plot_opts: global overrides applied to all subplot options. See `PlotOpts`.
     :param global_plot_kwargs: global overrides applied to all subplot kwargs. See `PlotSpec`.
     :param **subplot_kwargs: all extra arguments are passed to plt.subplots
-    :return: the Figure and Axes objects
+    :return: the Figure and Axes objects, optionally the FuncAnimation object if plot is animated
     """
     if plot_opts is None:
         plot_opts = {}
@@ -480,21 +480,37 @@ def gridplot(
             ax = axs[i, j]
             cbar = cbars[i][j]
 
-            kwargs = copy.deepcopy(spec.kwargs)
-            if cbar is not None:
-                kwargs["norm"] = copy.deepcopy(cbar.norm)
-                kwargs["cmap"] = cbar.cmap
+            def _get_kwargs():
+                kwargs = copy.deepcopy(spec.kwargs)
+                if cbar is not None:
+                    kwargs["norm"] = copy.deepcopy(cbar.norm)
+                    kwargs["cmap"] = cbar.cmap
+                return kwargs
 
             p = None
             match spec.kind.lower():
                 case "line":
-                    p, = ax.plot([], [], label=spec.opts.leg_label, **kwargs)
+                    p, = ax.plot([], [], label=spec.opts.leg_label, **spec.kwargs)
                 case "pcolor":
-                    p = ax.pcolormesh(*_empty_structured_mesh(), **kwargs)
+                    p = ax.pcolormesh(*_empty_structured_mesh(), **_get_kwargs())
                 case "contour":
-                    p = ax.contour(*_empty_structured_mesh(), **kwargs)
+                    p = ax.contour(*_empty_structured_mesh(), **_get_kwargs())
                 case "contourf":
-                    p = ax.contourf(*_empty_structured_mesh(), **kwargs)
+                    p = ax.contourf(*_empty_structured_mesh(), **_get_kwargs())
+                case "hist":
+                    kwargs = copy.deepcopy(spec.kwargs)
+                    if "bins" not in kwargs:
+                        kwargs["bins"] = 10
+                    _, bin_edges, container = ax.hist([0.0, 1.0], label=spec.opts.leg_label, **kwargs)
+                    container._hist_bins = bin_edges  # monkey-patch for some reason
+                    p = container
+                case "hist2d":
+                    kwargs = _get_kwargs()
+                    if "bins" not in kwargs:
+                        kwargs["bins"] = 10
+                    _, xedges, yedges, mesh = ax.hist2d([0.0, 1.0], [0.0, 1.0], **kwargs)
+                    mesh._hist_bins = (xedges, yedges) # monkey-patch for some reason
+                    p = mesh
                 case other:
                     raise ValueError(f"Plot kind '{other}' not recognized")
             
@@ -507,7 +523,8 @@ def gridplot(
 
         return artists
     
-    all_artists = _draw_empty_plots()
+    all_artists_og = _draw_empty_plots()
+    all_artists = copy.copy(all_artists_og)
     fig.suptitle("")
     fig.canvas.draw()
 
@@ -583,6 +600,115 @@ def gridplot(
                     new_artist = ax.contourf(*data, **_get_kwargs())
                     all_artists[flat_idx] = new_artist
                     updated_artists.append(new_artist)
+                
+                case "hist":
+                    kwargs = _get_kwargs()
+                    orientation = kwargs.get("orientation", "vertical")
+                    stacked = kwargs.get("stacked", False)
+                    if spec.opts.leg_label is not None and "label" not in kwargs:
+                        kwargs["label"] = spec.opts.leg_label
+
+                    if isinstance(data, tuple):
+                        x = data[0]
+                        bins_override = data[1] if len(data) > 1 else None
+                        weights_override = data[2] if len(data) > 2 else None
+                    else:
+                        x = data
+                        bins_override = None
+                        weights_override = None
+
+                    is_multiset = np.ndim(x) > 1
+                    if isinstance(x, list) and len(x) > 0 and not np.isscalar(x[0]):
+                        is_multiset = True
+
+                    if stacked or is_multiset:
+                        # Fallback to re-plot for stacked/multi-dataset histograms.
+                        if bins_override is not None:
+                            kwargs["bins"] = bins_override
+                        if weights_override is not None:
+                            kwargs["weights"] = weights_override
+                        for patch in artist.patches:
+                            patch.remove()
+                        n, bin_edges, new_container = ax.hist(x, **kwargs)
+                        new_container._hist_bins = bin_edges
+                        all_artists[flat_idx] = new_container
+                        updated_artists.extend(new_container.patches)
+                    else:
+                        bins = bins_override if bins_override is not None else kwargs.get("bins")
+                        if bins is None:
+                            bins = getattr(artist, "_hist_bins", 10)
+                        weights = weights_override if weights_override is not None else kwargs.get("weights")
+                        range_ = kwargs.get("range")
+                        density = kwargs.get("density", False)
+
+                        hist, bin_edges = np.histogram(x, bins=bins, range=range_, density=density, weights=weights)
+
+                        if len(artist.patches) != len(hist):
+                            if bins_override is not None:
+                                kwargs["bins"] = bins_override
+                            if weights_override is not None:
+                                kwargs["weights"] = weights_override
+                            for patch in artist.patches:
+                                patch.remove()
+                            n, bin_edges, new_container = ax.hist(x, **kwargs)
+                            new_container._hist_bins = bin_edges
+                            all_artists[flat_idx] = new_container
+                            updated_artists.extend(new_container.patches)
+                        else:
+                            artist._hist_bins = bin_edges
+                            bottom = kwargs.get("bottom", 0.0)
+                            if np.ndim(bottom) == 0:
+                                bottom_vals = np.full_like(hist, float(bottom), dtype=float)
+                            else:
+                                bottom_vals = np.asarray(bottom, dtype=float)
+                            for patch, count, left, right, base in zip(
+                                artist.patches, hist, bin_edges[:-1], bin_edges[1:], bottom_vals
+                            ):
+                                width = right - left
+                                if orientation == "horizontal":
+                                    patch.set_x(base)
+                                    patch.set_width(count)
+                                    patch.set_y(left)
+                                    patch.set_height(width)
+                                else:
+                                    patch.set_x(left)
+                                    patch.set_width(width)
+                                    patch.set_y(base)
+                                    patch.set_height(count)
+                            updated_artists.extend(artist.patches)
+                
+                case "hist2d":
+                    kwargs = _get_kwargs()
+
+                    if isinstance(data, tuple):
+                        if len(data) < 2:
+                            raise ValueError("hist2d expects (x, y) data.")
+                        x, y = data[0], data[1]
+                        weights_override = data[2] if len(data) > 2 else None
+                    else:
+                        raise ValueError("hist2d expects (x, y) data.")
+
+                    bins = kwargs.get("bins")
+                    if bins is None:
+                        bins = getattr(artist, "_hist_bins", 10)
+                    range_ = kwargs.get("range")
+                    density = kwargs.get("density")
+                    weights = weights_override if weights_override is not None else kwargs.get("weights")
+
+                    hist, xedges, yedges = np.histogram2d(x, y, bins=bins, range=range_, density=density, weights=weights)
+                    if cbar is not None and spec.opts.clim == 'auto':
+                        cbar.norm.vmin = np.nanmin(hist)
+                        cbar.norm.vmax = np.nanmax(hist)
+                        kwargs["norm"] = copy.deepcopy(cbar.norm)
+                        kwargs["cmap"] = cbar.cmap
+
+                    artist.remove()
+                    for key in ["bins", "range", "density", "weights", "cmin", "cmax"]:
+                        kwargs.pop(key, None)
+                    mesh = ax.pcolormesh(xedges, yedges, hist.T, **kwargs)
+                    mesh._hist_bins = (xedges, yedges)
+                    all_artists[flat_idx] = mesh
+                    updated_artists.append(mesh)
 
                 case other:
                     raise ValueError(f"Plot kind '{other}' not recognized")
@@ -628,15 +754,15 @@ def gridplot(
             ax.set_position(ax.get_position().frozen())
             ax.set_in_layout(False)
 
-        ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists, repeat=False, 
+        ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists_og, repeat=False, 
                             cache_frame_data=False, blit=a_opts['blit'], interval=int(1000/a_opts['fps']))
 
         if save is not None:
             print(f"Saving animation to '{save}'")
             del a_opts['blit']
             ani.save(Path(save), **a_opts)
-        else:
-            plt.show()
+
+        return fig, axs, ani
     
     # Static figure
     else:
@@ -644,9 +770,7 @@ def gridplot(
         if save is not None:
             fig.savefig(Path(save), bbox_inches='tight')
     
-    return fig, axs
-
-# tri/quad/hist/hist2d
+        return fig, axs
 
 
 ### DEPRECATED ###
