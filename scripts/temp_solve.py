@@ -16,7 +16,7 @@ from romtools.typing import PyTree
 import os
 from pathlib import Path
 
-jax.config.update("jax_platforms", "cpu")
+# jax.config.update("jax_platforms", "cpu")
 jax.config.update("jax_enable_x64", True)
 
 if (Path(os.getcwd()).name) != "scripts":
