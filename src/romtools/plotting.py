@@ -2,31 +2,48 @@
 
 Includes:
   - gridplot - Plot simulation data (1d or 2d) in a grid (with animation utilities)
-  - compare  - Helper to compare two sets of simulation data in a 3-column (truth, rom, error) plot
+  - get_scheme - Get a plotting color scheme
 """
 # ruff: noqa
 import copy
 from abc import ABC
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, NotRequired, Optional, TypedDict
+from typing import Callable, Literal, NotRequired, Optional, TypedDict, Any, Generator, Iterable
+import math
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.collections import PolyCollection, TriMesh
 from matplotlib.tri import Triangulation
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
+from matplotlib.artist import Artist
+from matplotlib.cm import ScalarMappable
+from matplotlib.colorbar import Colorbar
 from numpy.typing import ArrayLike
 
-from romtools.utils import edge_normal, get_boundary, relative_error
 
-__all__ = ['gridplot', 'compare']
+__all__ = ['gridplot', 'PlotOpts', 'PlotSpec', 'SupportedPlots', 'get_scheme']
+
+
+def _default_progress(i, n):
+    """For printing animation save progress."""
+    if n is not None:
+        if np.mod(i, int(0.1 * n)) == 0 or i == 0 or i == n - 1:
+            print(f'Saving frame {i+1}/{n}...')
+    else:
+        if np.mod(i+1, 20) == 0 or i == 0:
+            print(f'Saving frame {i+1}...')
+
 
 ANIMATE_DEFAULT = {
-    'blit': True, 
-    'fps': 10, 
-    'frame_skip': 1, 
-    'dpi': 200
+    'blit': False, 
+    'fps': 10,
+    'dpi': 200,
+    'writer': 'ffmpeg',
+    'progress_callback': _default_progress
 }
 
 GRID_OPTS = {
@@ -127,28 +144,7 @@ class PcolorMetadata(PlotMetadata):
     Y: ArrayLike
 
 
-def _format_time_engineering(seconds: float):
-    """Helper to format times in common engineering magnitudes."""
-    prefixes = [
-        (1e-12, "ps"),
-        (1e-9, "ns"),
-        (1e-6, "μs"),
-        (1e-3, "ms"),
-        (1.0,  "s"),
-        (1e3, "ks")
-    ]
-
-    # Find the appropriate prefix and scale
-    for factor, suffix in prefixes:
-        scaled = seconds / factor
-        if 1 <= scaled < 1000:
-            return f"{scaled:.1f} {suffix}"
-    
-    # Fall back to scientific notation if out of normal range
-    return f"{seconds:.1e} s"
-
-
-def _get_scheme(scheme: Literal['white', 'dark']):
+def get_scheme(scheme: Literal['white', 'dark']):
     """Return text and background colors for given scheme."""
     match scheme.lower():
         case 'white':
@@ -164,260 +160,497 @@ def _get_scheme(scheme: Literal['white', 'dark']):
     return text_color, bg_color
 
 
-def compare(first: list[list[Frame]],
-            second: list[list[Frame]],
-            data_opts: PlotMetadata | dict,
-            show_error: bool = True, 
-            variable: str | list[str] = None,
-            row_labels: list[str] = None,
-            col_labels: list[str] = None,
-            tag_data_labels: bool = False,
-            text_offset: float = 0.05,
-            error_func: Literal['absolute', 'relative'] | Callable[[ArrayLike, ArrayLike], ArrayLike] = 'relative',
-            error_func_opts: dict = None,
-            error_plot_opts: dict = None,
-            error_grid_opts: dict = GRID_OPTS,
-            combine_opts: tuple[dict, dict] = (),
-            **gridplot_opts
-            ):
-    """Helper to compare two sets of simulation data using the gridplot function.
+type SupportedPlots = Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d", "quad", "tri"]
+type PlotName = str  # just a short, memorable key name
 
-    Each element of `first` and `second` is frame data for a single row of comparison (see `gridplot`). If
-    this frame data has several items (i.e. multiple frames), then it will be animated.
-    If either `first` or `second` has only one element, then this data will be repeated on each row.
-    A third column will show the relative error (pointwise) between the first two columns.
+@dataclass
+class PlotOpts:
+    """A few particular options common to all types of plots.
     
-    :param first: The frame data for the first column. One set of frames per row.
-    :param second: The frame data for the second column. One set of frames per row.
-    :param data_opts: Contains mesh/coord information, assumed to be the same for all rows and both columns.
-    :param show_error: Whether to include pointwise error in a third column.
-    :param variable: The variable to plot from each frame (defaults to first). If multiple are provided in a list, 
-                     then only the first item of first/second will be selected for plotting, and each row will 
-                     instead contain the data for each of these variables.
-    :param row_labels: Labels for rows. Rows not labeled if None.
-    :param col_labels: Labels for first two columns (optionally third label for error column). Columns not labeled if None.
-    :param tag_data_labels: If true, will add col_labels to data labels when merging (by default, will overwrite existing data label)
-    :param text_offset: for row labels on the left - the amount (in figure coords) to push row labels to the left
-    :param error_func: Callable as error_func(second_col, first_col, **opts), computes error between columns (default is relative error)
-    :param error_func_opts: Options to pass to the error func
-    :param error_plot_opts: different options to use for error column (defaults to using same as variables)
-    :param error_grid_opts: If provided, options for showing a grid in the error column (shows small gray grid by default), set to None to turn off
-    :param combine_opts: If provided, the first and second columns will be combined, with the provided options overriding
-                         any existing plot options for variables in each column. This is only recommended for 1d data.
-    :param gridplot_opts: Rest of the options are passed to gridplot
+    :ivar xlabel: the x-axis label
+    :ivar ylabel: the y-axis label
+    :ivar xscale: scale for x-axis
+    :ivar yscale: scale for y-axis
+    :ivar xlim: limits for x-axis (defaults to autoscale if None)
+    :ivar ylim: limits for y-axis (defaults to autoscale if None)
+    :ivar clim: limits for colorbar (if None, will not show a colorbar), can also set to 'auto'
+    :ivar cbar_label: label for the colorbar (must set clim to show colorbar)
+    :ivar leg_label: label for legend (legend only shown if all artists on an axis have a label)
+    :ivar ax_visible: whether to show axes, ticks, and spines (default True)
+    :ivar animate: whether to animate data for this plot (default False)
     """
-    if variable is None:
-        variable = next(iter(first[0][0]))
-    
-    num_frames = len(first[0])  # same for all
-    
-    data_opts = copy.deepcopy(data_opts)
-    opts = copy.deepcopy(gridplot_opts)
-    pre_adjust = opts.get("adjust", None)
-    data_plot_opts = {}
-    data_labels = {}
+    xlabel: str = ""
+    ylabel: str = ""
+    xscale: str | None = None
+    yscale: str | None = None
+    xlim: tuple[float, float] | None = None
+    ylim: tuple[float, float] | None = None
+    clim: tuple[float, float] | Literal['auto'] | None = None
+    cbar_label: str | None = None
+    leg_label: str | None = None
+    ax_visible: bool = True
+    animate: bool = False
 
-    if error_func_opts is None:
-        error_func_opts = {}
+@dataclass
+class PlotSpec:
+    """Specs for a matplotlib plot.
 
-    if isinstance(error_func, str):
-        match error_func:
-            case 'relative': 
-                error_func = relative_error
-                error_func_opts.update({"pointwise": True})
-                error_tag = 'relative error'
-            case 'absolute':
-                error_func = lambda pred, targ, **kwargs: np.abs(pred - targ)
-                error_tag = 'absolute error'
-                error_title = 'Absolute error'
-            case _:
-                raise NotImplementedError(f"Error function '{error_func}' not recognized.")
-    else:
-        error_tag = 'error'
-    
-    if col_labels is not None and show_error and len(col_labels) < 3:
-        col_labels.append(error_tag.capitalize())
-
-    # Figure out how to iterate variables (depending on which plots are sharing)
-    if isinstance(data_opts, PlotMetadata):
-        data_opts = asdict(data_opts)
-
-    share_plot = data_opts.get('share_plot', {})
-    if isinstance(variable, str):
-        # Only one variable, no sharing, just pick frames and go
-        num_rows = max(len(first), len(second))
-        def _iter_rows():
-            for r in range(num_rows):
-                frame1 = first[r] if len(first) > 1 else first[0]
-                frame2 = second[r] if len(second) > 1 else second[0]
-                yield r, frame1, frame2, variable
-    else:
-        if share_plot:
-            # Decide row based on share plots
-            all_vars = copy.deepcopy(variable)
-            set_vars = set(all_vars)
-            for s in share_plot.values():
-                set_vars = set_vars - set(s)
-            num_single_vars = len(set_vars)
-            num_rows = num_single_vars + len(share_plot)
-
-            # Divide plots up into groups
-            shared_groups = list(share_plot.values())
-            shared_groups_map = {}  # shared group_idx -> index in all groups
-            all_groups = []
-            for v in all_vars:
-                v_in_shared_group = False
-                for group_idx, group in enumerate(shared_groups):
-                    if v in group:
-                        v_in_shared_group = True
-                        if group_idx in shared_groups_map:
-                            all_groups[shared_groups_map[group_idx]].append(v)
-                        else:
-                            all_groups.append([v])
-                            shared_groups_map[group_idx] = len(all_groups) - 1
-                        break  # each variable should only be in exactly one group
-                
-                if not v_in_shared_group:  # single vars get their own plot
-                    all_groups.append([v])
-
-            def _iter_rows():
-                for r, group in enumerate(all_groups):
-                    for v in group:
-                        yield r, first[0], second[0], v
-        else:
-            # No sharing, just iterate all variables (only use first items for each column)
-            num_rows = len(variable)
-            def _iter_rows():
-                for r in range(num_rows):
-                    yield r, first[0], second[0], variable[r]
-
-    num_cols = 3 if show_error else 2
-    opts['grid'] = (num_rows, num_cols - 1 if len(combine_opts) > 0 else num_cols)  # One less column if combining
-    combined_frames = [{} for _ in range(num_frames)]
-
-    vmin = []
-    vmax = []
-
-    new_share_plot = {}
-    share_plot_tags = col_labels if col_labels is not None else ['', ' ', '  ']  # need distinct group names for new share plot
-    if share_plot:
-        for group in share_plot:
-            for j in range(num_cols):
-                if len(combine_opts) > 0:
-                    if j == 0:
-                        new_share_plot.setdefault(group, [])
-                    elif j == 1:
-                        new_share_plot.setdefault(f"{group} {error_tag}", [])
-                else:
-                    new_share_plot.setdefault(f"{group} {share_plot_tags[j]}", [])
-
-    # Combine frames and plot options
-    for r, frame1, frame2, curr_var in _iter_rows():
-        # Will only work on single static frames (animations update clims over time)
-        vmin.append(np.nanmin([np.nanmin(frame1[0][curr_var]), np.nanmin(frame2[0][curr_var])]))
-        vmax.append(np.nanmax([np.nanmax(frame1[0][curr_var]), np.nanmax(frame2[0][curr_var])]))
-
-        og_label = opts.get('data_labels', {}).get(curr_var, curr_var)
-        share_curr_var = len(combine_opts) > 0
-        if share_curr_var:
-            for group in share_plot:
-                if curr_var in share_plot[group]:
-                    share_curr_var = False  # Prevent redundant sharing
-                    break
-
-        if share_curr_var:
-            new_share_plot.setdefault(og_label, [])
+    !!! Example "Animation"
+        You can generate an animation simply like:
+        ```python
+        spec = PlotSpec(
+            kind='line',
+            data=[(x0, y0), (x1, y1), ...],
+            opts={'animate': True},
+            kwargs={'color': 'red', 'ls': '--'}
+        )
         
-        for j in range(num_cols):
-            var_key = f'{r}_{j}_{curr_var}'  # unique id for variable data and plotting options
+        fig, ax = gridplot(spec)
+        ```
+    
+    :ivar kind: the type of plot (see `SupportedPlots`)
+    :ivar data: the data to plot. For animations use an iterable over data to generate frame data.
+    :ivar opts: extra specialized plot options (see `PlotOpts`)
+    :ivar kwargs: extra kwargs passed directly to the matplotlib plotting routine (e.g. plot, contour, etc.)
+    :ivar name: optional short name for specifying local option overrides
+    """
+    kind: SupportedPlots
+    data: Any | Iterable[Any]
+    opts: PlotOpts = field(default_factory=lambda: PlotOpts())
+    kwargs: dict = field(default_factory=dict)
+    name: PlotName | None = None
+
+type PlotSpecs = PlotSpec | tuple[PlotSpec, ...]  # multiple on same graph
+type DataFrame = list[list[tuple[Any, ...]]]
+
+
+def _fill_plot_specs_grid(plots, local_opts, global_opts, local_kwargs, global_kwargs, shape):
+    """Fill a 2d grid of plot specs, merging global and local options with the default.
+       The order of precedence is: local > global > default.
+       opts are specialized plot options. kwargs are everything else that go into plt functions.
+    """
+    def fill_spec(spec: dict | PlotSpec):
+        """For a single plot spec"""
+        # Get default opts and kwargs
+        spec = copy.copy(spec) if isinstance(spec, PlotSpec) else PlotSpec(**spec)
+        opts = spec.opts
+        if isinstance(opts, PlotOpts):
+            opts = copy.deepcopy(asdict(opts))
+        kwargs = copy.deepcopy(spec.kwargs)
+
+        # Overwrite with global
+        d = global_opts
+        if isinstance(d, PlotOpts):
+            d = asdict(d)
+        opts.update(d)
+        kwargs.update(global_kwargs)
+
+        # Overwrite with local
+        if spec.name is not None:
+            d = local_opts.get(spec.name, {})
+            if isinstance(d, PlotOpts):
+                d = asdict(d)
+            opts.update(d)
+            kwargs.update(local_kwargs.get(spec.name, {}))
+
+        spec.opts = PlotOpts(**opts)
+        spec.kwargs = kwargs
+        return spec
+
+    def fill_specs(specs: dict | PlotSpec | tuple):
+        """Handle multiple specs per plot"""
+        if isinstance(specs, tuple):
+            return tuple(fill_spec(spec) for spec in specs)
+        else:
+            return (fill_spec(specs),)
+    
+    # 1 subplot
+    if isinstance(plots, dict | PlotSpec | tuple):
+        return [[fill_specs(plots)]]
+    
+    # 2d grid
+    if all(isinstance(row, list) for row in plots):
+        return [[fill_specs(spec) for spec in row] for row in plots]
+    
+    # Convert 1d sequence to 2d
+    if shape is None:
+        n = len(plots)
+        c = int(math.ceil(math.sqrt(n)))
+        r = int(math.ceil(n / c))
+        shape = (r, c)
+
+    grid = []
+    nrows, ncols = shape
+    for i in range(nrows):
+        row = [fill_specs(spec) for spec in plots[i*ncols:(i+1)*ncols]]
+        row += [None] * (ncols - len(row))  # pad
+        grid.append(row)
+
+    return grid
+
+
+def gridplot(
+    plots: PlotSpecs | list[PlotSpecs] | list[list[PlotSpecs]],
+    scheme: Literal['white', 'dark'] = 'white',
+    subplot_size_in: tuple[float, float] = (3, 2.5),
+    shape: tuple[int, int] | None = None,
+    title: Iterable[str] | None = None,
+    save: str | Path | None = None,
+    adjust: Callable[[Figure, Axes, Iterable[Artist], list[list[Colorbar]]], None] | None = None,
+    animate_opts: dict | None = None,
+    legend_opts: dict | None = None,
+    plot_opts: dict[PlotName, PlotOpts] | None = None,
+    plot_kwargs: dict[PlotName, dict[str, Any]] | None = None,
+    global_plot_opts: PlotOpts | None = None,
+    global_plot_kwargs: dict[str, Any] | None = None,
+    **subplot_kwargs
+):
+    """Generate a grid of plt subplots with easy formatting and animation.
+    
+    All you need to specify are plot specs (the data, colors, linestyles, etc.). The plots will be arranged nicely
+    and a lot of the animation/formatting routines are automated. Also provides a nice way to apply similar formats
+    across different subplots.
+    
+    !!! Example "A static line plot and an animated contour"
+        ```python
+        def generate_contour():
+            for t in range(50):
+                yield X, Y, np.sin(X * t) * np.cos(Y * t)
+
+        sin_spec = dict(kind='line', data=(x, np.sin(x)))
+        cos_spec = dict(kind='line', data=(x, np.cos(x)))
+        contour_spec = dict(
+            kind='contour', 
+            data=generate_contour(), 
+            opts=dict(animate=True)
+        )
+
+        fig, axs = gridplot([(sin_spec, cos_spec), contour_spec]) -> (1,2) animated subplot with sin/cos on first axis
+        ```
+    
+    :param plots: grid of PlotSpecs with plot data and style options. If a single PlotSpec, then a (1,1) figure will
+                  be generated. If a 1D list of PlotSpecs, then the grid will be shaped to the nearest square. If a 
+                  2D list of PlotSpecs, then will use this grid directly. Use tuples of PlotSpecs to specify multiple
+                  plots per axis. See `PlotSpec` for details on specifying plot data, styles, and supported plot types.
+    :param scheme: the color scheme (dark or white)
+    :param subplot_size_in: the size of each subplot in inches (W, H)
+    :param shape: the shape of the subplot grid. If None, the shape will be inferred
+    :param title: for animations, an iterable to update the figure title (such as showing the time step)
+    :param save: name of file to save (use .gif or .mp4 for animations, use .pdf, .png, or similar for static)
+    :param adjust: catch-all func for applying changes before saving/animating. Call as adjust(fig, axs, artists, cbars)
+    :param animate_opts: options for animating/saving movie. Defaults to 10 fps, 200 dpi, and blit=False with ffmpeg
+    :param legend_opts: extra options for legends (same used for all subplots if applicable)
+    :param plot_opts: local overrides for plot options. Specify as plot.name -> { override_opts }. See `PlotOpts`.
+    :param plot_kwargs: local ovverides for plot kwargs. Specify as plot.name -> { override_kwargs }. See `PlotSpec`.
+    :param global_plot_opts: global overrides applied to all subplot options. See `PlotOpts`.
+    :param global_plot_kwargs: global overrides applied to all subplot kwargs. See `PlotSpec`.
+    :param **subplot_kwargs: all extra arguments are passed to plt.subplots
+    :return: the Figure and Axes objects
+    """
+    if plot_opts is None:
+        plot_opts = {}
+    if plot_kwargs is None:
+        plot_kwargs = {}
+    if animate_opts is None:
+        animate_opts = {}
+    if legend_opts is None:
+        legend_opts = {}
+    if global_plot_opts is None:
+        global_plot_opts = {}
+    if global_plot_kwargs is None:
+        global_plot_kwargs = {}
+
+    plots = _fill_plot_specs_grid(plots, plot_opts, global_plot_opts, plot_kwargs, global_plot_kwargs, shape)
+    shape = (len(plots), len(plots[0]))
+    a_opts = copy.deepcopy(ANIMATE_DEFAULT)
+    a_opts.update(animate_opts)
+    text_color, bg_color = get_scheme(scheme)
+    
+    fig, axs = plt.subplots(*shape, squeeze=False, layout='constrained',
+                            figsize=(subplot_size_in[0]*shape[1], subplot_size_in[1]*shape[0]), **subplot_kwargs)
+    fig.patch.set_facecolor(bg_color)
+
+    def _iter_plot_specs():
+        """Iterate over all axes (i,j) and plot specs (k) per axis."""
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                if plots[i][j] is not None:
+                    for k, spec in enumerate(plots[i][j]):
+                        yield i, j, k, spec
+    
+    def _get_iterable_data():
+        """For animation. Return new iterators over all data."""
+        data = [[list() for _ in range(shape[1])] for _ in range(shape[0])]
+
+        for i, j, k, spec in _iter_plot_specs():
+            data[i][j].append(iter(spec.data) if spec.opts.animate else iter([spec.data]))
+        
+        return data
+ 
+    def _setup_plotting_area():
+        """Setup axis colors, ticks, spines, legend, etc. Return cbars, animate status, and legend(s) status"""
+        animate = False
+        cbars = [[None for _ in range(shape[1])] for _ in range(shape[0])]
+        legends = [[False for _ in range(shape[1])] for _ in range(shape[0])]
+        for i, j, k, spec in _iter_plot_specs():
+            if k > 0:  # Just set up each i,j axis once
+                continue
+
+            ax = axs[i, j]
+
+            if spec.opts.clim is not None:
+                sm = ScalarMappable(norm=spec.kwargs.pop("norm", "linear"), cmap=spec.kwargs.pop("cmap", "viridis"))
+                sm.set_array([])
+
+                if spec.opts.clim != 'auto':
+                    sm.norm.vmin = spec.opts.clim[0]
+                    sm.norm.vmax = spec.opts.clim[1]
+
+                cb = fig.colorbar(sm, ax=ax)
+                cb.ax.set_ylabel(spec.opts.cbar_label or "", color=text_color)
+                cb.ax.tick_params(labelcolor=text_color, color=text_color)
+                cb.ax.tick_params(which='minor', color=(0, 0, 0, 0), width=0, size=0)
+                cb.ax.minorticks_off()
+                cb.outline.set_edgecolor(text_color)
+                cbars[i][j] = cb
+
+            xlabel, ylabel, xscale, yscale, xlim, ylim = None, None, None, None, None, None
+            for s in plots[i][j]:
+                if xlabel is None or xlabel == "":
+                    xlabel = s.opts.xlabel
+                if ylabel is None or ylabel == "":
+                    ylabel = s.opts.ylabel
+                if xscale is None or xscale == "":
+                    xscale = s.opts.xscale
+                if yscale is None or yscale == "":
+                    yscale = s.opts.yscale
+                if xlim is None:
+                    xlim = s.opts.xlim
+                if ylim is None:
+                    ylim = s.opts.ylim
+            ax_visible = any(s.opts.ax_visible for s in plots[i][j])
+            animate = animate or any(s.opts.animate for s in plots[i][j])
+            legends[i][j] = all(s.opts.leg_label is not None for s in plots[i][j])
+
+            ax.tick_params(axis='both', which='both', top=False, bottom=ax_visible, 
+                           left=ax_visible, right=False, direction='in', labelleft=ax_visible, 
+                           labelbottom=ax_visible, color=text_color, labelcolor=text_color)
+            ax.set_facecolor(bg_color)
+            for spine in ['bottom', 'left', 'top', 'right']:
+                ax.spines[spine].set_visible(ax_visible)
+                ax.spines[spine].set_color(text_color)
             
-            data_plot_opts[var_key] = copy.deepcopy(opts.get('data_plot_opts', {}).get(curr_var, {}))
-            data_labels[var_key] = og_label
+            if ax_visible and xlabel is not None:
+                ax.set_xlabel(xlabel, color=text_color)
+            if ax_visible and ylabel is not None:
+                ax.set_ylabel(ylabel, color=text_color)
+            if xscale is not None:
+                ax.set_xscale(xscale)
+            if yscale is not None:
+                ax.set_yscale(yscale)
+            if xlim is not None:
+                ax.set_xlim(xlim)
+            else:
+                ax.autoscale(enable=True, axis="x")
+            if ylim is not None:
+                ax.set_ylim(ylim)
+            else:
+                ax.autoscale(enable=True, axis="y")
+        
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                if plots[i][j] is None:
+                    axs[i, j].axis('off')
 
-            # Update plot options for first two columns if combining
-            if len(combine_opts) > 0 and j < 2:
-                data_plot_opts[var_key].update(combine_opts[j])
-                if tag_data_labels:
-                    data_labels[var_key] += f' {share_plot_tags[j]}'
-                elif col_labels is not None:
-                    data_labels[var_key] = col_labels[j]
+        return animate, cbars, legends
 
-            # Update error plot opts
-            if j >= 2:
-                if error_plot_opts is not None:
-                    if var_key in data_plot_opts:
-                        data_plot_opts[var_key].update(error_plot_opts)
+    animate, cbars, legends = _setup_plotting_area()
+
+    def _draw_empty_plots():
+        """Initialize plots and gather all artists."""
+        artists = []
+
+        def _empty_structured_mesh() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            x = np.array([[0.0, 1.0], [0.0, 1.0]])
+            y = np.array([[0.0, 0.0], [1.0, 1.0]])
+            z = np.zeros((2, 2))
+            return x, y, z
+
+        for i, j, k, spec in _iter_plot_specs():
+            ax = axs[i, j]
+            cbar = cbars[i][j]
+
+            kwargs = copy.deepcopy(spec.kwargs)
+            if cbar is not None:
+                kwargs["norm"] = copy.deepcopy(cbar.norm)
+                kwargs["cmap"] = cbar.cmap
+
+            p = None
+            match spec.kind.lower():
+                case "line":
+                    p, = ax.plot([], [], label=spec.opts.leg_label, **kwargs)
+                case "pcolor":
+                    p = ax.pcolormesh(*_empty_structured_mesh(), **kwargs)
+                case "contour":
+                    p = ax.contour(*_empty_structured_mesh(), **kwargs)
+                case "contourf":
+                    p = ax.contourf(*_empty_structured_mesh(), **kwargs)
+                case other:
+                    raise ValueError(f"Plot kind '{other}' not recognized")
+            
+            artists.append(p)
+
+            if legends[i][j]:
+                leg = dict(facecolor=bg_color, edgecolor=text_color, labelcolor=text_color, fancybox=True)
+                leg.update(legend_opts)
+                ax.legend(**leg)
+
+        return artists
+    
+    all_artists = _draw_empty_plots()
+    fig.suptitle("")
+    fig.canvas.draw()
+
+    if adjust is not None:
+        adjust(fig, axs, all_artists, cbars)
+    
+    def _update(frame_and_title: tuple[DataFrame, str | None]):
+        """Update the plot with new data."""
+        frame, title_str = frame_and_title
+        updated_artists = []  # only the artists that get updated
+
+        if title_str is not None:
+            fig.suptitle(title_str, color=text_color)
+        else:
+            fig.suptitle("")
+
+        for flat_idx, ((i, j, k, spec), artist) in enumerate(zip(_iter_plot_specs(), list(all_artists))):
+            ax = axs[i, j]
+            cbar = cbars[i][j]
+            data = frame[i][j][k]
+
+            if data is None:
+                continue  # No data left
+            
+            def _update_clim():
+                z = data[-1] if isinstance(data, tuple) else data
+                if cbar is not None and spec.opts.clim == 'auto':
+                    cbar.norm.vmin = np.nanmin(z)
+                    cbar.norm.vmax = np.nanmax(z)
+            
+            def _get_kwargs():
+                kwargs = copy.deepcopy(spec.kwargs)
+                if cbar is not None:
+                    kwargs["norm"] = copy.deepcopy(cbar.norm)
+                    kwargs["cmap"] = cbar.cmap
+                return kwargs
+
+            match spec.kind.lower():
+                case "line":
+                    if isinstance(data, tuple):  # ([X], [Y])
+                        if data[0] is not None:
+                            artist.set_xdata(data[0])
+                        if data[1] is not None:
+                            artist.set_ydata(data[1])
                     else:
-                        data_plot_opts[var_key] = error_plot_opts
-                if share_curr_var:
-                    data_labels[var_key] = error_tag.capitalize()
-                    # data_labels[var_key] += f' {error_tag}'
+                        artist.set_ydata(data)   # [Y]
+                    updated_artists.append(artist)
+
+                case "pcolor":
+                    _update_clim()
+                    if isinstance(data, tuple):  # (X, Y, Z)
+                        artist.remove()
+                        new_artist = ax.pcolormesh(*data, **_get_kwargs())
+                        all_artists[flat_idx] = new_artist
+                        updated_artists.append(new_artist)
+                        if data[0] is not None and data[1] is not None:
+                            ax.set_xlim(np.nanmin(data[0]), np.nanmax(data[0]))
+                            ax.set_ylim(np.nanmin(data[1]), np.nanmax(data[1]))
+                    else:
+                        artist.set_array(data)    # [Z]
+                        updated_artists.append(artist)
+
+                case "contour":
+                    _update_clim()
+                    artist.remove()
+                    new_artist = ax.contour(*data, **_get_kwargs())
+                    all_artists[flat_idx] = new_artist
+                    updated_artists.append(new_artist)
+
+                case "contourf":
+                    _update_clim()
+                    artist.remove()
+                    new_artist = ax.contourf(*data, **_get_kwargs())
+                    all_artists[flat_idx] = new_artist
+                    updated_artists.append(new_artist)
+
+                case other:
+                    raise ValueError(f"Plot kind '{other}' not recognized")
             
-            # Share data for 1d plots
-            if share_plot:
-                for group in share_plot:
-                    if curr_var in share_plot[group]:
-                        if len(combine_opts) > 0:
-                            if j < 2:  # combine first two columns
-                                new_share_plot[group].append(var_key)
-                            else:
-                                new_share_plot[f"{group} {error_tag}"].append(var_key)
-                        else:
-                            new_share_plot[f"{group} {share_plot_tags[j]}"].append(var_key)
+            if ax.get_autoscalex_on() or ax.get_autoscaley_on():
+                ax.relim()
+                ax.autoscale_view()
+                # fig.canvas.draw_idle()
+                # fig.canvas.flush_events()
+
+        return updated_artists
+
+    def _frames() -> Generator[tuple[DataFrame, str | None], None, None]:
+        """Return the next data from all plot specs (if available), and a title str."""
+        iterable_data = _get_iterable_data()
+        iterable_title = iter(title) if title is not None else None
+        
+        while True:
+            frame = [[list() for _ in range(shape[1])] for _ in range(shape[0])]
+            keep_going = False
+            for i, j, k, _ in _iter_plot_specs():
+                try:
+                    next_data = next(iterable_data[i][j][k])
+                    keep_going = True
+                except StopIteration:
+                    next_data = None
+                frame[i][j].append(next_data)
             
-            # Combine first two columns even if not originally shared
-            if share_curr_var and j < 2:
-                new_share_plot[og_label].append(var_key)
-
-            # Merge the frames
-            for i in range(num_frames):
-                row_data = [frame1[i][curr_var], frame2[i][curr_var]]
-                
-                if show_error and j >= 2:
-                    row_data.append(error_func(row_data[1], row_data[0], **error_func_opts))
-                    
-                combined_frames[i][var_key] = row_data[j]
+            if not keep_going:
+                break
+            
+            title_str = None
+            if title is not None:
+                try:
+                    title_str = next(iterable_title)
+                except StopIteration:
+                    title_str = None
+   
+            yield frame, title_str
     
-    def _adjust(fig, axs):
-        text_color, bg_color = _get_scheme(opts.get("scheme", "white"))
-        text_opts = opts.get("text_opts", {})
-        if pre_adjust is not None:
-            pre_adjust(fig, axs)
+    if animate:
+        for ax in axs.flatten():
+            ax.set_position(ax.get_position().frozen())
+            ax.set_in_layout(False)
 
-        for i in range(axs.shape[0]):
-            for j in range(axs.shape[1]):
-                # Merge first two column color bars (won't work on animations, just for single frames)
-                if j < axs.shape[1] - 1:
-                    if len(axs[i, j].collections) > 0:  # 2d data
-                        axs[i, j].collections[0].set_clim(vmin[i], vmax[i])
-                    elif len(axs[i, j].lines) > 0:      # 1d data
-                        axs[i, j].set_ylim([vmin[i], vmax[i]])
-                else:
-                    if show_error and error_grid_opts:
-                        axs[i, j].grid(**error_grid_opts)
-                
-                if i == 0 and col_labels is not None and len(combine_opts) == 0:
-                    axs[i, j].set_title(col_labels[j] if j < len(col_labels) else error_tag.capitalize(), color=text_color, **text_opts)
-                
-                if j == 0 and row_labels is not None:
-                    pos = axs[i, 0].get_position()
-                    x_pos = pos.x0 - text_offset
-                    y_pos = 0.5 * (pos.y1 + pos.y0)
-                    fig.text(x_pos, y_pos, row_labels[i], va='center', ha='right', rotation=90, color=text_color, **text_opts)
-                
-    if new_share_plot:
-        data_opts['share_plot'] = new_share_plot
+        ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists, repeat=False, 
+                            cache_frame_data=False, blit=a_opts['blit'], interval=int(1000/a_opts['fps']))
+
+        if save is not None:
+            print(f"Saving animation to '{save}'")
+            del a_opts['blit']
+            ani.save(Path(save), **a_opts)
+        else:
+            plt.show()
     
-    opts['data_labels'] = data_labels
-    opts['data_plot_opts'] = data_plot_opts
-    opts['adjust'] = _adjust
-
-    fig, axs = gridplot(combined_frames, data_opts, **opts)
-
+    # Static figure
+    else:
+        _update(next(_frames()))
+        if save is not None:
+            fig.savefig(Path(save), bbox_inches='tight')
+    
     return fig, axs
 
+# tri/quad/hist/hist2d
 
-def gridplot(data: list[Frame],
+
+### DEPRECATED ###
+def _old_gridplot(data: list[Frame],
              data_opts: PlotMetadata | dict,
              data_plot_opts: dict = None,
              global_plot_opts: dict = None,
@@ -486,7 +719,7 @@ def gridplot(data: list[Frame],
     
     all_vars = [v for v in data[0].keys() if v not in exclude]
 
-    text_color, bg_color = _get_scheme(scheme)
+    text_color, bg_color = get_scheme(scheme)
     labels = {v: data_labels.get(v, v) for v in all_vars}
     a_opts = {k: animate_opts.get(k, v) for k, v in ANIMATE_DEFAULT.items()}
     plot_opts = copy.deepcopy(data_plot_opts)

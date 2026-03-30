@@ -106,3 +106,24 @@ def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,
         logger.addHandler(f_handler)
 
     return logger
+
+
+def format_time_engineering(seconds: float):
+    """Helper to format times in common engineering magnitudes."""
+    prefixes = [
+        (1e-12, "ps"),
+        (1e-9, "ns"),
+        (1e-6, "μs"),
+        (1e-3, "ms"),
+        (1.0,  "s"),
+        (1e3, "ks")
+    ]
+
+    # Find the appropriate prefix and scale
+    for factor, suffix in prefixes:
+        scaled = seconds / factor
+        if 1 <= scaled < 1000:
+            return f"{scaled:.1f} {suffix}"
+    
+    # Fall back to scientific notation if out of normal range
+    return f"{seconds:.1e} s"
