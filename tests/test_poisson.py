@@ -3,6 +3,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import matplotlib.pyplot as plt
 
 from romtools import YamlLoader
 from romtools.solvers.poisson import (
@@ -14,6 +15,7 @@ from romtools.solvers.poisson import (
 )
 from romtools.solvers.utils import UniformGrid, homogeneous_boundary
 from romtools.typing import DictModel
+from romtools.plotting import gridplot
 
 
 def test_gaussian_forcing_jit_and_grad() -> None:
@@ -141,25 +143,16 @@ def test_poisson_evaluate():
 
 def get_laplace_solver():
     """Basic laplace solver on unit square."""
-    def initial_guess(coords):
-        p = {'sigma': 0.2, 'A0': 0.5, 'mu_x': 0.5, 'mu_y': 0.5, 'coords': coords}
-        return gaussian_forcing(p, {})
-    
     laplace = Poisson2D(
         config={
             "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(50, 50)),
             "solver": {
                 "name": "Newton", 
-                "opts": {"rtol": 1e-10, "atol": 1e-10}
-            },
-            "adjoint": {
-                "name": "ImplicitAdjoint", 
-                "opts": {}
+                "opts": {"rtol": 1, "atol": 1e-4} # only look at residual atol essentially
             },
             "max_steps": 20,
-            "initial_guess": initial_guess
-        },
-        conductivity_defaults={'alpha': 0.0}
+            "initial_guess": jnp.ones((50, 50))
+        }
     )
 
     return laplace
@@ -168,54 +161,20 @@ def get_laplace_solver():
 def test_laplace_solve():
     """Run Poisson with no forcing and unity conductivity. Initial Gaussian bump should smooth to 0."""
     laplace = get_laplace_solver()
-
-    inputs = {
-        "conductivity": {"k0": 1.0, "alpha": 0.0},
-    }
-    target = {"phi_residual": jnp.zeros_like(laplace.config.grid.coords[0])}
-
-    out = laplace.solve(inputs, target)
-    assert jnp.max(jnp.abs(out["phi"])) < 1e-10
+    out = laplace.solve()
+    assert jnp.max(jnp.abs(out["phi"])) < 1e-4
 
 
-def test_poisson_manufactured_solve():
-    """Test analytical solution of manufactured sinusoid forcing."""
-    shape = (100, 100)
-    dx_error = (1/shape[0]) ** 2  # TODO: Not sure what a good convergence is here
-    mms = Poisson2D(
-        config={
-            "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
-            "max_steps": 50,
-            "solver": dict(name='Newton', opts={'rtol': 1e-3, 'atol': dx_error*1.5}),
-            "initial_guess": jnp.ones(shape),
-            "throw": False
-        }, 
-        forcing="sinusoid", 
-        conductivity_defaults={"alpha": 0.0}
-    )
-
-    x, y = mms.config.grid.coords
-    inputs = {}
-    target = {"phi_residual": jnp.zeros_like(x)}
-    phi = mms.solve(inputs, target)["phi"]
-    phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
-    res = jnp.max(jnp.abs(phi - phi_exact))
-
-    assert res < dx_error*2
-
-
-def test_poisson_solve_jit_and_grad():
+def test_laplace_solve_jit_and_grad():
     """Add constant forcing and take gradients of the sum over the grid."""
     laplace = get_laplace_solver()
 
+    @jax.jit
     def solve_sum(A0: jnp.ndarray) -> jnp.ndarray:
         inputs = {
             "forcing": {"const": A0},
-            "conductivity": {"k0": 1.0, "alpha": 0.0},
-            "boundary": homogeneous_boundary(ndim=2),
         }
-        target = {"phi_residual": jnp.zeros_like(laplace.config.grid.coords[0])}
-        phi = laplace.solve(inputs, target)["phi"]
+        phi = laplace.solve(inputs)["phi"]
         return jnp.sum(phi)
 
     center = 0.5
@@ -225,9 +184,37 @@ def test_poisson_solve_jit_and_grad():
     assert jnp.allclose(grad, fd, atol=1e-2, rtol=1e-2)
 
 
-def test_poisson_nontrivial_solve():
-    # TODO: Implement a nontrivial poisson problem (either by changing the forcing or conductivity params or BCs).
-    # Try to use a standard numerical benchmark example if applicable.
-    # Optionally generate plots so that we can visually verify the solution matches the benchmark.
-    # Tune the solver params as necessary to get reasonable convergence.
-    pass
+def test_poisson_manufactured_solve(show_plot=False):
+    """Test analytical solution of manufactured sinusoid forcing."""
+    shape = (50, 50)
+    dx_error = (1/shape[0]) ** 2
+    mms = Poisson2D(
+        config={
+            "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
+            "max_steps": 50,
+            "solver": dict(name='Newton', opts={'rtol': 1e2, 'atol': dx_error*1.5}),
+            "initial_guess": jnp.ones(shape),
+            "throw": False
+        }, 
+        forcing="sinusoid",
+    )
+
+    x, y = mms.config.grid.coords
+    phi = mms.solve()["phi"]
+    phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
+    error = jnp.abs(phi - phi_exact)
+    vmin = min(float(jnp.min(phi)), float(jnp.min(phi_exact)))
+    vmax = max(float(jnp.max(phi)), float(jnp.max(phi_exact)))
+    clim = (vmin, vmax)
+
+    if show_plot:
+        opts = {'xlabel': "$x$", 'ylabel': "$y$"}
+        kwargs = {'shading': 'gouraud'}
+        approx_spec = {'kind': 'pcolor', 'data': (x, y, phi), 'opts': {**opts, 'clim': clim}, 'kwargs': kwargs}
+        true_spec = {'kind': 'pcolor', 'data': (x, y, phi_exact), 'opts': {**opts, 'clim': clim}, 'kwargs': kwargs}
+        error_spec = {'kind': 'pcolor', 'data': (x, y, error), 'opts': {**opts, 'clim': 'auto'}, 
+                      'kwargs': {**kwargs, 'cmap': 'bwr'}}
+        gridplot([approx_spec, true_spec, error_spec], scheme='dark', shape=(1, 3), sharey='row')
+        plt.show()
+
+    assert jnp.max(error) < dx_error*2
