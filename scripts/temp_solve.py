@@ -7,17 +7,20 @@ import lineax as lx
 import optimistix as optx
 import optax
 from pydantic import Field
+import matplotlib.pyplot as plt
 
 from romtools.model import Model
-from romtools.optimization import Optimizer, NewtonDebug
+from romtools.optimization import Optimizer
 from romtools.utils import tree_l2_norm
 from romtools.typing import PyTree
+from romtools.plotting import gridplot
+from romtools.solvers.utils import homogeneous_boundary, BoundarySpec
 
 import os
 from pathlib import Path
 
 # jax.config.update("jax_platforms", "cpu")
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 
 if (Path(os.getcwd()).name) != "scripts":
     os.chdir("scripts")
@@ -302,27 +305,43 @@ def optimize_newton_debug():
 def optimize_poisson():
     from romtools.solvers import Poisson2D
 
+    neumann_bc = BoundarySpec(type='neumann', value=0.0)
+    boundary = homogeneous_boundary(ndim=2, value=0.0)
+    # boundary.boundary[1] = (neumann_bc, neumann_bc)  # y-bds
+    # boundary.boundary[0] = (neumann_bc, neumann_bc)
+
     poisson = Poisson2D(
         config={
-            "solver": optx.Newton(rtol=1e10, atol=1e-6),
-            "grid": {"shape": (100, 100), "bounds": ((0, 1), (0, 1))},
+            "solver": optx.Newton(rtol=1e2, atol=1e-6),
+            "grid": {"shape": (50, 50), "bounds": ((0, 1), (0, 1))},
             "throw": False,
-            "max_steps": 800
+            "max_steps": 50,
+            # "initial_guess": lambda coords: jnp.ones_like(coords[0]) * 3
         },
-        forcing='constant',
-        conductivity='nonlinear',
-        forcing_defaults={"const": 1.},
-        conductivity_defaults={"alpha": 0., "k0": 1.}
+        forcing_defaults={"const": 0.5},
+        boundary_defaults=boundary
     )
 
     init_residual = poisson.evaluate({}, {"phi": jnp.zeros_like(poisson.config.grid.coords[0])})["phi_residual"]
     solution = poisson.solve(return_sol=True)
+    print(f"Solution range: {solution.value.min()}, {solution.value.max()}")
+    print(f"Solution shape: {solution.value.shape}")
     print(f"Result: {optx.RESULTS[solution.result]}")
     print(f"Stats: {solution.stats}")
-    print(f"Diff: {solution.state.diff}")
+    print(f"Diff: {jnp.linalg.norm(solution.state.diff)}")
     print(f"Diff size: {solution.state.diffsize}")
     print(f"Initial residual: {jnp.linalg.norm(init_residual)}")
     print(f"Final residual: {jnp.linalg.norm(solution.state.f)}")
+
+    solve_spec = {
+        'kind': 'pcolor',
+        'data': (*poisson.config.grid.coords, solution.value),
+        'opts': {'clim': 'auto', 'xlabel': "$x$", 'ylabel': "$y$", 'cbar_label': r"$\phi(x,y)$"},
+        'kwargs': {'shading': 'gouraud'}
+    }
+    gridplot(solve_spec, subplot_size_in=(4, 3), scheme='dark')
+    plt.show()
+
 
 def main() -> None:
     # solve_known_systems()

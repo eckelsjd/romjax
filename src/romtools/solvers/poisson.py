@@ -77,8 +77,8 @@ class PoissonInputs(DictModel):
     :ivar conductivity: conductivity inputs
     :ivar boundary: boundary condition parameters
     """
-    forcing: DictModel = Field(default_factory=ConstantForcingInputs)
-    conductivity: DictModel = Field(default_factory=NonlinearConductivityInputs)
+    forcing: DictModel = Field(default_factory=lambda: ConstantForcingInputs(const=0.0))
+    conductivity: DictModel = Field(default_factory=lambda: ConstantForcingInputs(const=1.0))
     boundary: DictModel = Field(default_factory=lambda: homogeneous_boundary(ndim=2))
 
 
@@ -116,7 +116,7 @@ class PoissonConfig(DictModel):
     :ivar throw: whether to throw failures as errors (default True)
     """
     grid: UniformGrid
-    solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-3, 'atol': 1e-6}),
+    solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
                                     validate_default=True)
     initial_guess: ArrayLike = Field(default_factory=lambda: zero_initial_guess, exclude=True, validate_default=True)
     options: dict[str, Any] = Field(default_factory=dict)
@@ -192,15 +192,15 @@ class Poisson2D(Model):
 
     # Optional/default
     forcing: ForcingCallable = constant_forcing
-    conductivity: ForcingCallable = nonlinear_conductivity
+    conductivity: ForcingCallable = constant_forcing
     boundary: BoundaryCallable = boundary_pass_through
 
     forcing_defaults: DictModel = Field(
-        default_factory=ConstantForcingInputs,
+        default_factory=lambda: ConstantForcingInputs(const=0.0),
         description="Default inputs for the forcing function (any PyTree).",
     )
     conductivity_defaults: DictModel = Field(
-        default_factory=NonlinearConductivityInputs,
+        default_factory=lambda: ConstantForcingInputs(const=1.0),
         description="Default inputs for the conductivity function (any PyTree).",
     )
     boundary_defaults: DictModel = Field(
@@ -240,6 +240,9 @@ class Poisson2D(Model):
         if info.field_name == 'conductivity_defaults':
             if info.data['conductivity'] is nonlinear_conductivity:
                 return NonlinearConductivityInputs(**value)
+            if info.data['conductivity'] is constant_forcing:
+                return ConstantForcingInputs(**value)
+            
         return value
     
     def _merge_inputs(self, inputs: PoissonInputs) -> PoissonInputs:
@@ -267,7 +270,7 @@ class Poisson2D(Model):
         phi = jnp.asarray(outputs["phi"])
         dx, dy = self.config['grid']['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
-        conductivity = jnp.asarray(self.conductivity(inputs['conductivity'], outputs))
+        conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs), phi.shape)
         xbds, ybds = inputs['boundary']['boundary']  # constant
 
         def _ghost_for_side(
@@ -327,11 +330,7 @@ class Poisson2D(Model):
 
         return {"phi_residual": phi_residual}
 
-    def evaluate(
-            self, 
-            inputs: PoissonInputs, 
-            outputs: PoissonOutputs
-        ) -> PoissonResiduals:
+    def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Evalute the Poisson residual on a 2D grid.
         
         :param inputs: params for forcing, conductivity, and boundary conditions

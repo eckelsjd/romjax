@@ -71,7 +71,7 @@ def test_merge_boundary_conditions():
     defaults = homogeneous_boundary(type="dirichlet", value=0.0, ndim=2)
 
     overrides = {
-        "boundary": (
+        "boundary": [
             (
                 {"value": jnp.array(1.0)},
                 {"value": jnp.array(2.0)},
@@ -80,7 +80,7 @@ def test_merge_boundary_conditions():
                 {"type": BoundaryType.neumann, "value": jnp.array(0.5)},
                 {"value": jnp.array(3.0)},
             ),
-        )
+        ]
     }
 
     merged = merge_pytrees(defaults, overrides)

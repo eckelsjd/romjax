@@ -37,7 +37,7 @@ class GridBoundaryInputs(DictModel):
     """Periodic, neumann, or dirichlet boundaries on uniform grid.
     Each tuple is the left/right boundary conditions for a given dimension.
     """
-    boundary: tuple[tuple[BoundarySpec, BoundarySpec], ...]
+    boundary: list[tuple[BoundarySpec, BoundarySpec]]
 
     @model_validator(mode='after')
     def _check_periodic(self) -> 'GridBoundaryInputs':
@@ -68,9 +68,7 @@ def homogeneous_boundary(type: str | BoundaryType = 'dirichlet',
     :return: the BoundaryGrid object
     """
     return GridBoundaryInputs(
-        boundary=tuple([(BoundarySpec(type=type, value=value), 
-                         BoundarySpec(type=type, value=value))
-                           for _ in range(ndim)])
+        boundary=[(BoundarySpec(type=type, value=value), BoundarySpec(type=type, value=value)) for _ in range(ndim)]
     )
 
 

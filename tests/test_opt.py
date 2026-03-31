@@ -5,9 +5,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from romtools.optimization import Optimizer, NewtonDebug
+from romtools.optimization import Optimizer
 from romtools.typing import PyTree
-from romtools.utils import pytree_l2_norm
 
 
 def test_pytree_opt_debug(tmp_path):
@@ -189,10 +188,3 @@ def test_pytree_opt_debug(tmp_path):
     saved_leaves = jax.tree_util.tree_leaves(saved_params)
     for a, b in zip(saved_leaves, leaves_hat):
         assert jnp.allclose(a, b, atol=1e-6, rtol=1e-6)
-
-
-def test_newton_debug():
-    def residual_callback(residual: PyTree) -> None:
-        err = tree_l2_norm(residual)
-        print()
-    solver = NewtonDebug(rtol=1e-6, atol=1e-6, callback=lambda residual: )
