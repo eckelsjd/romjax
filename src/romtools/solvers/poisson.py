@@ -1,4 +1,6 @@
 from typing import Literal, Mapping, TypedDict, Any
+from dataclasses import dataclass
+import time
 
 import jax.numpy as jnp
 import optimistix as optx
@@ -9,6 +11,7 @@ from pydantic import (
     ValidationInfo, 
     field_validator,
 )
+import jax
 
 from romtools.model import Model
 from romtools.solvers.utils import (
@@ -28,7 +31,7 @@ from romtools.typing import (
     IterativeSolver,
     AdjointMethod
 )
-from romtools.utils import merge_pytrees, to_pytree
+from romtools.utils import merge_pytrees, to_pytree, get_gpu_memory
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
@@ -102,6 +105,10 @@ def zero_initial_guess(coords: Coordinates) -> ArrayLike:
     return jnp.zeros_like(coords[0])
 
 
+def const_initial_guess(const: float) -> InitialCallable:
+    return lambda coords: const * jnp.ones_like(coords[0])
+
+
 class PoissonConfig(DictModel):
     """Numerical configs for solving the Poisson PDE on a 2D grid.
 
@@ -109,7 +116,7 @@ class PoissonConfig(DictModel):
     
     :ivar grid: the uniform 2D Cartesian grid
     :ivar solver: Optimistix nonlinear root finding solver (name+opts or instance), default is Newton
-    :ivar initial_guess: array matching the shape of the grid, or a callable that takes coords and generates the array
+    :ivar initial_guess: callable that takes coords and generates an initial guess on the grid
     :ivar options: runtime options for the nonlinear solver
     :ivar max_steps: maximum number of solver steps
     :ivar adjoint: Optimistix adjoint method
@@ -118,7 +125,7 @@ class PoissonConfig(DictModel):
     grid: UniformGrid
     solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
                                     validate_default=True)
-    initial_guess: ArrayLike = Field(default_factory=lambda: zero_initial_guess, exclude=True, validate_default=True)
+    initial_guess: InitialCallable = Field(default=zero_initial_guess, exclude=True)
     options: dict[str, Any] = Field(default_factory=dict)
     max_steps: PositiveInt = 100
     adjoint: AdjointMethod = Field(default_factory=lambda: dict(name='ImplicitAdjoint'), validate_default=True)
@@ -130,14 +137,6 @@ class PoissonConfig(DictModel):
         if len(value.shape) != 2:
             raise ValueError("Only 2D grid supported for Poisson")
         
-        return value
-    
-    @field_validator("initial_guess", mode="before")
-    @classmethod
-    def _coerce_initial_guess(cls, value: ArrayLike | InitialCallable, info: ValidationInfo) -> ArrayLike:
-        if callable(value):
-            return value(info.data["grid"].coords)
-
         return value
 
 
@@ -267,6 +266,7 @@ class Poisson2D(Model):
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
+        print("Starting _compute residual")
         phi = jnp.asarray(outputs["phi"])
         dx, dy = self.config['grid']['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
@@ -328,6 +328,9 @@ class Poisson2D(Model):
 
         phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
+        time.sleep(4)
+        print("Ending _compute_residual")
+
         return {"phi_residual": phi_residual}
 
     def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
@@ -364,17 +367,44 @@ class Poisson2D(Model):
         def residual_fn(phi: ArrayLike, args: PyTree) -> ArrayLike:
             residual = self._compute_residual(args['inputs'], {'phi': phi})
             return residual['phi_residual'] - args['target']
+        
+        used_mib, total_mib = get_gpu_memory()[0]
+        print(f"Before optx: {used_mib} / {total_mib} MiB")
+
+        @dataclass
+        class Solution:
+            value: ArrayLike
+
+        # s = 1000
+        # key = jax.random.PRNGKey(1)
+        # solution = Solution(value=jax.random.normal(key, shape=(s, s)))
+        # phi0 = jnp.asarray(self.config.initial_guess(self.config.grid.coords))
+        # res = residual_fn(phi0, args)
+        # solution = Solution(value=res)
+        # optx.root_find(
+        #     lambda p, *args: p**2 - 10,
+        #     solver=optx.Newton(rtol=1, atol=1e-4),
+        #     y0 = jnp.array(100),
+        #     max_steps=100,
+        #     throw=False
+        # )
+        
 
         solution = optx.root_find(
             residual_fn,
             solver=self.config.solver,
-            y0=jnp.asarray(self.config.initial_guess),
+            y0=jnp.asarray(self.config.initial_guess(self.config.grid.coords)),
             args=args,
             options=self.config.options,
             max_steps=self.config.max_steps,
             adjoint=self.config.adjoint,
             throw=self.config.throw,
         )
+
+        time.sleep(4)
+
+        used_mib, total_mib = get_gpu_memory()[0]
+        print(f"After optx: {used_mib} / {total_mib} MiB")
 
         ret = solution if return_sol else {"phi": solution.value} 
         return ret

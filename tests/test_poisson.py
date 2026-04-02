@@ -151,7 +151,7 @@ def get_laplace_solver():
                 "opts": {"rtol": 1, "atol": 1e-4} # only look at residual atol essentially
             },
             "max_steps": 20,
-            "initial_guess": jnp.ones((50, 50))
+            "initial_guess": lambda coords: jnp.ones_like(coords[0])
         }
     )
 
@@ -193,7 +193,7 @@ def test_poisson_manufactured_solve(show_plot=False):
             "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
             "max_steps": 50,
             "solver": dict(name='Newton', opts={'rtol': 1e2, 'atol': dx_error*1.5}),
-            "initial_guess": jnp.ones(shape),
+            "initial_guess": lambda coords: jnp.ones_like(coords[0]),
             "throw": False
         }, 
         forcing="sinusoid",
