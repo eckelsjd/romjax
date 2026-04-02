@@ -15,6 +15,7 @@ from romtools.utils import tree_l2_norm
 from romtools.typing import PyTree
 from romtools.plotting import gridplot
 from romtools.solvers.utils import homogeneous_boundary, BoundarySpec
+from romtools.solvers.poisson import const_initial_guess
 
 import os
 from pathlib import Path
@@ -81,7 +82,7 @@ class NonlinearSystem(Model):
 
     solver: Any = Field(default_factory=lambda: optx.Newton(rtol=1e-10, atol=1e-10, linear_solver=lx.QR()))
     adjoint: Any = Field(default_factory=lambda: optx.ImplicitAdjoint(linear_solver=lx.QR()))
-    initial_guess: jnp.ndarray = Field(default_factory=lambda: jnp.array(1.0))
+    initial_guess: Callable = Field(default_factory=lambda: const_initial_guess(1.0))
     max_steps: int = 100
     throw: bool = False
 

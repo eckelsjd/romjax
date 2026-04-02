@@ -19,12 +19,13 @@ def test_basic_gridplot(tmp_path):
         name="my_plot"
     )
 
-    fig, ax = gridplot(
+    fig, ax, ani = gridplot(
         sin_spec, 
         scheme='dark', 
         plot_kwargs={"my_plot": {"lw": 3}},
         animate_opts={"writer": "pillow", "dpi": 100, "fps": 15, "blit": False},
         save=Path(tmp_path) / "sine.gif",
     )
+    print(tmp_path)
 
     assert (Path(tmp_path) / "sine.gif").exists()

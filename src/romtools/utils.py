@@ -3,6 +3,8 @@ from typing import Mapping
 import logging
 import sys
 from pathlib import Path
+import subprocess
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -10,9 +12,10 @@ from pydantic import BaseModel
 
 from romtools.typing import PyTree
 
-__all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm']
+__all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm', 
+           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory']
 
-LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-15s — %(message)s")
+LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
 
 
 @jax.jit
@@ -127,3 +130,113 @@ def format_time_engineering(seconds: float):
     
     # Fall back to scientific notation if out of normal range
     return f"{seconds:.1e} s"
+
+
+def _parse_nvidia_smi_output(output: str) -> list[tuple[int, int]]:
+    """
+    Parse the output of an nvidia-smi memory query.
+
+    :param output: Raw stdout from nvidia-smi.
+    :return: List of (used_mib, total_mib) tuples for each visible GPU.
+    """
+    entries: list[tuple[int, int]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        used_mib = int(parts[0])
+        total_mib = int(parts[1])
+        entries.append((used_mib, total_mib))
+    return entries
+
+
+def get_gpu_memory() -> list[tuple[int, int]]:
+    """
+    Query GPU memory usage via nvidia-smi.
+
+    :return: List of (used_mib, total_mib) tuples for each visible GPU.
+    :raises FileNotFoundError: If nvidia-smi is not available.
+    :raises subprocess.CalledProcessError: If nvidia-smi fails.
+    """
+    command = [
+        "nvidia-smi",
+        "--query-gpu=memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        usage = _parse_nvidia_smi_output(result.stdout)
+    except FileNotFoundError:
+        print("GPU memory: nvidia-smi not found in PATH.")
+        return
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "unknown error"
+        print(f"GPU memory: nvidia-smi failed ({stderr}).")
+        return
+    
+    return usage
+
+
+def print_gpu_memory(logger: logging.Logger | None = None) -> None:
+    """
+    Print the current GPU memory usage and total memory in MiB.
+
+    :param logger: logging object to use (if None, just prints to console)
+    """
+    print_fn = print if logger is None else logger.info
+    usage = get_gpu_memory()
+    
+    if not usage:
+        print_fn("GPU memory: no GPUs detected.")
+        return
+
+    if len(usage) == 1:
+        used_mib, total_mib = usage[0]
+        print_fn(f"GPU memory: {used_mib} MiB / {total_mib} MiB")
+        return
+
+    for index, (used_mib, total_mib) in enumerate(usage):
+        print_fn(f"GPU {index} memory: {used_mib} MiB / {total_mib} MiB")
+
+
+def _monitor_loop(stop_event: threading.Event, interval_seconds: float) -> None:
+    """
+    Continuously print GPU memory usage until stop_event is set.
+
+    :param stop_event: Event used to stop the loop.
+    :param interval_seconds: Sleep interval between samples.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive.")
+
+    while not stop_event.is_set():
+        print_gpu_memory()
+        stop_event.wait(interval_seconds)
+
+
+def monitor_gpu_memory(interval_seconds: float = 5.0) -> tuple[threading.Thread, threading.Event]:
+    """
+    Start a background thread that periodically prints GPU memory usage.
+
+    :param interval_seconds: Time between samples in seconds.
+    :return: Tuple of (thread, stop_event).
+    """
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive.")
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_monitor_loop,
+        args=(stop_event, interval_seconds),
+        daemon=True,
+    )
+    thread.start()
+    return thread, stop_event
