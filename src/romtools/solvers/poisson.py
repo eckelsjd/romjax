@@ -266,7 +266,7 @@ class Poisson2D(Model):
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
-        print("Starting _compute residual")
+        # print("Starting _compute residual")
         phi = jnp.asarray(outputs["phi"])
         dx, dy = self.config['grid']['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
@@ -328,8 +328,8 @@ class Poisson2D(Model):
 
         phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
-        time.sleep(4)
-        print("Ending _compute_residual")
+        # time.sleep(4)
+        # print("Ending _compute_residual")
 
         return {"phi_residual": phi_residual}
 
@@ -368,12 +368,12 @@ class Poisson2D(Model):
             residual = self._compute_residual(args['inputs'], {'phi': phi})
             return residual['phi_residual'] - args['target']
         
-        used_mib, total_mib = get_gpu_memory()[0]
-        print(f"Before optx: {used_mib} / {total_mib} MiB")
+        # used_mib, total_mib = get_gpu_memory()[0]
+        # print(f"Before optx: {used_mib} / {total_mib} MiB")
 
-        @dataclass
-        class Solution:
-            value: ArrayLike
+        # @dataclass
+        # class Solution:
+        #     value: ArrayLike
 
         # s = 1000
         # key = jax.random.PRNGKey(1)
@@ -389,7 +389,6 @@ class Poisson2D(Model):
         #     throw=False
         # )
         
-
         solution = optx.root_find(
             residual_fn,
             solver=self.config.solver,
@@ -401,10 +400,9 @@ class Poisson2D(Model):
             throw=self.config.throw,
         )
 
-        time.sleep(4)
-
-        used_mib, total_mib = get_gpu_memory()[0]
-        print(f"After optx: {used_mib} / {total_mib} MiB")
+        # time.sleep(4)
+        # used_mib, total_mib = get_gpu_memory()[0]
+        # print(f"After optx: {used_mib} / {total_mib} MiB")
 
         ret = solution if return_sol else {"phi": solution.value} 
         return ret
