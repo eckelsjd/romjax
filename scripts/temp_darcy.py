@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import optimistix as optx
 import optax
+import lineax as lx
 
 from romtools.solvers import Poisson2D
 from romtools.plotting import gridplot, get_scheme
@@ -22,7 +23,7 @@ from romtools.optimization import Optimizer
 from romtools.utils import get_gpu_memory, monitor_gpu_memory
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".50"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 
 def get_darcy_solver(shape):
@@ -32,8 +33,10 @@ def get_darcy_solver(shape):
     darcy = Poisson2D(
         config={
             "solver": optx.Newton(rtol=1, atol=1e-3),
+                                #   linear_solver=lx.GMRES(rtol=1e-3, atol=1e-20, max_steps=100, restart=30,
+                                #                          stagnation_iters=30)),
             "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
-            "max_steps": 100,
+            "max_steps": 200,
             "throw": True
         },
         forcing_defaults={'const': -1.0},
@@ -149,19 +152,19 @@ def sinusoid_forcing(inputs, outputs):
 
 def train_forcing(shape, key, save_dir):
     """Try to learn a forcing parameter over some random fields."""
-    used_mib, total_mib = get_gpu_memory()[0]
-    print(f"Initial GPU: {used_mib} / {total_mib} MiB")
+    # used_mib, total_mib = get_gpu_memory()[0]
+    # print(f"Initial GPU: {used_mib} / {total_mib} MiB")
 
     train_key, test_key = jax.random.split(key, 2)
 
-    ntrain = 1
-    # ntest = 5
+    ntrain = 10
+    ntest = 5
 
     darcy = get_darcy_solver(shape)
     x, y = darcy.config.grid.coords
 
     train_in = sample_darcy_random_field((x, y), ntrain, key=train_key)
-    # test_in = sample_darcy_random_field((x, y), ntest, key=test_key)
+    test_in = sample_darcy_random_field((x, y), ntest, key=test_key)
 
     # Use a "true" value on the training data
     darcy.forcing = sinusoid_forcing
@@ -175,71 +178,71 @@ def train_forcing(shape, key, save_dir):
     
     solve_many = jax.vmap(solve_one, in_axes=(0, None), out_axes=0)
     
-    used_mib, total_mib = get_gpu_memory()[0]
-    print(f"Before solve GPU: {used_mib} / {total_mib} MiB")
+    # used_mib, total_mib = get_gpu_memory()[0]
+    # print(f"Before solve GPU: {used_mib} / {total_mib} MiB")
 
-    print("Starting GPU monitor...")
+    # print("Starting GPU monitor...")
 
-    thread, stop_event = monitor_gpu_memory(0.3)
+    # thread, stop_event = monitor_gpu_memory(0.3)
 
     train_out = solve_many(train_in, true_param)
-    time.sleep(4)
-    # test_out = solve_many(test_in, true_param)
+    # time.sleep(4)
+    test_out = solve_many(test_in, true_param)
 
-    print("Closing GPU monitor...")
-    stop_event.set()
-    thread.join()
+    # print("Closing GPU monitor...")
+    # stop_event.set()
+    # thread.join()
 
-    used_mib, total_mib = get_gpu_memory()[0]
-    print(f"After solve GPU: {used_mib} / {total_mib} MiB")
+    # used_mib, total_mib = get_gpu_memory()[0]
+    # print(f"After solve GPU: {used_mib} / {total_mib} MiB")
 
     # Can't take grad of vmap(optx.root_find) apparently, so manually loop over train/test sets
-    # @jax.jit
-    # def loss_fn(param):
-    #     def body(i, acc):
-    #         pred = solve_one(train_in[i], param)
-    #         diff = pred - train_out[i]
-    #         return acc + jnp.mean(diff**2)
-    #     total = jax.lax.fori_loop(0, train_in.shape[0], body, 0.0)
-    #     return total / train_in.shape[0]
+    @jax.jit
+    def loss_fn(param):
+        def body(i, acc):
+            pred = solve_one(train_in[i], param)
+            diff = pred - train_out[i]
+            return acc + jnp.mean(diff**2)
+        total = jax.lax.fori_loop(0, train_in.shape[0], body, 0.0)
+        return total / train_in.shape[0]
     
-    # @jax.jit
-    # def test_fn(param):
-    #     def body(i, acc):
-    #         pred = solve_one(test_in[i], param)
-    #         diff = pred - test_out[i]
-    #         return acc + jnp.mean(diff**2)
-    #     total = jax.lax.fori_loop(0, test_in.shape[0], body, 0.0)
-    #     return total / test_in.shape[0]
+    @jax.jit
+    def test_fn(param):
+        def body(i, acc):
+            pred = solve_one(test_in[i], param)
+            diff = pred - test_out[i]
+            return acc + jnp.mean(diff**2)
+        total = jax.lax.fori_loop(0, test_in.shape[0], body, 0.0)
+        return total / test_in.shape[0]
 
-    # opt = Optimizer()
+    opt = Optimizer()
 
-    # res = opt.run_debug(
-    #     loss_fn,
-    #     params0=param0,
-    #     optimizer=optax.adam(0.2),
-    #     max_steps=100,
-    #     max_runtime_s=120,
-    #     grad_tol=1e-10,
-    #     log_interval=5,
-    #     plot_interval=5,
-    #     test_fn=test_fn,
-    #     live_plot=True,
-    #     save=save_dir,
-    #     prefix="darcy_"
-    # )
+    res = opt.run_debug(
+        loss_fn,
+        params0=param0,
+        optimizer=optax.adam(0.2),
+        max_steps=100,
+        max_runtime_s=120,
+        grad_tol=1e-10,
+        log_interval=5,
+        plot_interval=5,
+        test_fn=test_fn,
+        live_plot=True,
+        save=save_dir,
+        prefix="darcy_"
+    )
 
-    # print(f"True param: {true_param}, Result: {res}")
+    print(f"True param: {true_param}, Result: {res}")
 
-    # # Save test data for offline validation plots
-    # test_data = {
-    #     "x": jax.device_get(x),
-    #     "y": jax.device_get(y),
-    #     "test_in": jax.device_get(test_in),
-    #     "test_out": jax.device_get(test_out),
-    # }
-    # with open(save_dir / "darcy_test_data.pkl", "wb") as fd:
-    #     pickle.dump(test_data, fd)
+    # Save test data for offline validation plots
+    test_data = {
+        "x": jax.device_get(x),
+        "y": jax.device_get(y),
+        "test_in": jax.device_get(test_in),
+        "test_out": jax.device_get(test_out),
+    }
+    with open(save_dir / "darcy_test_data.pkl", "wb") as fd:
+        pickle.dump(test_data, fd)
 
 
 def plot_validation(save_dir: str | Path, nshow: int = 3) -> None:
@@ -274,7 +277,7 @@ def plot_validation(save_dir: str | Path, nshow: int = 3) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Sample Darcy random fields and solve Poisson.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for the Darcy field sampler.")
-    parser.add_argument("--shape", type=list[int], default=[190, 190], help="Shape of 2d grid")
+    parser.add_argument("--shape", type=list[int], default=[32, 32], help="Shape of 2d grid")
     parser.add_argument("--save-dir", type=str, default="darcy-opt", help="Where to save results")
     args = parser.parse_args()
     
@@ -285,6 +288,6 @@ if __name__ == '__main__':
 
     nshow = 3
 
-    # show_random_samples(shape, 1, key)
+    # show_random_samples(shape, nshow, key)
     train_forcing(shape, key, save_dir)
-    # plot_validation(save_dir, nshow)
+    plot_validation(save_dir, nshow)
