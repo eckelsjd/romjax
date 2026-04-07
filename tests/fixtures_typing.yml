@@ -2,7 +2,7 @@ settings: !model:tests.test_typing.CustomSettings
   one: hello
   two: there
   four: 4
-configs: !model:romtools.typing.DictModel
+configs: !model:romjax.typing.DictModel
   one: goodbye
   two: here
   four: 4

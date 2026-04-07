@@ -7,18 +7,19 @@ import copy
 
 import jax
 import jaxtyping
-import jax.numpy as jnp
 from jax.typing import ArrayLike
 from pydantic import field_validator
 
-from romtools.utils import save_h5
-from romtools.typing import DictModel
+from romjax.utils import save_h5
+from romjax.typing import DictModel
 
-__all__ = ['Distribution', 'parametric_sampler', 'sampling_keys', 'BatchSampler']
+
+__all__ = ['Distribution', 'parametric_sampler', 'gen_sampling_keys', 'BatchSampler']
 
 
 type DistributionName = Literal['uniform', 'normal']
 type ParamName = str
+
 
 @runtime_checkable
 class BatchSampler(Protocol):
@@ -39,6 +40,7 @@ def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kw
 
 
 class Distribution(DictModel):
+    """Simple class that provides validation for common distributions."""
     distribution: DistributionCallable
 
     @field_validator('distribution', mode='before')
@@ -66,13 +68,14 @@ class Distribution(DictModel):
 
 def parametric_sampler(
     keys: Iterable[jaxtyping.Key], 
-    paths: Iterable[str | Path],
+    paths: Iterable[str | os.PathLike],
     format: Literal['h5', 'txt'] = 'h5',
     prefix: str = 'sample',
     write_summary: bool = True,
     **params: dict[ParamName, Distribution]
 ) -> None:
-    """Independently sample all parameter distributions passed in as kwargs and save to file.
+    """
+    Independently sample all parameter distributions passed in as kwargs and save to file.
     
     :param keys: the jax random keys per sample
     :param paths: the base paths to save samples associated with keys
@@ -107,17 +110,26 @@ def parametric_sampler(
 
         if write_summary:
             with open(Path(path) / f"{prefix}_summary.txt", 'w') as fd:
-                param_lines = [f"{param}: shape={arr.shape} dtype={arr.dtype}" for param, arr in sample.items()]
+                param_lines = [f"{param}: shape={arr.shape} dtype={arr.dtype}\n" for param, arr in sample.items()]
                 fd.writelines([f"Date: {time.asctime()}\n\n"] + param_lines)
 
 
-def sampling_keys(
+def gen_sampling_keys(
     size: int,
-    path: str | Path, 
+    path: str | os.PathLike, 
     seed: int | None = None, 
     reuse: bool = True,
 ) -> tuple[list[jaxtyping.Key], list[Path]]:
-    """Setup and return keys/paths for file-based reproducible sampling using jax."""
+    """
+    Setup and return jax keys and file paths for file-based reproducible sampling using jax. Will create a unique
+    directory for the seed and all samples underneath it.
+    
+    :param size: the number of samples
+    :param path: the base path for storing samples
+    :param seed: the random seed (if None, uses the current time)
+    :param reuse: whether to reuse existing samples found in the path (default True)
+    :return: the jax keys and file paths for each sample
+    """
     if seed is None:
         seed = int(time.time())
     base_key = jax.random.key(seed)
@@ -125,15 +137,15 @@ def sampling_keys(
     seed_path = Path(path) / f"seed_{seed}"
     os.makedirs(seed_path, exist_ok=True)
 
-    info_path = Path(path) / "ROMTOOLS.txt"
+    info_path = Path(path) / "romjax.txt"
     if not info_path.exists():
         with open(info_path, "w") as fd:
             fd.write(f"Date: {time.asctime()}\n\n"
-                     f"This directory has been used as a `romtools` sampling location.\n"
+                     f"This directory has been used as a `romjax` sampling location.\n"
                      f"The structure is seed_i/sample_j for the jth sample of random seed i.\n"
                      f"Sample directories with 'ignore' in the name will be ignored.\n")
 
-    existing = [f for f in os.listdir(seed_path) if Path(f).is_dir() and str(f).startswith("sample_") and 
+    existing = [f for f in os.listdir(seed_path) if (seed_path / f).is_dir() and str(f).startswith("sample_") and 
                 "ignore" not in str(f)]
     existing_int = {int(f.split("_")[1]) for f in existing}
     new_int = [i for i in range(size) if not reuse or (i not in existing_int)]

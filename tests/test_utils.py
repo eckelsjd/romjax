@@ -2,10 +2,11 @@ import jax
 import jax.numpy as jnp
 import lineax as lx
 import optimistix as optx
+import numpy as np
 from jax.typing import ArrayLike
 
-from romtools import DictModel
-from romtools.utils import merge_pytrees, to_pytree, save_h5, load_h5
+from romjax import DictModel
+from romjax.utils import merge_pytrees, to_pytree, save_h5, load_h5
 
 
 def test_to_pytree():
@@ -143,6 +144,25 @@ def test_optimistix_implicit_adjoint_grad():
     assert jnp.allclose(grad, fd, atol=1e-3, rtol=1e-3)
 
 
-def test_save_load_h5():
-    # TODO
-    pass
+def test_save_load_h5(tmp_path):
+    data = {
+        "scalars": {"a": jnp.array(1.5), "b": jnp.array(2.5, dtype=jnp.float32)},
+        "vectors": {"x": jnp.arange(5.0), "y": jnp.linspace(0.0, 1.0, 6)},
+        "matrix": {"M": jnp.arange(12.0).reshape(3, 4)},
+    }
+
+    filename = tmp_path / "roundtrip.h5"
+    save_h5(data, filename, mode="w")
+
+    loaded: dict[str, ArrayLike] = {}
+    load_h5(loaded, filename, mode="r", jax=True)
+
+    orig_leaves, orig_def = jax.tree_util.tree_flatten(data)
+    loaded_leaves, loaded_def = jax.tree_util.tree_flatten(loaded)
+
+    assert orig_def == loaded_def
+    assert len(orig_leaves) == len(loaded_leaves)
+    for orig, got in zip(orig_leaves, loaded_leaves):
+        assert np.asarray(orig).shape == np.asarray(got).shape
+        assert np.asarray(orig).dtype == np.asarray(got).dtype
+        assert np.allclose(np.asarray(orig), np.asarray(got))

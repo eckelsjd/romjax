@@ -1,42 +1,25 @@
-from typing import Literal, Mapping, TypedDict, Any, Iterable
-from pathlib import Path
+"""Example 2D Poisson solver."""
+from typing import Literal, Mapping, TypedDict, Any, Iterable, Callable
+from os import PathLike
 import copy
 
 import jax.numpy as jnp
 import optimistix as optx
-from jax.typing import ArrayLike
-from pydantic import (
-    Field,
-    PositiveInt, 
-    ValidationInfo, 
-    field_validator,
-)
+from jaxtyping import ArrayLike, PyTree, Key
+from pydantic import Field, PositiveInt, ValidationInfo, field_validator
 import jax
 
-from romtools.model import Model
-from romtools.solvers.utils import (
-    boundary_pass_through,
-    homogeneous_boundary,
-    UniformGrid,
-    BoundarySpec,
-    BoundaryType
-)
-from romtools.typing import (
-    BoundaryCallable, 
-    Coordinates, 
-    DictModel, 
-    ForcingCallable, 
-    InitialCallable,
-    PyTree,
-    IterativeSolver,
-    AdjointMethod
-)
-from romtools.utils import merge_pytrees, to_pytree
-from romtools.random import BatchSampler, Distribution, parametric_sampler
+from romjax.pde import Coordinates, homogeneous_boundary, UniformGrid, BoundarySpec, BoundaryType
+from romjax.typing import IterativeSolver, AdjointMethod, DictModel, ImplicitModel
+from romjax.utils import merge_pytrees, to_pytree
+from romjax.random import BatchSampler, Distribution, parametric_sampler
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
 type SamplerName = Literal["parametric"]
+type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
+type BoundaryCallable = Callable[[PyTree], PyTree]
+type InitialCallable = Callable[[Coordinates], ArrayLike]
 
 
 class SinusoidForcingInputs(DictModel):
@@ -103,43 +86,13 @@ class PoissonResiduals(TypedDict):
     phi_residual: ArrayLike
 
 
-def zero_initial_guess(coords: Coordinates) -> ArrayLike:
-    return jnp.zeros_like(coords[0])
-
-
 def const_initial_guess(const: float) -> InitialCallable:
     return lambda coords: const * jnp.ones_like(coords[0])
 
 
-class PoissonConfig(DictModel):
-    """Numerical configs for solving the Poisson PDE on a 2D grid.
-
-    See Optimistix docs for `root_find()` method.
-    
-    :ivar grid: the uniform 2D Cartesian grid
-    :ivar solver: Optimistix nonlinear root finding solver (name+opts or instance), default is Newton
-    :ivar initial_guess: callable that takes coords and generates an initial guess on the grid
-    :ivar options: runtime options for the nonlinear solver
-    :ivar max_steps: maximum number of solver steps
-    :ivar adjoint: Optimistix adjoint method
-    :ivar throw: whether to throw failures as errors (default True)
-    """
-    grid: UniformGrid
-    solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
-                                    validate_default=True)
-    initial_guess: InitialCallable = Field(default=zero_initial_guess, exclude=True)
-    options: dict[str, Any] = Field(default_factory=dict)
-    max_steps: PositiveInt = 100
-    adjoint: AdjointMethod = Field(default_factory=lambda: dict(name='ImplicitAdjoint'), validate_default=True)
-    throw: bool = True
-
-    @field_validator("grid", mode="after")
-    @classmethod
-    def _check_2d_grid(cls, value: UniformGrid) -> UniformGrid:
-        if len(value.shape) != 2:
-            raise ValueError("Only 2D grid supported for Poisson")
-        
-        return value
+def boundary_pass_through(inputs: PyTree) -> PyTree:
+    """Simple boundary that uses boundary input params directly (just pass them through)."""
+    return inputs
 
 
 def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
@@ -186,7 +139,88 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
     return inputs['k0'] * (1 + inputs['alpha'] * (phi * phi))
 
 
-class Poisson2D(Model):
+def darcy_field(
+    key: Key, 
+    nsamples: int = 1, 
+    bounds: tuple[tuple[int, int], tuple[int, int]] = ((0, 1), (0, 1)),
+    shape: tuple[int, int] = (16, 16),
+    nemytskii: tuple[float, float] = (3.0, 12.0),
+    cov_diag: float = 9.0
+) -> ArrayLike:
+    """Sample darcy flow conductivity field according to Sec 6.2 of Kovachki 2022.
+
+    https://arxiv.org/abs/2108.08481
+
+    :param key: the random key
+    :param nsamples: number of random fields to generate
+    :param bounds: 2d bounds of grid
+    :param shape: 2d shape of grid
+    :param nemytskii: the result of the nemytskii pushforward, term 0 if field < 0, term 1 if field > 0
+    :param cov_diag: additional amount to add to cov diagonal on top of Laplacian eigenvalues
+    :return: Array of shape [nsamples, W, H] giving the random field samples
+    """
+    (x0, x1), (y0, y1) = bounds
+    nx, ny = shape
+    x = jnp.linspace(x0, x1, nx)
+    y = jnp.linspace(y0, y1, ny)
+    xx, yy = jnp.meshgrid(x, y, indexing="ij")
+
+    kx = jnp.arange(nx)
+    ky = jnp.arange(ny)
+
+    scale_x = jnp.where(kx == 0, 1.0, jnp.sqrt(2.0))
+    scale_y = jnp.where(ky == 0, 1.0, jnp.sqrt(2.0))
+
+    lx = x1 - x0
+    ly = y1 - y0
+    x_hat = (xx[:, 0] - x0) / lx
+    y_hat = (yy[0, :] - y0) / ly
+    phi_x = jnp.cos(jnp.pi * x_hat[:, None] * kx[None, :]) * scale_x[None, :]
+    phi_y = jnp.cos(jnp.pi * y_hat[:, None] * ky[None, :]) * scale_y[None, :]
+
+    lap_eigs = (jnp.pi ** 2) * ((kx[:, None] / lx) ** 2 + (ky[None, :] / ly) ** 2)
+    cov_eigs = (lap_eigs + cov_diag) ** -2
+    sqrt_cov = jnp.sqrt(cov_eigs)
+
+    coeffs = jax.random.normal(key, (nsamples, nx, ny)) * sqrt_cov[None, :, :]
+    gauss_field = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
+
+    low, high = nemytskii
+    return jnp.where(gauss_field >= 0.0, high, low)
+
+
+class PoissonConfig(DictModel):
+    """Numerical configs for solving the Poisson PDE on a 2D grid.
+
+    See Optimistix docs for `root_find()` method.
+    
+    :ivar grid: the uniform 2D Cartesian grid
+    :ivar solver: Optimistix nonlinear root finding solver (name+opts or instance), default is Newton
+    :ivar initial_guess: callable that takes coords and generates an initial guess on the grid
+    :ivar options: runtime options for the nonlinear solver
+    :ivar max_steps: maximum number of solver steps
+    :ivar adjoint: Optimistix adjoint method
+    :ivar throw: whether to throw failures as errors (default True)
+    """
+    grid: UniformGrid
+    solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
+                                    validate_default=True)
+    initial_guess: InitialCallable = Field(default_factory=lambda: const_initial_guess(0.0), exclude=True)
+    options: dict[str, Any] = Field(default_factory=dict)
+    max_steps: PositiveInt = 100
+    adjoint: AdjointMethod = Field(default_factory=lambda: dict(name='ImplicitAdjoint'), validate_default=True)
+    throw: bool = True
+
+    @field_validator("grid", mode="after")
+    @classmethod
+    def _check_2d_grid(cls, value: UniformGrid) -> UniformGrid:
+        if len(value.shape) != 2:
+            raise ValueError("Only 2D grid supported for Poisson")
+        
+        return value
+
+
+class Poisson2D(ImplicitModel):
 
     # Required (and static once set)
     config: PoissonConfig
@@ -423,7 +457,7 @@ class Poisson2D(Model):
         ret = solution if return_sol else {"phi": solution.value} 
         return ret
     
-    def sample_inputs(self, keys: Iterable[jax.random.PRNGKey], paths: Iterable[str | Path]) -> None:
+    def sample_inputs(self, keys: Iterable[Key], paths: Iterable[str | PathLike]) -> None:
         def _sample(keys, sampler, opts, prefix):
             if sampler is not None:
                 opts = copy.copy(opts)

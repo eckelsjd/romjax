@@ -1,10 +1,11 @@
-"""Tools for reduced-order modeling.
+"""Reduced-order modeling in jax.
 
 - Author - Joshua Eckels (eckelsjd@umich.edu)
 - License - MIT
 """
 __version__ = "0.0.1"
-__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel']
+__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
+           'gen_sampling_keys', 'train']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -14,72 +15,14 @@ from pathlib import Path as _Path
 from types import BuiltinFunctionType as _BuiltinFunctionType, FunctionType as _FunctionType
 from types import FunctionType as _FunctionType
 from typing import IO as _IO, Any as _Any, Optional as _Optional, Type as _Type, Union as _Union
-from typing import Iterable as _Iterable, MutableMapping as _MutableMapping, Iterator as _Iterator
 
 import yaml as _yaml
-from pydantic import BaseModel as _BaseModel, ConfigDict as _ConfigDict
-from jaxtyping import PyTree as _PyTree, Key as _Key
 
-
-class ImplicitModel(_BaseModel, _ABC):
-    """An implicit function f(b,u) that maps inputs/outputs to residuals."""
-    model_config = _ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
-
-    @_abstractmethod
-    def evaluate(self, inputs: _PyTree, outputs: _PyTree) -> _PyTree:
-        """Evaluate forward residual function f(b,u)."""
-        raise NotImplementedError
-
-    @_abstractmethod
-    def solve(self, inputs: _PyTree, residuals: _PyTree) -> _PyTree:
-        """Solve inverse residual function f(b,u)=w."""
-        raise NotImplementedError
-    
-    @_abstractmethod
-    def sample_inputs(self, keys: _Iterable[_Key], paths: _Iterable[str | _PathLike]) -> None:
-        """Sample and save reproducible model inputs with the given keys at the given paths."""
-        raise NotImplementedError
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by YamlLoader for this model class."""
-        return f"!model:{cls.__module__}.{cls.__name__}"
-
-
-class DictModel(_BaseModel, _MutableMapping):
-    """Allow dict-like access of pydantic models."""
-
-    model_config = _ConfigDict(
-        arbitrary_types_allowed=True, 
-        extra="allow", 
-        validate_assignment=True,
-        use_enum_values=True
-    )
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by YamlLoader for this model class."""
-        return f"!model:{cls.__module__}.{cls.__name__}"
-
-    def __getitem__(self, key: str) -> _Any:
-        if not hasattr(self, key):
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: _Any) -> None:
-        setattr(self, key, value)
-
-    def __delitem__(self, key: str) -> None:
-        if not hasattr(self, key):
-            raise KeyError(key)
-        delattr(self, key)
-
-    def __iter__(self) -> _Iterator[str]:
-        for k, _ in super().__iter__():
-            yield k
-
-    def __len__(self) -> int:
-        return len(dict(self))
+from .plotting import gridplot
+from .utils import load_h5, save_h5
+from .random import gen_sampling_keys
+from .optim import train
+from .typing import DictModel, ImplicitModel
 
 
 class ConfigLoader(_ABC):

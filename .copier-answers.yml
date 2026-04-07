@@ -2,15 +2,15 @@
 _commit: v0.6.0
 _src_path: gh:eckelsjd/copier-numpy
 copyright_license: MIT
-distribution_name: romtools
-import_name: romtools
+distribution_name: romjax
+import_name: romjax
 include_cicd: false
 include_docs: false
 init_github: true
 install_jupyter: false
 is_distributable: true
 project_description: Tools for reduced-order modeling
-project_name: romtools
+project_name: romjax
 python_manager: uv
 repository_namespace: eckelsjd
 requires_python: '>=3.11'

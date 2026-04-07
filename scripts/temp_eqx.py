@@ -11,8 +11,8 @@ import numpy as np
 
 import matplotlib.pyplot as plt
 
-from romtools.plotting import gridplot
-from romtools.optimization import Optimizer
+from romjax.plotting import gridplot
+from romjax.optimization import Optimizer
 
 jax.config.update('jax_platform_name', 'cpu')
 
@@ -93,7 +93,7 @@ def simple_cnn():
         "test_images": "t10k-images-idx3-ubyte.gz",
         "test_labels": "t10k-labels-idx1-ubyte.gz",
     }
-    cache_dir = Path.home() / ".cache" / "romtools" / "mnist"
+    cache_dir = Path.home() / ".cache" / "romjax" / "mnist"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for filename in files.values():

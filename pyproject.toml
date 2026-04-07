@@ -1,5 +1,5 @@
 [project]
-name = "romtools"
+name = "romjax"
 version = "0.0.1"
 description = "Tools for reduced-order modeling"
 authors = [
@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/eckelsjd/romtools.git"
+Repository = "https://github.com/eckelsjd/romjax.git"
 
 [project.optional-dependencies]
 cpu = [
@@ -58,7 +58,7 @@ test = [
 ]
 
 [tool.pyproject-runner.tasks]
-test = { cmd = "pytest --cov=romtools --cov-report html:htmlcov tests", cwd = "!" }
+test = { cmd = "pytest --cov=romjax --cov-report html:htmlcov tests", cwd = "!" }
 lint = { cmd = "ruff check src tests", cwd = "!" }
 sync = { cmd = "uv sync --all-groups --extra", help = "Choose a jax extra [cpu, cu12, cu13]." }
 bump = "cz bump"
@@ -83,7 +83,7 @@ extend-exclude = ["*.ipynb"]
 [tool.commitizen]
 version_scheme = "pep440"
 version_provider = "pep621"
-version_files = ["src/romtools/__init__.py:__version__"]
+version_files = ["src/romjax/__init__.py:__version__"]
 update_changelog_on_bump = true
 tag_format = "v$version"
 changelog_file = "CHANGELOG.md"

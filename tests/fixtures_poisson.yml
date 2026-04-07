@@ -1,8 +1,8 @@
-solver: !model:romtools.solvers.Poisson2D
+solver: !model:romjax.poisson.Poisson2D
   config:
     grid:
-      shape: [50, 50]
-      bounds: [[0, 1], [0, 1]]
+      shape: &s [50, 50]
+      bounds: &b [[0, 1], [0, 1]]
     solver:
       name: Newton
       opts:
@@ -28,4 +28,7 @@ solver: !model:romtools.solvers.Poisson2D
   conductivity_sampler_opts:
     format: h5
     write_summary: true
-    k0: { distribution: !!python/name:romtools.solvers.poisson.darcy_sampler }
+    k0: 
+      distribution: !!python/name:romjax.poisson.darcy_field
+      shape: *s
+      bounds: *b

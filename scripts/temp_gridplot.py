@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from romtools.plotting import gridplot, PlotOpts, PlotSpec
+from romjax.plotting import gridplot, PlotOpts, PlotSpec
 
 type PcolorFrame = tuple[np.ndarray, np.ndarray, np.ndarray]
 type LineFrame = tuple[np.ndarray, np.ndarray]

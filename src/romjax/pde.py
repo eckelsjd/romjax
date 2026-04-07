@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from jaxtyping import ArrayLike
 from pydantic import Field, PositiveFloat, PositiveInt, model_validator, field_validator
 
-from romtools import DictModel
+from romjax.typing import DictModel
 
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid']
