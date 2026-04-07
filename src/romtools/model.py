@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Iterable
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
+import jax
 
 from romtools.typing import PyTree
 
@@ -21,6 +23,11 @@ class Model(BaseModel, ABC):
     @abstractmethod
     def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
         """Solve inverse residual function."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def sample_inputs(self, keys: Iterable[jax.random.PRNGKey], paths: Iterable[str | Path]) -> None:
+        """Sample and save reproducible model inputs with the given keys at the given paths."""
         raise NotImplementedError
 
     @classmethod

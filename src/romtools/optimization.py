@@ -2,11 +2,12 @@ import logging
 import time
 import pickle
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, Any
 
 import jax
 import optax
 import jax.numpy as jnp
+import equinox as eqx
 import numpy as np
 import matplotlib.pyplot as plt
 from pydantic import BaseModel, Field, ConfigDict
@@ -23,9 +24,10 @@ class Optimizer(BaseModel):
 
     def run_debug(
         self,
-        loss_fn: Callable[[PyTree], float],
+        loss_fn: Callable[[PyTree, Any], float],
         params0: PyTree,
         optimizer: optax.GradientTransformation,
+        argsloader: Iterator[Any] | None = None,
         max_steps: int = 200,
         grad_tol: float = 1e-6,
         param_tol: float = 1e-6,
@@ -42,16 +44,22 @@ class Optimizer(BaseModel):
         save: str | Path | None = None,
         prefix: str = "",
     ) -> PyTree:
-        @jax.jit
-        def step(params: PyTree, opt_state: optax.OptState):
-            loss, grads = jax.value_and_grad(loss_fn)(params)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
+        def _infinite_loader():
+            while True:
+                yield ()
+        if argsloader is None:
+            argsloader = _infinite_loader()
+
+        @eqx.filter_jit
+        def step(params: PyTree, opt_state: optax.OptState, args: Any):
+            loss, grads = eqx.filter_value_and_grad(loss_fn)(params, args)
+            updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
+            params = eqx.apply_updates(params, updates)
             return params, opt_state, loss, grads
 
         # Initialize
         params = params0
-        opt_state = optimizer.init(params)
+        opt_state = optimizer.init(eqx.filter(params, eqx.is_array))
         curr_step = 1
         loss_val = jnp.inf
         test_val = jnp.inf
@@ -70,6 +78,7 @@ class Optimizer(BaseModel):
             loss_ax.set_xlabel("Iteration")
             loss_ax.set_ylabel("Objective")
             loss_ax.set_yscale('log')
+            loss_ax.grid(True)
 
             if test_fn is not None:
                 test_fig, test_ax = plt.subplots(figsize=(6, 5), layout='tight')
@@ -77,15 +86,23 @@ class Optimizer(BaseModel):
                 test_ax.set_xlabel("Iteration")
                 test_ax.set_ylabel("Test score")
                 test_ax.set_yscale('log')
+                test_ax.grid(True)
 
         self.logger.info("Initializing optimization")
         t_start = time.time()
 
         while True:
+            # Get mini-batch 
+            try:
+                args = next(argsloader)
+            except StopIteration:
+                self.logger.info(f"Args loader has stopped at k={curr_step}. Terminating...")
+                break
+        
             # Update step
             prev_params = params
             t0 = time.perf_counter()
-            params, opt_state, loss, grads = step(params, opt_state)
+            params, opt_state, loss, grads = step(params, opt_state, args)
             loss = jax.block_until_ready(loss)
             dt = time.perf_counter() - t0
             loss_val = float(loss)
@@ -128,7 +145,7 @@ class Optimizer(BaseModel):
                 self.logger.info(f"Termination criteria reached: {curr_step}/{max_steps} iterations")
                 break
             if (t_diff := time.time() - t_start) >= max_runtime_s:
-                self.logger.info(f"Termination criteria reached: {t_diff:d}/{max_runtime_s:d} seconds")
+                self.logger.info(f"Termination criteria reached: {t_diff}/{max_runtime_s} seconds")
                 break
             if grad_tol > 0:
                 if not jnp.isfinite(grad_norm):
@@ -138,10 +155,15 @@ class Optimizer(BaseModel):
                     self.logger.info(f"Termination criteria reached: gradient norm {grad_norm:.2e} < {grad_tol:.2e}")
                     break
             if param_tol > 0:
-                if (param_norm := tree_l2_norm(jax.tree.map(lambda x, y: x - y, params, prev_params))) < param_tol:
+                param_norm = tree_l2_norm(jax.tree.map(
+                    lambda x, y: x - y, 
+                    eqx.filter(params, eqx.is_array), 
+                    eqx.filter(prev_params, eqx.is_array)
+                ))
+                if param_norm < param_tol:
                     self.logger.info(f"Termination criteria reached: param step norm {param_norm:.2e} < {param_tol:.2e}")
                     break
-            if len(history["loss"]) > 2:
+            if loss_tol > 0 and len(history["loss"]) > 2:
                 loss_max = max(history["loss"][-loss_window:])
                 loss_min = min(history["loss"][-loss_window:])
                 if (loss_diff := abs(loss_max - loss_min) / max(1, loss_min)) < loss_tol:

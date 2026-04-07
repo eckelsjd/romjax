@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Callable, Iterator, MutableMapping, Protocol, Annotated, TypeAlias
+from typing import Any, Callable, Iterator, MutableMapping, Protocol, Annotated
 from weakref import WeakKeyDictionary
 
 import lineax as lx

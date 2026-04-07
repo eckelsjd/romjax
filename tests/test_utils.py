@@ -210,3 +210,8 @@ def test_optimistix_implicit_adjoint_grad():
     eps = 1e-4
     fd = (solve_root(0.5 + eps) - solve_root(0.5 - eps)) / (2 * eps)
     assert jnp.allclose(grad, fd, atol=1e-3, rtol=1e-3)
+
+
+def test_save_load_h5():
+    # TODO
+    pass

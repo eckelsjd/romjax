@@ -218,3 +218,8 @@ def test_poisson_manufactured_solve(show_plot=False):
         plt.show()
 
     assert jnp.max(error) < dx_error*2
+
+
+def test_poisson_sample_inputs():
+    # TODO
+    pass
