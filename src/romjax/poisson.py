@@ -464,8 +464,9 @@ class Poisson2D(ImplicitModel):
                 opts['prefix'] = (f"{p}_" if (p := opts.get("prefix")) is not None else "") + prefix
                 sampler(keys, paths, **opts)
         
-        forcing_keys, conductivity_keys, boundary_keys = zip(*[jax.random.split(k, 3) for k in keys])
-        
-        _sample(forcing_keys, self.forcing_sampler, self.forcing_sampler_opts, 'forcing')
-        _sample(conductivity_keys, self.conductivity_sampler, self.conductivity_sampler_opts, 'conductivity')
-        _sample(boundary_keys, self.boundary_sampler, self.boundary_sampler_opts, 'boundary')
+        if len(keys) > 0 and len(paths) > 0:
+            forcing_keys, conductivity_keys, boundary_keys = zip(*[jax.random.split(k, 3) for k in keys])
+            
+            _sample(forcing_keys, self.forcing_sampler, self.forcing_sampler_opts, 'forcing')
+            _sample(conductivity_keys, self.conductivity_sampler, self.conductivity_sampler_opts, 'conductivity')
+            _sample(boundary_keys, self.boundary_sampler, self.boundary_sampler_opts, 'boundary')
