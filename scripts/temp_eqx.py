@@ -140,12 +140,12 @@ def simple_cnn():
     )
 
     BATCH_SIZE = 1024
-    LEARNING_RATE = 0.01
-    STEPS = 1500
+    LEARNING_RATE = 0.015
+    STEPS = 2000
     PRINT_EVERY = 100
-    PLOT_EVERY = 50
+    PLOT_EVERY = 25
     SEED = 5678
-    EPOCHS = 26
+    EPOCHS = 30
 
     key = jax.random.PRNGKey(SEED)
 

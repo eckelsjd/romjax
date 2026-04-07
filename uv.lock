@@ -1645,6 +1645,7 @@ source = { editable = "." }
 dependencies = [
     { name = "equinox" },
     { name = "h5py" },
+    { name = "jaxtyping" },
     { name = "lineax" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -1684,6 +1685,7 @@ requires-dist = [
     { name = "jax", marker = "extra == 'cpu'", specifier = ">=0.9.1" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cu12'", specifier = ">=0.9.1" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cu13'", specifier = ">=0.9.1" },
+    { name = "jaxtyping", specifier = ">=0.3.9" },
     { name = "lineax", specifier = ">=0.1.0" },
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "numpy", specifier = ">=2.0" },

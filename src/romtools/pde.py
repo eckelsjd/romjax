@@ -2,10 +2,16 @@
 from enum import IntEnum
 
 import jax.numpy as jnp
-from jax.typing import ArrayLike
+from jaxtyping import ArrayLike
 from pydantic import Field, PositiveFloat, PositiveInt, model_validator, field_validator
 
-from romtools.typing import Coordinates, DictModel, PyTree
+from romtools import DictModel
+
+
+__all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid']
+
+
+type Coordinates = tuple[ArrayLike, ...]
 
 
 class BoundaryType(IntEnum):
@@ -72,16 +78,12 @@ def homogeneous_boundary(type: str | BoundaryType = 'dirichlet',
     )
 
 
-def boundary_pass_through(inputs: PyTree) -> PyTree:
-    """Simple boundary that uses boundary input params directly (just pass them through)."""
-    return inputs
-
-
 class UniformGrid(DictModel):
-    """Uniformly-spaced Cartesian grid (cell-centered). Either provide coords or some consistent 
-       combination of shape, spacing, and bounds. If coords is not specified, then you must have
-       bounds and only one of shape or spacing. Everything else gets filled in automatically.
-       Use matrix 'ij' notation for meshgrid.
+    """
+    Uniformly-spaced Cartesian grid (cell-centered). Either provide coords or some consistent 
+    combination of shape, spacing, and bounds. If coords is not specified, then you must have
+    bounds and only one of shape or spacing. Everything else gets filled in automatically.
+    Use matrix 'ij' notation for meshgrid.
     
     :ivar shape: (Nx, ...) the grid shape
     :ivar spacing: (dx, ...) uniform spacing on the grid

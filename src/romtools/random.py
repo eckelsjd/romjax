@@ -1,16 +1,18 @@
 """Reproducible, file-based sampling via jax.random with pydantic validation."""
 import time
 from pathlib import Path
-from typing import Protocol, Iterable, Any, Literal, Mapping
+from typing import Protocol, Iterable, Any, Literal, Mapping, runtime_checkable
 import os
 import copy
 
 import jax
+import jaxtyping
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 from pydantic import field_validator
 
-from romtools.utils import DictModel, save_h5
+from romtools.utils import save_h5
+from romtools.typing import DictModel
 
 __all__ = ['Distribution', 'parametric_sampler', 'sampling_keys', 'BatchSampler']
 
@@ -18,19 +20,20 @@ __all__ = ['Distribution', 'parametric_sampler', 'sampling_keys', 'BatchSampler'
 type DistributionName = Literal['uniform', 'normal']
 type ParamName = str
 
-
+@runtime_checkable
 class BatchSampler(Protocol):
     """Take in random keys and corresponding paths, write samples to paths however you want. May take any kwargs."""
-    def __call__(self, keys: Iterable[jax.random.PRNGKey], paths: Iterable[str | Path], 
+    def __call__(self, keys: Iterable[jaxtyping.Key], paths: Iterable[str | Path], 
                  **kwargs: dict[str, Any]) -> None: ...
 
 
+@runtime_checkable
 class DistributionCallable(Protocol):
     """Take in a random key and extra options and produce an array of samples."""
-    def __call__(self, key: jax.random.PRNGKey, **kwargs: dict[str, Any]) -> ArrayLike: ...
+    def __call__(self, key: jaxtyping.Key, **kwargs: dict[str, Any]) -> ArrayLike: ...
 
 
-def normal(key: jax.random.PRNGKey, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs):
+def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs) -> ArrayLike:
     """Small wrapper of jax.random.normal to support mean/std args."""
     return jax.random.normal(key, **kwargs) * std + mean
 
@@ -57,12 +60,12 @@ class Distribution(DictModel):
     def opts(self):
         return self.model_extra
     
-    def sample(self, key: jax.random.PRNGKey):
+    def sample(self, key: jaxtyping.Key):
         return self.distribution(key, **self.opts)
 
 
 def parametric_sampler(
-    keys: Iterable[jax.random.PRNGKey], 
+    keys: Iterable[jaxtyping.Key], 
     paths: Iterable[str | Path],
     format: Literal['h5', 'txt'] = 'h5',
     prefix: str = 'sample',
@@ -113,7 +116,7 @@ def sampling_keys(
     path: str | Path, 
     seed: int | None = None, 
     reuse: bool = True,
-) -> tuple[list[jax.random.PRNGKey], list[Path]]:
+) -> tuple[list[jaxtyping.Key], list[Path]]:
     """Setup and return keys/paths for file-based reproducible sampling using jax."""
     if seed is None:
         seed = int(time.time())

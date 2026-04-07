@@ -4,27 +4,82 @@
 - License - MIT
 """
 __version__ = "0.0.1"
-__all__ = []
+__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
 from importlib import import_module as _import_module
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
-from types import BuiltinFunctionType as _BuiltinFunctionType
+from types import BuiltinFunctionType as _BuiltinFunctionType, FunctionType as _FunctionType
 from types import FunctionType as _FunctionType
-from typing import IO as _IO
-from typing import Any as _Any
-from typing import Optional as _Optional
-from typing import Type as _Type
-from typing import Union as _Union
+from typing import IO as _IO, Any as _Any, Optional as _Optional, Type as _Type, Union as _Union
+from typing import Iterable as _Iterable, MutableMapping as _MutableMapping, Iterator as _Iterator
 
 import yaml as _yaml
+from pydantic import BaseModel as _BaseModel, ConfigDict as _ConfigDict
+from jaxtyping import PyTree as _PyTree, Key as _Key
 
-from romtools.model import Model as _Model
-from romtools.typing import DictModel
 
-__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel']
+class ImplicitModel(_BaseModel, _ABC):
+    """An implicit function f(b,u) that maps inputs/outputs to residuals."""
+    model_config = _ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+
+    @_abstractmethod
+    def evaluate(self, inputs: _PyTree, outputs: _PyTree) -> _PyTree:
+        """Evaluate forward residual function f(b,u)."""
+        raise NotImplementedError
+
+    @_abstractmethod
+    def solve(self, inputs: _PyTree, residuals: _PyTree) -> _PyTree:
+        """Solve inverse residual function f(b,u)=w."""
+        raise NotImplementedError
+    
+    @_abstractmethod
+    def sample_inputs(self, keys: _Iterable[_Key], paths: _Iterable[str | _PathLike]) -> None:
+        """Sample and save reproducible model inputs with the given keys at the given paths."""
+        raise NotImplementedError
+
+    @classmethod
+    def yaml_tag(cls) -> str:
+        """YAML tag used by YamlLoader for this model class."""
+        return f"!model:{cls.__module__}.{cls.__name__}"
+
+
+class DictModel(_BaseModel, _MutableMapping):
+    """Allow dict-like access of pydantic models."""
+
+    model_config = _ConfigDict(
+        arbitrary_types_allowed=True, 
+        extra="allow", 
+        validate_assignment=True,
+        use_enum_values=True
+    )
+
+    @classmethod
+    def yaml_tag(cls) -> str:
+        """YAML tag used by YamlLoader for this model class."""
+        return f"!model:{cls.__module__}.{cls.__name__}"
+
+    def __getitem__(self, key: str) -> _Any:
+        if not hasattr(self, key):
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: _Any) -> None:
+        setattr(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        if not hasattr(self, key):
+            raise KeyError(key)
+        delattr(self, key)
+
+    def __iter__(self) -> _Iterator[str]:
+        for k, _ in super().__iter__():
+            yield k
+
+    def __len__(self) -> int:
+        return len(dict(self))
 
 
 class ConfigLoader(_ABC):
@@ -73,7 +128,7 @@ class YamlLoader(ConfigLoader):
             value = loader.construct_scalar(node)
             return _construct_python_name_multi(loader, value, node)
 
-        def _construct_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _Model:
+        def _construct_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> ImplicitModel | DictModel:
             if not tag_suffix:
                 raise ValueError("Missing model class path in YAML tag.")
             module_name, _, class_name = tag_suffix.rpartition(".")
@@ -83,8 +138,8 @@ class YamlLoader(ConfigLoader):
             cls_obj = getattr(module, class_name, None)
             if cls_obj is None:
                 raise ValueError(f"Model class not found: {tag_suffix!r}")
-            if not isinstance(cls_obj, type) or not issubclass(cls_obj, _Model | DictModel):
-                raise TypeError(f"Tagged class is not a Model or DictModel: {tag_suffix!r}")
+            if not isinstance(cls_obj, type) or not issubclass(cls_obj, ImplicitModel | DictModel):
+                raise TypeError(f"Tagged class is not an ImplicitModel or DictModel: {tag_suffix!r}")
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
                 return cls_obj(**data)
@@ -106,14 +161,14 @@ class YamlLoader(ConfigLoader):
             name = f"{data.__module__}.{data.__qualname__}"
             return dumper.represent_scalar("tag:yaml.org,2002:python/name", name)
 
-        def _represent_model(dumper: _yaml.SafeDumper, data: _Model) -> _yaml.Node:
+        def _represent_model(dumper: _yaml.SafeDumper, data: ImplicitModel) -> _yaml.Node:
             tag = data.yaml_tag()
             payload = data.model_dump()
             return dumper.represent_mapping(tag, payload)
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
-        _Dumper.add_multi_representer(_Model, _represent_model)
+        _Dumper.add_multi_representer(ImplicitModel, _represent_model)
         return _Dumper
 
     @classmethod
