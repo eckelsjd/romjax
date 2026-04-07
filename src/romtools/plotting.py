@@ -580,7 +580,7 @@ def gridplot(
                         new_artist = ax.pcolormesh(*data, **_get_kwargs())
                         all_artists[flat_idx] = new_artist
                         updated_artists.append(new_artist)
-                        if data[0] is not None and data[1] is not None:
+                        if len(data) == 3 and data[0] is not None and data[1] is not None:
                             ax.set_xlim(np.nanmin(data[0]), np.nanmax(data[0]))
                             ax.set_ylim(np.nanmin(data[1]), np.nanmax(data[1]))
                     else:

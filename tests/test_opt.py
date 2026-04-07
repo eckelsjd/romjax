@@ -125,7 +125,7 @@ def test_pytree_opt_debug(tmp_path):
         losses = [jnp.mean((p - t) ** 2) for p, t in zip(leaves_p, leaves_t)]
         return jnp.mean(jnp.stack(losses))
 
-    def loss_fn(params: PyTree) -> PyTree:
+    def loss_fn(params: PyTree, *args) -> PyTree:
         # MSE over training data using approx model
         preds = approx_model(train_data["inputs"], params)
         return tree_mse(preds, train_data["targets"])

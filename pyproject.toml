@@ -68,8 +68,8 @@ echo = "echo"
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-optimistix = { path = "../optimistix", editable = true }
+# [tool.uv.sources]
+# optimistix = { path = "../optimistix", editable = true }
 
 [tool.ruff.lint]
 select = ['E', 'F', 'I']

@@ -1,6 +1,6 @@
-from typing import Literal, Mapping, TypedDict, Any
-from dataclasses import dataclass
-import time
+from typing import Literal, Mapping, TypedDict, Any, Iterable
+from pathlib import Path
+import copy
 
 import jax.numpy as jnp
 import optimistix as optx
@@ -31,10 +31,12 @@ from romtools.typing import (
     IterativeSolver,
     AdjointMethod
 )
-from romtools.utils import merge_pytrees, to_pytree, get_gpu_memory
+from romtools.utils import merge_pytrees, to_pytree
+from romtools.random import BatchSampler, Distribution, parametric_sampler
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
+type SamplerName = Literal["parametric"]
 
 
 class SinusoidForcingInputs(DictModel):
@@ -186,13 +188,21 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
 
 class Poisson2D(Model):
 
-    # Required
+    # Required (and static once set)
     config: PoissonConfig
 
-    # Optional/default
+    # Optional/default (and optionally variable online)
     forcing: ForcingCallable = constant_forcing
     conductivity: ForcingCallable = constant_forcing
     boundary: BoundaryCallable = boundary_pass_through
+
+    forcing_sampler: BatchSampler | None = None
+    conductivity_sampler: BatchSampler | None = None
+    boundary_sampler: BatchSampler | None = None
+
+    forcing_sampler_opts: dict[str, Any] = Field(default_factory=dict)
+    conductivity_sampler_opts: dict[str, Any] = Field(default_factory=dict)
+    boundary_sampler_opts: dict[str, Any] = Field(default_factory=dict)
 
     forcing_defaults: DictModel = Field(
         default_factory=lambda: ConstantForcingInputs(const=0.0),
@@ -218,12 +228,47 @@ class Poisson2D(Model):
                 "sinusoid": sinusoid_forcing,
             }
             if value not in mapping:
-                raise ValueError(f"Unknown function: {value!r}")
+                raise ValueError(f"Unknown forcing function: {value!r}")
             return mapping[value]
         if callable(value):
             return value
         raise TypeError("forcing and conductivity must be a callable or a supported string literal.")
 
+    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", mode="before")
+    @classmethod
+    def _coerce_sampler(cls, value: BatchSampler | SamplerName | None) -> BatchSampler | None:
+        if isinstance(value, str):
+            mapping: Mapping[SamplerName, BatchSampler] = {
+                "parametric": parametric_sampler
+            }
+            if value not in mapping:
+                raise ValueError(f"Unknown sampler: {value!r}")
+            return mapping[value]
+        if value is None:
+            return value
+        if callable(value):
+            return value
+        raise TypeError("samplers must be either a valid name, callable, or none.")
+    
+    @field_validator("forcing_sampler_opts", "conductivity_sampler_opts", "boundary_sampler_opts", mode="after")
+    @classmethod
+    def _coerce_sampler_opts(cls, value: dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
+        """Just provides validation for known sampler function params."""
+        check_flag = False
+        for s in ['forcing', 'conductivity', 'boundary']:
+            s_flag = info.field_name == f"{s}_sampler_opts" and info.data[f"{s}_sampler"] is parametric_sampler
+            check_flag = check_flag or s_flag
+
+        # Validate distributions for parametric sampling
+        if check_flag:
+            for k in list(value.keys()):
+                if k not in ['write_summary', 'format', 'prefix']:
+                    if not isinstance(value[k], Mapping):
+                        raise TypeError(f"Extra parametric sampler opts must be a Distribution-like mapping.")
+                    value[k] = Distribution(**value[k])
+        
+        return value
+    
     @field_validator("forcing_defaults", "conductivity_defaults", mode="before")
     @classmethod
     def _coerce_defaults(cls, value: object, info: ValidationInfo) -> DictModel:
@@ -266,7 +311,6 @@ class Poisson2D(Model):
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
-        # print("Starting _compute residual")
         phi = jnp.asarray(outputs["phi"])
         dx, dy = self.config['grid']['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
@@ -328,9 +372,6 @@ class Poisson2D(Model):
 
         phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
-        # time.sleep(4)
-        # print("Ending _compute_residual")
-
         return {"phi_residual": phi_residual}
 
     def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
@@ -368,27 +409,6 @@ class Poisson2D(Model):
             residual = self._compute_residual(args['inputs'], {'phi': phi})
             return residual['phi_residual'] - args['target']
         
-        # used_mib, total_mib = get_gpu_memory()[0]
-        # print(f"Before optx: {used_mib} / {total_mib} MiB")
-
-        # @dataclass
-        # class Solution:
-        #     value: ArrayLike
-
-        # s = 1000
-        # key = jax.random.PRNGKey(1)
-        # solution = Solution(value=jax.random.normal(key, shape=(s, s)))
-        # phi0 = jnp.asarray(self.config.initial_guess(self.config.grid.coords))
-        # res = residual_fn(phi0, args)
-        # solution = Solution(value=res)
-        # optx.root_find(
-        #     lambda p, *args: p**2 - 10,
-        #     solver=optx.Newton(rtol=1, atol=1e-4),
-        #     y0 = jnp.array(100),
-        #     max_steps=100,
-        #     throw=False
-        # )
-        
         solution = optx.root_find(
             residual_fn,
             solver=self.config.solver,
@@ -400,10 +420,18 @@ class Poisson2D(Model):
             throw=self.config.throw,
         )
 
-        # time.sleep(4)
-        # used_mib, total_mib = get_gpu_memory()[0]
-        # print(f"After optx: {used_mib} / {total_mib} MiB")
-
         ret = solution if return_sol else {"phi": solution.value} 
         return ret
     
+    def sample_inputs(self, keys: Iterable[jax.random.PRNGKey], paths: Iterable[str | Path]) -> None:
+        def _sample(keys, sampler, opts, prefix):
+            if sampler is not None:
+                opts = copy.copy(opts)
+                opts['prefix'] = (f"{p}_" if (p := opts.get("prefix")) is not None else "") + prefix
+                sampler(keys, paths, **opts)
+        
+        forcing_keys, conductivity_keys, boundary_keys = zip(*[jax.random.split(k, 3) for k in keys])
+        
+        _sample(forcing_keys, self.forcing_sampler, self.forcing_sampler_opts, 'forcing')
+        _sample(conductivity_keys, self.conductivity_sampler, self.conductivity_sampler_opts, 'conductivity')
+        _sample(boundary_keys, self.boundary_sampler, self.boundary_sampler_opts, 'boundary')

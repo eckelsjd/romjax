@@ -1,5 +1,5 @@
 """Module for assorted processing utilities."""
-from typing import Mapping
+from typing import Mapping, Any
 import logging
 import sys
 from pathlib import Path
@@ -9,11 +9,13 @@ import threading
 import jax
 import jax.numpy as jnp
 from pydantic import BaseModel
+import numpy as np
+import h5py
 
 from romtools.typing import PyTree
 
 __all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm', 
-           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory']
+           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
 
@@ -240,3 +242,65 @@ def monitor_gpu_memory(interval_seconds: float = 5.0) -> tuple[threading.Thread,
     )
     thread.start()
     return thread, stop_event
+
+
+def save_h5(data: dict[str, Any], filename: str | Path, mode: str = 'a'):
+    """Save data to h5 file."""
+
+    def _recursively_save(h5group, obj):
+        """Helper to recursively save dictionary to h5 file."""
+        for key, val in obj.items():
+            if isinstance(val, dict):
+                subgroup = h5group[key] if key in h5group else h5group.create_group(key, track_order=True)
+                _recursively_save(subgroup, val)
+            else:
+                if key in h5group:
+                    del h5group[key]
+                h5group.create_dataset(key, data=np.asarray(val))
+
+    with h5py.File(Path(filename), mode, track_order=True) as f:
+        for key in data:
+            if isinstance(data[key], dict):  # recurse
+                group = f[key] if key in f else f.create_group(key, track_order=True)
+                _recursively_save(group, data[key])
+            else:
+                if key in f:
+                    del f[key]
+                f.create_dataset(key, data=np.asarray(data[key]))
+
+
+def load_h5(data: dict[str, Any], filename: str | Path, mode: str = 'r'):
+    """Load data from h5 file into a dictionary. An empty dictionary will load everything.
+    Selectively mark data to load in the dictionary with None.
+    """
+
+    def _recursively_load(node):
+        """Return Python objects for an h5 node (Group -> dict, Dataset -> np.ndarray)."""
+        if isinstance(node, h5py.Group):
+            out = {}
+            for k in node:
+                out[k] = _recursively_load(node[k])
+            return out
+        else:
+            return node[()]
+
+    def _recursively_fill(pattern: dict[str, Any], node):
+        """Fill a pattern dict in-place from the corresponding h5 group/node."""
+        for k in list(pattern.keys()):
+            if k not in node:
+                continue
+            if pattern[k] is None:
+                pattern[k] = _recursively_load(node[k])
+            elif isinstance(pattern[k], dict) and isinstance(node[k], h5py.Group):
+                _recursively_fill(pattern[k], node[k])
+            # if pattern[k] is not None and not a dict, leave as-is
+
+    with h5py.File(Path(filename), mode, track_order=True) as f:
+        # Load everything
+        if len(data) == 0:
+            for key in f:
+                data[key] = _recursively_load(f[key])
+        # Selectively load requested data (supports nested dict patterns)
+        else:
+            _recursively_fill(data, f)
+            
