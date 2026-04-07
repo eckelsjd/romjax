@@ -16,11 +16,12 @@ import matplotlib.pyplot as plt
 import optimistix as optx
 import optax
 import lineax as lx
+from jaxtyping import Key, ArrayLike
 
-from romtools.solvers import Poisson2D
-from romtools.plotting import gridplot, get_scheme
-from romtools.optimization import Optimizer
-from romtools.utils import get_gpu_memory, monitor_gpu_memory
+from romjax.solvers import Poisson2D
+from romjax.plotting import gridplot, get_scheme
+from romjax.optimization import Optimizer
+from romjax.utils import get_gpu_memory, monitor_gpu_memory
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".50"
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"

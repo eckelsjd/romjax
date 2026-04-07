@@ -1,6 +1,6 @@
 import numpy as np
 
-from romtools.plotting import gridplot, PlotSpec, PlotOpts
+from romjax.plotting import gridplot, PlotSpec, PlotOpts
 
 
 def generate_hist2d_frames(num_frames: int, samples_per_frame: int) -> list[tuple[np.ndarray, np.ndarray]]:

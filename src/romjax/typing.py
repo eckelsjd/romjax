@@ -1,16 +1,80 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Protocol, Annotated
+from typing import Any, Protocol, Annotated, MutableMapping, Iterator, Iterable
 from weakref import WeakKeyDictionary
+from abc import abstractmethod, ABC
+from os import PathLike
 
 import lineax as lx
 import optimistix as optx
-from pydantic import BaseModel, Field, TypeAdapter, AfterValidator
+from jaxtyping import PyTree, Key
+from pydantic import BaseModel, Field, TypeAdapter, AfterValidator, ConfigDict
 from pydantic_core import core_schema
 
 
-__all__ = ['LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['DictModel', 'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+
+
+class DictModel(BaseModel, MutableMapping):
+    """Allow dict-like access of pydantic models."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, 
+        extra="allow", 
+        validate_assignment=True,
+        use_enum_values=True
+    )
+
+    @classmethod
+    def yaml_tag(cls) -> str:
+        """YAML tag used by YamlLoader for this model class."""
+        return f"!model:{cls.__module__}.{cls.__name__}"
+
+    def __getitem__(self, key: str) -> Any:
+        if not hasattr(self, key):
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        if not hasattr(self, key):
+            raise KeyError(key)
+        delattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        for k, _ in super().__iter__():
+            yield k
+
+    def __len__(self) -> int:
+        return len(dict(self))
+
+
+class ImplicitModel(BaseModel, ABC):
+    """An implicit function f(b,u) that maps inputs/outputs to residuals."""
+    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+
+    @abstractmethod
+    def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
+        """Evaluate forward residual function f(b,u)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
+        """Solve inverse residual function f(b,u)=w."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def sample_inputs(self, keys: Iterable[Key], paths: Iterable[str | PathLike]) -> None:
+        """Sample and save reproducible model inputs with the given keys at the given paths."""
+        raise NotImplementedError
+
+    @classmethod
+    def yaml_tag(cls) -> str:
+        """YAML tag used by YamlLoader for this model class."""
+        return f"!model:{cls.__module__}.{cls.__name__}"
 
 
 class ModuleObjectSpec(BaseModel):
@@ -50,14 +114,14 @@ def _store_spec(obj: object, name: str, opts: dict[str, Any]) -> None:
     except TypeError:
         pass
     try:
-        setattr(obj, "__romtools_spec__", spec)
+        setattr(obj, "__romjax_spec__", spec)
     except Exception:
         pass
 
 
 def _get_spec(obj: object) -> dict[str, Any] | None:
-    if hasattr(obj, "__romtools_spec__"):
-        return getattr(obj, "__romtools_spec__")
+    if hasattr(obj, "__romjax_spec__"):
+        return getattr(obj, "__romjax_spec__")
     try:
         return _SPEC_REGISTRY.get(obj)
     except TypeError:

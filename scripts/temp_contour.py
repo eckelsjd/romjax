@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from romtools.plotting import gridplot
-from romtools.utils import format_time_engineering
+from romjax.plotting import gridplot
+from romjax.utils import format_time_engineering
 
 # -----------------------
 # Create synthetic data

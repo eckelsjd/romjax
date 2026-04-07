@@ -104,8 +104,8 @@ Configuration files should:
 Example:
 
 ```yaml
-solver: !model:romtools.solvers.poisson.Poisson2D
-  forcing: !!python/name:romtools.solvers.poisson.gaussian_forcing
+solver: !model:romjax.solvers.poisson.Poisson2D
+  forcing: !!python/name:romjax.solvers.poisson.gaussian_forcing
   tolerance: 1e-6
   max_iterations: 1000
 ```
@@ -125,12 +125,11 @@ Plots should:
 The project follows this layout:
 
 ```
-romtools/
+romjax/
 ├── .venv — virtual environment managed by `uv`
-├── src/romtools — python library API
+├── src/romjax — python library API
 ├── scripts/ — Standalone scripts for experiments and analysis
 ├── tests/ — Unit and integration tests
-│   Unit and integration tests
 ```
 
 Guidelines:
@@ -154,7 +153,6 @@ Python ≥ 3.14
 ### Formatting
 
 Follow **PEP 8** with a line-length of `120 characters`.
-See `romtools.dataloader.py` for a good example.
 Use in-line comments to add clarity where needed.
 
 ### Type Hints

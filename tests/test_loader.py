@@ -6,16 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from romtools import YamlLoader
-from romtools.model import Model
-from romtools.solvers.poisson import Poisson2D
+from romjax import YamlLoader
+from romjax.typing import ImplicitModel
+from romjax.poisson import Poisson2D
 
 
 def example_forcing(inputs: dict, outputs: dict):
     return int(inputs.get("value", 0))
 
 
-class CustomModel(Model):
+class CustomModel(ImplicitModel):
     opts: dict[str, int]
     detail: str
 
@@ -23,6 +23,9 @@ class CustomModel(Model):
         return 0
 
     def solve(self, *args, **kwargs) -> int:
+        return 0
+    
+    def sample_inputs(self, *args, **kwargs):
         return 0
 
 
@@ -86,14 +89,14 @@ def test_poisson_model_load_and_dump() -> None:
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
-    assert "!model:romtools.solvers.poisson.Poisson2D" in dumped
+    assert "!model:romjax.poisson.Poisson2D" in dumped
     assert "!!python/name" in dumped
     _assert_round_trip(data)
 
 
 def test_custom_model_load_and_dump() -> None:
     yaml_text_colon = (
-        "solver: !model:romtools.solvers.poisson.Poisson2D\n"
+        "solver: !model:romjax.poisson.Poisson2D\n"
         "  forcing: !!python/name:tests.test_loader.example_forcing\n"
         "  config:\n"
         "    grid:\n"
@@ -106,7 +109,7 @@ def test_custom_model_load_and_dump() -> None:
     _assert_round_trip(data_colon)
 
     yaml_text_space = (
-        "solver: !model:romtools.solvers.poisson.Poisson2D\n"
+        "solver: !model:romjax.poisson.Poisson2D\n"
         "  forcing: !!python/name tests.test_loader.example_forcing\n"
         "  config:\n"
         "    grid:\n"

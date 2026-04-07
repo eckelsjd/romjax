@@ -1639,7 +1639,7 @@ wheels = [
 ]
 
 [[package]]
-name = "romtools"
+name = "romjax"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

@@ -1,4 +1,4 @@
-## Contributing to romtools
+## Contributing to romjax
 You might be here if you want to:
 
 - Report a bug
@@ -26,8 +26,8 @@ An example contribution workflow is shown here:
 
 ```shell
 # Fork the repo on Github
-git clone https://github.com/<your-user-name>/romtools.git
-cd romtools
+git clone https://github.com/<your-user-name>/romjax.git
+cd romjax
 uv sync
 git checkout -b <your-branch-name>
 

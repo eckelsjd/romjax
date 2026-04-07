@@ -1,15 +1,17 @@
 from pathlib import Path
 import pickle
+import os
 
 import jax
 import jax.numpy as jnp
 import optax
+from jaxtyping import PyTree
 
-from romtools.optimization import Optimizer
-from romtools.typing import PyTree
+from romjax.optim import train
+from romjax.utils import get_logger
 
 
-def test_pytree_opt_debug(tmp_path):
+def test_pytree_train(tmp_path):
     """Simple function approximation with optax adam and nested pytrees."""
     true_params = {
         "encoder": {
@@ -135,12 +137,11 @@ def test_pytree_opt_debug(tmp_path):
         # MSE over test data using approx model
         preds = approx_model(test_data["inputs"], params)
         return tree_mse(preds, test_data["targets"])
-
-    opt = Optimizer()
-    opt.set_logger(log_file=Path(tmp_path) / 'opt.log', stdout=False)
+    
+    logger = get_logger("Test train", log_file=Path(tmp_path) / 'opt.log', stdout=False)
     options = {
         "save": tmp_path,
-        "prefix": "test_",
+        "save_prefix": "test_",
         "live_plot": False,
         "save_interval": 100,
         "log_interval": 100,
@@ -148,14 +149,15 @@ def test_pytree_opt_debug(tmp_path):
         "max_steps": 400,
         "max_runtime_s": 10,
         "test_fn": test_score,
-        "loss_tol": 1e-8
+        "loss_tol": 1e-8,
+        "logger": logger
     }
     leaves, treedef = jax.tree_util.tree_flatten(true_params)
-    keys = jax.random.split(jax.random.PRNGKey(123), len(leaves))
+    keys = jax.random.split(jax.random.key(123), len(leaves))
     perturbed_leaves = [leaf + 0.15 * jax.random.normal(k, leaf.shape) for leaf, k in zip(leaves, keys)]
     params0 = jax.tree_util.tree_unflatten(treedef, perturbed_leaves)
     optimizer = optax.adam(0.2)
-    params_hat = opt.run_debug(loss_fn, params0, optimizer, **options)
+    params_hat = train(loss_fn, params0, optimizer, **options)
     
     train_score = float(loss_fn(params_hat))
     test_score_val = float(test_score(params_hat))
@@ -173,14 +175,15 @@ def test_pytree_opt_debug(tmp_path):
     log_file = Path(tmp_path) / "opt.log"
     assert log_file.exists()
 
-    results_file = Path(tmp_path) / "test_opt-results.pkl"
     history_file = Path(tmp_path) / "test_opt-history.csv"
     loss_plot = Path(tmp_path) / "test_opt-loss.pdf"
     test_plot = Path(tmp_path) / "test_opt-test.pdf"
-    assert results_file.exists()
     assert history_file.exists()
     assert loss_plot.exists()
     assert test_plot.exists()
+
+    steps = sorted([int(f.split("iter-")[1].split(".")[0]) for f in os.listdir(tmp_path) if f.endswith(".pkl")])
+    results_file = Path(tmp_path) / f"test_opt-iter-{steps[-1]}.pkl"
 
     with open(results_file, "rb") as fd:
         saved = pickle.load(fd)

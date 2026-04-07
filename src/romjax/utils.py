@@ -271,7 +271,7 @@ def save_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'a'):
                 f.create_dataset(key, data=np.asarray(data[key]))
 
 
-def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r'):
+def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r', jax: bool = False):
     """Load data from h5 file into a dictionary. An empty dictionary will load everything.
     Selectively mark data to load in the dictionary with None.
     """
@@ -284,7 +284,7 @@ def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r'):
                 out[k] = _recursively_load(node[k])
             return out
         else:
-            return node[()]
+            return jnp.asarray(node[()]) if jax else node[()]
 
     def _recursively_fill(pattern: dict[str, Any], node):
         """Fill a pattern dict in-place from the corresponding h5 group/node."""

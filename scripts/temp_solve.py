@@ -9,13 +9,13 @@ import optax
 from pydantic import Field
 import matplotlib.pyplot as plt
 
-from romtools.model import Model
-from romtools.optimization import Optimizer
-from romtools.utils import tree_l2_norm
-from romtools.typing import PyTree
-from romtools.plotting import gridplot
-from romtools.solvers.utils import homogeneous_boundary, BoundarySpec
-from romtools.solvers.poisson import const_initial_guess
+from romjax.model import Model
+from romjax.optimization import Optimizer
+from romjax.utils import tree_l2_norm
+from romjax.typing import PyTree
+from romjax.plotting import gridplot
+from romjax.solvers.utils import homogeneous_boundary, BoundarySpec
+from romjax.solvers.poisson import const_initial_guess
 
 import os
 from pathlib import Path
@@ -304,7 +304,7 @@ def optimize_newton_debug():
 
 
 def optimize_poisson():
-    from romtools.solvers import Poisson2D
+    from romjax.solvers import Poisson2D
 
     neumann_bc = BoundarySpec(type='neumann', value=0.0)
     boundary = homogeneous_boundary(ndim=2, value=0.0)
