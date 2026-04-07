@@ -1,4 +1,6 @@
 data/
+darcy-opt/
+scripts/darcy-opt/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

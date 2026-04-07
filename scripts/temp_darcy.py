@@ -7,27 +7,24 @@
 import argparse
 import pickle
 from pathlib import Path
-import os
-import time
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import optimistix as optx
 import optax
-import lineax as lx
-from jaxtyping import Key, ArrayLike
 
-from romjax.solvers import Poisson2D
+from romjax.poisson import Poisson2D, darcy_field
 from romjax.plotting import gridplot, get_scheme
-from romjax.optimization import Optimizer
-from romjax.utils import get_gpu_memory, monitor_gpu_memory
+from romjax.optim import train
+from romjax.utils import get_gpu_memory, monitor_gpu_memory, load_h5
+from romjax.random import gen_sampling_keys, iterate_samples
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".50"
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 
-def get_darcy_solver(shape):
+def get_darcy_solver(shape, bounds):
     """For testing Darcy flow: constant forcing, homogeneous dirichlet BCs on [0,1]^2
     with a random field conductivity kappa(x)=a(x).
     """
@@ -36,44 +33,17 @@ def get_darcy_solver(shape):
             "solver": optx.Newton(rtol=1, atol=1e-3),
                                 #   linear_solver=lx.GMRES(rtol=1e-3, atol=1e-20, max_steps=100, restart=30,
                                 #                          stagnation_iters=30)),
-            "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
+            "grid": {"shape": shape, "bounds": bounds},
             "max_steps": 200,
             "throw": True
         },
         forcing_defaults={'const': -1.0},
-        conductivity_defaults={'const': 1.0}
+        conductivity_defaults={'const': 1.0},
+        conductivity_sampler='parametric',
+        conductivity_sampler_opts={'const': {'distribution': darcy_field, 'shape': shape, 'bounds': bounds}}
     )
 
     return darcy
-
-
-def sample_darcy_random_field(coords, nsamples, *, key=None):
-    """Get random field according to Sec 6.2 of Kovachki 2022."""
-    x, y = coords
-    nx, ny = x.shape
-    if key is None:
-        key = jax.random.PRNGKey(0)
-
-    kx = jnp.arange(nx)
-    ky = jnp.arange(ny)
-
-    # Orthonormal cosine basis for Neumann Laplacian on (0, 1)
-    scale_x = jnp.where(kx == 0, 1.0, jnp.sqrt(2.0))
-    scale_y = jnp.where(ky == 0, 1.0, jnp.sqrt(2.0))
-    phi_x = jnp.cos(jnp.pi * x[:, 0, None] * kx[None, :]) * scale_x[None, :]
-    phi_y = jnp.cos(jnp.pi * y[0, :, None] * ky[None, :]) * scale_y[None, :]
-
-    # Eigenvalues of covariance C = (-Δ + 9I)^-2
-    lap_eigs = (jnp.pi ** 2) * (kx[:, None] ** 2 + ky[None, :] ** 2)
-    cov_eigs = (lap_eigs + 9.0) ** -2
-    sqrt_cov = jnp.sqrt(cov_eigs)
-
-    # Sample Gaussian random field g ~ N(0, C)
-    coeffs = jax.random.normal(key, (nsamples, nx, ny)) * sqrt_cov[None, :, :]
-    gauss_field = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
-
-    # Nemytskii operator: piecewise-constant conductivity
-    return jnp.where(gauss_field >= 0.0, 12.0, 3.0)
 
 
 def plot_samples(samples, solutions, x, y, *, predictions=None):
@@ -128,27 +98,40 @@ def plot_samples(samples, solutions, x, y, *, predictions=None):
     return fig, axs
 
 
-def show_random_samples(shape, nsamples, key):
+def show_random_samples(shape, bounds, nsamples, path, seed):
     """Just show some random fields and solutions."""
-    darcy = get_darcy_solver(shape)
+    darcy = get_darcy_solver(shape, bounds)
     x, y = darcy.config.grid.coords
-    samples = sample_darcy_random_field((x, y), nsamples, key=key)
+
+    keys, paths = gen_sampling_keys(nsamples, path, seed=seed)
+    darcy.sample_inputs(keys, paths)
+
+    def _skip(p):
+        return Path(p).parent.name != f"seed_{seed}"
+
+    samples = []
+    for p in iterate_samples(path, skip=_skip):
+        sample = {}
+        load_h5(sample, p / "conductivity.h5", jax=True)
+        samples.append(sample)
+
+    samples = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *samples)
 
     @jax.jit
-    def solve_one(kappa):
-        return darcy.solve({"conductivity": {"const": kappa}})["phi"]
+    def solve_one(sample):
+        return darcy.solve({"conductivity": sample})
 
     solutions = jax.vmap(solve_one)(samples)
 
-    fig, axs = plot_samples(samples, solutions, x, y)
+    fig, axs = plot_samples(samples["const"], solutions["phi"], x, y)
 
     plt.show()
 
 
 def sinusoid_forcing(inputs, outputs):
-        """Smooth one-parameter forcing to keep Poisson solver stable."""
-        xg, yg = inputs["coords"]
-        return inputs["amplitude"] * jnp.sin(jnp.pi * xg) * jnp.sin(jnp.pi * yg)
+    """Smooth one-parameter forcing to keep Poisson solver stable."""
+    xg, yg = inputs["coords"]
+    return inputs["amplitude"] * jnp.sin(jnp.pi * xg) * jnp.sin(jnp.pi * yg)
 
 
 def train_forcing(shape, key, save_dir):
@@ -278,17 +261,17 @@ def plot_validation(save_dir: str | Path, nshow: int = 3) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Sample Darcy random fields and solve Poisson.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for the Darcy field sampler.")
-    parser.add_argument("--shape", type=list[int], default=[32, 32], help="Shape of 2d grid")
-    parser.add_argument("--save-dir", type=str, default="darcy-opt", help="Where to save results")
+    parser.add_argument("--shape", type=int, default=32, help="Square shape of 2d grid")
+    parser.add_argument("--path", type=str, default="darcy-opt", help="Where to save results")
+    parser.add_argument("--nshow", type=int, default=3, help="How many samples to show")
     args = parser.parse_args()
     
-    key = jax.random.PRNGKey(args.seed)
-    shape = tuple(args.shape)
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(exist_ok=True)
+    seed = args.seed
+    bounds = ((0, 1), (0, 1))
+    shape = (args.shape, args.shape)
+    path = Path(args.path)
+    nshow = args.nshow
 
-    nshow = 3
-
-    # show_random_samples(shape, nshow, key)
-    train_forcing(shape, key, save_dir)
-    plot_validation(save_dir, nshow)
+    show_random_samples(shape, bounds, nshow, path, seed)
+    # train_forcing(shape, key, save_dir)
+    # plot_validation(save_dir, nshow)
