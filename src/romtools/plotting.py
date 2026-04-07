@@ -2,27 +2,25 @@
 
 Includes:
   - gridplot - Plot simulation data (1d or 2d) in a grid (with animation utilities)
+  - PlotOpts - Extra options for plotting (see gridplot)
+  - PlotSpec - Spec for a single subplot (see gridplot)
+  - SupportedPlots - plt plots supported by gridplot
   - get_scheme - Get a plotting color scheme
 """
-# ruff: noqa
 import copy
-from abc import ABC
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, NotRequired, Optional, TypedDict, Any, Generator, Iterable
+from typing import Callable, Literal, Optional, Any, Generator, Iterable
 import math
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.collections import PolyCollection, TriMesh
-from matplotlib.tri import Triangulation
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from matplotlib.artist import Artist
 from matplotlib.cm import ScalarMappable
 from matplotlib.colorbar import Colorbar
-from numpy.typing import ArrayLike
 
 
 __all__ = ['gridplot', 'PlotOpts', 'PlotSpec', 'SupportedPlots', 'get_scheme']
@@ -46,103 +44,6 @@ ANIMATE_DEFAULT = {
     'progress_callback': _default_progress
 }
 
-GRID_OPTS = {
-    "color": (0.5, 0.5, 0.5, 0.2),
-    "lw": 0.5
-}
-
-
-class Frame(TypedDict):
-    """A single frame of simulation data. Maps several variable names `v` to numpy arrays.
-    The arrays can be any shape, so long as all variables have the same shape.
-    
-    For example:
-       (N,)    - 1d data
-       (N, 2)  - 2d unstructured mesh data
-       (N, M)  - 2d structured mesh data
-       etc.
-    """
-    v: NotRequired[ArrayLike]
-
-
-class PlotMetadata(ABC):
-    """Base class for providing extra required info for generating plots. 
-    
-    Currently supported plot types:
-
-    line - standard plt.plot lines
-    pcolor - pcolormesh from structured 2d mesh data
-    cell - use PolyCollection for quadrilaterals (such as from unstructured finite-volume mesh)
-    """
-    _supported = ['line', 'pcolor', 'cell']
-    
-    @classmethod
-    def from_dict(cls, d):
-        if 'type' not in d:
-            raise TypeError(f"Must give a 'type' to construct PlotMetadata from a dict. Options are: {cls._supported}")
-        
-        plot_type = d.pop('type')
-
-        if plot_type not in cls._supported:
-            raise TypeError(f"Unsupported plot type '{plot_type}'. Options are: {cls._supported}")
-
-        return {'line': LineMetadata, 'pcolor': PcolorMetadata, 'cell': CellMetadata}.get(plot_type)(**d)
-
-
-@dataclass(frozen=True)
-class LineMetadata(PlotMetadata):
-    """Options for standard line plots.
-    
-    :ivar coord: (N,) 1d array of the horizontal coordinate
-    :ivar animated_bar: if provided, an animated vertical bar will move left->right across the plot,
-                        this dict will be passed to a plt line plot to change how the line looks.
-    :ivar share_plot: sets of variables to display on same subplot, dict keys give the ylabels for the subplots,
-                      each variable should only be shown on exactly one subplot
-    """
-    coord: ArrayLike
-    animated_bar: Optional[dict] = None
-    share_plot: dict[str, list[str]] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class CellMetadata(PlotMetadata):
-    """Options for treating 2d data as cell-centered quadrilaterals.
-    
-    Required options are:
-    :ivar cells: (N, 2) array of cell-center coordinates corresponding to the arrays in `data`. Order is (x,y)
-    :ivar vertices: (M, 2) array of vertex coordinates. Order for coordinates is (x,y)
-    :ivar connectivity: (N, 4) array specifying vertex indices for each cell
-    
-    Optional options are:
-    :ivar shading: If flat (default), just color cells with avg value. If gouraud, use tripcolor to shade
-    :ivar show_mesh: Show grid lines of mesh (must have node data and connectivity)
-    :ivar cell_center_opts: If provided, options for plotting cell centers. Not plotted if None
-    :ivar boundary_cell_color: If provided, the color to highlight boundary cells. Not highlighted if None
-    :ivar boundary_colors: colors for boundaries, specify as dict for different values for each boundary group
-    :ivar group_boundary: Sorts edges by index into groups (from which boundary is selected), defaults to selecting all
-    """
-    cells: ArrayLike
-    vertices: ArrayLike
-    connectivity: ArrayLike
-    shading: Literal['flat', 'gouraud'] = 'flat'
-    show_mesh: bool = False
-    cell_center_opts: Optional[dict] = None
-    boundary_cell_color: Optional[str] = None
-    boundary_colors: Optional[dict | str] = None
-    group_boundary: Optional[callable] = None
-
-
-@dataclass(frozen=True)
-class PcolorMetadata(PlotMetadata):
-    """Options for treating 2d data as 2d regular mesh for pcolormesh (see plt docs for details).
-    
-    Required options are:
-    :ivar X: (Nx,) 1d array of horizontal coordinates
-    :ivar Y: (Ny,) 1d array of vertical coordinates
-    """
-    X: ArrayLike
-    Y: ArrayLike
-
 
 def get_scheme(scheme: Literal['white', 'dark']):
     """Return text and background colors for given scheme."""
@@ -162,6 +63,7 @@ def get_scheme(scheme: Literal['white', 'dark']):
 
 type SupportedPlots = Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
 type PlotName = str  # just a short, memorable key name
+
 
 @dataclass
 class PlotOpts:
@@ -191,6 +93,7 @@ class PlotOpts:
     ax_visible: bool = True
     animate: bool = False
 
+
 @dataclass
 class PlotSpec:
     """Specs for a matplotlib plot.
@@ -219,6 +122,7 @@ class PlotSpec:
     opts: PlotOpts = field(default_factory=lambda: PlotOpts())
     kwargs: dict = field(default_factory=dict)
     name: PlotName | None = None
+
 
 type PlotSpecs = PlotSpec | tuple[PlotSpec, ...]  # multiple on same graph
 type DataFrame = list[list[tuple[Any, ...]]]
@@ -771,386 +675,4 @@ def gridplot(
             fig.savefig(Path(save), bbox_inches='tight')
     
         return fig, axs
-
-
-### DEPRECATED ###
-def _old_gridplot(data: list[Frame],
-             data_opts: PlotMetadata | dict,
-             data_plot_opts: dict = None,
-             global_plot_opts: dict = None,
-             text_opts: dict = None,
-             animate_opts: dict = None,
-             legend_opts: dict = None,
-             data_labels: dict = None,
-             coord_labels: list[str] = None,
-             time: ArrayLike = None,
-             scheme: Literal['white', 'dark'] = 'white',
-             exclude: list[str] = None,
-             grid: tuple[int, int] = None,
-             subplot_size_in: tuple[float, float] = (3, 2.5),
-             save: str | Path = None,
-             adjust: callable = None
-             ):
-    """Plots simulation data in a grid of subplots. Can do both 1d and 2d plots, and optionally animate over time.
     
-    :param data: List of frames of simulation data to plot. If several frames are provided, the result will be
-                 animated. If a single frame is provided, the result will be a static plot. Each frame is a dict
-                 with field variable names mapped to arrays of data to plot.
-    :param data_opts: Options for plotting data (CellMetadata, LineMetadata, and PcolorMetadata supported, see their
-                 docstrings for details). Most importantly, this will contain information about the 1d or 2d grid coordinates.
-    :param data_plot_opts: A dict mapping variable names to plot options. All plot options are passed to the underlying
-                 matplotlib plot function for the given data type (e.g. ax.plot(**opts) for line plots)
-    :param global_plot_opts: Options to use on all subplots in the grid (data_plot_opts takes priority for a given variable)
-    :param text_opts: Options to pass to axis labels
-    :param animate_opts: dict with animation options alternate for (blit=True, fps=10, frame_skip=1, dpi=200)
-    :param legend_opts: Options to pass to axis legend construction
-    :param data_labels: Labels to show on colorbars or y axes for each variable (defaults to just using variable names)
-    :param coord_labels: Will show axis labels for (x,y) if provided, otherwise will hide axes (default)
-    :param time: (Nt,) array of simulation time values (only used for labeling animation plot), must be same length as data
-    :param scheme: Either white (default) or dark, for setting text and background colors
-    :param exclude: variables to exclude from plotting, (default none)
-    :param grid: The shape of subplots for multiple variables. By default, will make the best square grid.
-    :param subplot_size_in: Tuple (W, H) of each subplot size (inches), all subplots are set to this size
-    :param save: Name of file to save to (won't save if None)
-    :param adjust: a catch-all func for applying additional changes to the plot before animating/saving,
-                   callable as adjust(fig, axs)
-    """
-    if isinstance(data_opts, dict):
-        if 'type' not in data_opts:
-            # Try to infer plot type
-            if 'cells' in data_opts:
-                data_opts['type'] = 'cell'
-            elif 'X' in data_opts and 'Y' in data_opts:
-                data_opts['type'] = 'pcolor'
-            elif 'coord' in data_opts:
-                data_opts['type'] = 'line'
-        data_opts = PlotMetadata.from_dict(data_opts)
-
-    if exclude is None:
-        exclude = {}
-    if data_labels is None:
-        data_labels = {}
-    if animate_opts is None:
-        animate_opts = {}
-    if data_plot_opts is None:
-        data_plot_opts = {}
-    if global_plot_opts is None:
-        global_plot_opts = {}
-    if text_opts is None:
-        text_opts = {}
-    if legend_opts is None:
-        legend_opts = {}
-    
-    all_vars = [v for v in data[0].keys() if v not in exclude]
-
-    text_color, bg_color = get_scheme(scheme)
-    labels = {v: data_labels.get(v, v) for v in all_vars}
-    a_opts = {k: animate_opts.get(k, v) for k, v in ANIMATE_DEFAULT.items()}
-    plot_opts = copy.deepcopy(data_plot_opts)
-
-    # Set defaults for plot options for all variables
-    for v in all_vars:
-        d = plot_opts.setdefault(v, global_plot_opts)
-        for k in global_plot_opts:
-            if k not in d:
-                d[k] = global_plot_opts[k]
-
-    # Plot sharing likely only ever needed for line plots
-    share_plot = data_opts.share_plot if hasattr(data_opts, 'share_plot') else {}
-    set_vars = set(all_vars)
-    for s in share_plot.values():
-        set_vars = set_vars - set(s)
-    num_single_vars = len(set_vars)
-    num_plots = num_single_vars + len(share_plot)
-
-    # Divide plots up into groups
-    shared_groups = list(share_plot.values())
-    shared_groups_map = {}  # shared group_idx -> index in all groups
-    all_groups = []
-    for v in all_vars:
-        v_in_shared_group = False
-        for group_idx, group in enumerate(shared_groups):
-            if v in group:
-                v_in_shared_group = True
-                if group_idx in shared_groups_map:
-                    all_groups[shared_groups_map[group_idx]].append(v)
-                else:
-                    all_groups.append([v])
-                    shared_groups_map[group_idx] = len(all_groups) - 1
-                break  # each variable should only be in exactly one group
-        
-        if not v_in_shared_group:  # single vars get their own plot
-            all_groups.append([v])
-    shared_groups_inverse = {v: k for k, v in shared_groups_map.items()}
-    
-    if grid is None:
-        c = int(np.ceil(np.sqrt(num_plots)))
-        r = int(np.ceil(num_plots / c))
-        grid = (r, c)
-
-    # Setup figure, axis subplots
-    fig, axs = plt.subplots(*grid, layout='tight', squeeze=False, sharex='col', 
-                            sharey='none' if isinstance(data_opts, LineMetadata) else 'row', 
-                            figsize=(subplot_size_in[0]*grid[1], subplot_size_in[1]*grid[0]))
-    fig.patch.set_facecolor(bg_color)
-
-    # Animation objects {variable: plot object}
-    xdata = {}       # set_xdata
-    ydata = {}       # set_ydata
-    collections = {} # set_array
-
-    # Do some extra stuff before plotting
-    def _pre_plot():
-        if isinstance(data_opts, CellMetadata):
-            quads = [[data_opts.vertices[i] for i in cell] for cell in data_opts.connectivity]
-            boundary_edges, boundary_cells = get_boundary(data_opts.connectivity)
-            edge_groups = data_opts.group_boundary(boundary_edges, data_opts.vertices) if data_opts.group_boundary is not None else {}
-
-            boundary_colors = {} if data_opts.boundary_colors is None else data_opts.boundary_colors
-            boundary_colors = {b: boundary_colors.get(b, text_color) if isinstance(boundary_colors, dict) else boundary_colors for 
-                               b in edge_groups}
-
-            if data_opts.show_mesh:
-                edgecolors = []
-                for cell_idx in range(len(quads)):
-                    if data_opts.boundary_cell_color is not None and cell_idx in boundary_cells:
-                        edgecolors.append(data_opts.boundary_cell_color)
-                    else:
-                        edgecolors.append((0.5, 0.5, 0.5, 0.3))
-            else:
-                edgecolors='face'
-            
-            if data_opts.shading == 'gouraud':
-                # Use tripcolor for shading
-                triangles = []
-                for quad in data_opts.connectivity:
-                    v0, v1, v2, v3 = quad
-                    triangles.append([v0, v1, v2])
-                    triangles.append([v0, v2, v3])
-                triangles = np.array(triangles)
-                triang = Triangulation(data_opts.vertices[:, 0], data_opts.vertices[:, 1], triangles)
-            else:
-                triang = None
-        
-            return (quads, boundary_edges, boundary_cells, edge_groups, boundary_colors, edgecolors, triang)
-        
-        else:
-            return ()
-
-    def _iter_all_vars():
-        """Iterate over variables and plot indices."""
-        # Group plots in the order variables appear, accounting for shared plots where applicable        
-        for plot_idx, group in enumerate(all_groups):
-            for v in group:
-                yield v, plot_idx
-
-    pre_plot_info = _pre_plot()  # in case more things are needed for plotting
-    skip_first_clims = False
-
-    for v, plot_idx in _iter_all_vars():
-        ax = axs.flatten()[plot_idx]
-        arr = data[0].get(v)
-
-        if np.all(np.isnan(arr)):
-            skip_first_clims = True
-            arr = np.full_like(arr, 1e-6)  # small workaround to avoid cbar issues
-
-        axes_visible = coord_labels is not None
-        ax.tick_params(axis='both', which='both', top=False, bottom=axes_visible, left=axes_visible, right=False, direction='in',
-                       labelleft=axes_visible, labelbottom=axes_visible, color=text_color, labelcolor=text_color)
-        ax.set_facecolor(bg_color)
-        for spine in ['bottom', 'left', 'top', 'right']:
-            ax.spines[spine].set_visible(axes_visible)
-            ax.spines[spine].set_color(text_color)
-        
-        if axes_visible and plot_idx // grid[1] == grid[0] - 1:  # last row on grid
-            ax.set_xlabel(coord_labels[0], color=text_color, **text_opts)
-        if axes_visible and plot_idx % grid[1] == 0 and len(coord_labels) > 1:  # first column
-            ax.set_ylabel(coord_labels[1], color=text_color, **text_opts)
-        
-        # Simple line plots
-        if isinstance(data_opts, LineMetadata):
-            line_opts = copy.deepcopy(plot_opts.get(v, {}))
-            if 'cmap' in line_opts:
-                if 'c' not in line_opts and 'color' not in line_opts:
-                    line_opts['color'] = plt.get_cmap(line_opts['cmap'])(0)  # Use first color in cmap
-                
-                del line_opts['cmap']  # Can't use this in line plots
-            
-            if 'norm' in line_opts:
-                ax.set_yscale(line_opts['norm'])
-                del line_opts['norm']  # Can't use this in line plots
-
-            l = ax.plot(data_opts.coord, arr, label=labels[v], **line_opts)
-            ydata[v] = l[0]
-            
-            if data_opts.animated_bar is not None:
-                lvert = ax.axvline(x=data_opts.coord[0], **data_opts.animated_bar)
-                xdata[v] = lvert
-
-            if plot_idx in shared_groups_inverse:
-                leg = dict(facecolor=bg_color, edgecolor=text_color, labelcolor=text_color, fancybox=True)
-                leg.update(legend_opts)
-                ax.legend(**leg)
-                ylabel = list(share_plot.keys())[shared_groups_inverse[plot_idx]]
-            else:
-                ylabel = labels[v]
-            ax.set_ylabel(ylabel, color=text_color, **text_opts)
-        
-        # Pcolor structured mesh 2d plot
-        elif isinstance(data_opts, PcolorMetadata):
-            pcm = ax.pcolormesh(data_opts.X, data_opts.Y, arr, **plot_opts.get(v, {}))
-            collections[v] = pcm
-
-            cb = plt.colorbar(pcm, ax=ax)
-            cb.ax.set_ylabel(labels.get(v, v), color=text_color, **text_opts)
-            cb.ax.tick_params(labelcolor=text_color, color=text_color)
-            cb.ax.tick_params(which='minor', color=(0,0,0,0), width=0, size=0)
-            cb.ax.minorticks_off()
-            cb.outline.set_edgecolor(text_color)
-        
-        # Polycollection quadrilateral 2d plot
-        elif isinstance(data_opts, CellMetadata):
-            coords_min = np.min(data_opts.vertices, axis=0)
-            coords_max = np.max(data_opts.vertices, axis=0)
-            ax.autoscale(enable=False)
-            ax.set_xlim([coords_min[0], coords_max[0]])
-            ax.set_ylim([coords_min[1], coords_max[1]])
-            quads, boundary_edges, boundary_cells, edge_groups, boundary_colors, edgecolors, triang = pre_plot_info
-
-            if triang is None:
-                # Use poly collection for 'flat' shading (default)
-                pc = PolyCollection(quads, array=arr, edgecolors=edgecolors, **plot_opts.get(v, {}))
-                ax.add_collection(pc)
-                collections[v] = pc
-            else:
-                # Use triangles for shading otherwise
-                vertex_arr = np.zeros(data_opts.vertices.shape[0])
-                counts = np.zeros_like(vertex_arr)
-                for center_val, verts in zip(arr, data_opts.connectivity):
-                    for vidx in verts:
-                        vertex_arr[vidx] += center_val
-                        counts[vidx] += 1
-                vertex_arr /= counts
-
-                tpc = ax.tripcolor(triang, vertex_arr, shading='gouraud', edgecolors=edgecolors, **plot_opts.get(v, {}))
-                collections[v] = tpc
-
-            # Outline the boundary
-            for i, edge in enumerate(boundary_edges):
-                x_vals, y_vals = data_opts.vertices[edge, 0], data_opts.vertices[edge, 1]
-                c = text_color
-                for b in edge_groups:
-                    if i in edge_groups[b]:
-                        c = boundary_colors[b]
-                        break
-                ax.plot(x_vals, y_vals, color=c, linewidth=1.5)
-            
-            # Show normal boundary vectors
-            if data_opts.boundary_cell_color is not None:
-                pos = np.zeros((len(boundary_edges), 2))
-                vel = np.zeros((len(boundary_edges), 2))
-                for i, edge in enumerate(boundary_edges):
-                    p1 = data_opts.vertices[edge[0]]
-                    p2 = data_opts.vertices[edge[1]]
-                    pos[i, :] = (p1 + p2) / 2
-                    vel[i, :] = edge_normal(p1, p2, data_opts.cells[boundary_cells[i]])
-                ax.quiver(pos[:, 0], pos[:, 1], vel[:, 0], vel[:, 1], color=data_opts.boundary_cell_color)
-
-            if data_opts.cell_center_opts is not None:
-                ax.scatter(data_opts.cells[:, 0], data_opts.cells[:, 1], **data_opts.cell_center_opts)
-            
-            cb = plt.colorbar(collections[v], ax=ax)
-            cb.ax.set_ylabel(labels.get(v, v), color=text_color, **text_opts)
-            cb.ax.tick_params(labelcolor=text_color, color=text_color)
-            cb.ax.tick_params(which='minor', color=(0,0,0,0), width=0, size=0)
-            cb.ax.minorticks_off()
-            cb.outline.set_edgecolor(text_color)
-
-    if adjust is not None:
-        adjust(fig, axs)
-    
-    # Iterate over frames to animate
-    if len(data) > 1:
-        # Get global (ymin, ymax) for ylims/clims
-        for v, plot_idx in _iter_all_vars():
-            ax = axs.flatten()[plot_idx]
-            if v in ydata:
-                curr_min, curr_max = ax.get_ylim()
-            elif v in collections:
-                curr_min, curr_max = collections[v].get_clim()
-            else:
-                curr_min, curr_max = (np.nan, np.nan)
-
-            ymin, ymax = [curr_min], [curr_max]
-            for i in range(len(data)):
-                if i == 0 and skip_first_clims:  # Only from an all-nan workaround
-                    continue
-
-                arr = data[i][v]
-                ymin.append(np.nanmin(arr))
-                ymax.append(np.nanmax(arr))
-            
-            if v in ydata:
-                ax.set_ylim([np.nanmin(ymin), np.nanmax(ymax)])
-            elif v in collections:
-                collections[v].set_clim(np.nanmin(ymin), np.nanmax(ymax))
-            else:
-                pass # Shouldn't be here
-        
-        num_frames = int(len(data) / a_opts['frame_skip']) + 1  # use last one to show last time step
-
-        def update(idx):
-            idx_use = idx * a_opts['frame_skip'] if idx < num_frames - 1 else len(data) - 1
-            if time is not None:
-                fig.suptitle(f"t={_format_time_engineering(time[idx_use])}", color=text_color, **text_opts)
-            
-            xret, ret = None, None
-            for v, plot_idx in _iter_all_vars():
-                if v in ydata:
-                    ydata[v].set_ydata(data[idx_use][v])
-                    if ret is None:
-                        ret = list(ydata.values())
-                elif v in collections:
-                    cell_arr = data[idx_use][v]
-
-                    # Need to average cell data to vertices for tri mesh
-                    if isinstance(collections[v], TriMesh):
-                        vertex_arr = np.zeros(data_opts.vertices.shape[0])
-                        counts = np.zeros_like(vertex_arr)
-                        for center_val, verts in zip(cell_arr, data_opts.connectivity):
-                            for vidx in verts:
-                                vertex_arr[vidx] += center_val
-                                counts[vidx] += 1
-                        vertex_arr /= counts
-                        collections[v].set_array(vertex_arr)
-                    else:
-                        collections[v].set_array(cell_arr)
-
-                    if ret is None:
-                        ret = list(collections.values())
-                
-                if v in xdata:
-                    xdata[v].set_xdata([data_opts.coord[idx_use], data_opts.coord[idx_use]])  # Vertical line
-                    if xret is None:
-                        xret = list(xdata.values())
-            
-            return ret + (xret if xret is not None else [])
-        
-        ani = FuncAnimation(fig, update, frames=num_frames, blit=a_opts['blit'], interval=1/a_opts['fps'])
-
-        if save is not None:
-            print(f"Saving animation to '{save}'")
-            def _progress(i, n):
-                if np.mod(i, int(0.1 * n)) == 0 or i == 0 or i == n - 1:
-                    print(f'Saving frame {i+1}/{n}...')
-            ani.save(Path(save), writer='ffmpeg', progress_callback=_progress, dpi=a_opts['dpi'], fps=a_opts['fps'])
-        else:
-            plt.show()
-    
-    # Static figure
-    else:
-        if save is not None:
-            fig.savefig(Path(save), bbox_inches='tight')
-    
-    return fig, axs

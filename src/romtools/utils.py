@@ -3,19 +3,21 @@ from typing import Mapping, Any
 import logging
 import sys
 from pathlib import Path
+from os import PathLike
 import subprocess
 import threading
 
 import jax
+from jaxtyping import PyTree
 import jax.numpy as jnp
 from pydantic import BaseModel
 import numpy as np
 import h5py
 
-from romtools.typing import PyTree
 
 __all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm', 
            'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
+
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
 
@@ -244,7 +246,7 @@ def monitor_gpu_memory(interval_seconds: float = 5.0) -> tuple[threading.Thread,
     return thread, stop_event
 
 
-def save_h5(data: dict[str, Any], filename: str | Path, mode: str = 'a'):
+def save_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'a'):
     """Save data to h5 file."""
 
     def _recursively_save(h5group, obj):
@@ -269,7 +271,7 @@ def save_h5(data: dict[str, Any], filename: str | Path, mode: str = 'a'):
                 f.create_dataset(key, data=np.asarray(data[key]))
 
 
-def load_h5(data: dict[str, Any], filename: str | Path, mode: str = 'r'):
+def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r'):
     """Load data from h5 file into a dictionary. An empty dictionary will load everything.
     Selectively mark data to load in the dictionary with None.
     """

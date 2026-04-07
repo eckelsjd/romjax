@@ -198,7 +198,7 @@ def train_forcing(shape, key, save_dir):
 
     # Can't take grad of vmap(optx.root_find) apparently, so manually loop over train/test sets
     @jax.jit
-    def loss_fn(param):
+    def loss_fn(param, *args):
         def body(i, acc):
             pred = solve_one(train_in[i], param)
             diff = pred - train_out[i]

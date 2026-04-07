@@ -15,6 +15,7 @@ dependencies = [
     "optimistix>=0.1.0",
     "optax>=0.2.8",
     "equinox>=0.13.6",
+    "jaxtyping>=0.3.9",
 ]
 requires-python = ">=3.12"
 readme = "README.md"

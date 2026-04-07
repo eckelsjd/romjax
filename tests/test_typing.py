@@ -5,8 +5,8 @@ import optimistix as optx
 import pytest
 from pydantic import ValidationError, BaseModel
 
-from romtools import YamlLoader
-from romtools.typing import DictModel, LxObject, OptxObject
+from romtools import YamlLoader, DictModel
+from romtools.typing import LxObject, OptxObject
 
 
 class CustomSettings(DictModel, extra='forbid'):

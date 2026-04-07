@@ -1,61 +1,16 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Callable, Iterator, MutableMapping, Protocol, Annotated
+from typing import Any, Protocol, Annotated
 from weakref import WeakKeyDictionary
 
 import lineax as lx
 import optimistix as optx
-from jax.typing import ArrayLike
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, AfterValidator
+from pydantic import BaseModel, Field, TypeAdapter, AfterValidator
 from pydantic_core import core_schema
 
-__all__ = ['PyTree', 'Coordinates', 'ForcingCallable', 'BoundaryCallable', 'DictModel', 
-           'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
-type PyTree = Any  # Python containers for use with jax
-
-# For PDEs
-type Coordinates = tuple[ArrayLike, ...]
-type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
-type BoundaryCallable = Callable[[PyTree], PyTree]
-type InitialCallable = Callable[[Coordinates], ArrayLike]
-
-
-class DictModel(BaseModel, MutableMapping):
-    """Allow dict-like access of pydantic models."""
-
-    model_config = ConfigDict(
-        arbitrary_types_allowed=True, 
-        extra="allow", 
-        validate_assignment=True,
-        use_enum_values=True
-    )
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by YamlLoader for this model class."""
-        return f"!model:{cls.__module__}.{cls.__name__}"
-
-    def __getitem__(self, key: str) -> Any:
-        if not hasattr(self, key):
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        setattr(self, key, value)
-
-    def __delitem__(self, key: str) -> None:
-        if not hasattr(self, key):
-            raise KeyError(key)
-        delattr(self, key)
-
-    def __iter__(self) -> Iterator[str]:
-        for k, _ in super().__iter__():
-            yield k
-
-    def __len__(self) -> int:
-        return len(dict(self))
+__all__ = ['LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 
 class ModuleObjectSpec(BaseModel):
