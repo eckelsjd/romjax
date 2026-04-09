@@ -1,5 +1,5 @@
 """Module for assorted processing utilities."""
-from typing import Mapping, Any
+from typing import Mapping, Any, Generator
 import logging
 import sys
 from pathlib import Path
@@ -15,12 +15,14 @@ import numpy as np
 import h5py
 
 
-__all__ = ['to_pytree', 'merge_pytrees', 'get_logger', 'tree_l2_norm', 
+__all__ = ['to_pytree', 'merge_pytrees', 'iter_pytree', 'pytree_at', 'get_logger', 'tree_l2_norm', 
            'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
 
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
 
+# TODO: maybe some interesting ideas with a custom PyTree object that implements magic methods
+# could support iter, index, len as well as add, sub, mult, broadcast and other array operations
 
 @jax.jit
 def tree_l2_norm(tree: PyTree):
@@ -87,6 +89,22 @@ def merge_pytrees(defaults: PyTree, overrides: PyTree) -> PyTree:
         return merged_list
     
     return overrides
+
+
+def iter_pytree(tree: PyTree) -> Generator[PyTree, None, None]:
+    """Yield per-sample pytrees from a batched pytree with a leading batch axis."""
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    if not leaves:
+        return
+    batch_size = leaves[0].shape[0]
+    for i in range(batch_size):
+        yield jax.tree_util.tree_unflatten(treedef, [leaf[i] for leaf in leaves])
+
+
+def pytree_at(tree: PyTree, index: int) -> PyTree:
+    """Return a pytree with each leaf at the provided index."""
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    return jax.tree_util.tree_unflatten(treedef, [leaf[index] for leaf in leaves])
 
 
 def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,

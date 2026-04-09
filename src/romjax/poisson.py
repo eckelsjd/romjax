@@ -1,7 +1,5 @@
 """Example 2D Poisson solver."""
 from typing import Literal, Mapping, TypedDict, Any, Iterable, Callable
-from os import PathLike
-import copy
 
 import jax.numpy as jnp
 import optimistix as optx
@@ -12,7 +10,7 @@ import jax
 from romjax.pde import Coordinates, homogeneous_boundary, UniformGrid, BoundarySpec, BoundaryType
 from romjax.typing import IterativeSolver, AdjointMethod, DictModel, ImplicitModel
 from romjax.utils import merge_pytrees, to_pytree
-from romjax.random import BatchSampler, Distribution, parametric_sampler
+from romjax.random import SamplerCallable, Distribution, parametric_sampler
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
@@ -140,13 +138,13 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
 
 
 def darcy_field(
-    key: Key, 
-    nsamples: int = 1, 
-    bounds: tuple[tuple[int, int], tuple[int, int]] = ((0, 1), (0, 1)),
-    shape: tuple[int, int] = (16, 16),
-    nemytskii: tuple[float, float] = (3.0, 12.0),
-    cov_diag: float = 9.0
-) -> ArrayLike:
+        key: Key, 
+        nsamples: int = 1, 
+        bounds: tuple[tuple[int, int], tuple[int, int]] = ((0, 1), (0, 1)),
+        shape: tuple[int, int] = (16, 16),
+        nemytskii: tuple[float, float] = (3.0, 12.0),
+        cov_diag: float = 9.0
+    ) -> ArrayLike:
     """Sample darcy flow conductivity field according to Sec 6.2 of Kovachki 2022.
 
     https://arxiv.org/abs/2108.08481
@@ -182,8 +180,12 @@ def darcy_field(
     cov_eigs = (lap_eigs + cov_diag) ** -2
     sqrt_cov = jnp.sqrt(cov_eigs)
 
-    coeffs = jax.random.normal(key, (nsamples, nx, ny)) * sqrt_cov[None, :, :]
-    gauss_field = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
+    if nsamples == 1:
+        coeffs = jax.random.normal(key, (nx, ny)) * sqrt_cov
+        gauss_field = jnp.einsum("ik,jl,kl->ij", phi_x, phi_y, coeffs)
+    else:
+        coeffs = jax.random.normal(key, (nsamples, nx, ny)) * sqrt_cov[None, :, :]
+        gauss_field = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
 
     low, high = nemytskii
     return jnp.where(gauss_field >= 0.0, high, low)
@@ -230,13 +232,15 @@ class Poisson2D(ImplicitModel):
     conductivity: ForcingCallable = constant_forcing
     boundary: BoundaryCallable = boundary_pass_through
 
-    forcing_sampler: BatchSampler | None = None
-    conductivity_sampler: BatchSampler | None = None
-    boundary_sampler: BatchSampler | None = None
+    forcing_sampler: SamplerCallable | None = None
+    conductivity_sampler: SamplerCallable | None = None
+    boundary_sampler: SamplerCallable | None = None
+    outputs_sampler: SamplerCallable | None = None
 
     forcing_sampler_opts: dict[str, Any] = Field(default_factory=dict)
     conductivity_sampler_opts: dict[str, Any] = Field(default_factory=dict)
     boundary_sampler_opts: dict[str, Any] = Field(default_factory=dict)
+    outputs_sampler_opts: dict[str, Any] = Field(default_factory=dict)
 
     forcing_defaults: DictModel = Field(
         default_factory=lambda: ConstantForcingInputs(const=0.0),
@@ -268,11 +272,11 @@ class Poisson2D(ImplicitModel):
             return value
         raise TypeError("forcing and conductivity must be a callable or a supported string literal.")
 
-    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", mode="before")
+    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", "outputs_sampler", mode="before")
     @classmethod
-    def _coerce_sampler(cls, value: BatchSampler | SamplerName | None) -> BatchSampler | None:
+    def _coerce_sampler(cls, value: SamplerCallable | SamplerName | None) -> SamplerCallable | None:
         if isinstance(value, str):
-            mapping: Mapping[SamplerName, BatchSampler] = {
+            mapping: Mapping[SamplerName, SamplerCallable] = {
                 "parametric": parametric_sampler
             }
             if value not in mapping:
@@ -284,22 +288,22 @@ class Poisson2D(ImplicitModel):
             return value
         raise TypeError("samplers must be either a valid name, callable, or none.")
     
-    @field_validator("forcing_sampler_opts", "conductivity_sampler_opts", "boundary_sampler_opts", mode="after")
+    @field_validator("forcing_sampler_opts", "conductivity_sampler_opts", 
+                     "boundary_sampler_opts", "outputs_sampler_opts", mode="after")
     @classmethod
     def _coerce_sampler_opts(cls, value: dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
         """Just provides validation for known sampler function params."""
         check_flag = False
-        for s in ['forcing', 'conductivity', 'boundary']:
+        for s in ['forcing', 'conductivity', 'boundary', 'outputs']:
             s_flag = info.field_name == f"{s}_sampler_opts" and info.data[f"{s}_sampler"] is parametric_sampler
             check_flag = check_flag or s_flag
 
         # Validate distributions for parametric sampling
         if check_flag:
             for k in list(value.keys()):
-                if k not in ['write_summary', 'format', 'prefix']:
-                    if not isinstance(value[k], Mapping):
-                        raise TypeError(f"Extra parametric sampler opts must be a Distribution-like mapping.")
-                    value[k] = Distribution(**value[k])
+                if not isinstance(value[k], Mapping):
+                    raise TypeError(f"Extra parametric sampler opts must be a Distribution-like mapping.")
+                value[k] = Distribution(**value[k])
         
         return value
     
@@ -457,16 +461,38 @@ class Poisson2D(ImplicitModel):
         ret = solution if return_sol else {"phi": solution.value} 
         return ret
     
-    def sample_inputs(self, keys: Iterable[Key], paths: Iterable[str | PathLike]) -> None:
-        def _sample(keys, sampler, opts, prefix):
-            if sampler is not None:
-                opts = copy.copy(opts)
-                opts['prefix'] = (f"{p}_" if (p := opts.get("prefix")) is not None else "") + prefix
-                sampler(keys, paths, **opts)
+    def sample_inputs(self, key: Key) -> PoissonInputs:
+        """Produce one sample of inputs for the given key."""
+        sample = {}
+        forcing_key, conductivity_key, boundary_key = jax.random.split(key, 3)
+
+        if self.forcing_sampler is not None:
+            sample['forcing'] = self.forcing_sampler(forcing_key, **self.forcing_sampler_opts)
+        if self.conductivity_sampler is not None:
+            sample['conductivity'] = self.conductivity_sampler(conductivity_key, **self.conductivity_sampler_opts)
+        if self.boundary_sampler is not None:
+            sample['boundary'] = self.boundary_sampler(boundary_key, **self.boundary_sampler_opts)
         
-        if len(keys) > 0 and len(paths) > 0:
-            forcing_keys, conductivity_keys, boundary_keys = zip(*[jax.random.split(k, 3) for k in keys])
-            
-            _sample(forcing_keys, self.forcing_sampler, self.forcing_sampler_opts, 'forcing')
-            _sample(conductivity_keys, self.conductivity_sampler, self.conductivity_sampler_opts, 'conductivity')
-            _sample(boundary_keys, self.boundary_sampler, self.boundary_sampler_opts, 'boundary')
+        return sample
+    
+    def sample_outputs(
+            self, 
+            key: Key, 
+            inputs: PoissonInputs | None = None, 
+            solution: PoissonOutputs | None = None
+        ) -> PoissonOutputs:
+        """
+        Produce one sample of outputs for the given key.
+        
+        :param key: the random key
+        :param inputs: optionally condition on inputs
+        :param solution: for efficiency, optionally condition on the precomputed solution of solve(inputs)=0
+        :return: the outputs sample
+        """
+        # TODO: how to handle stratified sampling
+        sample = {}
+
+        if self.outputs_sampler is not None:
+            sample["phi"] = self.outputs_sampler(key, inputs=inputs, solution=solution, **self.outputs_sampler_opts)
+        
+        return sample

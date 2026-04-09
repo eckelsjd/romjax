@@ -17,7 +17,7 @@ from romjax.poisson import (
 from romjax.pde import UniformGrid, homogeneous_boundary
 from romjax.typing import DictModel
 from romjax.plotting import gridplot
-from romjax.random import gen_sampling_keys
+from romjax.random import gen_keys
 from romjax.utils import load_h5
 
 
@@ -223,40 +223,24 @@ def test_poisson_manufactured_solve(show_plot=False):
     assert jnp.max(error) < dx_error*2
 
 
-def test_poisson_sample_inputs(tmp_path):
+def test_poisson_sample_inputs():
     fixture_path = Path("tests/fixtures_poisson.yml")
     model = YamlLoader.load(fixture_path)['solver']
 
-    keys, paths = gen_sampling_keys(3, tmp_path, seed=122)
-    
-    model.sample_inputs(keys, paths)
-
-    for key, path in zip(keys, paths):
-        forcing_path = Path(path) / "forcing.txt"
-        conductivity_path = Path(path) / "conductivity.h5"
-        conductivity_summary = Path(path) / "conductivity_summary.txt"
-
-        assert forcing_path.exists()
-        assert conductivity_path.exists()
-        assert conductivity_summary.exists()
-
-        forcing_header, forcing_data = forcing_path.read_text().strip().splitlines()
-        forcing_params = forcing_header.split()
-        forcing_values = [float(v) for v in forcing_data.split()]
-        forcing_map = dict(zip(forcing_params, forcing_values))
-
+    for key in gen_keys(3, seed=122):
+        sample = model.sample_inputs(key)
         forcing_key, conductivity_key, _ = jax.random.split(key, 3)
         forcing_subkeys = jax.random.split(forcing_key, 2)
         expected_mu_x = jax.random.uniform(forcing_subkeys[0], minval=0.4, maxval=0.6, shape=())
         expected_a0 = jax.random.normal(forcing_subkeys[1], shape=()) * 0.1 + 0.5
 
-        assert forcing_map["mu_x"] >= 0.4
-        assert forcing_map["mu_x"] < 0.6
-        assert np.isclose(forcing_map["mu_x"], float(expected_mu_x), rtol=1e-5, atol=1e-6)
-        assert np.isclose(forcing_map["A0"], float(expected_a0), rtol=1e-5, atol=1e-6)
-
-        loaded: dict[str, jnp.ndarray] = {}
-        load_h5(loaded, conductivity_path, mode="r", jax=True)
+        assert "forcing" in sample
+        assert "mu_x" in sample["forcing"]
+        assert "A0" in sample["forcing"]
+        assert sample["forcing"]["mu_x"] >= 0.4
+        assert sample["forcing"]["mu_x"] < 0.6
+        assert np.isclose(sample["forcing"]["mu_x"], float(expected_mu_x), rtol=1e-5, atol=1e-6)
+        assert np.isclose(sample["forcing"]["A0"], float(expected_a0), rtol=1e-5, atol=1e-6)
 
         expected_k0 = darcy_field(
             jax.random.split(conductivity_key, 1)[0],
@@ -264,6 +248,7 @@ def test_poisson_sample_inputs(tmp_path):
             bounds=((0, 1), (0, 1)),
         )
 
-        assert "k0" in loaded
-        assert loaded["k0"].shape == (1, 50, 50)
-        assert np.allclose(np.asarray(loaded["k0"]), np.asarray(expected_k0))
+        assert "conductivity" in sample
+        assert "k0" in sample["conductivity"]
+        assert sample["conductivity"]["k0"].shape == (50, 50)
+        assert np.allclose(np.asarray(sample["conductivity"]["k0"]), np.asarray(expected_k0))

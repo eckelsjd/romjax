@@ -67,8 +67,8 @@ class ImplicitModel(BaseModel, ABC):
         raise NotImplementedError
     
     @abstractmethod
-    def sample_inputs(self, keys: Iterable[Key], paths: Iterable[str | PathLike]) -> None:
-        """Sample and save reproducible model inputs with the given keys at the given paths."""
+    def sample_inputs(self, key: Key) -> PyTree:
+        """Sample a single model input for the given key."""
         raise NotImplementedError
 
     @classmethod
