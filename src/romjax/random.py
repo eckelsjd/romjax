@@ -1,21 +1,19 @@
 """Reproducible, file-based sampling via jax.random with pydantic validation."""
 import time
 from pathlib import Path
-from typing import Protocol, Iterable, Any, Literal, Mapping, runtime_checkable, Generator, Callable
+from typing import Protocol, Optional, Any, Literal, Mapping, runtime_checkable, Generator, Callable, Iterable
 import os
 import copy
-import re
 
 import jax
 import jaxtyping
 from jax.typing import ArrayLike
 from pydantic import field_validator
 
-from romjax.utils import save_h5
 from romjax.typing import DictModel
 
 
-__all__ = ['Distribution', 'parametric_sampler', 'gen_sampling_keys', 'BatchSampler']
+__all__ = ['Distribution', 'parametric_sampler', 'gen_keys', 'SamplerCallable']
 
 
 type DistributionName = Literal['uniform', 'normal']
@@ -23,10 +21,9 @@ type ParamName = str
 
 
 @runtime_checkable
-class BatchSampler(Protocol):
-    """Take in random keys and corresponding paths, write samples to paths however you want. May take any kwargs."""
-    def __call__(self, keys: Iterable[jaxtyping.Key], paths: Iterable[str | Path], 
-                 **kwargs: dict[str, Any]) -> None: ...
+class SamplerCallable(Protocol):
+    """Take in a random key and return a single pytree sample. May take any kwargs."""
+    def __call__(self, key: jaxtyping.Key, **kwargs: dict[str, Any]) -> jaxtyping.PyTree: ...
 
 
 @runtime_checkable
@@ -67,122 +64,73 @@ class Distribution(DictModel):
         return self.distribution(key, **self.opts)
 
 
-def parametric_sampler(
-    keys: Iterable[jaxtyping.Key], 
-    paths: Iterable[str | os.PathLike],
-    format: Literal['h5', 'txt'] = 'h5',
-    prefix: str = 'sample',
-    write_summary: bool = True,
-    **params: dict[ParamName, Distribution]
-) -> None:
+def parametric_sampler(key: jaxtyping.Key, **params: dict[ParamName, Distribution]) -> jaxtyping.PyTree:
     """
-    Independently sample all parameter distributions passed in as kwargs and save to file.
+    Independently sample all parameter distributions passed in as kwargs and return as a pytree.
     
-    :param keys: the jax random keys per sample
-    :param paths: the base paths to save samples associated with keys
-    :param format: data format for the generated arrays (defaults to h5). For txt, only scalars are supported.
-    :param write_summary: write summary of saved data array names and shapes (default true)
+    :param key: the jax random key
     :param **params: a map from param names to their distributions (see `Distribution`)
+    :return: a PyTree representing a single sample of all parameters
     """
-    _supported = ['h5', 'txt']
-    if format not in _supported:
-        raise ValueError(f"Format '{format}' not supported. Only {_supported}.")
-
     params = copy.copy(params)
     for k in list(params.keys()):
         if not isinstance(params[k], Mapping):
             raise TypeError(f"All params for parametric sampling must be a Distribution-like mapping.")
         params[k] = Distribution(**params[k])
+
     num_rvs = len(params)
+    subkeys = jax.random.split(key, num_rvs)
+    sample = {rv: dist.sample(subkey) for (rv, dist), subkey in zip(params.items(), subkeys)}
 
-    for key, path in zip(keys, paths):
-        subkeys = jax.random.split(key, num_rvs)
-        sample = {rv: dist.sample(subkey) for (rv, dist), subkey in zip(params.items(), subkeys)}
-
-        if format == 'h5':
-            save_h5(sample, Path(path) / f"{prefix}.h5")
-        elif format == 'txt':
-            if any([len(arr.squeeze().shape) > 0 for arr in sample.values()]):
-                raise ValueError("Can't write non-scalar array to txt format")
-            with open(Path(path) / f"{prefix}.txt", "w") as fd:
-                header = " ".join(list(sample.keys()))
-                data = " ".join([f"{arr.squeeze():.6E}" for arr in sample.values()])
-                fd.write(f"{header}\n{data}\n")
-
-        if write_summary:
-            with open(Path(path) / f"{prefix}_summary.txt", 'w') as fd:
-                param_lines = [f"{param}: shape={arr.shape} dtype={arr.dtype}\n" for param, arr in sample.items()]
-                fd.writelines([f"Date: {time.asctime()}\n\n"] + param_lines)
+    return sample
 
 
-def gen_sampling_keys(
-    size: int,
-    path: str | os.PathLike, 
-    seed: int | None = None, 
-    reuse: bool = True,
-) -> tuple[list[jaxtyping.Key], list[Path]]:
+def gen_keys(
+    indices: int | Iterable[int],
+    seed: int | None = None,
+    path: str | os.PathLike | None = None,
+    skip: Callable[[str | os.PathLike], bool] | Literal['existing'] | None = None
+) -> Generator[tuple[jaxtyping.Key, Optional[str | os.PathLike]], None, None]:
     """
-    Setup and return jax keys and file paths for file-based reproducible sampling using jax. Will create a unique
-    directory for the seed and all samples underneath it.
-    
-    :param size: the number of samples
-    :param path: the base path for storing samples
-    :param seed: the random seed (if None, uses the current time)
-    :param reuse: whether to reuse existing samples found in the path (default True)
-    :return: the jax keys and file paths for each sample
+    Generator of jax random keys from a given seed. Optionally generate a matching path for saving samples.
+
+    :param indices: the number of keys to generate, or the specific indices (defaults to range(indices))
+    :param seed: the jax random seed for the base key
+    :param path: optional, if provided also creates and yields a path/seed_i/sample_j folder structure
+    :param skip: optional, if provided along with path, this decides whether to skip a certain directory
+    :yield: (key_i, Optional[path_i]), the jax random key for each index and optionally the associated path
     """
     if seed is None:
         seed = int(time.time())
     base_key = jax.random.key(seed)
 
-    seed_path = Path(path) / f"seed_{seed}"
-    os.makedirs(seed_path, exist_ok=True)
+    if isinstance(indices, int):
+        indices = range(indices)
 
-    info_path = Path(path) / "romjax.txt"
-    if not info_path.exists():
-        with open(info_path, "w") as fd:
-            fd.write(f"Date: {time.asctime()}\n\n"
-                     f"This directory has been used as a `romjax` sampling location.\n"
-                     f"The structure is seed_i/sample_j for the jth sample of random seed i.\n"
-                     f"Sample directories with 'ignore' in the name will be ignored.\n")
+    if skip == 'existing':
+        skip = lambda p: Path(p).exists()
+    if skip is None:
+        skip = lambda p: False
 
-    existing = [f for f in os.listdir(seed_path) if (seed_path / f).is_dir() and str(f).startswith("sample_") and 
-                "ignore" not in str(f)]
-    existing_int = {int(f.split("_")[1]) for f in existing}
-    new_int = [i for i in range(size) if not reuse or (i not in existing_int)]
-
-    keys, paths = [], []
-    for i in new_int:
-        p = seed_path / f"sample_{i}"
-        os.makedirs(p, exist_ok=True)
-        paths.append(p)
-        keys.append(jax.random.fold_in(base_key, i))
+    if path is not None:
+        seed_path = Path(path) / f"seed_{seed}"
+        os.makedirs(seed_path, exist_ok=True)
+        info_path = Path(path) / "romjax.txt"
+        if not info_path.exists():
+            with open(info_path, "w") as fd:
+                fd.write(f"Date: {time.asctime()}\n\n"
+                        f"This directory has been used as a `romjax` sampling location.\n"
+                        f"The structure is seed_i/sample_j for the jth sample of random seed i.\n")
     
-    return keys, paths
+    for i in indices:
+        if path is not None:
+            p = seed_path / f"sample_{i}"
 
+            if skip(p):
+                continue
 
-def iterate_samples(
-    base_path: str | os.PathLike, 
-    skip: Callable[[str | os.PathLike], bool] | None = None
-) -> Generator[str | os.PathLike, None, None]:
-    """Iterate over samples in a base directory (generated by gen_sampling_keys).
-
-    Will try to match samples of the form base_path/seed_i/sample_j
-    
-    :param base_path: the base path to iterate over sample directories
-    :param skip: a callable that decides whether a sample path should be skipped (default: no skipping)
-    :yield: a path to a sample directory
-    """
-    seed_re = re.compile(r"seed_\d+$")
-    sample_re = re.compile(r"sample_\d+$")
-    for f1 in os.listdir(base_path):
-        match = seed_re.fullmatch(str(f1))
-        if match:
-            for f2 in os.listdir(Path(base_path) / f1):
-                match = sample_re.fullmatch(str(f2))
-                if match:
-                    p = Path(base_path) / f1 / f2
-                    if skip is not None and skip(p):
-                        continue
-
-                    yield p
+            os.makedirs(p, exist_ok=True)
+            yield jax.random.fold_in(base_key, i), p
+        
+        else:
+            yield jax.random.fold_in(base_key, i)

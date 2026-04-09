@@ -7,6 +7,8 @@
 import argparse
 import pickle
 from pathlib import Path
+import os
+import shutil
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +18,9 @@ import optax
 
 from romjax.poisson import Poisson2D, darcy_field
 from romjax.plotting import gridplot, get_scheme
-from romjax.optim import train
-from romjax.utils import get_gpu_memory, monitor_gpu_memory, load_h5
-from romjax.random import gen_sampling_keys, iterate_samples
+from romjax.optim import train, load_train_file
+from romjax.utils import get_gpu_memory, monitor_gpu_memory, load_h5, save_h5, iter_pytree, pytree_at, get_logger
+from romjax.random import gen_keys
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".50"
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -34,7 +36,7 @@ def get_darcy_solver(shape, bounds):
                                 #   linear_solver=lx.GMRES(rtol=1e-3, atol=1e-20, max_steps=100, restart=30,
                                 #                          stagnation_iters=30)),
             "grid": {"shape": shape, "bounds": bounds},
-            "max_steps": 200,
+            "max_steps": 100,
             "throw": True
         },
         forcing_defaults={'const': -1.0},
@@ -103,27 +105,17 @@ def show_random_samples(shape, bounds, nsamples, path, seed):
     darcy = get_darcy_solver(shape, bounds)
     x, y = darcy.config.grid.coords
 
-    keys, paths = gen_sampling_keys(nsamples, path, seed=seed)
-    darcy.sample_inputs(keys, paths)
+    pairs = list(gen_keys(nsamples, path=path, seed=seed))
+    keys, paths = zip(*pairs)
+    keys = jnp.stack(keys)
+    samples = jax.jit(jax.vmap(darcy.sample_inputs))(keys)
+    solutions = jax.jit(jax.vmap(darcy.solve))(samples)
+    
+    for p, sample, sol in zip(paths, iter_pytree(samples), iter_pytree(solutions)):
+        save_h5(sample, p / "inputs.h5")
+        save_h5(sol, p / "solution.h5")
 
-    def _skip(p):
-        return Path(p).parent.name != f"seed_{seed}"
-
-    samples = []
-    for p in iterate_samples(path, skip=_skip):
-        sample = {}
-        load_h5(sample, p / "conductivity.h5", jax=True)
-        samples.append(sample)
-
-    samples = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *samples)
-
-    @jax.jit
-    def solve_one(sample):
-        return darcy.solve({"conductivity": sample})
-
-    solutions = jax.vmap(solve_one)(samples)
-
-    fig, axs = plot_samples(samples["const"], solutions["phi"], x, y)
+    fig, axs = plot_samples(samples['conductivity']["const"], solutions["phi"], x, y)
 
     plt.show()
 
@@ -134,21 +126,25 @@ def sinusoid_forcing(inputs, outputs):
     return inputs["amplitude"] * jnp.sin(jnp.pi * xg) * jnp.sin(jnp.pi * yg)
 
 
-def train_forcing(shape, key, save_dir):
+def train_forcing(shape, bounds, path, seed):
     """Try to learn a forcing parameter over some random fields."""
     # used_mib, total_mib = get_gpu_memory()[0]
     # print(f"Initial GPU: {used_mib} / {total_mib} MiB")
-
+    key = jax.random.key(seed)
     train_key, test_key = jax.random.split(key, 2)
 
     ntrain = 10
     ntest = 5
 
-    darcy = get_darcy_solver(shape)
+    train_keys = jnp.stack(jax.random.split(train_key, ntrain))
+    test_keys = jnp.stack(jax.random.split(test_key, ntest))
+
+    darcy = get_darcy_solver(shape, bounds)
     x, y = darcy.config.grid.coords
 
-    train_in = sample_darcy_random_field((x, y), ntrain, key=train_key)
-    test_in = sample_darcy_random_field((x, y), ntest, key=test_key)
+    sample_many = jax.jit(jax.vmap(darcy.sample_inputs))
+    train_in = sample_many(train_keys)
+    test_in = sample_many(test_keys)
 
     # Use a "true" value on the training data
     darcy.forcing = sinusoid_forcing
@@ -157,26 +153,23 @@ def train_forcing(shape, key, save_dir):
     param0 = jnp.asarray(-10.)
 
     @jax.jit
-    def solve_one(kappa, param):
-        return darcy.solve({"conductivity": {"const": kappa}, "forcing": {"amplitude": param}})["phi"]
-    
-    solve_many = jax.vmap(solve_one, in_axes=(0, None), out_axes=0)
+    def solve_one(inputs, param):
+        d = {**inputs}
+        d['forcing'] = {'amplitude': param}
+        return darcy.solve(d)
     
     # used_mib, total_mib = get_gpu_memory()[0]
     # print(f"Before solve GPU: {used_mib} / {total_mib} MiB")
-
     # print("Starting GPU monitor...")
-
     # thread, stop_event = monitor_gpu_memory(0.3)
 
+    solve_many = jax.vmap(solve_one, in_axes=(0, None), out_axes=0)
     train_out = solve_many(train_in, true_param)
-    # time.sleep(4)
     test_out = solve_many(test_in, true_param)
-
+    
     # print("Closing GPU monitor...")
     # stop_event.set()
     # thread.join()
-
     # used_mib, total_mib = get_gpu_memory()[0]
     # print(f"After solve GPU: {used_mib} / {total_mib} MiB")
 
@@ -184,36 +177,35 @@ def train_forcing(shape, key, save_dir):
     @jax.jit
     def loss_fn(param, *args):
         def body(i, acc):
-            pred = solve_one(train_in[i], param)
-            diff = pred - train_out[i]
+            pred = solve_one(pytree_at(train_in, i), param)["phi"]
+            diff = pred - pytree_at(train_out, i)["phi"]
             return acc + jnp.mean(diff**2)
-        total = jax.lax.fori_loop(0, train_in.shape[0], body, 0.0)
-        return total / train_in.shape[0]
+        total = jax.lax.fori_loop(0, ntrain, body, 0.0)
+        return total / ntrain
     
     @jax.jit
     def test_fn(param):
         def body(i, acc):
-            pred = solve_one(test_in[i], param)
-            diff = pred - test_out[i]
+            pred = solve_one(pytree_at(test_in, i), param)["phi"]
+            diff = pred - pytree_at(test_out, i)["phi"]
             return acc + jnp.mean(diff**2)
-        total = jax.lax.fori_loop(0, test_in.shape[0], body, 0.0)
-        return total / test_in.shape[0]
-
-    opt = Optimizer()
-
-    res = opt.run_debug(
+        total = jax.lax.fori_loop(0, ntest, body, 0.0)
+        return total / ntest
+    
+    res = train(
         loss_fn,
         params0=param0,
         optimizer=optax.adam(0.2),
         max_steps=100,
         max_runtime_s=120,
-        grad_tol=1e-10,
         log_interval=5,
         plot_interval=5,
         test_fn=test_fn,
+        test_tol=1e-6,
         live_plot=True,
-        save=save_dir,
-        prefix="darcy_"
+        save=path,
+        save_prefix="darcy_",
+        logger=get_logger("darcy-opt", stdout=False, log_file=path/"train.log")
     )
 
     print(f"True param: {true_param}, Result: {res}")
@@ -225,36 +217,43 @@ def train_forcing(shape, key, save_dir):
         "test_in": jax.device_get(test_in),
         "test_out": jax.device_get(test_out),
     }
-    with open(save_dir / "darcy_test_data.pkl", "wb") as fd:
+    with open(path / "darcy_test_data.pkl", "wb") as fd:
         pickle.dump(test_data, fd)
 
 
-def plot_validation(save_dir: str | Path, nshow: int = 3) -> None:
+def plot_validation(shape, bounds, path, nshow) -> None:
     """Load saved results and make quick validation plots."""
-    save_dir = Path(save_dir)
-    with open(save_dir / "darcy_opt-results.pkl", "rb") as fd:
-        res = pickle.load(fd)["params"]
+    save_dir = Path(path)
+    res = load_train_file(save_dir)["params"]
+
     with open(save_dir / "darcy_test_data.pkl", "rb") as fd:
         test_data = pickle.load(fd)
 
     x = jnp.asarray(test_data["x"])
     y = jnp.asarray(test_data["y"])
-    test_in = jnp.asarray(test_data["test_in"])
-    test_out = jnp.asarray(test_data["test_out"])
-
-    darcy = get_darcy_solver(test_in.shape[-2:])
+    test_in = jax.tree.map(lambda x: jnp.asarray(x), test_data['test_in'])
+    test_out = jax.tree.map(lambda x: jnp.asarray(x), test_data['test_out'])
+    darcy = get_darcy_solver(shape, bounds)
 
     darcy.forcing = sinusoid_forcing
     darcy.forcing_defaults = {"amplitude": 1.0}
 
     @jax.jit
-    def solve_one(kappa, param):
-        return darcy.solve({"conductivity": {"const": kappa}, "forcing": {"amplitude": param}})["phi"]
+    def solve_one(inputs, param):
+        d = {**inputs}
+        d['forcing'] = {'amplitude': param}
+        return darcy.solve(d)
 
-    solve_many = jax.vmap(solve_one, in_axes=(0, None))
+    solve_many = jax.vmap(solve_one, in_axes=(0, None), out_axes=0)
     pred_test = solve_many(test_in, res)
-    nshow = min(nshow, test_in.shape[0])
-    plot_samples(test_in[:nshow], test_out[:nshow], x, y, predictions=pred_test[:nshow])
+
+    nshow = min(nshow, pred_test['phi'].shape[0])
+    plot_samples(
+        test_in['conductivity']['const'][:nshow], 
+        test_out['phi'][:nshow], 
+        x, y, 
+        predictions=pred_test['phi'][:nshow]
+    )
     plt.show()
 
 
@@ -272,6 +271,16 @@ if __name__ == '__main__':
     path = Path(args.path)
     nshow = args.nshow
 
-    show_random_samples(shape, bounds, nshow, path, seed)
-    # train_forcing(shape, key, save_dir)
-    # plot_validation(save_dir, nshow)
+    if path.exists():
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+    # thread, stop = monitor_gpu_memory(0.5)
+
+    # show_random_samples(shape, bounds, nshow, path, seed)
+    train_forcing(shape, bounds, path, seed)
+
+    # stop.set()
+    # thread.join()
+    
+    plot_validation(shape, bounds, path, nshow)

@@ -20,14 +20,10 @@ solver: !model:romjax.poisson.Poisson2D
     k0: 1.0
   forcing_sampler: parametric
   forcing_sampler_opts:
-    format: txt
-    write_summary: false
     mu_x: { distribution: uniform, minval: 0.4, maxval: 0.6 }
     A0: { distribution: normal, mean: 0.5, std: 0.1 }
   conductivity_sampler: parametric
   conductivity_sampler_opts:
-    format: h5
-    write_summary: true
     k0: 
       distribution: !!python/name:romjax.poisson.darcy_field
       shape: *s

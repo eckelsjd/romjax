@@ -5,6 +5,8 @@ import pickle
 from pathlib import Path
 from typing import Callable, Iterator, Any
 from os import PathLike
+import os
+import re
 
 import jax
 import optax
@@ -17,7 +19,7 @@ import matplotlib.pyplot as plt
 from romjax.utils import tree_l2_norm
 
 
-__all__ = ['train']
+__all__ = ['train', 'load_train_file']
 
 
 def _prettify_timedelta(delta: float) -> str:
@@ -33,6 +35,33 @@ def _prettify_timedelta(delta: float) -> str:
     if minutes > 0:
         return f"{minutes:02d}:{seconds:02d}"
     return f"{delta:.3f} s"
+
+
+def load_train_file(path: str | PathLike, step: int = -1):
+    path = Path(path)
+    root = path if path.is_dir() else path.parent
+    pattern = re.compile(r"^(?P<prefix>.*)opt-iter-(?P<iter>\d+)\.pkl$")
+
+    matches: list[tuple[int, str]] = []
+    for entry in os.scandir(root):
+        if not entry.is_file():
+            continue
+        m = pattern.match(entry.name)
+        if m is None:
+            continue
+        matches.append((int(m.group("iter")), entry.path))
+
+    if not matches:
+        raise FileNotFoundError(f"No train iteration files found in {root}")
+
+    matches.sort(key=lambda x: x[0])
+    try:
+        target = matches[step][1]
+    except IndexError as exc:
+        raise IndexError(f"Iteration index {step} out of range (found {len(matches)} files)") from exc
+
+    with open(target, "rb") as fd:
+        return pickle.load(fd)
 
 
 def train(

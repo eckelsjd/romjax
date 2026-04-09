@@ -5,7 +5,7 @@
 """
 __version__ = "0.0.1"
 __all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
-           'gen_sampling_keys', 'train']
+           'gen_keys', 'train']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -20,7 +20,7 @@ import yaml as _yaml
 
 from .plotting import gridplot
 from .utils import load_h5, save_h5
-from .random import gen_sampling_keys
+from .random import gen_keys
 from .optim import train
 from .typing import DictModel, ImplicitModel
 
