@@ -13,10 +13,20 @@ from pydantic import BaseModel, Field, TypeAdapter, AfterValidator, ConfigDict
 from pydantic_core import core_schema
 
 
-__all__ = ['DictModel', 'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['RoxObject', 'DictModel', 'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 
-class DictModel(BaseModel, MutableMapping):
+class RoxObject:
+    """Subclass this if you want your classes to be recognized and loaded by romjax.YamlLoader."""
+    YAML_TAG = "!rox:"
+
+    @classmethod
+    def yaml_tag(cls) -> str:
+        """YAML tag used by romjax.YamlLoader"""
+        return f"{cls.YAML_TAG}{cls.__module__}.{cls.__name__}"
+    
+
+class DictModel(BaseModel, MutableMapping, RoxObject):
     """Allow dict-like access of pydantic models."""
 
     model_config = ConfigDict(
@@ -25,11 +35,6 @@ class DictModel(BaseModel, MutableMapping):
         validate_assignment=True,
         use_enum_values=True
     )
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by YamlLoader for this model class."""
-        return f"!model:{cls.__module__}.{cls.__name__}"
 
     def __getitem__(self, key: str) -> Any:
         if not hasattr(self, key):
@@ -49,10 +54,10 @@ class DictModel(BaseModel, MutableMapping):
             yield k
 
     def __len__(self) -> int:
-        return len(dict(self))
+        return len(self.model_extra)
 
 
-class ImplicitModel(BaseModel, ABC):
+class ImplicitModel(BaseModel, RoxObject, ABC):
     """An implicit function f(b,u) that maps inputs/outputs to residuals."""
     model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
 
@@ -70,11 +75,6 @@ class ImplicitModel(BaseModel, ABC):
     def sample_inputs(self, key: Key) -> PyTree:
         """Sample a single model input for the given key."""
         raise NotImplementedError
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by YamlLoader for this model class."""
-        return f"!model:{cls.__module__}.{cls.__name__}"
 
 
 class ModuleObjectSpec(BaseModel):
