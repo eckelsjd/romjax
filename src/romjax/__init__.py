@@ -22,7 +22,7 @@ from .plotting import gridplot
 from .utils import load_h5, save_h5
 from .random import gen_keys
 from .optim import train
-from .typing import DictModel, ImplicitModel
+from .typing import DictModel, ImplicitModel, RoxObject
 
 
 class ConfigLoader(_ABC):
@@ -44,10 +44,10 @@ class ConfigLoader(_ABC):
 class YamlLoader(ConfigLoader):
     """YAML configs. 
     
-    **Models**
-    - Represent `Model` or `DictModel` objects with `!model:path.to.Subclass` tag.
+    **romjax objects**
+    - Represent `romjax` objects with `!rox:path.to.Subclass` tag. Must be subclass of `RoxObject`
     - Supports basic Pydantic model_dump() to dictionary.
-    - Supports !!python/name tag for functions.
+    - Supports !!python/name tag for functions and other importable names
     """
 
     @staticmethod
@@ -68,21 +68,23 @@ class YamlLoader(ConfigLoader):
             return obj
 
         def _construct_python_name(loader: _yaml.SafeLoader, node: _yaml.Node) -> _Any:
+            """Any importable name (e.g. functions)."""
             value = loader.construct_scalar(node)
             return _construct_python_name_multi(loader, value, node)
 
-        def _construct_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> ImplicitModel | DictModel:
+        def _construct_romjax_object(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> RoxObject:
+            """Essentially just a convenience to automatically construct dataclasses when loading."""
             if not tag_suffix:
-                raise ValueError("Missing model class path in YAML tag.")
+                raise ValueError("Missing class path in YAML tag.")
             module_name, _, class_name = tag_suffix.rpartition(".")
             if not module_name or not class_name:
-                raise ValueError(f"Invalid model tag: {tag_suffix!r}")
+                raise ValueError(f"Invalid romjax tag: {tag_suffix!r}")
             module = _import_module(module_name)
             cls_obj = getattr(module, class_name, None)
             if cls_obj is None:
-                raise ValueError(f"Model class not found: {tag_suffix!r}")
-            if not isinstance(cls_obj, type) or not issubclass(cls_obj, ImplicitModel | DictModel):
-                raise TypeError(f"Tagged class is not an ImplicitModel or DictModel: {tag_suffix!r}")
+                raise ValueError(f"Class not found: {tag_suffix!r}")
+            if not isinstance(cls_obj, type) or not issubclass(cls_obj, RoxObject):
+                raise TypeError(f"Tagged class is not an instance of required RoxObject: {tag_suffix!r}")
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
                 return cls_obj(**data)
@@ -91,7 +93,7 @@ class YamlLoader(ConfigLoader):
 
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
-        _Loader.add_multi_constructor("!model:", _construct_model)
+        _Loader.add_multi_constructor(RoxObject.YAML_TAG, _construct_romjax_object)
         return _Loader
 
     @staticmethod
@@ -104,14 +106,14 @@ class YamlLoader(ConfigLoader):
             name = f"{data.__module__}.{data.__qualname__}"
             return dumper.represent_scalar("tag:yaml.org,2002:python/name", name)
 
-        def _represent_model(dumper: _yaml.SafeDumper, data: ImplicitModel) -> _yaml.Node:
+        def _represent_romjax_object(dumper: _yaml.SafeDumper, data: RoxObject) -> _yaml.Node:
             tag = data.yaml_tag()
             payload = data.model_dump()
             return dumper.represent_mapping(tag, payload)
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
-        _Dumper.add_multi_representer(ImplicitModel, _represent_model)
+        _Dumper.add_multi_representer(RoxObject, _represent_romjax_object)
         return _Dumper
 
     @classmethod
