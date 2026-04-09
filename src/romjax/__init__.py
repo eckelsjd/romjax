@@ -5,7 +5,7 @@
 """
 __version__ = "0.0.1"
 __all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
-           'gen_keys', 'train']
+           'gen_keys', 'train', 'random']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -20,7 +20,8 @@ import yaml as _yaml
 
 from .plotting import gridplot
 from .utils import load_h5, save_h5
-from .random import gen_keys
+from . import rng as random
+from .rng import gen_keys
 from .optim import train
 from .typing import DictModel, ImplicitModel, RoxObject
 
@@ -88,8 +89,11 @@ class YamlLoader(ConfigLoader):
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
                 return cls_obj(**data)
-            data = loader.construct_object(node)
-            return cls_obj(**data)
+            if isinstance(node, _yaml.SequenceNode):
+                data = loader.construct_sequence(node, deep=True)
+                return cls_obj(data)
+            data = loader.construct_scalar(node)
+            return cls_obj(data)
 
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
@@ -109,6 +113,8 @@ class YamlLoader(ConfigLoader):
         def _represent_romjax_object(dumper: _yaml.SafeDumper, data: RoxObject) -> _yaml.Node:
             tag = data.yaml_tag()
             payload = data.model_dump()
+            if isinstance(payload, list | tuple):
+                return dumper.represent_sequence(tag, payload)
             return dumper.represent_mapping(tag, payload)
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)

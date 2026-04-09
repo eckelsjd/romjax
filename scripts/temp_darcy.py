@@ -20,7 +20,7 @@ from romjax.poisson import Poisson2D, darcy_field
 from romjax.plotting import gridplot, get_scheme
 from romjax.optim import train, load_train_file
 from romjax.utils import get_gpu_memory, monitor_gpu_memory, load_h5, save_h5, iter_pytree, pytree_at, get_logger
-from romjax.random import gen_keys
+from romjax.rng import gen_keys
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".50"
 # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
