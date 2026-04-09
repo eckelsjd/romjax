@@ -17,7 +17,7 @@ from romjax.poisson import (
 from romjax.pde import UniformGrid, homogeneous_boundary
 from romjax.typing import DictModel
 from romjax.plotting import gridplot
-from romjax.random import gen_keys
+from romjax.rng import gen_keys
 from romjax.utils import load_h5
 
 

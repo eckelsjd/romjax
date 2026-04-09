@@ -1,13 +1,14 @@
-from typing import Hashable, Mapping, Any, Callable, Literal
+from typing import Hashable, Callable, Literal
 
-from pydantic import BaseModel, model_validator, field_validator, Field, ConfigDict, ValidationInfo
+import networkx as nx
+from pydantic import BaseModel, model_validator, Field, ConfigDict
 from jaxtyping import PyTree
 
-from romjax.typing import DictModel, RoxObject
+from romjax.typing import ListModel, RoxObject
 
 
-class Node(Hashable, BaseModel, RoxObject):
-    """Hashable node to be used with networkx. Allows pydantic validation of other node configs."""
+class Node(BaseModel, Hashable, RoxObject):
+    """Hashable node to be used with networkx. Essentially just a string with some extra validated fields."""
     name: str 
 
     @model_validator(mode="before")
@@ -30,9 +31,13 @@ class Node(Hashable, BaseModel, RoxObject):
     
     def __str__(self) -> str:
         return self.name
+    
+    def __repr__(self) ->str:
+        return self.__str__()
 
 
-class Edge(Hashable, BaseModel, RoxObject):
+class Edge(BaseModel, Hashable, RoxObject):
+    """Hashable edge to be used with networkx. Uses pydantic validation to support convenient a->b specification."""
     source: Node
     target: Node
     name: str = ""
@@ -50,13 +55,11 @@ class Edge(Hashable, BaseModel, RoxObject):
 
         return value
 
-    @field_validator("name", mode="after")
-    @classmethod
-    def _non_empty_name(cls, value, info: ValidationInfo) -> str:
-        if value == "" or value is None:
-            return f"{str(info.data['source'])}->{str(info.data['target'])}"
-        
-        return value
+    @model_validator(mode="after")
+    def _set_default_name(self):
+        if self.name == "" or self.name is None:
+            self.name = f"{self.source}->{self.target}"
+        return self
 
     def __hash__(self):
         return hash(self.name)
@@ -72,6 +75,9 @@ class Edge(Hashable, BaseModel, RoxObject):
     def __str__(self) -> str:
         return self.name
 
+    def __repr__(self) -> str:
+        return f"{self.name}: {self.source}->{self.target}"
+
     def __call__(self, x: PyTree, direction: Literal["forward", "backward"] = "forward") -> PyTree:
         if direction == "forward":
             if self.forward is None:
@@ -83,79 +89,40 @@ class Edge(Hashable, BaseModel, RoxObject):
             return self.backward(x)
         else:
             raise ValueError(f"Unknown direction {direction}")
-        
 
-class NodeList(DictModel):
-    """
-    Allow list- or dict-like access of graph nodes with validation.
-    
-    Primarily acts like a MutableMapping and a Pydantic model, whose elements are validated Nodes.
-    Also for convenience acts like an ordered list with integer/slice indexing.
-    """
 
-    def __init__(self, data: Mapping | list | tuple | None = None, **kwargs):
-        super().__init__()
-        self.update(data, **kwargs)  # Triggers validation of all elements
-    
-    def __setitem__(self, key: str | int, value: Any) -> None:
-        if isinstance(key, int):
-            key = list(self.keys())[key]
-        super().__setitem__(str(key), Node.model_validate(value))
-    
-    def __getitem__(self, key) -> Node | list[Node]:
-        if isinstance(key, list | tuple):
-            return [self.__getitem__(ele) for ele in key]
-        if isinstance(key, int | slice):
-            return list(self.values())[key]
-        return super().__getitem__(str(key))
-    
-    def __delitem__(self, key) -> None:
-        if isinstance(key, list | tuple):
-            _keys = list(self.keys())
-            _del_keys = [_keys[ele] for ele in key]
-            for ele in _del_keys:
-                self.__delitem__(ele)
-        elif isinstance(key, int | slice):
-            ele = list(self.keys())[key]
-            if isinstance(ele, list):
-                for item in ele:
-                    super().__delitem__(item)
-            else:
-                super().__delitem__(ele)
-        else:
-            super().__delitem__(str(key))
+# Equivalent to the alias NodeList = ListModel[Node], but now others can use this by importing it
+class NodeList(ListModel[Node]):
+    """A list of graph nodes."""
+    pass
 
-    # Override dict to work with lists or dicts
-    def update(self, data: Mapping | list | tuple | None = None, **kwargs):
-        if data is not None:
-            if isinstance(data, Mapping):
-                super().update(data)
-            else:
-                data = [data] if not isinstance(data, list | tuple) else data
-                for ele in data:
-                    self.__setitem__(str(ele), ele)
-        if kwargs:
-            super().update(kwargs)
-    
-    # Some extra list-like methods for convenience (since we can)
-    def append(self, data):
-        self.update(data)
 
-    def extend(self, data):
-        self.update(data)
-    
-    def index(self, key):
-        for i, k in enumerate(self.keys()):
-            if k == key:
-                return i
-        raise ValueError(f"'{key}' is not in list")
+class EdgeList(ListModel[Edge]):
+    """A list of graph edges."""
+    pass
 
 
 class FunctionGraph(BaseModel, RoxObject):
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
     nodes: NodeList = Field(default_factory=NodeList)
+    edges: EdgeList = Field(default_factory=EdgeList)
 
-    def graph(self):
-        # Build nx graph on the fly from nodes/edges
-        pass
+    @model_validator(mode='after')
+    def _add_extra_nodes_from_edges(self):
+        """If edges have source/targets not in the provided node list, add them"""
+        for edge in self.edges.values():
+            if edge.source not in self.nodes:
+                self.nodes.append(edge.source)
+            if edge.target not in self.nodes:
+                self.nodes.append(edge.target)
+        
+        return self
+
+    def graph(self) -> nx.DiGraph:
+        graph = nx.DiGraph()
+        graph.add_nodes_from(self.nodes.values())
+        graph.add_edges_from(
+            [(edge.source, edge.target, {"object": edge}) for edge in self.edges.values()]
+        )
+        return graph

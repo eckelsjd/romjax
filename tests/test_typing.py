@@ -3,10 +3,10 @@ from pathlib import Path
 import lineax as lx
 import optimistix as optx
 import pytest
-from pydantic import ValidationError, BaseModel
+from pydantic import ValidationError, BaseModel, model_validator
 
 from romjax import YamlLoader, DictModel
-from romjax.typing import LxObject, OptxObject
+from romjax.typing import LxObject, OptxObject, ListModel
 
 
 class CustomSettings(DictModel, extra='forbid'):
@@ -89,6 +89,37 @@ class LinearSolverConfig(BaseModel):
     solver: LxObject
 
 
+class ListNode(BaseModel):
+    name: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_str(cls, value):
+        if isinstance(value, str):
+            return {"name": value}
+        return value
+
+
+class ListEdge(BaseModel):
+    src: str
+    dst: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_tuple(cls, value):
+        if isinstance(value, tuple) and len(value) == 2:
+            return {"src": value[0], "dst": value[1]}
+        return value
+
+
+class NodeListModel(ListModel[ListNode]):
+    pass
+
+
+class EdgeListModel(ListModel[ListEdge]):
+    pass
+
+
 def test_module_object_nested_validation():
     data = {
         "name": "Newton",
@@ -139,3 +170,68 @@ def test_module_object_external_serialization():
     assert "rtol" in dumped["solver"]["opts"]
     assert "atol" in dumped["solver"]["opts"]
     
+
+def test_list_model():
+    nodes = NodeListModel(["a", "b", "c"])
+    edges = EdgeListModel([("a", "b"), ("b", "c")])
+
+    assert list(nodes.keys()) == ["a", "b", "c"]
+    assert nodes[0].name == "a"
+    assert [n.name for n in nodes[1:]] == ["b", "c"]
+    assert [n.name for n in nodes[[2, 0]]] == ["c", "a"]
+    assert nodes["b"].name == "b"
+    assert isinstance(edges[0], ListEdge)
+    assert edges[0].src == "a"
+    assert edges[0].dst == "b"
+
+    nodes[1] = "beta"
+    nodes["d"] = {"name": "d"}
+    nodes.append("e")
+    assert list(nodes.keys()) == ["a", "b", "c", "d", "e"]
+    assert nodes[1].name == "beta"
+    assert all(isinstance(node, ListNode) for node in nodes.values())
+
+    with pytest.raises(ValidationError):
+        nodes["bad"] = {"not_name": "x"}
+    with pytest.raises(ValidationError):
+        edges["bad"] = {"src": "x"}
+
+    del nodes[0]
+    assert list(nodes.keys()) == ["b", "c", "d", "e"]
+    del nodes[[1, 2]]
+    assert list(nodes.keys()) == ["b", "e"]
+
+    assert "_adapter" not in nodes.model_dump()
+    assert "_adapter" not in repr(nodes)
+
+    yaml_text = (
+        "nodes: !rox:tests.test_typing.NodeListModel\n"
+        "  a: a\n"
+        "  b: {name: b}\n"
+        "edges: !rox:tests.test_typing.EdgeListModel\n"
+        "  ab: {src: a, dst: b}\n"
+        "  bc: {src: b, dst: c}\n"
+    )
+    data = YamlLoader.load(yaml_text)
+    assert isinstance(data["nodes"], NodeListModel)
+    assert isinstance(data["edges"], EdgeListModel)
+    assert [n.name for n in data["nodes"].values()] == ["a", "b"]
+    assert [(e.src, e.dst) for e in data["edges"].values()] == [("a", "b"), ("b", "c")]
+
+    dumped = YamlLoader.dump({"nodes": nodes, "edges": edges})
+    reloaded = YamlLoader.load(dumped)
+    assert isinstance(reloaded["nodes"], NodeListModel)
+    assert isinstance(reloaded["edges"], EdgeListModel)
+    assert [n.name for n in reloaded["nodes"].values()] == ["beta", "e"]
+    assert [(e.src, e.dst) for e in reloaded["edges"].values()] == [("a", "b"), ("b", "c")]
+
+
+def test_list_model_serialization_round_trip():
+    nodes = NodeListModel(["alpha", {"name": "beta"}])
+
+    dumped = nodes.model_dump()
+    assert dumped == [{"name": "alpha"}, {"name": "beta"}]
+
+    reloaded = NodeListModel(dumped)
+    assert isinstance(reloaded, NodeListModel)
+    assert [node.name for node in reloaded.values()] == ["alpha", "beta"]

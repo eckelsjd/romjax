@@ -10,7 +10,7 @@ import jax
 from romjax.pde import Coordinates, homogeneous_boundary, UniformGrid, BoundarySpec, BoundaryType
 from romjax.typing import IterativeSolver, AdjointMethod, DictModel, ImplicitModel
 from romjax.utils import merge_pytrees, to_pytree
-from romjax.random import SamplerCallable, Distribution, parametric_sampler
+from romjax.rng import SamplerCallable, Distribution, parametric_sampler
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]

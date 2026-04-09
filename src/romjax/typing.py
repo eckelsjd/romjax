@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Protocol, Annotated, MutableMapping, Iterator, Iterable
+from typing import Any, Protocol, Annotated, MutableMapping, Iterator, Mapping, get_args
 from weakref import WeakKeyDictionary
 from abc import abstractmethod, ABC
-from os import PathLike
 
 import lineax as lx
 import optimistix as optx
 from jaxtyping import PyTree, Key
-from pydantic import BaseModel, Field, TypeAdapter, AfterValidator, ConfigDict
+from pydantic import BaseModel, Field, TypeAdapter, AfterValidator, ConfigDict, PrivateAttr, SerializationInfo, model_serializer, model_validator
 from pydantic_core import core_schema
 
 
-__all__ = ['RoxObject', 'DictModel', 'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['RoxObject', 'DictModel', 'ListModel', 
+           'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 
 class RoxObject:
@@ -54,7 +54,115 @@ class DictModel(BaseModel, MutableMapping, RoxObject):
             yield k
 
     def __len__(self) -> int:
-        return len(self.model_extra)
+        return len(type(self).model_fields) + len(self.model_extra or ())
+
+
+class ListModel[T: BaseModel](DictModel):
+    """
+    Allow list- or dict-like access/storage of generic pydantic models (T), and validates them when setting.
+    
+    Primarily acts like a MutableMapping and a Pydantic model, whose elements are validated pydantic models of type T.
+    Also for convenience acts like an ordered list with integer/slice indexing.
+    """
+
+    _adapter: TypeAdapter | None = PrivateAttr(default=None)
+
+    def _item_type(self) -> type[BaseModel]:
+        args = self.__pydantic_generic_metadata__.get('args', ())
+        if args:
+            return args[0]
+
+        for cls in type(self).mro():
+            meta = getattr(cls, "__pydantic_generic_metadata__", None)
+            if not meta:
+                continue
+            base_args = meta.get("args", ())
+            if base_args:
+                return base_args[0]
+
+        for base in getattr(type(self), "__orig_bases__", ()):
+            base_args = get_args(base)
+            if base_args:
+                return base_args[0]
+
+        raise TypeError(f"Could not infer item type for {type(self).__name__}")
+
+    def _get_adapter(self) -> TypeAdapter:
+        """Helper for using type T as a way to validate internal data when setting."""
+        if self._adapter is None:
+            self._adapter = TypeAdapter(self._item_type())
+        return self._adapter
+    
+    # @model_validator(mode='before')
+    # @classmethod
+    # def _from_list(cls, value):
+    #     if isinstance(value, list):
+    #         return cls(value)  # avoids dict unpacking
+    #     return value
+    
+    @model_serializer(mode="plain")
+    def _serialize_as_list(self, info: SerializationInfo) -> list[Any]:
+        """Serialize as a list of T-serialized items in key iteration order."""
+        adapter = self._get_adapter()
+        mode = "json" if info.mode == "json" else "python"
+        return [adapter.dump_python(value, mode=mode) for value in self.values()]
+
+    def __init__(self, data: Mapping | list | tuple | None = None, **kwargs):
+        super().__init__()
+        self.update(data, **kwargs)  # Triggers validation of all elements
+    
+    def __setitem__(self, key: str | int, value: Any) -> None:
+        if isinstance(key, int):
+            key = list(self.keys())[key]
+        super().__setitem__(str(key), self._get_adapter().validate_python(value))
+    
+    def __getitem__(self, key) -> T | list[T]:
+        if isinstance(key, list | tuple):
+            return [self.__getitem__(ele) for ele in key]
+        if isinstance(key, int | slice):
+            return list(self.values())[key]
+        return super().__getitem__(str(key))
+    
+    def __delitem__(self, key) -> None:
+        if isinstance(key, list | tuple):
+            _keys = list(self.keys())
+            _del_keys = [_keys[ele] for ele in key]
+            for ele in _del_keys:
+                self.__delitem__(ele)
+        elif isinstance(key, int | slice):
+            ele = list(self.keys())[key]
+            if isinstance(ele, list):
+                for item in ele:
+                    super().__delitem__(item)
+            else:
+                super().__delitem__(ele)
+        else:
+            super().__delitem__(str(key))
+
+    # Override dict to work with lists or dicts
+    def update(self, data: Mapping | list | tuple | None = None, **kwargs):
+        if data is not None:
+            if isinstance(data, Mapping):
+                super().update(data)
+            else:
+                data = [data] if not isinstance(data, list | tuple) else data
+                for ele in data:
+                    self.__setitem__(str(ele), ele)
+        if kwargs:
+            super().update(kwargs)
+    
+    # Some extra list-like methods for convenience (since we can)
+    def append(self, data):
+        self.update(data)
+
+    def extend(self, data):
+        self.update(data)
+    
+    def index(self, key):
+        for i, k in enumerate(self.keys()):
+            if k == key:
+                return i
+        raise ValueError(f"'{key}' is not in list")
 
 
 class ImplicitModel(BaseModel, RoxObject, ABC):

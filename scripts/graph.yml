@@ -1,0 +1,10 @@
+!rox:romjax.graph.FunctionGraph
+nodes: [v1, v2, v3, v6]
+edges: 
+  - source: v1
+    target: v2
+    forward: !!python/name:__main__.fun1
+    backward: !!python/name:__main__.fun1_inv
+  - v2->v3
+  - v3->v1
+  - v4->v5
