@@ -4,7 +4,7 @@
 - License - MIT
 """
 __version__ = "0.0.1"
-__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
+__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ListModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
            'gen_keys', 'train', 'random']
 
 from abc import ABC as _ABC
@@ -23,7 +23,7 @@ from .utils import load_h5, save_h5
 from . import rng as random
 from .rng import gen_keys
 from .optim import train
-from .typing import DictModel, ImplicitModel, RoxObject
+from .typing import DictModel, ListModel, RoxObject
 
 
 class ConfigLoader(_ABC):

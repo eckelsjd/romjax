@@ -1,4 +1,5 @@
-from typing import Hashable, Callable, Literal
+from typing import Hashable, Literal, Any
+from abc import abstractmethod, ABC
 
 import networkx as nx
 from pydantic import BaseModel, model_validator, Field, ConfigDict
@@ -8,7 +9,11 @@ from romjax.typing import ListModel, RoxObject
 
 
 class Node(BaseModel, Hashable, RoxObject):
-    """Hashable node to be used with networkx. Essentially just a string with some extra validated fields."""
+    """
+    A Node in a FunctionGraph represents a vector space. At the moment, this is essentially just a string identifier.
+
+    Must be hashable to be usable with networkx. Just hashes using the string identifier currently.
+    """
     name: str 
 
     @model_validator(mode="before")
@@ -36,13 +41,19 @@ class Node(BaseModel, Hashable, RoxObject):
         return self.__str__()
 
 
-class Edge(BaseModel, Hashable, RoxObject):
-    """Hashable edge to be used with networkx. Uses pydantic validation to support convenient a->b specification."""
+class Edge(BaseModel, Hashable, RoxObject, ABC):
+    """
+    An Edge is the abstract class for function mappings between nodes (vector spaces) in a FunctionGraph.
+
+    Must implement forward/backward calls to map vectors (PyTrees) between the source/target nodes.
+    Hashable for easy access and consistency with Node via a string identifier.
+    Can specify simply as "a->b" for convenience.
+    """
+    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+
     source: Node
     target: Node
     name: str = ""
-    forward: Callable[[PyTree], PyTree] | None = None
-    backward: Callable[[PyTree], PyTree] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -80,16 +91,32 @@ class Edge(BaseModel, Hashable, RoxObject):
 
     def __call__(self, x: PyTree, direction: Literal["forward", "backward"] = "forward") -> PyTree:
         if direction == "forward":
-            if self.forward is None:
-                raise RuntimeError(f"Must define a forward function for edge {self.name}")
             return self.forward(x)
         elif direction == "backward":
-            if self.backward is None:
-                raise RuntimeError(f"Must define a backward function for edge {self.name}")
             return self.backward(x)
         else:
             raise ValueError(f"Unknown direction {direction}")
+    
+    @abstractmethod
+    def forward(self, x: PyTree) -> PyTree:
+        """Maps a vector `x` from source to target."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def backward(self, x: PyTree) -> PyTree:
+        """Maps a vector `x` from target to source."""
+        raise NotImplementedError
+    
 
+class IdentityEdge(Edge):
+    """Default edge mapping that acts as the identity in both directions."""
+
+    def forward(self, x: PyTree) -> PyTree:
+        return x
+
+    def backward(self, x: PyTree) -> PyTree:
+        return x
+    
 
 # Equivalent to the alias NodeList = ListModel[Node], but now others can use this by importing it
 class NodeList(ListModel[Node]):
@@ -98,8 +125,15 @@ class NodeList(ListModel[Node]):
 
 
 class EdgeList(ListModel[Edge]):
-    """A list of graph edges."""
-    pass
+    """A list of graph edges.
+
+    Untyped edge inputs (e.g., dicts or strings) are parsed as :class:`IdentityEdge` by default.
+    """
+
+    def __setitem__(self, key: str | int, value: Any) -> None:
+        if not isinstance(value, Edge):
+            value = IdentityEdge.model_validate(value)
+        super().__setitem__(key, value)
 
 
 class FunctionGraph(BaseModel, RoxObject):

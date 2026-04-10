@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from romjax import YamlLoader
-from romjax.typing import ImplicitModel
+from romjax.graph import ImplicitModel
 from romjax.poisson import Poisson2D
 
 
@@ -26,6 +26,9 @@ class CustomModel(ImplicitModel):
         return 0
     
     def sample_inputs(self, *args, **kwargs):
+        return 0
+    
+    def sample_outputs(self, *args, **kwargs):
         return 0
 
 

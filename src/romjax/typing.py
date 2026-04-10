@@ -3,17 +3,22 @@ from __future__ import annotations
 from inspect import Parameter, signature
 from typing import Any, Protocol, Annotated, MutableMapping, Iterator, Mapping, get_args
 from weakref import WeakKeyDictionary
-from abc import abstractmethod, ABC
 
 import lineax as lx
 import optimistix as optx
-from jaxtyping import PyTree, Key
-from pydantic import BaseModel, Field, TypeAdapter, AfterValidator, ConfigDict, PrivateAttr, SerializationInfo, model_serializer, model_validator
-from pydantic_core import core_schema
+from pydantic import (
+    BaseModel, 
+    Field, 
+    TypeAdapter, 
+    AfterValidator, 
+    ConfigDict, 
+    PrivateAttr, 
+    SerializationInfo, 
+    model_serializer, 
+)
 
 
-__all__ = ['RoxObject', 'DictModel', 'ListModel', 
-           'ImplicitModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['RoxObject', 'DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 
 class RoxObject:
@@ -163,26 +168,6 @@ class ListModel[T: BaseModel](DictModel):
             if k == key:
                 return i
         raise ValueError(f"'{key}' is not in list")
-
-
-class ImplicitModel(BaseModel, RoxObject, ABC):
-    """An implicit function f(b,u) that maps inputs/outputs to residuals."""
-    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
-
-    @abstractmethod
-    def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
-        """Evaluate forward residual function f(b,u)."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
-        """Solve inverse residual function f(b,u)=w."""
-        raise NotImplementedError
-    
-    @abstractmethod
-    def sample_inputs(self, key: Key) -> PyTree:
-        """Sample a single model input for the given key."""
-        raise NotImplementedError
 
 
 class ModuleObjectSpec(BaseModel):

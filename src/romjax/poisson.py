@@ -8,9 +8,11 @@ from pydantic import Field, PositiveInt, ValidationInfo, field_validator
 import jax
 
 from romjax.pde import Coordinates, homogeneous_boundary, UniformGrid, BoundarySpec, BoundaryType
-from romjax.typing import IterativeSolver, AdjointMethod, DictModel, ImplicitModel
+from romjax.typing import IterativeSolver, AdjointMethod, DictModel
 from romjax.utils import merge_pytrees, to_pytree
 from romjax.rng import SamplerCallable, Distribution, parametric_sampler
+from romjax.graph import Node
+from romjax.model import ImplicitModel, Sampleable
 
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
@@ -222,10 +224,14 @@ class PoissonConfig(DictModel):
         return value
 
 
-class Poisson2D(ImplicitModel):
+class Poisson2D(ImplicitModel, Sampleable):
 
     # Required (and static once set)
     config: PoissonConfig
+
+    # To satisfy criteria for being a graph edge
+    source: Node = Node("poisson_in")
+    target: Node = Node("poisson_out")
 
     # Optional/default (and optionally variable online)
     forcing: ForcingCallable = constant_forcing
