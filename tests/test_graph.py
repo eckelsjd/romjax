@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from romjax.graph import Node, Edge, NodeList, EdgeList
+from romjax.graph import Node, Edge, IdentityEdge, NodeList, EdgeList
 from romjax import YamlLoader
 
 
@@ -55,9 +55,9 @@ def test_node_list():
 def test_edge_list():
     edges = EdgeList(
         [
-            Edge(source="a", target="b"),
-            Edge(source="b", target="c", name="b->c"),
-            Edge(source="c", target="d", name=""),
+            IdentityEdge(source="a", target="b"),
+            IdentityEdge(source="b", target="c", name="b->c"),
+            IdentityEdge(source="c", target="d", name=""),
         ]
     )
 
@@ -71,7 +71,7 @@ def test_edge_list():
 
     edges[1] = {"source": "b", "target": "beta", "name": "b->beta"}
     edges["d->e"] = {"source": "d", "target": "e", "name": "d->e"}
-    edges.append(Edge(source="e", target="f", name="e->f"))
+    edges.append(IdentityEdge(source="e", target="f", name="e->f"))
     assert list(edges.keys()) == ["a->b", "b->c", "c->d", "d->e", "e->f"]
     assert edges[1].name == "b->beta"
     assert all(isinstance(e, Edge) for e in edges.values())
@@ -84,7 +84,7 @@ def test_edge_list():
     del edges[[1, 2]]
     assert list(edges.keys()) == ["b->c", "e->f"]
 
-    edge = Edge(source="omega", target="psi", name="omega->psi")
+    edge = IdentityEdge(source="omega", target="psi", name="omega->psi")
     assert edge == "omega->psi"
     assert edge != "omega->other"
     assert edge != Node(name="omega")
