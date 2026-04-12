@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from romjax.plotting import gridplot
-from romjax.optimization import Optimizer
+from romjax.optim import train
 
 jax.config.update('jax_platform_name', 'cpu')
 
@@ -217,7 +217,6 @@ def simple_cnn():
             cnt += 1
         return avg_acc / cnt
 
-    opt = Optimizer()
     key, subkey = jax.random.split(key, 2)
     model = CNN(subkey)
     trainloader = dataloader((x_train, y_train), BATCH_SIZE, epochs=EPOCHS)  # infinite
@@ -245,7 +244,7 @@ def simple_cnn():
     
     # model_hat = train(model, trainloader, optax.adamw(LEARNING_RATE), STEPS, PRINT_EVERY)
 
-    model_hat = opt.run_debug(
+    model_hat = train(
         loss,
         model,
         optax.adam(LEARNING_RATE),
@@ -287,6 +286,84 @@ def simple_cnn():
     plt.show()
 
 
+def filtering():
+    # See what we can do with eqx.filter
+    shape = (3, 2)
+    pytree = {
+        "inputs": {
+            "boundary": [1, 2, 3],
+            "conductivity": {
+                "k0": jnp.array([1, 2, 3, 4 ,5 ]),
+                "alpha": jnp.array(1.0)
+            }
+        },
+        "outputs": {
+            "a": (1, {"hello": 2, "phi": jnp.ones(shape) * 3.3}, 3, jax.nn.relu),
+            "b": jnp.ones(shape) * 1.1,
+        }
+    }
+
+    def _get_subtree(tree, path):
+        node = tree
+        for token in path:
+            if isinstance(node, dict):
+                node = node[token]
+            elif isinstance(token, int):
+                node = node[token]
+            else:
+                node = getattr(node, token)
+        return node
+
+    def _apply_to_subtree(subtree, spec_value):
+        if not isinstance(spec_value, bool) and not callable(spec_value):
+            raise TypeError("spec_value must be a bool or a predicate callable.")
+        return jax.tree_util.tree_map(lambda _: spec_value, subtree)
+
+    def filter_subtree(tree, *paths, default=False, keep=True):
+        """
+        Keep only explicitly specified subtree paths without knowing the full tree structure.
+
+        :param tree: arbitrary pytree
+        :param paths: sequences of keys/indices/attribute names
+        :param default: default spec value for all leaves
+        :param keep: whether to keep (True) or drop (False) the specified paths
+        :return: filtered pytree with only the requested subtree paths preserved
+        """
+        spec = jax.tree_util.tree_map(lambda _: default, tree)
+        for path in paths:
+            subtree = _get_subtree(tree, path)
+            replacement = _apply_to_subtree(subtree, keep)
+            spec = eqx.tree_at(lambda t, p=path: _get_subtree(t, p), spec, replacement)
+        return eqx.filter(tree, spec)
+
+    def filter_with_spec_paths(tree, path_specs, default=False):
+        """
+        Build a full spec pytree, then override specific paths with explicit spec values.
+
+        :param tree: arbitrary pytree
+        :param path_specs: list of (path, spec_value) overrides
+        :param default: default spec value for all leaves
+        :return: filtered pytree with overridden paths
+        """
+        spec = jax.tree_util.tree_map(lambda _: default, tree)
+        for path, spec_value in path_specs:
+            subtree = _get_subtree(tree, path)
+            replacement = _apply_to_subtree(subtree, spec_value)
+            spec = eqx.tree_at(lambda t, p=path: _get_subtree(t, p), spec, replacement)
+        return eqx.filter(tree, spec)
+
+    root = ({"tag": "meta"}, pytree, [jnp.array(0.0)])
+    filtered = filter_subtree(root, (1, "inputs"))
+    print(filtered)
+
+    filtered = filter_with_spec_paths(
+        root,
+        [((1, "outputs"), lambda x: eqx.is_array(x) and getattr(x, "shape", None) == shape)],
+    )
+    print(filtered)
+
+
 if __name__ == '__main__':
     # simple_mlp()
-    simple_cnn()
+    # simple_cnn()
+    filtering()
