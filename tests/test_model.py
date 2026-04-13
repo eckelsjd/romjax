@@ -1,125 +1,371 @@
+from __future__ import annotations
+
+import equinox as eqx
+import jax
 import jax.numpy as jnp
+import optax
 
 from romjax import YamlLoader
-from romjax.model import FilterModel
+from romjax.graph import FunctionGraph, Node
+from romjax.model import (
+    ConvAutoencoder2D,
+    ExplicitModel,
+    FilterModel,
+    ImplicitModel,
+    LinearProjection,
+    eqx_evaluate,
+)
 
 
-def _empty_forward_tree() -> dict:
+def _tree_input() -> dict:
     return {
-        "outputs": {"a_plus": None, "b_times": None},
-        "meta": {"shift": None, "gain": None, "tag": None},
+        "pde1": {
+            "inputs": {
+                "forcing": jnp.array([1.0, 2.0, 3.0]),
+                "alpha": jnp.array(0.25),
+            },
+            "outputs": {
+                "phi": jnp.array([2.0, 4.0, 6.0]),
+            },
+        },
+        "meta": {
+            "tag": "case-a",
+        },
     }
 
 
-def _empty_backward_tree() -> dict:
+def forward_pack_fields(x: dict, _: object | None = None) -> dict:
+    forcing = x["pde1"]["inputs"]["forcing"]
+    phi = x["pde1"]["outputs"]["phi"]
     return {
-        "inputs": {"a": None, "b": [None, {"gain": None}]},
-        "meta": {"shift": None, "tag": None},
+        "features": {
+            "pair": jnp.stack([forcing, phi], axis=0),
+        },
+        "carry": {
+            "alpha": x["pde1"]["inputs"]["alpha"],
+        },
+        "meta": {
+            "tag": x["meta"]["tag"],
+        },
     }
 
 
-def forward_a(x: dict) -> dict:
-    y = _empty_forward_tree()
-    y["outputs"]["a_plus"] = x["inputs"]["a"] + x["meta"]["shift"]
-    y["meta"]["shift"] = x["meta"]["shift"]
-    return y
-
-
-def backward_a(y: dict) -> dict:
-    x = _empty_backward_tree()
-    shift = y["meta"]["shift"]
-    x["inputs"]["a"] = y["outputs"]["a_plus"] - shift
-    x["meta"]["shift"] = shift
-    return x
-
-
-def forward_b(x: dict, multiplier: float = 1.0) -> dict:
-    y = _empty_forward_tree()
-    b0 = x["inputs"]["b"][0]
-    gain = x["inputs"]["b"][1]["gain"]
-    y["outputs"]["b_times"] = b0 * gain * multiplier
-    y["meta"]["gain"] = gain
-    y["meta"]["tag"] = x["meta"]["tag"]
-    return y
-
-
-def backward_b(y: dict, multiplier: float = 1.0) -> dict:
-    x = _empty_backward_tree()
-    gain = y["meta"]["gain"]
-    x["inputs"]["b"] = [y["outputs"]["b_times"] / (gain * multiplier), {"gain": gain}]
-    x["meta"]["tag"] = y["meta"]["tag"]
-    return x
+def backward_unpack_fields(y: dict, _: object | None = None) -> dict:
+    pair = y["latent"]["pair"]
+    return {
+        "recovered": {
+            "forcing": pair[0],
+            "phi": pair[1],
+            "alpha": y["latent"]["alpha"],
+            "tag": y["meta"]["tag"],
+        }
+    }
 
 
 def _model_yaml() -> str:
     return (
         "model: !rox:romjax.model.FilterModel\n"
-        "  source: latent\n"
-        "  target: observed\n"
+        "  source: pde1_state\n"
+        "  target: pde2_state\n"
         "  filters:\n"
         "    - in_paths:\n"
-        "        - path: [inputs, a]\n"
-        "        - path: [meta, shift]\n"
+        "        - path: [pde1, inputs, forcing]\n"
+        "        - path: [pde1, outputs, phi]\n"
+        "        - path: [pde1, inputs, alpha]\n"
+        "        - path: [meta, tag]\n"
         "      out_paths:\n"
-        "        - path: [outputs, a_plus]\n"
-        "        - path: [meta, shift]\n"
-        "      forward: !!python/name:tests.test_model.forward_a\n"
-        "      backward: !!python/name:tests.test_model.backward_a\n"
-        "    - in_spec:\n"
-        "        inputs:\n"
-        "          a: false\n"
-        "          b: [true, {gain: true}]\n"
-        "        meta:\n"
-        "          shift: false\n"
-        "          tag: true\n"
-        "      out_spec:\n"
-        "        outputs:\n"
-        "          a_plus: false\n"
-        "          b_times: true\n"
-        "        meta:\n"
-        "          shift: false\n"
-        "          gain: true\n"
-        "          tag: true\n"
-        "      forward: !!python/name:tests.test_model.forward_b\n"
-        "      forward_opts: {multiplier: 2.0}\n"
-        "      backward: !!python/name:tests.test_model.backward_b\n"
-        "      backward_opts: {multiplier: 2.0}\n"
+        "        - path: [latent, pair]\n"
+        "        - path: [latent, alpha]\n"
+        "        - path: [meta, tag]\n"
+        "      forward: !!python/name:tests.test_model.forward_pack_fields\n"
+        "      backward: !!python/name:tests.test_model.backward_unpack_fields\n"
+        "      forward_routes:\n"
+        "        - source: [features, pair]\n"
+        "          target: [latent, pair]\n"
+        "        - source: [carry, alpha]\n"
+        "          target: [latent, alpha]\n"
+        "        - source: [meta, tag]\n"
+        "          target: [meta, tag]\n"
+        "      backward_routes:\n"
+        "        - source: [recovered, forcing]\n"
+        "          target: [pde1, inputs, forcing]\n"
+        "        - source: [recovered, phi]\n"
+        "          target: [pde1, outputs, phi]\n"
+        "        - source: [recovered, alpha]\n"
+        "          target: [pde1, inputs, alpha]\n"
+        "        - source: [recovered, tag]\n"
+        "          target: [meta, tag]\n"
     )
 
 
-def _input_tree() -> dict:
+class ToyHighPDE(ImplicitModel):
+    source: Node = Node(name="high_inputs")
+    target: Node = Node(name="high_outputs")
+
+    def evaluate(self, inputs: dict, outputs: dict) -> dict:
+        pred_phi = inputs["forcing"] + inputs["alpha"]
+        return {"phi_residual": outputs["phi"] - pred_phi}
+
+    def solve(self, inputs: dict, residuals: dict) -> dict:
+        pred_phi = inputs["forcing"] + inputs["alpha"]
+        return {"phi": residuals["phi_residual"] + pred_phi}
+
+
+class ToyLowPDE(ImplicitModel):
+    source: Node = Node(name="low_inputs")
+    target: Node = Node(name="low_outputs")
+
+    def evaluate(self, inputs: dict, outputs: dict) -> dict:
+        pred_phi = inputs["x_inputs"] + inputs["x_outputs"] + inputs["x_shared"]
+        return {"phi_red_residual": outputs["phi_red"] - pred_phi}
+
+    def solve(self, inputs: dict, residuals: dict) -> dict:
+        pred_phi = inputs["x_inputs"] + inputs["x_outputs"] + inputs["x_shared"]
+        return {"phi_red": residuals["phi_red_residual"] + pred_phi}
+
+
+class LatentGainEdge(ExplicitModel):
+    source: Node = Node(name="latent")
+    target: Node = Node(name="latent_proc")
+
+    def pushforward(self, inputs: dict) -> dict:
+        return {"z": inputs["gain"] * inputs["z"]}
+
+
+def high_to_low(x: dict, _: object | None = None) -> dict:
+    forcing = x["high"]["inputs"]["forcing"]
+    phi = x["high"]["outputs"]["phi"]
     return {
-        "inputs": {
-            "a": jnp.array([1.0, 3.0, 5.0]),
-            "b": [jnp.array([[2.0, 4.0], [6.0, 8.0]]), {"gain": jnp.array(3.0)}],
-        },
-        "meta": {"shift": jnp.array(0.25), "tag": "case-a"},
+        "features": {
+            "x_inputs": forcing,
+            "x_outputs": phi,
+            "x_shared": forcing + phi,
+        }
     }
 
 
-def test_filter_model_load_from_yaml() -> None:
+def low_to_high(y: dict, _: object | None = None) -> dict:
+    forcing = y["low"]["inputs"]["x_inputs"]
+    phi = y["low"]["inputs"]["x_outputs"]
+    return {
+        "recovered": {
+            "forcing": forcing,
+            "phi": phi,
+            "alpha": phi - forcing,
+        }
+    }
+
+
+def test_filter_model_yaml_round_trip_and_routing() -> None:
     data = YamlLoader.load(_model_yaml())
     model = data["model"]
     assert isinstance(model, FilterModel)
-    assert model.source.name == "latent"
-    assert model.target.name == "observed"
-    assert len(model.filters) == 2
+    assert len(model.filters) == 1
 
-
-def test_filter_model_round_trip_nontrivial_pytree() -> None:
-    model = YamlLoader.load(_model_yaml())["model"]
-    x = _input_tree()
-
+    x = _tree_input()
     y = model.forward(x)
-    assert jnp.allclose(y["outputs"]["a_plus"], x["inputs"]["a"] + x["meta"]["shift"])
-    assert jnp.allclose(y["outputs"]["b_times"], x["inputs"]["b"][0] * x["inputs"]["b"][1]["gain"] * 2.0)
-    assert jnp.allclose(y["meta"]["shift"], x["meta"]["shift"])
-    assert jnp.allclose(y["meta"]["gain"], x["inputs"]["b"][1]["gain"])
+
+    assert jnp.allclose(y["latent"]["pair"][0], x["pde1"]["inputs"]["forcing"])
+    assert jnp.allclose(y["latent"]["pair"][1], x["pde1"]["outputs"]["phi"])
+    assert jnp.allclose(y["latent"]["alpha"], x["pde1"]["inputs"]["alpha"])
     assert y["meta"]["tag"] == x["meta"]["tag"]
 
     x_hat = model.backward(y)
-    assert jnp.allclose(x_hat["inputs"]["a"], x["inputs"]["a"])
-    assert jnp.allclose(x_hat["inputs"]["b"][0], x["inputs"]["b"][0])
-    assert jnp.allclose(x_hat["inputs"]["b"][1]["gain"], x["inputs"]["b"][1]["gain"])
-    assert jnp.allclose(x_hat["meta"]["shift"], x["meta"]["shift"])
+    assert jnp.allclose(x_hat["pde1"]["inputs"]["forcing"], x["pde1"]["inputs"]["forcing"])
+    assert jnp.allclose(x_hat["pde1"]["outputs"]["phi"], x["pde1"]["outputs"]["phi"])
+    assert jnp.allclose(x_hat["pde1"]["inputs"]["alpha"], x["pde1"]["inputs"]["alpha"])
     assert x_hat["meta"]["tag"] == x["meta"]["tag"]
+
+    dumped = YamlLoader.dump(data)
+    assert dumped is not None
+    reloaded = YamlLoader.load(dumped)
+    assert isinstance(reloaded["model"], FilterModel)
+    assert reloaded["model"].model_dump() == model.model_dump()
+
+
+def test_filter_model_integration_with_toy_pde_graph() -> None:
+    high = ToyHighPDE(source="high_inputs", target="high_outputs")
+    low = ToyLowPDE(source="low_inputs", target="low_outputs")
+
+    filter_edge = FilterModel(
+        source="high_state",
+        target="low_state",
+        filters=[
+            {
+                "in_paths": [
+                    {"path": ["high", "inputs", "forcing"]},
+                    {"path": ["high", "outputs", "phi"]},
+                ],
+                "out_paths": [
+                    {"path": ["low", "inputs", "x_inputs"]},
+                    {"path": ["low", "inputs", "x_outputs"]},
+                    {"path": ["low", "inputs", "x_shared"]},
+                ],
+                "forward": high_to_low,
+                "backward": low_to_high,
+                "forward_routes": [
+                    {"source": ["features", "x_inputs"], "target": ["low", "inputs", "x_inputs"]},
+                    {"source": ["features", "x_outputs"], "target": ["low", "inputs", "x_outputs"]},
+                    {"source": ["features", "x_shared"], "target": ["low", "inputs", "x_shared"]},
+                ],
+                "backward_routes": [
+                    {"source": ["recovered", "forcing"], "target": ["high", "inputs", "forcing"]},
+                    {"source": ["recovered", "phi"], "target": ["high", "outputs", "phi"]},
+                    {"source": ["recovered", "alpha"], "target": ["high", "inputs", "alpha"]},
+                ],
+            }
+        ],
+    )
+
+    graph = FunctionGraph(edges={"high": high, "filter": filter_edge, "low": low})
+    assert "high_state" in [node.name for node in graph.nodes.values()]
+    assert "low_state" in [node.name for node in graph.nodes.values()]
+
+    high_inputs = {"forcing": jnp.array(2.0), "alpha": jnp.array(1.0)}
+    high_outputs = high.solve(high_inputs, {"phi_residual": jnp.array(0.0)})
+
+    low_state = filter_edge.forward({"high": {"inputs": high_inputs, "outputs": high_outputs}})
+    low_outputs = low.solve(low_state["low"]["inputs"], {"phi_red_residual": jnp.array(0.0)})
+
+    high_state_hat = filter_edge.backward({"low": {"inputs": low_state["low"]["inputs"], "outputs": low_outputs}})
+    high_res = high.evaluate(high_state_hat["high"]["inputs"], high_state_hat["high"]["outputs"])
+
+    assert jnp.allclose(high_res["phi_residual"], jnp.array(0.0))
+
+
+def test_linear_projection_optimization_matches_pod() -> None:
+    key = jax.random.PRNGKey(7)
+    k_basis, k_coef, k_noise, k_init = jax.random.split(key, 4)
+
+    n_samples = 96
+    n_full = 12
+    n_rank = 5
+    n_latent = 3
+
+    basis_raw = jax.random.normal(k_basis, (n_rank, n_full))
+    basis, _ = jnp.linalg.qr(basis_raw.T)
+    basis = basis.T
+
+    coeffs = jax.random.normal(k_coef, (n_samples, n_rank))
+    data = coeffs @ basis + 0.02 * jax.random.normal(k_noise, (n_samples, n_full))
+
+    _, _, vh = jnp.linalg.svd(data, full_matrices=False)
+    pod_basis = vh[:n_latent, :]
+    pod_recon = data @ pod_basis.T @ pod_basis
+    pod_loss = jnp.mean((pod_recon - data) ** 2)
+
+    model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "in_paths": [{"path": ["full", "x"]}],
+                "out_paths": [{"path": ["latent", "z"]}],
+                "forward": eqx_evaluate,
+                "backward": eqx_evaluate,
+                "forward_opts": {"input_path": ["full", "x"], "method": "reduce"},
+                "backward_opts": {"input_path": ["latent", "z"], "method": "reconstruct"},
+                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
+                "backward_routes": [{"source": [], "target": ["full", "x"]}],
+            }
+        ],
+    )
+
+    projection = LinearProjection(matrix=0.25 * jax.random.normal(k_init, (n_latent, n_full)))
+    opt = optax.adam(1e-1)
+    opt_state = opt.init(eqx.filter(projection, eqx.is_array))
+
+    @eqx.filter_jit
+    def loss_fn(module: LinearProjection) -> jax.Array:
+        z_tree = model.forward({"full": {"x": data}, "filters": [module]})
+        x_hat = model.backward({"latent": {"z": z_tree["latent"]["z"]}, "filters": [module]})
+        return jnp.mean((x_hat["full"]["x"] - data) ** 2)
+
+    @eqx.filter_jit
+    def step(module: LinearProjection, state: optax.OptState) -> tuple[LinearProjection, optax.OptState, jax.Array]:
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(module)
+        updates, state = opt.update(grads, state, eqx.filter(module, eqx.is_array))
+        module = eqx.apply_updates(module, updates)
+        return module, state, loss
+
+    init_loss = float(loss_fn(projection))
+    for _ in range(450):
+        projection, opt_state, _ = step(projection, opt_state)
+    final_loss = float(loss_fn(projection))
+
+    assert final_loss < init_loss
+    assert final_loss <= float(pod_loss) * 1.20
+
+
+def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
+    key = jax.random.PRNGKey(11)
+    k_phase, k_amp, k_model = jax.random.split(key, 3)
+
+    n_samples = 24
+    h, w = 8, 8
+    latent_dim = 6
+
+    xx, yy = jnp.meshgrid(jnp.linspace(0.0, 1.0, h), jnp.linspace(0.0, 1.0, w), indexing="ij")
+    phase = jax.random.uniform(k_phase, (n_samples, 1, 1, 1), minval=0.0, maxval=2.0 * jnp.pi)
+    amp = 0.8 + 0.4 * jax.random.uniform(k_amp, (n_samples, 1, 1, 1))
+    fields = amp * jnp.sin(2.0 * jnp.pi * (xx[None, None, :, :] + yy[None, None, :, :]) + phase)
+
+    autoencoder = ConvAutoencoder2D(input_shape=(h, w), latent_dim=latent_dim, key=k_model, in_channels=1)
+    gain_edge = LatentGainEdge(source="latent", target="latent_proc")
+
+    filter_edge = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "in_paths": [{"path": ["full", "phi"]}],
+                "out_paths": [{"path": ["latent", "z"]}],
+                "forward": eqx_evaluate,
+                "backward": eqx_evaluate,
+                "forward_opts": {"input_path": ["full", "phi"], "method": "encode", "batched": True},
+                "backward_opts": {"input_path": ["latent", "z"], "method": "decode", "batched": True},
+                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
+                "backward_routes": [{"source": [], "target": ["full", "phi"]}],
+            }
+        ],
+    )
+
+    graph = FunctionGraph(edges={"filter": filter_edge, "gain": gain_edge})
+    assert graph.edges["filter"].name == "full->latent"
+    assert graph.edges["gain"].name == "latent->latent_proc"
+
+    params = {
+        "autoencoder": autoencoder,
+        "gain": jnp.array(0.65),
+    }
+
+    opt = optax.adam(5e-2)
+    opt_state = opt.init(eqx.filter(params, eqx.is_array))
+
+    @eqx.filter_jit
+    def loss_fn(curr_params: dict) -> jax.Array:
+        encoded = graph.edges["filter"].forward(
+            {"full": {"phi": fields}, "filters": [curr_params["autoencoder"]]}
+        )
+        latent_proc = graph.edges["gain"].pushforward(
+            {"z": encoded["latent"]["z"], "gain": curr_params["gain"]}
+        )
+        decoded = graph.edges["filter"].backward(
+            {"latent": {"z": latent_proc["z"]}, "filters": [curr_params["autoencoder"]]}
+        )
+        return jnp.mean((decoded["full"]["phi"] - fields) ** 2)
+
+    @eqx.filter_jit
+    def step(curr_params: dict, state: optax.OptState) -> tuple[dict, optax.OptState, jax.Array]:
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_params)
+        updates, state = opt.update(grads, state, eqx.filter(curr_params, eqx.is_array))
+        curr_params = eqx.apply_updates(curr_params, updates)
+        return curr_params, state, loss
+
+    init_loss = float(loss_fn(params))
+    for _ in range(220):
+        params, opt_state, _ = step(params, opt_state)
+    final_loss = float(loss_fn(params))
+
+    assert final_loss < init_loss * 0.75
+    assert float(jnp.abs(params["gain"] - 0.65)) > 1e-3
