@@ -6,6 +6,7 @@ from weakref import WeakKeyDictionary
 
 import lineax as lx
 import optimistix as optx
+from pydantic_core import core_schema
 from pydantic import (
     BaseModel, 
     Field, 
