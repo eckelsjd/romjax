@@ -1,118 +1,38 @@
 ## Objective
-Design a `FilterModel` class API to enable flexible pytree-pytree mapping for use as an `Edge` in a `FunctionGraph`, similar to how `ImplicitModel` is used for PDEs. The `FilterModel` will act as a graph edge to map between two PDE `ImplicitModel` edges, and will generally work using the equinox library for neural networks to form black-box, data-driven functions between vector spaces.
+Clean up the eqx_evaluate and FilterModel pipeline to support handling of auxiliary data gathered by the forward function, and passed to the backward function later on. This may require a rework of the larger Edge API as well to support auxiliary data in the forward and backward directions.
+
+Your goal is also to plan and enable smooth caching and passing of information around a FunctionGraph, including proper handling of this new auxiliary data API.
 
 ## Tasks
-- [ ] Design and implement a `FilterModel` API according to the specifications and use-cases in this document.
-- [ ] Come up with and implement a suite of tests to make sure the basic functionality works. This should include simple unit tests demonstrating the basic usage, as well as integration tests for how well this works with toy PDE models inside a FunctionGraph. Your tests should also include loading and using configs from yaml with pydantic validation, and demonstrate round-trip loading/serializing consistency.
-- [ ] Implement a simple filter model that performs linear projection using a matrix for the forward reduction step, and its transpose for the backward reconstruction step. Verify that optimizing this matrix on a simple dataset gives comparable results to the proper orthogonal decomposition
-- [ ] Implement a simple convolutional autoencoder in equinox and demonstrate how it can be integrated directly into a FunctionGraph and optimized alongside parameters for other edges in the graph
+- Rework the FilterModel and eqx_evaluate API to support automatic handling of auxiliary data needed by the backward function from the forward function and vice versa. Specifically for eqx_evaluate, the backward function needs the pytree "template" argument, which can be gathered during the forward evaluation by evaluating the passed inputs and inferring their array shapes.
+- Think about and generalize this idea of auxiliary data passing so that graph Edges besides just FilterModel can make use of and use auxiliary data.
+- Adjust the larger Edge API if needed to support the passing of auxiliary data alongside the main forward/backward pytrees. You may need to adjust the ImplicitModel and ExplicitModel classes to support this as well.
+- Adjust the Poisson2D class to be compatible with this new auxiliary data passing API. While the Poisson2D class does not currently use auxiliary data, it may be desirable to pass information regarding solver statistics for example.
+- Rewrite the tests in test_model.py to support the new API.
+- Specifically for the test_simple_eqx_filter_model test in test_model.py, rewrite the FilterModel to use as many default options as possible and no extra callables. For example, use "stack" collection and reconstruction, and make sure the "template" auxiliary data is automatically collected and passed by the new API.
+- Make sure that the automatic templates gathered and used by FilterModel/eqx_evaluate support scalars and 1d arrays as well, as well as nested pytrees.
+- Rework the LinearProjection class so that it is initialized by a jax key and the size of the matrix (much like the autoencoder is initialized)
+- Plan and document how auxiliary data will be handled and cached when composing multiple edges around a FunctionGraph.
+- Implement a method in FunctionGraph to cleanly and transparently push inputs starting at one node along a specified path of edges to a target destination node, i.e. function composition. 
 
 ## Constraints
-- Maintain all existing API outside of FilterModel
-- Do not require any additional external dependencies
-- Keep the forward and backward functions jit/jax-compatible with no side-effects
-- Implementation must follow the guiding principles in this document (below)
-
-You are free to complete these tasks however you wish, including rewriting the existing API for the FilterModel in `model.py`. But please provide thorough documentation on your thinking and all public APIs, and please describe in detail how you are solving the problems that come up and how they align with the overall goals explained in this document. You can create and modify as many new files as you need, including for testing and documentation purposes.
+- Everything must remain jax/jit friendly and compatible, i.e. only pure functions with no side-effects
+- You are free to adjust the FunctionGraph and Edge APIs to support auxiliary data passing as long as everything is documented and kept clean and interpretable.
+- It should be possible to easily pass inputs from one node to another along the edges of the FunctionGraph without ever thinking about or manually handling the auxiliary data. That is, the auxiliary data should be transparently handled by your API design (and optional if the user does not need it).
+- The configuration of the FunctionGraph should remain simple, concise, and easy to use, without excessive new options and configurations to worry about for every edge case. The defaults should be sufficient for most use cases.
 
 ## Definition of Done
-After all major changes, run `uv run pytest` on all your test cases in the `tests/` directory and make sure they pass.
-All new features should be covered by the tests.
-Repeat this after every major change: run the tests, if they fail then debug, repeat until passing.
+You are done when your unit tests pass and accurately capture all of the new behavior. Please also run all other tests with `uv run pytest` and fix all side issues that come up from your new implementation, to ensure consistency with the existing API.
 
-## Key files
-- `model.py` - this is where FilterModel should be implemented
-- `graph.py` - this is where the FunctionGraph object is defined. The FilterModel should implement the Edge class
-- `poisson.py` - the Poisson2D class is a good example of a PDE that the FilterModel is meant to interface with
-- `scripts/temp_eqx.py` - this temporary script has some ideas on how to use equinox for neural networks
-- `optim.py` - the train function shows how optax will be used to optimize parameters of the FunctionGraph when complete
-- `tests/` - new tests can be written here using normal pytest formatting/structure
-- `tests/test_model.py` - this has existing tests for the FilterModel, but need reworking with your new design for proper unit testing
+## Beware of the sharp bits
+The general idea with this new auxiliary data API is that the forward and backward functions of a graph Edge may "learn" something at runtime about the data being passed through it that the opposite function might need to know in order to do its job correctly. For example, the FilterModel.backward pass with eqx_evaluate needs to know the pytree template of the inputs gathered during the forward pass. We could configure this template statically up front if we know what the data looks like ahead of time, but our design philosophy is that we want to be as flexible as possible with the incoming data, and instead infer this auxiliary information at runtime. Another use case example might be if a PDE solver fails at runtime, we can capture this information and handle it downstream rather than crashing. Since we are working in a pure-function jax environment, we need to compute and return this extra information at runtime and somehow make it available to the user in a transparent and clean manner.
 
-## Guiding principles for FilterModel
-The FilterModel class should implement a flexible pytree->pytree map that is fully configurable from yaml with pydantic. It should be useful across a wide-variety of use cases without needing to subclass or edit the source code. The intended usage is to map between two spaces that are defined by more concrete models, such as PDEs like Poisson2D that have very rigid/meaningful input/output specs. While the concrete models are highly-specific in form and structure, the FilterModel generally only cares about mapping array-like data to array-like data. The primary target is to use the equinox neural network library to actually perform the array->array computations (i.e. linear maps, convolutions, etc.). The main challenge with the FilterModel then, is to flexibly collect input arrays from one concrete model, do some computations, and flexibly reformat/rearrange the output arrays into the specific form required by another concrete model.
+Here is where an issue arises that your design needs to handle. The FunctionGraph will compose and transport PyTrees around the graph by passing them through the Edge forward/backward functions. However, if we are attaching auxiliary data somehow to the inputs/outputs of the edge functions, the information from one edge may accidentally get propagated to an Edge that does not know how to handle it. Instead, the FunctionGraph and Edges should work with a clean and consistent API/structure so that everyone knows where to put their auxiliary information and how to retrieve the information relevant to their forward/backward functions.
 
-Since the FilterModel is an instance of an Edge in a FunctionGraph, it needs to map in both the forward and backward directions, i.e. map arrays from one concrete space to another, and back. For example, this could be as simple as transposing a matrix, or it may be more complicated like an encoder/decoder structure using convolutional neural networks in the equinox library. In all cases, this behavior should be configurable and transparent.
+When coming up with and implementing your design, be aware of and make sure you handle a couple cases listed here:
+- We may inititiate the traversal of a path, compute auxiliary data as we go, and then use that auxiliary data where needed during runtime (e.g. going forward and then backward with eqx_evaluate to a latent space)
+- We may traverse a path, compute auxiliary data as we go, and not end up using any of it in that specific traversal, instead returning the aux data to the caller
+- We may start traversing a path, but then try to take a route (e.g. backward direction) that requires aux data that we haven't computed or passed in. This should raise an error. 
+- We may traverse a path that we know ahead of time requires auxiliary data. The user can pass this in to the inputs before evaluating the path (e.g. the aux data may be known ahead of time or precomputed from a previous traversal). This should work fine just as if the aux data had been computed by the traversal itself.
 
-Since equinox neural networks are the primary target for computation, it may be desirable to have special structure in the FilterModel input/output pytrees to support passing in eqx.Module objects, which serve as the primary interface to equinox neural networks. Note that these Modules must be passed through the forward/backward functions to support auto-differentiation of their parameters: eqx.Modules *are* pytreees themselves, so they are just another part of the inputs to the FilterModel.
-
-### End-to-end example of desired behavior
-Let's say the input+output space to PDE #1 can be specified as a pytree:
-```
-{
-    "inputs": {
-        "conductivity": {
-            "const": jnp.array([...]),  # 2d input field
-            "alpha": 1.0                # scalar param
-        },
-        "boundary": [
-            ({"type": "dirichlet", "value": 0.0}, {"type": "dirichlet", "value": 0.0}),
-            ({"type": "neumann", "value": 0.0}, {"type": "neumann", "value": 0.0}),
-        ]
-    },
-    "outputs": {
-        "phi": jnp.array([...])         # 2d field potential
-    }
-}
-```
-Let's then say the corresponding input+output space of PDE #2 can be specifed as:
-```
-{
-    "inputs" {
-        "x_inputs": jnp.array(...),     # just a function of inputs
-        "x_outputs": jnp.array(...),    # just a function of outputs
-        "x_shared": jnp.array(...),     # function of both inputs/outputs
-    },
-    "outputs" {
-        "phi_red": jnp.array(...)       # a lower dimensional scalar potential field
-    }
-}
-```
-In this case, PDE #2 can be thought of as a "reduced" model of PDE #1, and we are trying to learn how to map information from PDE #1 to PDE #2 (and vice versa). When mapping from #1 to #2, we might want to support a few cases:
-```
-pytree["inputs"]["x_inputs"] = f(pytree["inputs"])
-pytree["inputs"]["x_outputs"] = f(pytree["outputs"])
-pytree["inputs"]["x_shared"] = f(pytree["inputs"] + pytree["outputs"])
-pytree["outputs"]["phi_red"] = f(pytree["outputs"]["phi"])
-```
-In this example, the functions "f" above may be computed by equinox Modules, but they may also be user-specified in case the user has some specific structure they want to implement. The benefit with equinox modules, is that we can take filtered input pytrees, and perform common operations such as flattening/reshaping before passing to a neural network.
-
-The FilterModel should transparently and flexibly handle all these cases (and others that are similar in spirit), so that we can map some "filtered" version of pytree #1 in several ways to "patches" of the output for pytree #2. The sum total result of this filter->compute->merge pattern is that we can map between arbitrary concrete pytree structures in a highly configurable way.
-
-In this example, I only show mapping from PDE #1 -> PDE #2, but keep in mind that we also need to do the inverse, i.e. map from PDE #2 -> PDE #1 in a similar way. You have some flexibility in how to implement this, so long as you maintain a clean and interpretable interface with yaml/pydantic configuration, and as long as the FilterModel maintains consistency with being an Edge in a FunctionGraph.
-
-### Some likely challenges to be solved
-Once some array data gets computed in the forward direction by a neural network, it needs to get placed in the output pytree in a place that the consumer of this new pytree understands (i.e. PDE #2) For example, you may take `pytree["inputs"] -> pytree["inputs"]["x_inputs"]` in the example above. This is likely very doable using the eqx.filter pipeline we have already built. However, when you go in the backward direction, the information in `pytree["inputs"]["x_inputs"]` may need to get split back into the various sources from the original pytree (i.e. the various subtrees in `pytree["inputs"]` in PDE #1). So it seems clear to me how to map "many subtrees" -> "one subtree", but it is less clear how to go from "one subtree" -> "many subtrees". You will likely need to come up with a new, clean API that enables this functionality to be specified from yaml in the same way that we have enabled "input filter specs".
-
-Relatedly, eqx.Module objects may be shared in both the forward and backward directions, for example a linear map and its transpose. But it is still possible that the forward/backward directions may require different parameters or eqx.Modules (i.e. an encoder/decoder -- although this may be shared too depending on implementation).
-
-Your API design should account for these challenges, and you are not necessarily confined to keep the current structure. For example, maybe it would be better to completely split the configurations for the forward and backward directions, specifying a list of "input filters" for each separately. But keep in mind the challenge that some parameters may be shared in both directions of the FilterModel, in much the same way that a PDE model uses one set of parameters for both directions.
-
-### An example use case in optimization
-Let's say we have a FunctionGraph with two PDE edges (using the ImplicitModel class for both) and two FilterModel edges representing the connections between the two PDE models. Each edge has a set of parameters that we want to optimize:
-```
-params = {
-    'pde_edge_1': {
-        'inputs': { ... }
-    },
-    'pde_edge_2': { ... }
-    'filter_edge_1': {
-        'filters': [ eqx.Module, eqx.Module, ...]
-    },
-    'filter_edge_2': {
-        'filters': [...]
-    }
-}
-```
-In total, the "params" object is a PyTree that we can pass to `optax` to optimize, and the FunctionGraph itself is used in the loss function to take the parameters and some inputs and compute a mean-squared error through the graph, such as:
-```
-def loss_fn(params, inputs, targets):
-    loss = 0.0
-    for edge, pytree in params.items():
-        pred = graph[edge](pytree, inputs)
-        loss += jnp.sum((pred - targets)**2)
-```
-Note how we use eqx.Module objects as the maps for the FilterModel. 
-
-### Current progress on implementation
-You can see the current progress on this API in `model.py`. Right now, the idea is for the `FilterModel` to have a list of "filter specs" that tell it how to filter incoming inputs from a pytree and how to compute the forward direction for each filtered input. The input filtering works okay, but as mentioned before, there are some difficulties with how to properly do the merging, and how to go in the backward direction. Your job is to finish this implementation according to the descriptions in this document, including a complete rewrite of FilterModel if you believe it be necessary.
+In all these cases, it should not be the Edge's job to filter or handle extra auxiliary data. It should be the FunctionGraph's job when traversing a path to make sure the right auxiliary data is collected and passed to the right Edge and nothing more.

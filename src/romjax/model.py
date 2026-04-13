@@ -6,7 +6,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from romjax.graph import Edge
 from romjax.typing import DictModel
@@ -106,6 +106,13 @@ class PathSpec(DictModel):
 
     path: TreePath
     spec: FilterSpec = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_path(cls, value):
+        if isinstance(value, tuple | list):
+            return {"path": value}
+        return value
 
     @field_validator("path", mode="before")
     @classmethod
@@ -441,22 +448,40 @@ class ConvAutoencoder2D(eqx.Module):
 
     def encode(self, x: ArrayLike) -> ArrayLike:
         """
-        Encode one sample to latent coordinates.
+        Encode one sample or a batch to latent coordinates.
 
-        :param x: input sample with shape ``(channels, height, width)``
-        :return: latent vector with shape ``(latent_dim,)``
+        :param x: input sample ``(channels, height, width)`` or batch ``(batch, channels, height, width)``
+        :return: latent vector ``(latent_dim,)`` or batch ``(batch, latent_dim)``
         """
+        x_array = jnp.asarray(x)
+        if x_array.ndim == 3:
+            return self._encode_one(x_array)
+        if x_array.ndim == 4:
+            return jax.vmap(self._encode_one)(x_array)
+        raise ValueError(f"encode expects rank-3 or rank-4 input but received shape {x_array.shape}.")
+
+    def decode(self, z: ArrayLike) -> ArrayLike:
+        """
+        Decode one latent vector or a batch to reconstructed samples.
+
+        :param z: latent vector ``(latent_dim,)`` or batch ``(batch, latent_dim)``
+        :return: reconstructed sample ``(channels, height, width)`` or batch ``(batch, channels, height, width)``
+        """
+        z_array = jnp.asarray(z)
+        if z_array.ndim == 1:
+            return self._decode_one(z_array)
+        if z_array.ndim == 2:
+            return jax.vmap(self._decode_one)(z_array)
+        raise ValueError(f"decode expects rank-1 or rank-2 input but received shape {z_array.shape}.")
+
+    def _encode_one(self, x: ArrayLike) -> ArrayLike:
+        """Encode one sample with shape ``(channels, height, width)``."""
         y = self.encoder_conv(jnp.asarray(x))
         y = jax.nn.tanh(y)
         return self.encoder_linear(jnp.ravel(y))
 
-    def decode(self, z: ArrayLike) -> ArrayLike:
-        """
-        Decode one latent vector to a reconstructed sample.
-
-        :param z: latent vector with shape ``(latent_dim,)``
-        :return: reconstructed sample with shape ``(channels, height, width)``
-        """
+    def _decode_one(self, z: ArrayLike) -> ArrayLike:
+        """Decode one latent vector with shape ``(latent_dim,)``."""
         h2, w2 = self.input_shape[0] // 2, self.input_shape[1] // 2
         y = self.decoder_linear(jnp.asarray(z))
         y = jax.nn.tanh(y)
@@ -544,66 +569,125 @@ def _merge_filtered_trees(base: PyTree, patch: PyTree) -> PyTree:
 def eqx_evaluate(
     x: PyTree,
     module: eqx.Module | Callable[[PyTree], PyTree],
-    reshape: Literal["flat", "stack"] | Callable[[PyTree], ArrayLike] | None = None,
-    input_path: TreePath | PathToken | None = None,
+    collect: Literal["flat", "stack"] | Callable[[PyTree], ArrayLike] | None = None,
     method: str | None = None,
     method_kwargs: dict[str, Any] | None = None,
-    batched: bool = False,
-    in_axes: int = 0,
-    out_axes: int = 0,
-    output_path: TreePath | PathToken | None = None,
+    reconstruct: Literal["flat", "stack"] | Callable[[ArrayLike, PyTree], PyTree] | None = None,
+    template: PyTree | None = None,
+    leaf_filter: Callable[[Any], bool] = eqx.is_array,
 ) -> PyTree:
     """
-    Evaluate array-like inputs with an Equinox-like module or callable.
+    Evaluate a filtered pytree with an Equinox-like module or callable.
 
-    :param x: numeric pytree input
+    ``FilterModel`` is expected to handle input/output path selection and routing. This helper only handles:
+    input collection, callable evaluation, and optional output reconstruction.
+
+    :param x: filtered pytree input
     :param module: Equinox module or callable
-    :param reshape: optional pre-processing of ``x`` before ``module(x)``
-        - ``None``: no reshape
+    :param collect: optional pre-processing of ``x`` before ``module(x)``
+        - ``None``: pass tree through unchanged
         - ``"flat"``: flatten and concatenate all leaves into one 1D array
         - ``"stack"``: stack leaves along a leading axis (requires compatible leaf shapes)
-        - callable: custom reshape function
-    :param input_path: optional subtree path selected before reshape/evaluation
+        - callable: custom collection function
     :param method: optional attribute name on ``module`` to call (for example ``\"encode\"``)
     :param method_kwargs: optional kwargs passed to the selected callable
-    :param batched: if ``True``, apply ``jax.vmap`` over the selected/reshaped input
-    :param in_axes: ``vmap`` input axis when ``batched`` is ``True``
-    :param out_axes: ``vmap`` output axis when ``batched`` is ``True``
-    :param output_path: optional path used to wrap output into a pytree
-    :return: callable output (optionally wrapped at ``output_path``)
+    :param reconstruct: optional post-processing of callable output
+        - ``None``: return callable output unchanged
+        - ``"flat"``: split one flat array into template leaf shapes
+        - ``"stack"``: split leading axis into template leaves
+        - callable: custom reconstruction function ``f(y, template) -> pytree``
+    :param template: optional pytree template for reconstruction. Defaults to ``x``.
+    :param leaf_filter: predicate selecting leaves used in ``"flat"``/``"stack"`` collection and reconstruction
+    :return: callable output (optionally reconstructed to a pytree)
     """
-    x_selected = _get_subtree(x, _coerce_path(input_path)) if input_path is not None else x
-
-    if reshape is None:
-        x_eval = x_selected
-    elif callable(reshape):
-        x_eval = reshape(x_selected)
-    elif reshape == "flat":
-        leaves = jax.tree_util.tree_leaves(x_selected)
-        if len(leaves) == 0:
-            x_eval = jnp.zeros((0,))
-        else:
-            flat_leaves = [jnp.ravel(jnp.asarray(leaf)) for leaf in leaves]
-            x_eval = jnp.concatenate(flat_leaves, axis=0)
-    elif reshape == "stack":
-        leaves = jax.tree_util.tree_leaves(x_selected)
-        if len(leaves) == 0:
-            x_eval = jnp.zeros((0,))
-        else:
-            x_eval = jnp.stack([jnp.asarray(leaf) for leaf in leaves], axis=0)
+    if collect is None:
+        x_eval = x
+    elif callable(collect):
+        x_eval = collect(x)
+    elif collect == "flat":
+        x_eval = _collect_tree_array(x, mode="flat", leaf_filter=leaf_filter)
+    elif collect == "stack":
+        x_eval = _collect_tree_array(x, mode="stack", leaf_filter=leaf_filter)
     else:
-        raise ValueError(f"Unknown reshape specification {reshape!r}")
+        raise ValueError(f"Unknown collect specification {collect!r}")
 
     call_kwargs = {} if method_kwargs is None else method_kwargs
     eval_fn = getattr(module, method) if method is not None else module
     if not callable(eval_fn):
         raise TypeError("Resolved module evaluation target is not callable.")
+    y = eval_fn(x_eval, **call_kwargs)
 
-    if batched:
-        y = jax.vmap(lambda xx: eval_fn(xx, **call_kwargs), in_axes=in_axes, out_axes=out_axes)(x_eval)
+    if reconstruct is None:
+        return y
+
+    template_tree = x if template is None else template
+    if callable(reconstruct):
+        return reconstruct(y, template_tree)
+    if reconstruct == "flat":
+        return _reconstruct_tree_array(y, template_tree, mode="flat", leaf_filter=leaf_filter)
+    if reconstruct == "stack":
+        return _reconstruct_tree_array(y, template_tree, mode="stack", leaf_filter=leaf_filter)
+    raise ValueError(f"Unknown reconstruct specification {reconstruct!r}")
+
+
+def _collect_tree_array(
+    tree: PyTree,
+    mode: Literal["flat", "stack"],
+    leaf_filter: Callable[[Any], bool],
+) -> ArrayLike:
+    """Collect selected tree leaves into one array."""
+    selected_leaves = [jnp.asarray(leaf) for leaf in jax.tree_util.tree_leaves(tree) if leaf_filter(leaf)]
+    if not selected_leaves:
+        return jnp.zeros((0,))
+
+    if mode == "flat":
+        return jnp.concatenate([jnp.ravel(leaf) for leaf in selected_leaves], axis=0)
+
+    ref_shape = selected_leaves[0].shape
+    for leaf in selected_leaves[1:]:
+        if leaf.shape != ref_shape:
+            raise ValueError(f"'stack' collect requires identical leaf shapes, got {leaf.shape} and {ref_shape}.")
+    return jnp.stack(selected_leaves, axis=0)
+
+
+def _reconstruct_tree_array(
+    value: ArrayLike,
+    template: PyTree,
+    mode: Literal["flat", "stack"],
+    leaf_filter: Callable[[Any], bool],
+) -> PyTree:
+    """Reconstruct selected template leaves from one array output."""
+    leaves, treedef = jax.tree_util.tree_flatten(template)
+    selected = [(idx, jnp.asarray(leaf)) for idx, leaf in enumerate(leaves) if leaf_filter(leaf)]
+    if not selected:
+        return template
+
+    output_leaves = list(leaves)
+    if mode == "flat":
+        flat_value = jnp.ravel(jnp.asarray(value))
+        expected = sum(leaf.size for _, leaf in selected)
+        if flat_value.shape[0] != expected:
+            raise ValueError(f"'flat' reconstruct expected {expected} values but received {flat_value.shape[0]}.")
+
+        offset = 0
+        for idx, leaf in selected:
+            size = leaf.size
+            output_leaves[idx] = jnp.reshape(flat_value[offset : offset + size], leaf.shape)
+            offset += size
     else:
-        y = eval_fn(x_eval, **call_kwargs)
+        stacked_value = jnp.asarray(value)
+        if stacked_value.shape[0] != len(selected):
+            raise ValueError(
+                f"'stack' reconstruct expected leading axis {len(selected)} but received {stacked_value.shape[0]}."
+            )
+        for i, (idx, leaf) in enumerate(selected):
+            candidate = stacked_value[i]
+            if candidate.shape != leaf.shape:
+                if candidate.size != leaf.size:
+                    raise ValueError(
+                        f"'stack' reconstruct cannot reshape leaf {i} from {candidate.shape} to {leaf.shape}."
+                    )
+                candidate = jnp.reshape(candidate, leaf.shape)
+            output_leaves[idx] = candidate
 
-    if output_path is not None:
-        return _set_subtree(None, _coerce_path(output_path), y)
-    return y
+    return jax.tree_util.tree_unflatten(treedef, output_leaves)

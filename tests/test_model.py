@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import prod
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -156,6 +158,42 @@ def low_to_high(y: dict, _: object | None = None) -> dict:
     }
 
 
+def collect_full_x(x: dict) -> jax.Array:
+    return x["full"]["x"]
+
+
+def collect_latent_z(x: dict) -> jax.Array:
+    return x["latent"]["z"]
+
+
+def collect_full_phi(x: dict) -> jax.Array:
+    return x["full"]["phi"]
+
+
+def collect_shared_fields(x: dict) -> jax.Array:
+    field1 = x["full"]["field1"]
+    field2 = x["full"]["field2"]
+    n_batch = field1.shape[0]
+    field1_flat = jnp.reshape(field1, (n_batch, -1))
+    field2_flat = jnp.reshape(field2, (n_batch, -1))
+    return jnp.concatenate([field1_flat, field2_flat], axis=-1)
+
+
+def reconstruct_shared_fields(x: jax.Array, template: dict) -> dict:
+    n_batch = x.shape[0]
+    field1_shape = template["full"]["field1"].shape
+    field2_shape = template["full"]["field2"].shape
+    field1_size = prod(field1_shape[1:])
+    field1_flat = x[:, :field1_size]
+    field2_flat = x[:, field1_size:]
+    return {
+        "full": {
+            "field1": jnp.reshape(field1_flat, field1_shape),
+            "field2": jnp.reshape(field2_flat, field2_shape),
+        }
+    }
+
+
 def test_filter_model_yaml_round_trip_and_routing() -> None:
     data = YamlLoader.load(_model_yaml())
     model = data["model"]
@@ -233,6 +271,90 @@ def test_filter_model_integration_with_toy_pde_graph() -> None:
     assert jnp.allclose(high_res["phi_residual"], jnp.array(0.0))
 
 
+def test_simple_eqx_filter() -> None:
+    key = jax.random.PRNGKey(24)
+    k_basis1, k_basis2, k_coef, k_noise1, k_noise2, k_init = jax.random.split(key, 6)
+
+    n_samples = 64
+    shape = (8, 8)
+    n_pixels = shape[0] * shape[1]
+    n_shared = 4
+    n_latent = 3
+    n_full = 2 * n_pixels
+
+    basis1_raw = jax.random.normal(k_basis1, (n_shared, n_pixels))
+    basis2_raw = jax.random.normal(k_basis2, (n_shared, n_pixels))
+    basis1 = basis1_raw / jnp.linalg.norm(basis1_raw, axis=1, keepdims=True)
+    basis2 = basis2_raw / jnp.linalg.norm(basis2_raw, axis=1, keepdims=True)
+    coeffs = jax.random.normal(k_coef, (n_samples, n_shared))
+
+    field1_flat = coeffs @ basis1 + 0.03 * jax.random.normal(k_noise1, (n_samples, n_pixels))
+    field2_flat = 0.8 * coeffs @ basis2 + 0.15 * field1_flat + 0.03 * jax.random.normal(k_noise2, (n_samples, n_pixels))
+
+    field1 = jnp.reshape(field1_flat, (n_samples, *shape))
+    field2 = jnp.reshape(field2_flat, (n_samples, *shape))
+    template = {"full": {"field1": jnp.zeros_like(field1), "field2": jnp.zeros_like(field2)}}
+
+    model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "in_paths": [{"path": ["full", "field1"]}, {"path": ["full", "field2"]}],
+                "out_paths": [{"path": ["latent", "z"]}],
+                "forward": eqx_evaluate,
+                "backward": eqx_evaluate,
+                "forward_opts": {"collect": collect_shared_fields, "method": "reduce"},
+                "backward_opts": {
+                    "collect": collect_latent_z,
+                    "method": "reconstruct",
+                    "reconstruct": reconstruct_shared_fields,
+                    "template": template,
+                },
+                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
+                "backward_routes": [
+                    {"source": ["full", "field1"], "target": ["full", "field1"]},
+                    {"source": ["full", "field2"], "target": ["full", "field2"]},
+                ],
+            }
+        ],
+    )
+
+    module = LinearProjection(matrix=0.25 * jax.random.normal(k_init, (n_latent, n_full)))
+    opt = optax.adam(1e-1)
+    opt_state = opt.init(eqx.filter(module, eqx.is_array))
+
+    @eqx.filter_jit
+    def loss_fn(curr_module: LinearProjection) -> jax.Array:
+        latent = model.forward({"full": {"field1": field1, "field2": field2}, "filters": [curr_module]})
+        reconstructed = model.backward({"latent": {"z": latent["latent"]["z"]}, "filters": [curr_module]})
+        field1_mse = jnp.mean((reconstructed["full"]["field1"] - field1) ** 2)
+        field2_mse = jnp.mean((reconstructed["full"]["field2"] - field2) ** 2)
+        return 0.5 * (field1_mse + field2_mse)
+
+    @eqx.filter_jit
+    def step(
+        curr_module: LinearProjection,
+        state: optax.OptState,
+    ) -> tuple[LinearProjection, optax.OptState, jax.Array]:
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_module)
+        updates, state = opt.update(grads, state, eqx.filter(curr_module, eqx.is_array))
+        curr_module = eqx.apply_updates(curr_module, updates)
+        return curr_module, state, loss
+
+    init_loss = float(loss_fn(module))
+    for _ in range(360):
+        module, opt_state, _ = step(module, opt_state)
+    final_loss = float(loss_fn(module))
+
+    assert final_loss < init_loss * 0.40
+    latent = model.forward({"full": {"field1": field1, "field2": field2}, "filters": [module]})
+    reconstructed = model.backward({"latent": {"z": latent["latent"]["z"]}, "filters": [module]})
+    assert reconstructed["full"]["field1"].shape == field1.shape
+    assert reconstructed["full"]["field2"].shape == field2.shape
+
+
+
 def test_linear_projection_optimization_matches_pod() -> None:
     key = jax.random.PRNGKey(7)
     k_basis, k_coef, k_noise, k_init = jax.random.split(key, 4)
@@ -263,8 +385,8 @@ def test_linear_projection_optimization_matches_pod() -> None:
                 "out_paths": [{"path": ["latent", "z"]}],
                 "forward": eqx_evaluate,
                 "backward": eqx_evaluate,
-                "forward_opts": {"input_path": ["full", "x"], "method": "reduce"},
-                "backward_opts": {"input_path": ["latent", "z"], "method": "reconstruct"},
+                "forward_opts": {"collect": collect_full_x, "method": "reduce"},
+                "backward_opts": {"collect": collect_latent_z, "method": "reconstruct"},
                 "forward_routes": [{"source": [], "target": ["latent", "z"]}],
                 "backward_routes": [{"source": [], "target": ["full", "x"]}],
             }
@@ -322,8 +444,8 @@ def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
                 "out_paths": [{"path": ["latent", "z"]}],
                 "forward": eqx_evaluate,
                 "backward": eqx_evaluate,
-                "forward_opts": {"input_path": ["full", "phi"], "method": "encode", "batched": True},
-                "backward_opts": {"input_path": ["latent", "z"], "method": "decode", "batched": True},
+                "forward_opts": {"collect": collect_full_phi, "method": "encode"},
+                "backward_opts": {"collect": collect_latent_z, "method": "decode"},
                 "forward_routes": [{"source": [], "target": ["latent", "z"]}],
                 "backward_routes": [{"source": [], "target": ["full", "phi"]}],
             }
