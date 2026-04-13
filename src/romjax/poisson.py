@@ -230,8 +230,8 @@ class Poisson2D(ImplicitModel, Sampleable):
     config: PoissonConfig
 
     # To satisfy criteria for being a graph edge
-    source: Node = Node("poisson_in")
-    target: Node = Node("poisson_out")
+    source: Node = Node(name="poisson_in")
+    target: Node = Node(name="poisson_out")
 
     # Optional/default (and optionally variable online)
     forcing: ForcingCallable = constant_forcing

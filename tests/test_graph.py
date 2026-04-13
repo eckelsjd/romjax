@@ -1,7 +1,9 @@
 import pytest
+import jax
+import jax.numpy as jnp
 from pydantic import ValidationError
 
-from romjax.graph import Node, Edge, IdentityEdge, NodeList, EdgeList
+from romjax.graph import Node, Edge, IdentityEdge, NodeList, EdgeList, FunctionGraph
 from romjax import YamlLoader
 
 
@@ -105,3 +107,111 @@ def test_edge_list():
     assert isinstance(data["edges"], EdgeList)
     assert list(data["edges"].keys()) == ["a->b", "b->c", "c->d"]
     assert [e.name for e in data["edges"].values()] == ["a->b", "b->c", "c->d"]
+
+
+class AuxShiftEdge(Edge):
+    source: Node = Node(name="a")
+    target: Node = Node(name="b")
+
+    def forward(self, x):
+        return x + 2.0
+
+    def backward(self, x):
+        return x - 2.0
+
+    def forward_aux(self, x, aux=None):
+        del aux
+        return self.forward(x), {"offset": jnp.array(2.0)}
+
+    def backward_aux(self, x, aux=None):
+        if aux is None or "offset" not in aux:
+            raise ValueError("Missing auxiliary offset for backward pass.")
+        return x - aux["offset"], None
+
+
+def test_function_graph_push_path_aux_round_trip() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": AuxShiftEdge(source="a", target="b"),
+            "bc": IdentityEdge(source="b", target="c"),
+        }
+    )
+
+    value = jnp.array(3.0)
+    forward_out, aux_cache = graph.push_path(
+        value,
+        start="a",
+        path=["ab", "bc"],
+        target="c",
+        return_aux=True,
+    )
+    assert jnp.allclose(forward_out, jnp.array(5.0))
+    assert "a->b" in aux_cache
+    assert "backward" in aux_cache["a->b"]
+
+    backward_out = graph.push_path(
+        forward_out,
+        start="c",
+        path=["bc", "ab"],
+        target="a",
+        aux=aux_cache,
+    )
+    assert jnp.allclose(backward_out, value)
+
+
+def test_function_graph_push_path_missing_or_precomputed_aux() -> None:
+    graph = FunctionGraph(edges={"ab": AuxShiftEdge(source="a", target="b")})
+
+    with pytest.raises(ValueError):
+        graph.push_path(jnp.array(5.0), start="b", path=["ab"], target="a")
+
+    precomputed_aux = {"a->b": {"backward": {"offset": jnp.array(2.0)}}}
+    out = graph.push_path(jnp.array(5.0), start="b", path=["ab"], target="a", aux=precomputed_aux)
+    assert jnp.allclose(out, jnp.array(3.0))
+
+
+def test_jit_grad_vmap_graph_push_path():
+    class AuxAffineEdge(Edge):
+        source: Node = Node(name="a")
+        target: Node = Node(name="b")
+
+        def forward(self, x):
+            return 3.0 * x - 1.0
+
+        def backward(self, x):
+            return (x + 1.0) / 3.0
+
+        def forward_aux(self, x, aux=None):
+            del aux
+            return self.forward(x), {"scale": jnp.array(3.0), "shift": jnp.array(-1.0)}
+
+        def backward_aux(self, x, aux=None):
+            if aux is None:
+                raise ValueError("Missing auxiliary data for backward pass.")
+            return (x - aux["shift"]) / aux["scale"], None
+
+    graph = FunctionGraph(edges={"ab": AuxAffineEdge(source="a", target="b")})
+
+    def push_forward(x):
+        y, aux = graph.push_path(x, start="a", path=["ab"], target="b", return_aux=True)
+        return y, aux
+
+    def round_trip(x):
+        y, aux = push_forward(x)
+        return graph.push_path(y, start="b", path=["ab"], target="a", aux=aux)
+
+    x0 = jnp.array(2.0)
+    expected = 3.0 * x0 - 1.0
+
+    jit_forward, jit_aux = jax.jit(push_forward)(x0)
+    jit_round_trip = jax.jit(round_trip)(x0)
+    grad_out = jax.grad(round_trip)(x0)
+    vmap_in = jnp.array([-1.0, 0.0, 2.0])
+    vmap_out = jax.vmap(round_trip)(vmap_in)
+
+    assert jnp.allclose(jit_forward, expected)
+    assert jnp.allclose(jit_aux["a->b"]["backward"]["scale"], jnp.array(3.0))
+    assert jnp.allclose(jit_aux["a->b"]["backward"]["shift"], jnp.array(-1.0))
+    assert jnp.allclose(jit_round_trip, x0)
+    assert jnp.allclose(grad_out, jnp.array(1.0))
+    assert jnp.allclose(vmap_out, vmap_in)

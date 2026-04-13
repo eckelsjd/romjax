@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from romjax import YamlLoader
-from romjax.graph import ImplicitModel
+from romjax.model import ImplicitModel
 from romjax.poisson import Poisson2D
 
 

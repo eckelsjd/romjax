@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from math import prod
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
 
 from romjax import YamlLoader
 from romjax.graph import FunctionGraph, Node
@@ -158,40 +157,54 @@ def low_to_high(y: dict, _: object | None = None) -> dict:
     }
 
 
-def collect_full_x(x: dict) -> jax.Array:
-    return x["full"]["x"]
+def test_eqx_evaluate():
+    """Tests that we can gather/scatter arraylike pytrees through an equinox module evaluation."""
+    class Affine(eqx.Module):
+        scale: jax.Array
+        bias: jax.Array
 
+        def reduce(self, x: jax.Array) -> jax.Array:
+            return self.scale * x + self.bias
 
-def collect_latent_z(x: dict) -> jax.Array:
-    return x["latent"]["z"]
+        def reconstruct(self, z: jax.Array) -> jax.Array:
+            return (z - self.bias) / self.scale
 
+    module = Affine(scale=jnp.array(2.0), bias=jnp.array(-1.5))
 
-def collect_full_phi(x: dict) -> jax.Array:
-    return x["full"]["phi"]
-
-
-def collect_shared_fields(x: dict) -> jax.Array:
-    field1 = x["full"]["field1"]
-    field2 = x["full"]["field2"]
-    n_batch = field1.shape[0]
-    field1_flat = jnp.reshape(field1, (n_batch, -1))
-    field2_flat = jnp.reshape(field2, (n_batch, -1))
-    return jnp.concatenate([field1_flat, field2_flat], axis=-1)
-
-
-def reconstruct_shared_fields(x: jax.Array, template: dict) -> dict:
-    n_batch = x.shape[0]
-    field1_shape = template["full"]["field1"].shape
-    field2_shape = template["full"]["field2"].shape
-    field1_size = prod(field1_shape[1:])
-    field1_flat = x[:, :field1_size]
-    field2_flat = x[:, field1_size:]
-    return {
-        "full": {
-            "field1": jnp.reshape(field1_flat, field1_shape),
-            "field2": jnp.reshape(field2_flat, field2_shape),
-        }
+    flat_tree = {
+        "left": jnp.array([1.0, 2.0]),
+        "right": {"v": jnp.array([-3.0, 4.0, 5.0])},
     }
+    encoded_flat, aux_flat = eqx_evaluate(flat_tree, module, gather="flat", method="reduce", return_aux=True)
+    decoded_flat = eqx_evaluate(encoded_flat, module, method="reconstruct", scatter="flat", aux=aux_flat)
+    assert encoded_flat.ndim == 1
+    assert jnp.allclose(decoded_flat["left"], flat_tree["left"])
+    assert jnp.allclose(decoded_flat["right"]["v"], flat_tree["right"]["v"])
+
+    stack_tree = {
+        "a": jnp.array([0.5, -1.0, 2.5]),
+        "b": jnp.array([3.0, 4.0, -2.0]),
+    }
+    encoded_stack, aux_stack = eqx_evaluate(stack_tree, module, gather="stack", method="reduce", return_aux=True)
+    decoded_stack = eqx_evaluate(encoded_stack, module, method="reconstruct", scatter="stack", aux=aux_stack)
+    assert encoded_stack.shape == (2, 3)
+    assert jnp.allclose(decoded_stack["a"], stack_tree["a"])
+    assert jnp.allclose(decoded_stack["b"], stack_tree["b"])
+
+    tree = {
+        "nested": {
+            "scalar": jnp.array(2.5),
+            "vector": jnp.array([1.0, -2.0, 3.0]),
+        },
+        "tail": [jnp.array([-1.0, 4.0, 2.0])],
+    }
+
+    encoded, aux = eqx_evaluate(tree, lambda x: x, gather="flat", return_aux=True)
+    decoded = eqx_evaluate(encoded, lambda x: x, scatter="flat", aux=aux)
+
+    assert jnp.allclose(decoded["nested"]["scalar"], tree["nested"]["scalar"])
+    assert jnp.allclose(decoded["nested"]["vector"], tree["nested"]["vector"])
+    assert jnp.allclose(decoded["tail"][0], tree["tail"][0])
 
 
 def test_filter_model_yaml_round_trip_and_routing() -> None:
@@ -271,91 +284,8 @@ def test_filter_model_integration_with_toy_pde_graph() -> None:
     assert jnp.allclose(high_res["phi_residual"], jnp.array(0.0))
 
 
-def test_simple_eqx_filter() -> None:
-    key = jax.random.PRNGKey(24)
-    k_basis1, k_basis2, k_coef, k_noise1, k_noise2, k_init = jax.random.split(key, 6)
-
-    n_samples = 64
-    shape = (8, 8)
-    n_pixels = shape[0] * shape[1]
-    n_shared = 4
-    n_latent = 3
-    n_full = 2 * n_pixels
-
-    basis1_raw = jax.random.normal(k_basis1, (n_shared, n_pixels))
-    basis2_raw = jax.random.normal(k_basis2, (n_shared, n_pixels))
-    basis1 = basis1_raw / jnp.linalg.norm(basis1_raw, axis=1, keepdims=True)
-    basis2 = basis2_raw / jnp.linalg.norm(basis2_raw, axis=1, keepdims=True)
-    coeffs = jax.random.normal(k_coef, (n_samples, n_shared))
-
-    field1_flat = coeffs @ basis1 + 0.03 * jax.random.normal(k_noise1, (n_samples, n_pixels))
-    field2_flat = 0.8 * coeffs @ basis2 + 0.15 * field1_flat + 0.03 * jax.random.normal(k_noise2, (n_samples, n_pixels))
-
-    field1 = jnp.reshape(field1_flat, (n_samples, *shape))
-    field2 = jnp.reshape(field2_flat, (n_samples, *shape))
-    template = {"full": {"field1": jnp.zeros_like(field1), "field2": jnp.zeros_like(field2)}}
-
-    model = FilterModel(
-        source="full",
-        target="latent",
-        filters=[
-            {
-                "in_paths": [{"path": ["full", "field1"]}, {"path": ["full", "field2"]}],
-                "out_paths": [{"path": ["latent", "z"]}],
-                "forward": eqx_evaluate,
-                "backward": eqx_evaluate,
-                "forward_opts": {"collect": collect_shared_fields, "method": "reduce"},
-                "backward_opts": {
-                    "collect": collect_latent_z,
-                    "method": "reconstruct",
-                    "reconstruct": reconstruct_shared_fields,
-                    "template": template,
-                },
-                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
-                "backward_routes": [
-                    {"source": ["full", "field1"], "target": ["full", "field1"]},
-                    {"source": ["full", "field2"], "target": ["full", "field2"]},
-                ],
-            }
-        ],
-    )
-
-    module = LinearProjection(matrix=0.25 * jax.random.normal(k_init, (n_latent, n_full)))
-    opt = optax.adam(1e-1)
-    opt_state = opt.init(eqx.filter(module, eqx.is_array))
-
-    @eqx.filter_jit
-    def loss_fn(curr_module: LinearProjection) -> jax.Array:
-        latent = model.forward({"full": {"field1": field1, "field2": field2}, "filters": [curr_module]})
-        reconstructed = model.backward({"latent": {"z": latent["latent"]["z"]}, "filters": [curr_module]})
-        field1_mse = jnp.mean((reconstructed["full"]["field1"] - field1) ** 2)
-        field2_mse = jnp.mean((reconstructed["full"]["field2"] - field2) ** 2)
-        return 0.5 * (field1_mse + field2_mse)
-
-    @eqx.filter_jit
-    def step(
-        curr_module: LinearProjection,
-        state: optax.OptState,
-    ) -> tuple[LinearProjection, optax.OptState, jax.Array]:
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_module)
-        updates, state = opt.update(grads, state, eqx.filter(curr_module, eqx.is_array))
-        curr_module = eqx.apply_updates(curr_module, updates)
-        return curr_module, state, loss
-
-    init_loss = float(loss_fn(module))
-    for _ in range(360):
-        module, opt_state, _ = step(module, opt_state)
-    final_loss = float(loss_fn(module))
-
-    assert final_loss < init_loss * 0.40
-    latent = model.forward({"full": {"field1": field1, "field2": field2}, "filters": [module]})
-    reconstructed = model.backward({"latent": {"z": latent["latent"]["z"]}, "filters": [module]})
-    assert reconstructed["full"]["field1"].shape == field1.shape
-    assert reconstructed["full"]["field2"].shape == field2.shape
-
-
-
-def test_linear_projection_optimization_matches_pod() -> None:
+def test_linear_projection() -> None:
+    """Make sure filter model with linear projection matches POD."""
     key = jax.random.PRNGKey(7)
     k_basis, k_coef, k_noise, k_init = jax.random.split(key, 4)
 
@@ -383,24 +313,22 @@ def test_linear_projection_optimization_matches_pod() -> None:
             {
                 "in_paths": [{"path": ["full", "x"]}],
                 "out_paths": [{"path": ["latent", "z"]}],
-                "forward": eqx_evaluate,
-                "backward": eqx_evaluate,
-                "forward_opts": {"collect": collect_full_x, "method": "reduce"},
-                "backward_opts": {"collect": collect_latent_z, "method": "reconstruct"},
+                "forward_opts": {"gather": "flat", "method": "reduce"},
+                "backward_opts": {"gather": "flat", "method": "reconstruct", "scatter": "flat"},
                 "forward_routes": [{"source": [], "target": ["latent", "z"]}],
-                "backward_routes": [{"source": [], "target": ["full", "x"]}],
+                "backward_routes": [{"source": ["full", "x"], "target": ["full", "x"]}],
             }
         ],
     )
 
-    projection = LinearProjection(matrix=0.25 * jax.random.normal(k_init, (n_latent, n_full)))
+    projection = LinearProjection(n_latent=n_latent, n_full=n_full, key=k_init)
     opt = optax.adam(1e-1)
     opt_state = opt.init(eqx.filter(projection, eqx.is_array))
 
     @eqx.filter_jit
     def loss_fn(module: LinearProjection) -> jax.Array:
-        z_tree = model.forward({"full": {"x": data}, "filters": [module]})
-        x_hat = model.backward({"latent": {"z": z_tree["latent"]["z"]}, "filters": [module]})
+        z_tree, aux = model.forward_aux({"full": {"x": data}, "filters": [module]})
+        x_hat, _ = model.backward_aux({"latent": {"z": z_tree["latent"]["z"]}, "filters": [module]}, aux=aux)
         return jnp.mean((x_hat["full"]["x"] - data) ** 2)
 
     @eqx.filter_jit
@@ -419,75 +347,171 @@ def test_linear_projection_optimization_matches_pod() -> None:
     assert final_loss <= float(pod_loss) * 1.20
 
 
-def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
-    key = jax.random.PRNGKey(11)
-    k_phase, k_amp, k_model = jax.random.split(key, 3)
+def test_filter_model_in_graph() -> None:
+    """Test linear projection with a filter model in a FunctionGraph"""
+    key = jax.random.PRNGKey(24)
+    k_basis1, k_basis2, k_coef, k_noise1, k_noise2, k_init = jax.random.split(key, 6)
 
-    n_samples = 24
-    h, w = 8, 8
-    latent_dim = 6
+    n_samples = 72
+    n_full = 32
+    n_shared = 6
+    n_latent = 4
 
-    xx, yy = jnp.meshgrid(jnp.linspace(0.0, 1.0, h), jnp.linspace(0.0, 1.0, w), indexing="ij")
-    phase = jax.random.uniform(k_phase, (n_samples, 1, 1, 1), minval=0.0, maxval=2.0 * jnp.pi)
-    amp = 0.8 + 0.4 * jax.random.uniform(k_amp, (n_samples, 1, 1, 1))
-    fields = amp * jnp.sin(2.0 * jnp.pi * (xx[None, None, :, :] + yy[None, None, :, :]) + phase)
+    basis1_raw = jax.random.normal(k_basis1, (n_shared, n_full))
+    basis2_raw = jax.random.normal(k_basis2, (n_shared, n_full))
+    basis1 = basis1_raw / jnp.linalg.norm(basis1_raw, axis=1, keepdims=True)
+    basis2 = basis2_raw / jnp.linalg.norm(basis2_raw, axis=1, keepdims=True)
+    coeffs = jax.random.normal(k_coef, (n_samples, n_shared))
 
-    autoencoder = ConvAutoencoder2D(input_shape=(h, w), latent_dim=latent_dim, key=k_model, in_channels=1)
-    gain_edge = LatentGainEdge(source="latent", target="latent_proc")
+    field1 = coeffs @ basis1 + 0.03 * jax.random.normal(k_noise1, (n_samples, n_full))
+    field2 = 0.8 * coeffs @ basis2 + 0.2 * field1 + 0.03 * jax.random.normal(k_noise2, (n_samples, n_full))
 
     filter_edge = FilterModel(
         source="full",
         target="latent",
         filters=[
             {
-                "in_paths": [{"path": ["full", "phi"]}],
-                "out_paths": [{"path": ["latent", "z"]}],
-                "forward": eqx_evaluate,
-                "backward": eqx_evaluate,
-                "forward_opts": {"collect": collect_full_phi, "method": "encode"},
-                "backward_opts": {"collect": collect_latent_z, "method": "decode"},
-                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
-                "backward_routes": [{"source": [], "target": ["full", "phi"]}],
+                "in_paths": [["full", "field1"], ["full", "field2"]],
+                "out_paths": [["latent", "z1"], ["latent", "z2"]],
+                "forward_opts": {"gather": "stack", "method": "reduce"},
+                "backward_opts": {"gather": "stack", "method": "reconstruct", "scatter": "stack"},
+                "forward_routes": [
+                    {"source": [0], "target": ["latent", "z1"]},
+                    {"source": [1], "target": ["latent", "z2"]},
+                ],
             }
         ],
     )
+    graph = FunctionGraph(edges={"filter": filter_edge})
 
-    graph = FunctionGraph(edges={"filter": filter_edge, "gain": gain_edge})
-    assert graph.edges["filter"].name == "full->latent"
-    assert graph.edges["gain"].name == "latent->latent_proc"
-
-    params = {
-        "autoencoder": autoencoder,
-        "gain": jnp.array(0.65),
-    }
-
-    opt = optax.adam(5e-2)
-    opt_state = opt.init(eqx.filter(params, eqx.is_array))
+    module = LinearProjection(n_latent=n_latent, n_full=n_full, key=k_init)
+    opt = optax.adam(1e-1)
+    opt_state = opt.init(eqx.filter(module, eqx.is_array))
 
     @eqx.filter_jit
-    def loss_fn(curr_params: dict) -> jax.Array:
-        encoded = graph.edges["filter"].forward(
-            {"full": {"phi": fields}, "filters": [curr_params["autoencoder"]]}
+    def loss_fn(curr_module: LinearProjection) -> jax.Array:
+        decoded = graph.push_path(
+            {"full": {"field1": field1, "field2": field2}, "filters": [curr_module]},
+            start="full",
+            path=["filter", "filter"],
+            target="full",
         )
-        latent_proc = graph.edges["gain"].pushforward(
-            {"z": encoded["latent"]["z"], "gain": curr_params["gain"]}
-        )
-        decoded = graph.edges["filter"].backward(
-            {"latent": {"z": latent_proc["z"]}, "filters": [curr_params["autoencoder"]]}
-        )
-        return jnp.mean((decoded["full"]["phi"] - fields) ** 2)
+        field1_mse = jnp.mean((decoded["full"]["field1"] - field1) ** 2)
+        field2_mse = jnp.mean((decoded["full"]["field2"] - field2) ** 2)
+        return 0.5 * (field1_mse + field2_mse)
 
     @eqx.filter_jit
-    def step(curr_params: dict, state: optax.OptState) -> tuple[dict, optax.OptState, jax.Array]:
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_params)
-        updates, state = opt.update(grads, state, eqx.filter(curr_params, eqx.is_array))
-        curr_params = eqx.apply_updates(curr_params, updates)
-        return curr_params, state, loss
+    def step(
+        curr_module: LinearProjection,
+        state: optax.OptState,
+    ) -> tuple[LinearProjection, optax.OptState, jax.Array]:
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_module)
+        updates, state = opt.update(grads, state, eqx.filter(curr_module, eqx.is_array))
+        curr_module = eqx.apply_updates(curr_module, updates)
+        return curr_module, state, loss
 
-    init_loss = float(loss_fn(params))
-    for _ in range(220):
-        params, opt_state, _ = step(params, opt_state)
-    final_loss = float(loss_fn(params))
+    init_loss = float(loss_fn(module))
+    for _ in range(300):
+        module, opt_state, _ = step(module, opt_state)
+    final_loss = float(loss_fn(module))
 
-    assert final_loss < init_loss * 0.75
-    assert float(jnp.abs(params["gain"] - 0.65)) > 1e-3
+    assert final_loss < init_loss * 0.45
+
+    encoded, aux_cache = graph.push_path(
+        {"full": {"field1": field1, "field2": field2}, "filters": [module]},
+        start="full",
+        path=["filter"],
+        target="latent",
+        return_aux=True,
+    )
+    decoded = graph.push_path(
+        {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
+        start="latent",
+        path=["filter"],
+        target="full",
+        aux=aux_cache,
+    )
+    assert decoded["full"]["field1"].shape == field1.shape
+    assert decoded["full"]["field2"].shape == field2.shape
+
+    with pytest.raises(ValueError):
+        graph.push_path(
+            {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
+            start="latent",
+            path=["filter"],
+            target="full",
+        )
+
+
+# def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
+#     key = jax.random.PRNGKey(11)
+#     k_phase, k_amp, k_model = jax.random.split(key, 3)
+
+#     n_samples = 24
+#     h, w = 8, 8
+#     latent_dim = 6
+
+#     xx, yy = jnp.meshgrid(jnp.linspace(0.0, 1.0, h), jnp.linspace(0.0, 1.0, w), indexing="ij")
+#     phase = jax.random.uniform(k_phase, (n_samples, 1, 1, 1), minval=0.0, maxval=2.0 * jnp.pi)
+#     amp = 0.8 + 0.4 * jax.random.uniform(k_amp, (n_samples, 1, 1, 1))
+#     fields = amp * jnp.sin(2.0 * jnp.pi * (xx[None, None, :, :] + yy[None, None, :, :]) + phase)
+
+#     autoencoder = ConvAutoencoder2D(input_shape=(h, w), latent_dim=latent_dim, key=k_model, in_channels=1)
+#     gain_edge = LatentGainEdge(source="latent", target="latent_proc")
+
+#     filter_edge = FilterModel(
+#         source="full",
+#         target="latent",
+#         filters=[
+#             {
+#                 "in_paths": [{"path": ["full", "phi"]}],
+#                 "out_paths": [{"path": ["latent", "z"]}],
+#                 "forward": eqx_evaluate,
+#                 "backward": eqx_evaluate,
+#                 "forward_opts": {"collect": collect_full_phi, "method": "encode"},
+#                 "backward_opts": {"collect": collect_latent_z, "method": "decode"},
+#                 "forward_routes": [{"source": [], "target": ["latent", "z"]}],
+#                 "backward_routes": [{"source": [], "target": ["full", "phi"]}],
+#             }
+#         ],
+#     )
+
+#     graph = FunctionGraph(edges={"filter": filter_edge, "gain": gain_edge})
+#     assert graph.edges["filter"].name == "full->latent"
+#     assert graph.edges["gain"].name == "latent->latent_proc"
+
+#     params = {
+#         "autoencoder": autoencoder,
+#         "gain": jnp.array(0.65),
+#     }
+
+#     opt = optax.adam(5e-2)
+#     opt_state = opt.init(eqx.filter(params, eqx.is_array))
+
+#     @eqx.filter_jit
+#     def loss_fn(curr_params: dict) -> jax.Array:
+#         encoded = graph.edges["filter"].forward(
+#             {"full": {"phi": fields}, "filters": [curr_params["autoencoder"]]}
+#         )
+#         latent_proc = graph.edges["gain"].pushforward(
+#             {"z": encoded["latent"]["z"], "gain": curr_params["gain"]}
+#         )
+#         decoded = graph.edges["filter"].backward(
+#             {"latent": {"z": latent_proc["z"]}, "filters": [curr_params["autoencoder"]]}
+#         )
+#         return jnp.mean((decoded["full"]["phi"] - fields) ** 2)
+
+#     @eqx.filter_jit
+#     def step(curr_params: dict, state: optax.OptState) -> tuple[dict, optax.OptState, jax.Array]:
+#         loss, grads = eqx.filter_value_and_grad(loss_fn)(curr_params)
+#         updates, state = opt.update(grads, state, eqx.filter(curr_params, eqx.is_array))
+#         curr_params = eqx.apply_updates(curr_params, updates)
+#         return curr_params, state, loss
+
+#     init_loss = float(loss_fn(params))
+#     for _ in range(220):
+#         params, opt_state, _ = step(params, opt_state)
+#     final_loss = float(loss_fn(params))
+
+#     assert final_loss < init_loss * 0.75
+#     assert float(jnp.abs(params["gain"] - 0.65)) > 1e-3

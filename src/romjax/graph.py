@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Hashable, Literal, Any
 from abc import abstractmethod, ABC
 
@@ -89,13 +90,23 @@ class Edge(BaseModel, Hashable, RoxObject, ABC):
     def __repr__(self) -> str:
         return f"{self.name}: {self.source}->{self.target}"
 
-    def __call__(self, x: PyTree, direction: Literal["forward", "backward"] = "forward") -> PyTree:
+    def __call__(
+        self,
+        x: PyTree,
+        direction: Literal["forward", "backward"] = "forward",
+        *,
+        aux: PyTree | None = None,
+        return_aux: bool = False,
+    ) -> PyTree | tuple[PyTree, PyTree | None]:
         if direction == "forward":
+            if return_aux:
+                return self.forward_aux(x, aux)
             return self.forward(x)
-        elif direction == "backward":
+        if direction == "backward":
+            if return_aux:
+                return self.backward_aux(x, aux)
             return self.backward(x)
-        else:
-            raise ValueError(f"Unknown direction {direction}")
+        raise ValueError(f"Unknown direction {direction}")
     
     @abstractmethod
     def forward(self, x: PyTree) -> PyTree:
@@ -106,6 +117,24 @@ class Edge(BaseModel, Hashable, RoxObject, ABC):
     def backward(self, x: PyTree) -> PyTree:
         """Maps a vector `x` from target to source."""
         raise NotImplementedError
+
+    def forward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+        """
+        Auxiliary-data aware forward map.
+
+        Edges that do not need auxiliary data can keep this default implementation.
+        """
+        del aux
+        return self.forward(x), None
+
+    def backward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+        """
+        Auxiliary-data aware backward map.
+
+        Edges that do not need auxiliary data can keep this default implementation.
+        """
+        del aux
+        return self.backward(x), None
     
 
 class IdentityEdge(Edge):
@@ -160,3 +189,94 @@ class FunctionGraph(BaseModel, RoxObject):
             [(edge.source, edge.target, {"object": edge}) for edge in self.edges.values()]
         )
         return graph
+
+    def _resolve_edge(self, edge_like: str | Edge) -> Edge:
+        """Resolve edge handle from an edge object or edge name."""
+        if isinstance(edge_like, Edge):
+            return edge_like
+        if edge_like in self.edges:
+            return self.edges[edge_like]
+        for edge in self.edges.values():
+            if edge.name == edge_like:
+                return edge
+        raise KeyError(f"Edge {edge_like!r} not found in graph.")
+
+    @staticmethod
+    def _copy_aux_cache(
+        aux: Mapping[str, Mapping[str, PyTree]] | None,
+    ) -> dict[str, dict[str, PyTree]]:
+        if aux is None:
+            return {}
+        out: dict[str, dict[str, PyTree]] = {}
+        for edge_name, edge_aux in aux.items():
+            out[edge_name] = dict(edge_aux)
+        return out
+
+    def push_path(
+        self,
+        x: PyTree,
+        *,
+        start: Node | str,
+        path: list[str | Edge],
+        target: Node | str | None = None,
+        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        return_aux: bool = False,
+    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+        """
+        Push one payload along a path of graph edges with transparent auxiliary-data handling.
+
+        Auxiliary cache format:
+        ``{edge_name: {"forward": aux_needed_for_forward, "backward": aux_needed_for_backward}}``
+
+        The cache is maintained by the graph:
+        - when traversing an edge forward, any produced auxiliary data is stored for that edge's backward direction
+        - when traversing an edge backward, any produced auxiliary data is stored for that edge's forward direction
+
+        :param x: payload to propagate along the path
+        :param start: starting node for the path
+        :param path: ordered edges to traverse (edge names or edge objects)
+        :param target: optional expected final node
+        :param aux: optional precomputed auxiliary cache
+        :param return_aux: if True, return both payload and updated auxiliary cache
+        :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
+        """
+        curr_node = start if isinstance(start, Node) else Node(name=start)
+        payload = x
+        aux_cache = self._copy_aux_cache(aux)
+
+        for edge_ref in path:
+            edge = self._resolve_edge(edge_ref)
+
+            if edge.source == curr_node:
+                direction: Literal["forward", "backward"] = "forward"
+                next_node = edge.target
+                produced_key = "backward"
+            elif edge.target == curr_node:
+                direction = "backward"
+                next_node = edge.source
+                produced_key = "forward"
+            else:
+                raise ValueError(
+                    f"Path discontinuity at edge {edge.name!r}: edge does not connect to current node {curr_node!r}."
+                )
+
+            edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
+            if direction == "forward":
+                payload, edge_aux_out = edge.forward_aux(payload, edge_aux_in)
+            else:
+                payload, edge_aux_out = edge.backward_aux(payload, edge_aux_in)
+
+            if edge_aux_out is not None:
+                edge_cache = aux_cache.setdefault(edge.name, {})
+                edge_cache[produced_key] = edge_aux_out
+
+            curr_node = next_node
+
+        if target is not None:
+            target_node = target if isinstance(target, Node) else Node(name=target)
+            if curr_node != target_node:
+                raise ValueError(f"Path ended at node {curr_node!r}, expected target node {target_node!r}.")
+
+        if return_aux:
+            return payload, aux_cache
+        return payload
