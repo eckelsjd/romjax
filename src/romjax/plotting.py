@@ -8,20 +8,19 @@ Includes:
   - get_scheme - Get a plotting color scheme
 """
 import copy
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Optional, Any, Generator, Iterable
-import math
+from typing import Any, Callable, Generator, Iterable, Literal, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
 from matplotlib.artist import Artist
+from matplotlib.axes import Axes
 from matplotlib.cm import ScalarMappable
 from matplotlib.colorbar import Colorbar
-
+from matplotlib.figure import Figure
 
 __all__ = ['gridplot', 'PlotOpts', 'PlotSpec', 'SupportedPlots', 'get_scheme']
 
@@ -599,7 +598,8 @@ def gridplot(
                     density = kwargs.get("density")
                     weights = weights_override if weights_override is not None else kwargs.get("weights")
 
-                    hist, xedges, yedges = np.histogram2d(x, y, bins=bins, range=range_, density=density, weights=weights)
+                    hist, xedges, yedges = np.histogram2d(x, y, bins=bins, range=range_, 
+                                                          density=density, weights=weights)
                     if cbar is not None and spec.opts.clim == 'auto':
                         cbar.norm.vmin = np.nanmin(hist)
                         cbar.norm.vmax = np.nanmax(hist)

@@ -1,5 +1,0 @@
-data: [1, 2, 3]
-name: Some information here
-solver: !model:__main__.UserModel
-  opts: {'a': 1, 'b': 2}
-  detail: Some more details about this solver

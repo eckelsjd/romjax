@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from romjax.rng import parametric_sampler, Distribution, gen_keys
+from romjax.rng import Distribution, gen_keys, parametric_sampler
 
 
 def test_distribution():

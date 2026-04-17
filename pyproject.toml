@@ -61,11 +61,6 @@ test = [
 [tool.pyproject-runner.tasks]
 test = { cmd = "pytest --cov=romjax --cov-report html:htmlcov tests", cwd = "!" }
 lint = { cmd = "ruff check src tests", cwd = "!" }
-sync = { cmd = "uv sync --all-groups --extra", help = "Choose a jax extra [cpu, cu12, cu13]." }
-bump = "cz bump"
-docs = "mkdocs serve"
-setup = "pre-commit install --allow-missing-config"
-echo = "echo"
 
 [tool.uv]
 package = true

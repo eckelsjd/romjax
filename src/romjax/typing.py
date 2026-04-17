@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from typing import Any, Protocol, Annotated, MutableMapping, Iterator, Mapping, get_args
+from typing import Annotated, Any, Iterator, Mapping, MutableMapping, Protocol, get_args
 from weakref import WeakKeyDictionary
 
 import lineax as lx
 import optimistix as optx
-from pydantic_core import core_schema
 from pydantic import (
-    BaseModel, 
-    Field, 
-    TypeAdapter, 
-    AfterValidator, 
-    ConfigDict, 
-    PrivateAttr, 
-    SerializationInfo, 
-    model_serializer, 
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SerializationInfo,
+    TypeAdapter,
+    model_serializer,
 )
-
+from pydantic_core import core_schema
 
 __all__ = ['RoxObject', 'DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 

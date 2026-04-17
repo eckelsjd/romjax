@@ -12,18 +12,22 @@ from abc import abstractmethod as _abstractmethod
 from importlib import import_module as _import_module
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
-from types import BuiltinFunctionType as _BuiltinFunctionType, FunctionType as _FunctionType
+from types import BuiltinFunctionType as _BuiltinFunctionType
 from types import FunctionType as _FunctionType
-from typing import IO as _IO, Any as _Any, Optional as _Optional, Type as _Type, Union as _Union
+from typing import IO as _IO
+from typing import Any as _Any
+from typing import Optional as _Optional
+from typing import Type as _Type
+from typing import Union as _Union
 
 import yaml as _yaml
 
-from .plotting import gridplot
-from .utils import load_h5, save_h5
 from . import rng as random
-from .rng import gen_keys
 from .optim import train
+from .plotting import gridplot
+from .rng import gen_keys
 from .typing import DictModel, ListModel, RoxObject
+from .utils import load_h5, save_h5
 
 
 class ConfigLoader(_ABC):

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from romjax.plotting import gridplot, PlotSpec, PlotOpts
+from romjax.plotting import PlotOpts, PlotSpec, gridplot
 
 
 def test_basic_gridplot(tmp_path):

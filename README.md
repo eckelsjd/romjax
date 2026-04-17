@@ -1,5 +1,5 @@
 # romjax
-[![Python version](https://img.shields.io/badge/python-3.11+-blue.svg?logo=python&logoColor=cccccc)](https://www.python.org/downloads/)
+[![Python version](https://img.shields.io/badge/python-3.12+-blue.svg?logo=python&logoColor=cccccc)](https://www.python.org/downloads/)
 [![Copier](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/copier-org/copier/master/img/badge/badge-grayscale-inverted-border-orange.json)](https://github.com/eckelsjd/copier-numpy)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -11,8 +11,8 @@ Reduced-order modeling in jax.
 
 ## ⚙️ Installation
 ```shell
-git clone https://github.com/eckelsjd/romjax.git
-pip install -e romjax
+git clone https://github.com/eckelsjd/romjax.git && cd romjax
+uv sync --all-groups --extra cpu  # or cu13 for gpu-support
 ```
 
 ## 🏗️ Contributing

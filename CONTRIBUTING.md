@@ -16,10 +16,9 @@ Pull requests are the best way to propose changes to the codebase (bug fixes, ne
 1. Fork the repo and create a branch from `main`.
 1. If you are adding a feature or making major changes, first create the issue in Github.
 1. If you've added code that should be tested, add to `/tests`.
-1. If you've made major changes, update the `/docs`.
-1. Ensure the test suite passes (`uv run dev.py test`).
+1. Ensure the test suite passes (`uv run rr test`).
 1. Follow [Conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) guidelines when adding a commit message.
-1. Ensure all `pre-commit` checks pass. Pro tip: use `uv run dev.py lint` to help.
+1. Ensure all `pre-commit` checks pass. Pro tip: use `uv run rr lint` to help.
 1. Issue the pull request!
 
 An example contribution workflow is shown here:
@@ -33,7 +32,7 @@ git checkout -b <your-branch-name>
 
 # Make local changes
 
-uv run dev.py test  # make sure tests pass
+uv run rr test  # make sure tests pass
 git add -A
 git commit -m "fix: adding a bugfix"
 git push -u origin <your-branch-name>

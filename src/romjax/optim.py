@@ -1,23 +1,22 @@
 """Optimization stuff."""
 import logging
-import time
-import pickle
-from pathlib import Path
-from typing import Callable, Iterator, Any
-from os import PathLike
 import os
+import pickle
 import re
+import time
+from os import PathLike
+from pathlib import Path
+from typing import Any, Callable, Iterator
 
+import equinox as eqx
 import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
 import optax
 from jaxtyping import PyTree
-import jax.numpy as jnp
-import equinox as eqx
-import numpy as np
-import matplotlib.pyplot as plt
 
 from romjax.utils import tree_l2_norm
-
 
 __all__ = ['train', 'load_train_file']
 

@@ -1,10 +1,10 @@
-import pytest
 import jax
 import jax.numpy as jnp
+import pytest
 from pydantic import ValidationError
 
-from romjax.graph import Node, Edge, IdentityEdge, NodeList, EdgeList, FunctionGraph
 from romjax import YamlLoader
+from romjax.graph import Edge, EdgeList, FunctionGraph, IdentityEdge, Node, NodeList
 
 
 def test_node_list():

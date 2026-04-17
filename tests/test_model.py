@@ -9,13 +9,12 @@ import pytest
 from romjax import YamlLoader
 from romjax.graph import FunctionGraph, Node
 from romjax.model import (
-    ConvAutoencoder2D,
     ExplicitModel,
     FilterModel,
     ImplicitModel,
-    LinearProjection,
     eqx_evaluate,
 )
+from romjax.nn import LinearProjection
 
 
 def _tree_input() -> dict:

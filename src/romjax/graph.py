@@ -1,10 +1,10 @@
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Hashable, Literal, Any
-from abc import abstractmethod, ABC
+from typing import Any, Hashable, Literal
 
 import networkx as nx
-from pydantic import BaseModel, model_validator, Field, ConfigDict
 from jaxtyping import PyTree
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from romjax.typing import ListModel, RoxObject
 
@@ -61,7 +61,7 @@ class Edge(BaseModel, Hashable, RoxObject, ABC):
     def _from_str(cls, value):
         if isinstance(value, str):
             if "->" not in value:
-                raise ValueError(f"Can't create an edge from provided string. Must be of the form 'source->target'")
+                raise ValueError("Can't create an edge from provided string. Must be of the form 'source->target'")
             _split = value.split("->")
             return {"source": _split[0].strip(), "target": _split[1].strip()}
 

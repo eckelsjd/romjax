@@ -1,19 +1,18 @@
 """Example 2D Poisson solver."""
-from typing import Literal, Mapping, TypedDict, Any, Iterable, Callable
+from typing import Any, Callable, Literal, Mapping, TypedDict
 
+import jax
 import jax.numpy as jnp
 import optimistix as optx
-from jaxtyping import ArrayLike, PyTree, Key
+from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import Field, PositiveInt, ValidationInfo, field_validator
-import jax
 
-from romjax.pde import Coordinates, homogeneous_boundary, UniformGrid, BoundarySpec, BoundaryType
-from romjax.typing import IterativeSolver, AdjointMethod, DictModel
-from romjax.utils import merge_pytrees, to_pytree
-from romjax.rng import SamplerCallable, Distribution, parametric_sampler
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
-
+from romjax.pde import BoundarySpec, BoundaryType, Coordinates, UniformGrid, homogeneous_boundary
+from romjax.rng import Distribution, SamplerCallable, parametric_sampler
+from romjax.typing import AdjointMethod, DictModel, IterativeSolver
+from romjax.utils import merge_pytrees, to_pytree
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
 type SamplerName = Literal["parametric"]
@@ -308,7 +307,7 @@ class Poisson2D(ImplicitModel, Sampleable):
         if check_flag:
             for k in list(value.keys()):
                 if not isinstance(value[k], Mapping):
-                    raise TypeError(f"Extra parametric sampler opts must be a Distribution-like mapping.")
+                    raise TypeError("Extra parametric sampler opts must be a Distribution-like mapping.")
                 value[k] = Distribution(**value[k])
         
         return value

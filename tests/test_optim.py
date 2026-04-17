@@ -1,6 +1,6 @@
-from pathlib import Path
-import pickle
 import os
+import pickle
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -53,12 +53,14 @@ def test_pytree_train(tmp_path):
         u = inputs["u"]
         meta = inputs["meta"]["scale"]
 
-        h = jnp.tanh(x @ true_params["encoder"]["A_x"] + u @ true_params["encoder"]["A_u"] + true_params["encoder"]["b0"])
+        h = jnp.tanh(x @ true_params["encoder"]["A_x"] + u @ true_params["encoder"]["A_u"] + 
+                     true_params["encoder"]["b0"])
         mod = meta * true_params["modulator"]["w"] + true_params["modulator"]["b"]
         h2 = jnp.tanh(h * mod)
 
         y = h2 @ true_params["heads"]["y"]["W"] + true_params["scales"][0]
-        z = jnp.tanh(h2 @ true_params["heads"]["z"]["W"] + true_params["heads"]["z"]["b"]) * true_params["scales"][1]["z"]
+        z = jnp.tanh(h2 @ true_params["heads"]["z"]["W"] + 
+                     true_params["heads"]["z"]["b"]) * true_params["scales"][1]["z"]
         energy = jnp.sum(h2**2, axis=1, keepdims=True)
 
         return {

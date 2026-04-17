@@ -3,10 +3,10 @@ from pathlib import Path
 import lineax as lx
 import optimistix as optx
 import pytest
-from pydantic import ValidationError, BaseModel, model_validator
+from pydantic import BaseModel, ValidationError, model_validator
 
-from romjax import YamlLoader, DictModel
-from romjax.typing import LxObject, OptxObject, ListModel
+from romjax import DictModel, YamlLoader
+from romjax.typing import ListModel, LxObject, OptxObject
 
 
 class CustomSettings(DictModel, extra='forbid'):

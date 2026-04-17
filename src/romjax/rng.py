@@ -1,9 +1,9 @@
 """Reproducible, file-based sampling via jax.random with pydantic validation."""
+import copy
+import os
 import time
 from pathlib import Path
-from typing import Protocol, Optional, Any, Literal, Mapping, runtime_checkable, Generator, Callable, Iterable
-import os
-import copy
+from typing import Any, Callable, Generator, Iterable, Literal, Mapping, Optional, Protocol, runtime_checkable
 
 import jax
 import jaxtyping
@@ -11,7 +11,6 @@ from jax.typing import ArrayLike
 from pydantic import field_validator
 
 from romjax.typing import DictModel
-
 
 __all__ = ['Distribution', 'parametric_sampler', 'gen_keys', 'SamplerCallable']
 
@@ -54,7 +53,7 @@ class Distribution(DictModel):
             return mapping[value]
         if callable(value):
             return value
-        raise TypeError(f"Distribution must be a supported name or a callable")
+        raise TypeError("Distribution must be a supported name or a callable")
 
     @property
     def opts(self):
@@ -75,7 +74,7 @@ def parametric_sampler(key: jaxtyping.Key, **params: dict[ParamName, Distributio
     params = copy.copy(params)
     for k in list(params.keys()):
         if not isinstance(params[k], Mapping):
-            raise TypeError(f"All params for parametric sampling must be a Distribution-like mapping.")
+            raise TypeError("All params for parametric sampling must be a Distribution-like mapping.")
         params[k] = Distribution(**params[k])
 
     num_rvs = len(params)

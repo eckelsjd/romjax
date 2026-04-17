@@ -1,0 +1,40 @@
+name: Lint and test
+on:
+  pull_request:
+    branches: [ main ]
+permissions:
+  contents: write
+jobs:
+  check-lint:
+    name: Lint check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.8"
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --all-groups --extra cpu
+      - run: uv run rr lint
+
+  pr-tests:
+    name: PR tests
+    runs-on: ${{ matrix.os }}
+    needs: check-lint
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.8"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv python install
+      - name: Install dependencies
+        run: uv sync --all-groups --extra cpu
+      - name: Run tests
+        run: uv run rr test
