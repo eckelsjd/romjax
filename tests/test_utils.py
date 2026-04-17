@@ -1,12 +1,12 @@
 import jax
 import jax.numpy as jnp
 import lineax as lx
-import optimistix as optx
 import numpy as np
+import optimistix as optx
 from jax.typing import ArrayLike
 
 from romjax import DictModel
-from romjax.utils import merge_pytrees, to_pytree, save_h5, load_h5
+from romjax.utils import load_h5, merge_pytrees, save_h5, to_pytree
 
 
 def test_to_pytree():
@@ -92,23 +92,6 @@ def test_to_pytree_merge_and_jit_grad():
     assert jnp.allclose(true_val, jit_val)
     assert jnp.allclose(true_vmap_val, vmap_val)
     assert jnp.allclose(grad_val, 2.0)  # only thing that matters is operations applied to the array
-
-
-# def test_optimistix_fixed_point_iteration():
-#     A = jnp.array([[2.0, 0.0], [0.0, 4.0]])
-#     b = jnp.array([2.0, 8.0])
-#     diag = jnp.diag(A)
-
-#     def jacobi_update(x: jnp.ndarray, _: None) -> jnp.ndarray:
-#         residual = A @ x - b
-#         return x - residual / diag
-
-#     solver = optx.FixedPointIteration(rtol=1e-10, atol=1e-10, damp=0.0)
-#     sol = optx.root_find(jacobi_update, solver, y0=jnp.zeros_like(b), args=None, max_steps=50)
-
-#     assert jnp.allclose(sol.value, jnp.array([1.0, 2.0]), atol=1e-6)
-#     jit_val = jax.jit(lambda: optx.root_find(jacobi_update, solver, y0=jnp.zeros_like(b), args=None, max_steps=50).value)()
-#     assert jnp.allclose(jit_val, jnp.array([1.0, 2.0]), atol=1e-6)
 
 
 # def test_lineax_gmres_matrix_free():

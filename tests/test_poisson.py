@@ -2,10 +2,12 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 from romjax import YamlLoader
+from romjax.pde import UniformGrid, homogeneous_boundary
+from romjax.plotting import gridplot
 from romjax.poisson import (
     GaussianForcingInputs,
     Poisson2D,
@@ -14,11 +16,8 @@ from romjax.poisson import (
     gaussian_forcing,
     nonlinear_conductivity,
 )
-from romjax.pde import UniformGrid, homogeneous_boundary
-from romjax.typing import DictModel
-from romjax.plotting import gridplot
 from romjax.rng import gen_keys
-from romjax.utils import load_h5
+from romjax.typing import DictModel
 
 
 def test_gaussian_forcing_jit_and_grad() -> None:

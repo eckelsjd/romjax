@@ -1,19 +1,18 @@
 """Module for assorted processing utilities."""
-from typing import Mapping, Any, Generator
 import logging
-import sys
-from pathlib import Path
-from os import PathLike
 import subprocess
+import sys
 import threading
+from os import PathLike
+from pathlib import Path
+from typing import Any, Generator, Mapping
 
-import jax
-from jaxtyping import PyTree
-import jax.numpy as jnp
-from pydantic import BaseModel
-import numpy as np
 import h5py
-
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jaxtyping import PyTree
+from pydantic import BaseModel
 
 __all__ = ['to_pytree', 'merge_pytrees', 'iter_pytree', 'pytree_at', 'get_logger', 'tree_l2_norm', 
            'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']

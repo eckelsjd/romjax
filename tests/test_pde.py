@@ -1,7 +1,7 @@
-import pytest
 import jax.numpy as jnp
+import pytest
 
-from romjax.pde import homogeneous_boundary, BoundaryType, UniformGrid
+from romjax.pde import BoundaryType, UniformGrid, homogeneous_boundary
 from romjax.utils import merge_pytrees
 
 
