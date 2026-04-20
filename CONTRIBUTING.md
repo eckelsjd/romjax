@@ -27,7 +27,7 @@ An example contribution workflow is shown here:
 # Fork the repo on Github
 git clone https://github.com/<your-user-name>/romjax.git
 cd romjax
-uv sync
+uv sync --all-groups --extra cpu
 git checkout -b <your-branch-name>
 
 # Make local changes
