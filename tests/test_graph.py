@@ -142,7 +142,6 @@ def test_function_graph_push_path_aux_round_trip() -> None:
         value,
         start="a",
         path=["ab", "bc"],
-        target="c",
         return_aux=True,
     )
     assert jnp.allclose(forward_out, jnp.array(5.0))
@@ -153,7 +152,6 @@ def test_function_graph_push_path_aux_round_trip() -> None:
         forward_out,
         start="c",
         path=["bc", "ab"],
-        target="a",
         aux=aux_cache,
     )
     assert jnp.allclose(backward_out, value)
@@ -163,10 +161,10 @@ def test_function_graph_push_path_missing_or_precomputed_aux() -> None:
     graph = FunctionGraph(edges={"ab": AuxShiftEdge(source="a", target="b")})
 
     with pytest.raises(ValueError):
-        graph.push_path(jnp.array(5.0), start="b", path=["ab"], target="a")
+        graph.push_path(jnp.array(5.0), start="b", path=["ab"])
 
     precomputed_aux = {"a->b": {"backward": {"offset": jnp.array(2.0)}}}
-    out = graph.push_path(jnp.array(5.0), start="b", path=["ab"], target="a", aux=precomputed_aux)
+    out = graph.push_path(jnp.array(5.0), start="b", path=["ab"], aux=precomputed_aux)
     assert jnp.allclose(out, jnp.array(3.0))
 
 
@@ -193,12 +191,12 @@ def test_jit_grad_vmap_graph_push_path():
     graph = FunctionGraph(edges={"ab": AuxAffineEdge(source="a", target="b")})
 
     def push_forward(x):
-        y, aux = graph.push_path(x, start="a", path=["ab"], target="b", return_aux=True)
+        y, aux = graph.push_path(x, start="a", path=["ab"], return_aux=True)
         return y, aux
 
     def round_trip(x):
         y, aux = push_forward(x)
-        return graph.push_path(y, start="b", path=["ab"], target="a", aux=aux)
+        return graph.push_path(y, start="b", path=["ab"], aux=aux)
 
     x0 = jnp.array(2.0)
     expected = 3.0 * x0 - 1.0

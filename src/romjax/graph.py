@@ -77,7 +77,7 @@ class Edge(BaseModel, Hashable, RoxObject, ABC):
         return hash(self.name)
     
     def __eq__(self, other):
-        if isinstance(other, Node):
+        if isinstance(other, Edge):
             return self.name == other.name
         elif isinstance(other, str):
             return self.name == other
@@ -218,7 +218,6 @@ class FunctionGraph(BaseModel, RoxObject):
         *,
         start: Node | str,
         path: list[str | Edge],
-        target: Node | str | None = None,
         aux: Mapping[str, Mapping[str, PyTree]] | None = None,
         return_aux: bool = False,
     ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
@@ -271,11 +270,6 @@ class FunctionGraph(BaseModel, RoxObject):
                 edge_cache[produced_key] = edge_aux_out
 
             curr_node = next_node
-
-        if target is not None:
-            target_node = target if isinstance(target, Node) else Node(name=target)
-            if curr_node != target_node:
-                raise ValueError(f"Path ended at node {curr_node!r}, expected target node {target_node!r}.")
 
         if return_aux:
             return payload, aux_cache

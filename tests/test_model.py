@@ -393,7 +393,6 @@ def test_filter_model_in_graph() -> None:
             {"full": {"field1": field1, "field2": field2}, "filters": [curr_module]},
             start="full",
             path=["filter", "filter"],
-            target="full",
         )
         field1_mse = jnp.mean((decoded["full"]["field1"] - field1) ** 2)
         field2_mse = jnp.mean((decoded["full"]["field2"] - field2) ** 2)
@@ -420,14 +419,12 @@ def test_filter_model_in_graph() -> None:
         {"full": {"field1": field1, "field2": field2}, "filters": [module]},
         start="full",
         path=["filter"],
-        target="latent",
         return_aux=True,
     )
     decoded = graph.push_path(
         {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
         start="latent",
         path=["filter"],
-        target="full",
         aux=aux_cache,
     )
     assert decoded["full"]["field1"].shape == field1.shape
@@ -438,7 +435,6 @@ def test_filter_model_in_graph() -> None:
             {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
             start="latent",
             path=["filter"],
-            target="full",
         )
 
 

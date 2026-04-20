@@ -141,14 +141,19 @@ class YamlLoader(ConfigLoader):
             with _Path(stream).open("r", encoding="utf-8") as fh:
                 return _yaml.load(fh, Loader=loader, **kwargs)
         if isinstance(stream, str):
-            looks_like_path = (
-                stream.endswith((".yml", ".yaml"))
-                or _Path(stream).is_absolute()
-                or stream.startswith(".")
-            )
-            if _Path(stream).exists() or looks_like_path:
-                with _Path(stream).open("r", encoding="utf-8") as fh:
-                    return _yaml.load(fh, Loader=loader, **kwargs)
+            try:
+                exists = _Path(stream).exists()
+                looks_like_path = (
+                    stream.endswith((".yml", ".yaml"))
+                    or _Path(stream).is_absolute()
+                    or stream.startswith(".")
+                )
+            except OSError:
+                return _yaml.load(stream, Loader=loader, **kwargs)
+            else: 
+                if exists or looks_like_path:
+                    with _Path(stream).open("r", encoding="utf-8") as fh:
+                        return _yaml.load(fh, Loader=loader, **kwargs)
             return _yaml.load(stream, Loader=loader, **kwargs)
         if isinstance(stream, (bytes, bytearray)):
             return _yaml.load(stream.decode("utf-8"), Loader=loader, **kwargs)
