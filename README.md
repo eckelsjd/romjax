@@ -15,6 +15,25 @@ git clone https://github.com/eckelsjd/romjax.git && cd romjax
 uv sync --all-groups --extra cpu  # or cu13 for gpu-support
 ```
 
+## Project roadmap
+
+Right now, we have the basic `FunctionGraph` API up and running with the `Poisson2D` model as a good PDE test case. The following list summarizes where we are heading next.
+
+- Sampling and data generation for the Poisson system. KLE sampling. How to sample output/residual space. How to save/structure samples on disk.
+- Dataloading interface. How to be memory efficient and repeatable in loading and using mini-batches for training. Is there a common format for the data used in training so we can use the same dataloading interface across models and data save files/locations. How about train versus test splitting.
+- Testing dataloading and optimization of simple linear projection on some Poisson data.
+- Implementing a Galerkin projection ROM ImplicitModel.
+- Configuring a full Poisson<->Galerkin graph from yaml.
+- Implementing various graph-theoretic objective functions (state reconstruction, solution error, etc.)
+- Implement a configurable file-based workflow for optimization. Make it easy to specify methods, hyperparams, etc.
+- Automate running multiple cases with different configurations (maybe scaling up hardware too)
+- Automate hyperparameter optimization
+- Post-processing scripts for comparing methods, plots, tables, etc.
+- Automate everything from a repeatable snakemake workflow
+- Then start looking at different modeling options (Vlasov, Conv2D, etc.)
+
+When we are done, we will have all of these features implemented with a thorough regression test suite in place and passing. You will generally only be working on one of these tasks at a time with a more specific set of instructions and "doneness" criteria provided when ready.
+
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.
 
