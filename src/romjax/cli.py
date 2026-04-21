@@ -357,14 +357,21 @@ def render_agent_command(command_template: str, manifest: dict[str, Any]) -> lis
 
 def split_windows_command(command: str) -> list[str]:
     """Split a Windows command line into argv using CommandLineToArgvW."""
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
     argc = ctypes.c_int()
-    argv_ptr = ctypes.windll.shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    argv_ptr = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
     if not argv_ptr:
         raise OSError("CommandLineToArgvW failed to parse command.")
     try:
         return [argv_ptr[index] for index in range(argc.value)]
     finally:
-        ctypes.windll.kernel32.LocalFree(argv_ptr)
+        kernel32.LocalFree(argv_ptr)
 
 
 def normalize_cwd(path_value: str | Path) -> Path:
