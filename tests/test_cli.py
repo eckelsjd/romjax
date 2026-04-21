@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -12,15 +13,19 @@ from romjax.cli import (
     cli,
     collect_plan_prompt,
     create_task,
+    current_git_branch,
     ensure_task_layout,
     ensure_task_ready,
     get_task_paths,
+    git_output,
     load_manifest,
     plan_task,
+    review_task,
     run_agent_once,
     start_task,
     stop_task,
     task_runtime_status,
+    terminate_process,
     validate_task_slug,
 )
 
@@ -67,6 +72,10 @@ def prepare_templates(repo_root: Path) -> Path:
         "# {task_slug}\n\n## Problem\nTODO: fill me\n",
         encoding="utf-8",
     )
+    (paths.templates_dir / "review.md").write_text(
+        "# Review Summary: {task_slug}\n\n## High-Level Summary\nTODO: fill me\n",
+        encoding="utf-8",
+    )
     return repo_root
 
 
@@ -90,6 +99,12 @@ def test_create_task_uses_prefix_template(tmp_path: Path):
     text = task_path.read_text(encoding="utf-8")
     assert "# feat-galerkin-rom" in text
     assert "TODO: fill me" in text
+
+
+def test_current_git_branch(tmp_path: Path):
+    repo_root = init_repo(tmp_path)
+
+    assert current_git_branch(repo_root) == "main"
 
 
 def test_ensure_task_ready_rejects_unfilled_template(tmp_path: Path):
@@ -241,6 +256,82 @@ def test_plan_task_reuses_existing_open_task(tmp_path: Path, monkeypatch: pytest
     assert "Fix issue 1127." in planned_task.read_text(encoding="utf-8")
 
 
+def test_git_output_reads_git_state(tmp_path: Path):
+    repo_root = init_repo(tmp_path)
+    (repo_root / "example.txt").write_text("hello\n", encoding="utf-8")
+
+    status = git_output(repo_root, ["status", "--short"])
+
+    assert "example.txt" in status
+
+
+def test_terminate_process_uses_kill_on_platform_without_killpg(monkeypatch: pytest.MonkeyPatch):
+    calls: list[tuple[int, int]] = []
+    monkeypatch.delattr("romjax.cli.os.killpg", raising=False)
+    monkeypatch.setattr("romjax.cli.os.kill", lambda pid, sig: calls.append((pid, sig)))
+
+    terminate_process(1234)
+
+    assert calls == [(1234, signal.SIGTERM)]
+
+
+def test_review_task_creates_review_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_templates(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nImplemented feature.\n", encoding="utf-8")
+    task_path.rename(paths.done_dir / task_path.name)
+
+    worktree_path = repo_root.parent / "feat-galerkin-rom"
+    worktree_path.mkdir()
+    manifest = {
+        "task_slug": "feat-galerkin-rom",
+        "task_path": str(paths.done_dir / "feat-galerkin-rom.md"),
+        "repo_root": str(repo_root),
+        "worktree_path": str(worktree_path),
+        "branch_name": "feat-galerkin-rom",
+        "base_ref": "main",
+        "run_dir": str(paths.runs_dir / "feat-galerkin-rom"),
+        "log_path": str(paths.runs_dir / "feat-galerkin-rom" / "feat-galerkin-rom.log"),
+        "prompt_path": str(paths.runs_dir / "feat-galerkin-rom" / "feat-galerkin-rom-prompt.md"),
+        "summary_path": str(paths.runs_dir / "feat-galerkin-rom" / "feat-galerkin-rom-summary.md"),
+        "exit_code_path": str(paths.runs_dir / "feat-galerkin-rom" / "feat-galerkin-rom.exitcode"),
+        "status": "succeeded",
+        "pid": 1111,
+    }
+    run_dir = paths.runs_dir / "feat-galerkin-rom"
+    run_dir.mkdir(parents=True)
+    (run_dir / "feat-galerkin-rom.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def fake_git_output(worktree: Path, args: list[str]) -> str:
+        assert worktree == worktree_path
+        command = " ".join(args)
+        if "--stat" in command:
+            return " src/romjax/model.py | 10 +++++-----"
+        if args[:2] == ["status", "--short"]:
+            return " M src/romjax/model.py"
+        if "...HEAD" in command:
+            return "diff --git a/src/romjax/model.py b/src/romjax/model.py"
+        return "diff --git a/src/romjax/model.py b/src/romjax/model.py"
+
+    def fake_run_review_agent(**kwargs):
+        prompt_text = Path(kwargs["review_prompt_path"]).read_text(encoding="utf-8")
+        assert "Implemented feature." in prompt_text
+        assert "src/romjax/model.py" in prompt_text
+        Path(kwargs["review_output_path"]).write_text(
+            "# Review Summary: feat-galerkin-rom\n\n## High-Level Summary\nUpdated the model.\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("romjax.cli.git_output", fake_git_output)
+    monkeypatch.setattr("romjax.cli.run_review_agent", fake_run_review_agent)
+
+    review_path = review_task(paths, "feat-galerkin-rom")
+
+    assert review_path.exists()
+    assert "Updated the model." in review_path.read_text(encoding="utf-8")
+
+
 def test_stop_task_updates_manifest_and_terminates_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = init_repo(tmp_path)
     paths = get_task_paths(repo_root)
@@ -267,7 +358,7 @@ def test_stop_task_updates_manifest_and_terminates_process(tmp_path: Path, monke
 
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr("romjax.cli.process_exists", lambda pid: True)
-    monkeypatch.setattr("romjax.cli.os.killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr("romjax.cli.terminate_process", lambda pid: killed.append((pid, signal.SIGTERM)))
 
     updated = stop_task(paths, "feat-galerkin-rom")
 
@@ -349,6 +440,25 @@ def test_cli_plan_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsy
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "feat-galerkin-rom.md" in captured.out
+
+
+def test_cli_review_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    repo_root = prepare_templates(init_repo(tmp_path))
+
+    def fake_review_task(paths, task_slug: str):
+        assert task_slug == "feat-galerkin-rom"
+        review_path = paths.runs_dir / task_slug / f"{task_slug}-review.md"
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_path.write_text("# Review Summary: feat-galerkin-rom\n", encoding="utf-8")
+        return review_path
+
+    monkeypatch.setattr("romjax.cli.review_task", fake_review_task)
+
+    exit_code = cli(["review", "feat-galerkin-rom"], repo_root=repo_root)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "feat-galerkin-rom-review.md" in captured.out
 
 
 def test_cli_list_hides_archived_tasks(tmp_path: Path, capsys: pytest.CaptureFixture[str]):

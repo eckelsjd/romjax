@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -22,6 +23,11 @@ DEFAULT_AGENT_CMD = (
 DEFAULT_PLAN_CMD = (
     "codex exec --sandbox read-only --cd {repo_root} "
     "--output-last-message {plan_output_path} -"
+)
+DEFAULT_REVIEW_CMD = (
+    "codex exec --sandbox read-only --cd {worktree_path} "
+    "--add-dir {repo_root} "
+    "--output-last-message {review_output_path} -"
 )
 TASK_STATES = ("open", "in_progress", "done", "archive")
 
@@ -203,6 +209,12 @@ def run_git(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess[str
     )
 
 
+def current_git_branch(repo_root: Path) -> str:
+    """Return the current branch name for the repository root."""
+    result = run_git(repo_root, ["branch", "--show-current"]).stdout.strip()
+    return result or "main"
+
+
 def ensure_git_worktree(paths: TaskPaths, task_slug: str) -> Path:
     """Create the git branch and sibling worktree for a task.
 
@@ -262,6 +274,52 @@ def build_plan_prompt(paths: TaskPaths, task_slug: str, task_path: Path, user_pr
     )
 
 
+def build_review_prompt(
+    *,
+    paths: TaskPaths,
+    task_slug: str,
+    task_path: Path,
+    review_template_path: Path,
+    diff_summary: str,
+    committed_diff: str,
+    working_tree_diff: str,
+    status_short: str,
+) -> str:
+    """Build the review prompt used to summarize implementation changes."""
+    template_text = review_template_path.read_text(encoding="utf-8")
+    task_text = task_path.read_text(encoding="utf-8")
+    return (
+        "You are preparing a concise human-facing code review summary for a completed task.\n\n"
+        f"Repository root: {paths.repo_root}\n"
+        f"Task slug: {task_slug}\n"
+        f"Task document path: {task_path}\n"
+        f"Review template path: {review_template_path}\n"
+        f"AGENTS instructions: {paths.repo_root / 'AGENTS.md'}\n\n"
+        "Fill the review template using the task document and the available git diff context. "
+        "Keep the summary concise and useful for a pull request or human review. "
+        "If a section has no relevant changes, say so briefly rather than inventing details. "
+        "Return only the final markdown document and do not wrap it in code fences.\n\n"
+        "<task_document>\n"
+        f"{task_text}\n"
+        "</task_document>\n\n"
+        "<review_template>\n"
+        f"{template_text}\n"
+        "</review_template>\n\n"
+        "<git_diff_summary>\n"
+        f"{diff_summary}\n"
+        "</git_diff_summary>\n\n"
+        "<git_status_short>\n"
+        f"{status_short}\n"
+        "</git_status_short>\n\n"
+        "<committed_diff_against_base>\n"
+        f"{committed_diff}\n"
+        "</committed_diff_against_base>\n\n"
+        "<working_tree_diff>\n"
+        f"{working_tree_diff}\n"
+        "</working_tree_diff>\n"
+    )
+
+
 def run_dir_for_task(paths: TaskPaths, task_slug: str) -> Path:
     """Return the run directory for a task."""
     return paths.runs_dir / task_slug
@@ -292,7 +350,34 @@ def write_manifest(paths: TaskPaths, task_slug: str, data: dict[str, Any]) -> Pa
 def render_agent_command(command_template: str, manifest: dict[str, Any]) -> list[str]:
     """Render the agent command template into argv form."""
     command = command_template.format(**manifest)
-    return shlex.split(command)
+    if os.name == "nt":
+        return split_windows_command(command)
+    return shlex.split(command, posix=True)
+
+
+def split_windows_command(command: str) -> list[str]:
+    """Split a Windows command line into argv using CommandLineToArgvW."""
+    argc = ctypes.c_int()
+    argv_ptr = ctypes.windll.shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv_ptr:
+        raise OSError("CommandLineToArgvW failed to parse command.")
+    try:
+        return [argv_ptr[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv_ptr)
+
+
+def normalize_cwd(path_value: str | Path) -> Path:
+    """Normalize a cwd/path value loaded from task metadata or manifests."""
+    return Path(path_value).expanduser().resolve()
+
+
+def terminate_process(pid: int) -> None:
+    """Terminate a process or process group in a cross-platform way."""
+    if hasattr(os, "killpg"):
+        os.killpg(pid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGTERM)
 
 
 def collect_plan_prompt() -> str:
@@ -333,6 +418,57 @@ def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str) -> Path:
     return task_path
 
 
+def review_task(paths: TaskPaths, task_slug: str) -> Path:
+    """Summarize a task implementation using the git diff from its worktree."""
+    ensure_task_layout(paths)
+    _, task_path = find_task_document(paths, task_slug)
+    manifest = load_manifest(paths, task_slug)
+    worktree_path = Path(manifest.get("worktree_path", paths.repo_root.parent / task_slug))
+    if not worktree_path.exists():
+        raise TaskWorkflowError(f"Task worktree does not exist: {worktree_path}")
+
+    base_ref = str(manifest.get("base_ref") or "main")
+    review_template_path = paths.templates_dir / "review.md"
+    if not review_template_path.exists():
+        raise TaskWorkflowError(f"Review template not found: {review_template_path}")
+
+    run_dir = run_dir_for_task(paths, task_slug)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    review_prompt_path = run_dir / f"{task_slug}-review-prompt.md"
+    review_output_path = run_dir / f"{task_slug}-review.md"
+    review_log_path = run_dir / f"{task_slug}-review.log"
+    review_command = os.environ.get("ROMJAX_TASK_REVIEW_CMD", DEFAULT_REVIEW_CMD)
+
+    diff_summary = git_output(worktree_path, ["diff", "--stat", f"{base_ref}...HEAD"])
+    committed_diff = git_output(worktree_path, ["diff", f"{base_ref}...HEAD"])
+    status_short = git_output(worktree_path, ["status", "--short"])
+    working_tree_diff = git_output(worktree_path, ["diff"])
+    prompt = build_review_prompt(
+        paths=paths,
+        task_slug=task_slug,
+        task_path=task_path,
+        review_template_path=review_template_path,
+        diff_summary=diff_summary,
+        committed_diff=committed_diff,
+        working_tree_diff=working_tree_diff,
+        status_short=status_short,
+    )
+    review_prompt_path.write_text(prompt, encoding="utf-8")
+    run_review_agent(
+        review_command=review_command,
+        repo_root=paths.repo_root,
+        worktree_path=worktree_path,
+        review_prompt_path=review_prompt_path,
+        review_output_path=review_output_path,
+        review_log_path=review_log_path,
+    )
+    reviewed_text = review_output_path.read_text(encoding="utf-8").strip()
+    if not reviewed_text:
+        raise TaskWorkflowError(f"Review command produced an empty summary for '{task_slug}'.")
+    review_output_path.write_text(reviewed_text + "\n", encoding="utf-8")
+    return review_output_path
+
+
 def run_planning_agent(
     *,
     plan_command: str,
@@ -368,6 +504,59 @@ def run_planning_agent(
         )
     if not plan_output_path.exists():
         raise TaskWorkflowError(f"Planning command did not create {plan_output_path}.")
+
+
+def run_review_agent(
+    *,
+    review_command: str,
+    repo_root: Path,
+    worktree_path: Path,
+    review_prompt_path: Path,
+    review_output_path: Path,
+    review_log_path: Path,
+) -> None:
+    """Run Codex review once and persist its raw outputs."""
+    argv = render_agent_command(
+        review_command,
+        {
+            "repo_root": str(repo_root),
+            "worktree_path": str(worktree_path),
+            "review_output_path": str(review_output_path),
+        },
+    )
+    with review_prompt_path.open("r", encoding="utf-8") as prompt_file, review_log_path.open(
+        "a", encoding="utf-8"
+    ) as log_file:
+        process = subprocess.run(
+            argv,
+            cwd=repo_root,
+            stdin=prompt_file,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if process.returncode != 0:
+        raise TaskWorkflowError(
+            f"Review command failed for '{review_prompt_path.stem.removesuffix('-review-prompt')}'. "
+            f"See {review_log_path}."
+        )
+    if not review_output_path.exists():
+        raise TaskWorkflowError(f"Review command did not create {review_output_path}.")
+
+
+def git_output(worktree_path: Path, args: list[str]) -> str:
+    """Return git command output from a task worktree."""
+    process = subprocess.run(
+        ["git", *args],
+        cwd=worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        return process.stderr.strip() or process.stdout.strip()
+    return process.stdout.strip()
 
 
 def start_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
@@ -407,6 +596,7 @@ def start_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
         "summary_path": str(summary_path),
         "exit_code_path": str(exit_code_path),
         "agent_command_template": agent_command,
+        "base_ref": current_git_branch(paths.repo_root),
         "status": "launching",
         "created_at": utc_now(),
     }
@@ -440,6 +630,7 @@ def run_agent_once(paths: TaskPaths, task_slug: str) -> int:
     summary_path = Path(manifest["summary_path"])
     exit_code_path = Path(manifest["exit_code_path"])
     prompt_path = Path(manifest["prompt_path"])
+    repo_root = normalize_cwd(manifest["repo_root"])
 
     argv = render_agent_command(manifest["agent_command_template"], manifest)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -452,7 +643,7 @@ def run_agent_once(paths: TaskPaths, task_slug: str) -> int:
     with prompt_path.open("r", encoding="utf-8") as prompt_file, log_path.open("a", encoding="utf-8") as log_file:
         process = subprocess.run(
             argv,
-            cwd=manifest["repo_root"],
+            cwd=repo_root,
             stdin=prompt_file,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -518,7 +709,7 @@ def stop_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
         return manifest
 
     if process_exists(pid):
-        os.killpg(pid, signal.SIGTERM)
+        terminate_process(pid)
 
     manifest["status"] = "stopped"
     manifest["stopped_at"] = utc_now()
@@ -605,6 +796,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="Create or update an open task using a Codex planning prompt")
     plan.add_argument("task_slug")
 
+    review = subparsers.add_parser("review", help="Summarize a completed task implementation for review")
+    review.add_argument("task_slug")
+
     start = subparsers.add_parser("start", help="Start an agent on an open task")
     start.add_argument("task_slug")
 
@@ -645,6 +839,10 @@ def cli(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
             task_path = plan_task(paths, args.task_slug, collect_plan_prompt())
             print(task_path)
             return 0
+        if args.command == "review":
+            review_path = review_task(paths, args.task_slug)
+            print(review_path)
+            return 0
         if args.command == "start":
             manifest = start_task(paths, args.task_slug)
             print(json.dumps(manifest, indent=2, sort_keys=True))
@@ -682,6 +880,7 @@ def main() -> None:
 __all__ = [
     "DEFAULT_AGENT_CMD",
     "DEFAULT_PLAN_CMD",
+    "DEFAULT_REVIEW_CMD",
     "TASK_STATES",
     "TaskPaths",
     "TaskWorkflowError",
@@ -690,20 +889,24 @@ __all__ = [
     "cli",
     "create_task",
     "collect_plan_prompt",
+    "current_git_branch",
     "ensure_task_layout",
     "ensure_task_ready",
     "find_task_document",
     "format_status",
     "get_or_create_open_task",
     "get_task_paths",
+    "git_output",
     "list_tasks",
     "load_manifest",
     "main",
     "manifest_path",
     "plan_task",
     "render_agent_command",
+    "review_task",
     "run_agent_once",
     "run_planning_agent",
+    "run_review_agent",
     "start_task",
     "stop_task",
     "task_runtime_status",
