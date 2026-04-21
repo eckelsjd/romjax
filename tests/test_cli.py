@@ -10,11 +10,13 @@ import pytest
 from romjax.cli import (
     archive_task,
     cli,
+    collect_plan_prompt,
     create_task,
     ensure_task_layout,
     ensure_task_ready,
     get_task_paths,
     load_manifest,
+    plan_task,
     run_agent_once,
     start_task,
     stop_task,
@@ -190,6 +192,55 @@ def test_task_runtime_status_reports_not_started(tmp_path: Path):
     assert status["run_status"] == "not_started"
 
 
+def test_collect_plan_prompt_raises_on_empty(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("romjax.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "   ")
+
+    with pytest.raises(Exception):
+        collect_plan_prompt()
+
+
+def test_plan_task_creates_missing_task_and_fills_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_templates(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+
+    def fake_run_planning_agent(**kwargs):
+        plan_prompt = Path(kwargs["plan_prompt_path"]).read_text(encoding="utf-8")
+        assert "Add a Galerkin ROM feature" in plan_prompt
+        Path(kwargs["plan_output_path"]).write_text(
+            "# feat-galerkin-rom\n\n## Summary\nImplement a Galerkin ROM feature.\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("romjax.cli.run_planning_agent", fake_run_planning_agent)
+
+    task_path = plan_task(paths, "feat-galerkin-rom", "Add a Galerkin ROM feature")
+
+    assert task_path.exists()
+    text = task_path.read_text(encoding="utf-8")
+    assert "Implement a Galerkin ROM feature." in text
+    assert "TODO:" not in text
+
+
+def test_plan_task_reuses_existing_open_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_templates(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    existing_task = create_task(paths, "fix-bug-1127")
+
+    def fake_run_planning_agent(**kwargs):
+        Path(kwargs["plan_output_path"]).write_text(
+            "# fix-bug-1127\n\n## Problem\nFix issue 1127.\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("romjax.cli.run_planning_agent", fake_run_planning_agent)
+
+    planned_task = plan_task(paths, "fix-bug-1127", "Plan a bug fix for issue 1127")
+
+    assert planned_task == existing_task
+    assert "Fix issue 1127." in planned_task.read_text(encoding="utf-8")
+
+
 def test_stop_task_updates_manifest_and_terminates_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = init_repo(tmp_path)
     paths = get_task_paths(repo_root)
@@ -273,6 +324,27 @@ def test_cli_create_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     repo_root = prepare_templates(init_repo(tmp_path))
 
     exit_code = cli(["create", "feat-galerkin-rom"], repo_root=repo_root)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "feat-galerkin-rom.md" in captured.out
+
+
+def test_cli_plan_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    repo_root = prepare_templates(init_repo(tmp_path))
+    monkeypatch.setattr("romjax.cli.collect_plan_prompt", lambda: "Plan a new Galerkin ROM feature")
+
+    def fake_plan_task(paths, task_slug: str, user_prompt: str):
+        assert task_slug == "feat-galerkin-rom"
+        assert user_prompt == "Plan a new Galerkin ROM feature"
+        task_path = paths.open_dir / f"{task_slug}.md"
+        task_path.parent.mkdir(parents=True, exist_ok=True)
+        task_path.write_text("# feat-galerkin-rom\n\n## Summary\nPlanned.\n", encoding="utf-8")
+        return task_path
+
+    monkeypatch.setattr("romjax.cli.plan_task", fake_plan_task)
+
+    exit_code = cli(["plan", "feat-galerkin-rom"], repo_root=repo_root)
 
     captured = capsys.readouterr()
     assert exit_code == 0

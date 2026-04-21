@@ -19,6 +19,10 @@ DEFAULT_AGENT_CMD = (
     "--add-dir {repo_root} "
     "--output-last-message {summary_path} -"
 )
+DEFAULT_PLAN_CMD = (
+    "codex exec --sandbox read-only --cd {repo_root} "
+    "--output-last-message {plan_output_path} -"
+)
 TASK_STATES = ("open", "in_progress", "done", "archive")
 
 
@@ -141,6 +145,17 @@ def create_task(paths: TaskPaths, task_slug: str) -> Path:
     return task_path
 
 
+def get_or_create_open_task(paths: TaskPaths, task_slug: str) -> Path:
+    """Return an open task document, creating it from the template if needed."""
+    try:
+        state, task_path = find_task_document(paths, task_slug)
+    except TaskWorkflowError:
+        return create_task(paths, task_slug)
+    if state != "open":
+        raise TaskWorkflowError(f"Task '{task_slug}' is not open; found state '{state}'.")
+    return task_path
+
+
 def find_task_document(paths: TaskPaths, task_slug: str) -> tuple[str, Path]:
     """Locate a task markdown document across known task states."""
     candidates = {
@@ -225,6 +240,28 @@ def build_agent_prompt(paths: TaskPaths, task_slug: str, task_path: Path, worktr
     )
 
 
+def build_plan_prompt(paths: TaskPaths, task_slug: str, task_path: Path, user_prompt: str) -> str:
+    """Build the planning prompt used to fill a task template."""
+    template_text = task_path.read_text(encoding="utf-8")
+    return (
+        "You are preparing a task markdown document for later implementation work.\n\n"
+        f"Repository root: {paths.repo_root}\n"
+        f"Task slug: {task_slug}\n"
+        f"Task document path: {task_path}\n"
+        f"AGENTS instructions: {paths.repo_root / 'AGENTS.md'}\n\n"
+        "Use the following task template as the starting point. Replace placeholder TODO items "
+        "with concrete, actionable recommendations based on the user prompt. Preserve markdown "
+        "structure and keep the result suitable for a later `task start` run.\n\n"
+        "Return only the final markdown document. Do not wrap it in code fences.\n\n"
+        "<user_prompt>\n"
+        f"{user_prompt}\n"
+        "</user_prompt>\n\n"
+        "<task_template>\n"
+        f"{template_text}\n"
+        "</task_template>\n"
+    )
+
+
 def run_dir_for_task(paths: TaskPaths, task_slug: str) -> Path:
     """Return the run directory for a task."""
     return paths.runs_dir / task_slug
@@ -256,6 +293,81 @@ def render_agent_command(command_template: str, manifest: dict[str, Any]) -> lis
     """Render the agent command template into argv form."""
     command = command_template.format(**manifest)
     return shlex.split(command)
+
+
+def collect_plan_prompt() -> str:
+    """Collect a planning prompt from the user."""
+    if sys.stdin.isatty():
+        prompt = input("Planning prompt: ").strip()
+    else:
+        prompt = sys.stdin.read().strip()
+    if not prompt:
+        raise TaskWorkflowError("Planning prompt cannot be empty.")
+    return prompt
+
+
+def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str) -> Path:
+    """Create or update an open task document using Codex planning guidance."""
+    ensure_task_layout(paths)
+    task_path = get_or_create_open_task(paths, task_slug)
+    run_dir = run_dir_for_task(paths, task_slug)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    plan_prompt_path = run_dir / f"{task_slug}-plan-prompt.md"
+    plan_output_path = run_dir / f"{task_slug}-plan.md"
+    plan_log_path = run_dir / f"{task_slug}-plan.log"
+    plan_command = os.environ.get("ROMJAX_TASK_PLAN_CMD", DEFAULT_PLAN_CMD)
+
+    prompt = build_plan_prompt(paths, task_slug, task_path, user_prompt)
+    plan_prompt_path.write_text(prompt, encoding="utf-8")
+    run_planning_agent(
+        plan_command=plan_command,
+        repo_root=paths.repo_root,
+        plan_prompt_path=plan_prompt_path,
+        plan_output_path=plan_output_path,
+        plan_log_path=plan_log_path,
+    )
+    planned_text = plan_output_path.read_text(encoding="utf-8").strip()
+    if not planned_text:
+        raise TaskWorkflowError(f"Planning command produced an empty task document for '{task_slug}'.")
+    task_path.write_text(planned_text + "\n", encoding="utf-8")
+    return task_path
+
+
+def run_planning_agent(
+    *,
+    plan_command: str,
+    repo_root: Path,
+    plan_prompt_path: Path,
+    plan_output_path: Path,
+    plan_log_path: Path,
+) -> None:
+    """Run Codex planning once and persist its raw outputs."""
+    argv = render_agent_command(
+        plan_command,
+        {
+            "repo_root": str(repo_root),
+            "plan_output_path": str(plan_output_path),
+        },
+    )
+    with plan_prompt_path.open("r", encoding="utf-8") as prompt_file, plan_log_path.open(
+        "a", encoding="utf-8"
+    ) as log_file:
+        process = subprocess.run(
+            argv,
+            cwd=repo_root,
+            stdin=prompt_file,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if process.returncode != 0:
+        raise TaskWorkflowError(
+            f"Planning command failed for '{plan_prompt_path.stem.removesuffix('-plan-prompt')}'. "
+            f"See {plan_log_path}."
+        )
+    if not plan_output_path.exists():
+        raise TaskWorkflowError(f"Planning command did not create {plan_output_path}.")
 
 
 def start_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
@@ -490,6 +602,9 @@ def build_parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create", help="Create a task document from a template")
     create.add_argument("task_slug")
 
+    plan = subparsers.add_parser("plan", help="Create or update an open task using a Codex planning prompt")
+    plan.add_argument("task_slug")
+
     start = subparsers.add_parser("start", help="Start an agent on an open task")
     start.add_argument("task_slug")
 
@@ -524,6 +639,10 @@ def cli(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
     try:
         if args.command == "create":
             task_path = create_task(paths, args.task_slug)
+            print(task_path)
+            return 0
+        if args.command == "plan":
+            task_path = plan_task(paths, args.task_slug, collect_plan_prompt())
             print(task_path)
             return 0
         if args.command == "start":
@@ -562,6 +681,7 @@ def main() -> None:
 
 __all__ = [
     "DEFAULT_AGENT_CMD",
+    "DEFAULT_PLAN_CMD",
     "TASK_STATES",
     "TaskPaths",
     "TaskWorkflowError",
@@ -569,17 +689,21 @@ __all__ = [
     "build_agent_prompt",
     "cli",
     "create_task",
+    "collect_plan_prompt",
     "ensure_task_layout",
     "ensure_task_ready",
     "find_task_document",
     "format_status",
+    "get_or_create_open_task",
     "get_task_paths",
     "list_tasks",
     "load_manifest",
     "main",
     "manifest_path",
+    "plan_task",
     "render_agent_command",
     "run_agent_once",
+    "run_planning_agent",
     "start_task",
     "stop_task",
     "task_runtime_status",

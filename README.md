@@ -34,6 +34,9 @@ Right now, we have the basic `FunctionGraph` API up and running with the `Poisso
 
 When we are done, we will have all of these features implemented with a thorough regression test suite in place and passing. You will generally only be working on one of these tasks at a time with a more specific set of instructions and "doneness" criteria provided when ready.
 
+## Some issues
+- [Issues with codex sandbox shell commands](https://github.com/openai/codex/issues/17525)
+
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.
 
