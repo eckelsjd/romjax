@@ -32,7 +32,7 @@ Use YAML-friendly configuration for public, file-loaded objects. Prefer `romjax.
 * Use **Sphinx-style docstrings** with typed parameters and returns; include math or implementation notes only when they materially help.
 * Prefer `import jax.numpy as jnp`.
 * Avoid Python side effects, mutation inside jitted functions, and non-JAX-compatible libraries in differentiable code.
-* Run tests with `uv run rr test`. Read the failures and fix them before continuing.
+* Run targeted unit tests with `uv run pytest ...` for specific small file changes. Run all tests with `uv run rr test` only for significant repo changes. Read the failures and fix them before continuing.
 
 ## Project structure
 
@@ -71,7 +71,7 @@ uv run rr lint                      # runs ruff check on src and tests directori
 uv run rr test                      # runs pytest on tests directory with coverage
 ```
 
-Success means both lint and test pass without issues. You usually do not need to run the initial `uv sync` step during local development.
+Success means both lint and test pass without issues. You usually do not need to run the initial `uv sync` step during local development. You only need to run full test coverage `uv run rr test` for significant repo changes. For small targeted changes, run lightweight unit tests via `uv run pytest ...` instead.
 
 ## Rules
 

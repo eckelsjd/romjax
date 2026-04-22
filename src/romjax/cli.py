@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import os
-import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,17 +14,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_AGENT_CMD = (
-    "codex exec --full-auto --cd {worktree_path} "
-    "--add-dir {repo_root} "
-    "--color never "
-    "--output-last-message {summary_path} -"
-)
-DEFAULT_PLAN_CMD = (
-    "codex exec --sandbox read-only --cd {repo_root} "
-    "--output-last-message {plan_output_path} -"
-)
-DEFAULT_REVIEW_CMD = "codex exec --sandbox read-only --cd {repo_root} --output-last-message {review_output_path} -"
 TASK_STATES = ("open", "running", "finished", "stopped", "review", "archive")
 PHASE_NAMES = ("planning", "implementation", "review")
 
@@ -156,9 +144,14 @@ def create_task(paths: TaskPaths, task_slug: str) -> Path:
     if not template_path.exists():
         raise TaskWorkflowError(f"No task template found for '{task_type}'. Expected {template_path}.")
 
+    try:
+        _, existing_path = find_task_document(paths, task_slug)
+    except TaskWorkflowError:
+        pass
+    else:
+        raise TaskWorkflowError(f"Task document already exists: {existing_path}")
+
     task_path = paths.open_dir / f"{task_slug}.md"
-    if task_path.exists():
-        raise TaskWorkflowError(f"Task document already exists: {task_path}")
 
     rendered = template_path.read_text(encoding="utf-8").format(**task_metadata(paths, task_slug))
     task_path.write_text(rendered, encoding="utf-8")
@@ -283,8 +276,20 @@ def build_agent_prompt(
     task_path: Path,
     worktree_path: Path,
     summary_path: Path,
+    *,
+    headless: bool,
 ) -> str:
     """Build the default prompt given to the implementation agent."""
+    if headless:
+        summary_instruction = (
+            "5. Return a concise final summary as your last assistant message describing what changed "
+            "and any blockers. Do not wrap it in code fences.\n"
+        )
+    else:
+        summary_instruction = (
+            "5. Write a concise final summary describing what changed and any blockers "
+            f"to {summary_path}.\n"
+        )
     return (
         "Read the repository instructions and execute the task.\n\n"
         f"Repository root: {paths.repo_root}\n"
@@ -297,8 +302,8 @@ def build_agent_prompt(
         "1. Read AGENTS.md before making changes.\n"
         "2. Read the task markdown document and implement only that scope.\n"
         "3. Use the task worktree as your working directory.\n"
-        "4. Run `uv run rr lint` and `uv run rr test` before finishing if feasible.\n"
-        f"5. Write a concise final summary describing what changed and any blockers to {summary_path}.\n"
+        "4. Run `uv run rr lint` and targeted unit tests `uv run pytest ...` on affected files.\n"
+        f"{summary_instruction}"
     )
 
 
@@ -431,33 +436,6 @@ def phase_entry(manifest: dict[str, Any], phase_name: str) -> dict[str, Any]:
     return phases.setdefault(phase_name, {})
 
 
-def render_agent_command(command_template: str, manifest: dict[str, Any]) -> list[str]:
-    """Render the agent command template into argv form."""
-    command = command_template.format(**manifest)
-    if os.name == "nt":
-        return split_windows_command(command)
-    return shlex.split(command, posix=True)
-
-
-def split_windows_command(command: str) -> list[str]:
-    """Split a Windows command line into argv using CommandLineToArgvW."""
-    shell32 = ctypes.windll.shell32
-    kernel32 = ctypes.windll.kernel32
-    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
-    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
-    argc = ctypes.c_int()
-    argv_ptr = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
-    if not argv_ptr:
-        raise OSError("CommandLineToArgvW failed to parse command.")
-    try:
-        return [argv_ptr[index] for index in range(argc.value)]
-    finally:
-        kernel32.LocalFree(argv_ptr)
-
-
 def normalize_cwd(path_value: str | Path) -> Path:
     """Normalize a cwd/path value loaded from task metadata or manifests."""
     return Path(path_value).expanduser().resolve()
@@ -499,82 +477,11 @@ def collect_plan_prompt() -> str:
     return prompt
 
 
-def latest_codex_session_id() -> str | None:
-    """Return the most recent Codex session id from the local session index."""
-    return latest_codex_session_id_for_home(Path.home() / ".codex")
-
-
-def latest_codex_session_id_for_home(codex_home: Path) -> str | None:
-    """Return the most recent Codex session id from a specific CODEX_HOME."""
-    index_path = codex_home / "session_index.jsonl"
-    if index_path.exists():
-        latest: str | None = None
-        for raw_line in index_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            latest = record.get("id") or latest
-        if latest is not None:
-            return latest
-
-    sessions_root = codex_home / "sessions"
-    if not sessions_root.exists():
-        return None
-
-    latest_file: Path | None = None
-    for candidate in sessions_root.rglob("*.jsonl"):
-        if latest_file is None or candidate.stat().st_mtime > latest_file.stat().st_mtime:
-            latest_file = candidate
-    if latest_file is None:
-        return None
-
-    try:
-        first_line = latest_file.read_text(encoding="utf-8").splitlines()[0]
-        record = json.loads(first_line)
-    except (IndexError, OSError, json.JSONDecodeError):
-        return None
-    return record.get("id")
-
-
 def phase_target_directory(phase_name: str, paths: TaskPaths, manifest: dict[str, Any]) -> Path:
     """Return the working directory used for a task phase."""
     if phase_name == "implementation":
         return normalize_cwd(manifest["worktree_path"])
     return paths.repo_root
-
-
-def phase_codex_home(paths: TaskPaths, task_slug: str, phase_name: str) -> Path:
-    """Return the isolated CODEX_HOME used for a task phase."""
-    return run_dir_for_task(paths, task_slug) / f"{task_slug}-{phase_name}-codex-home"
-
-
-def prepare_phase_codex_home(paths: TaskPaths, task_slug: str, phase_name: str) -> Path:
-    """Prepare an isolated CODEX_HOME for a task phase with shared auth/config links."""
-    codex_home = phase_codex_home(paths, task_slug, phase_name)
-    codex_home.mkdir(parents=True, exist_ok=True)
-    source_home = Path.home() / ".codex"
-    for name in ("auth.json", "config.toml", "version.json"):
-        source = source_home / name
-        target = codex_home / name
-        if source.exists() and not target.exists():
-            try:
-                target.symlink_to(source)
-            except OSError:
-                target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-    for name in ("rules", "skills"):
-        source = source_home / name
-        target = codex_home / name
-        if source.exists() and not target.exists():
-            try:
-                target.symlink_to(source, target_is_directory=True)
-            except OSError:
-                if source.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-    return codex_home
 
 
 def ensure_task_for_start(paths: TaskPaths, task_slug: str) -> Path:
@@ -583,7 +490,7 @@ def ensure_task_for_start(paths: TaskPaths, task_slug: str) -> Path:
     if state == "open":
         ensure_task_ready(task_path)
         return move_task_to_state(paths, task_slug, "running")
-    if state in {"finished", "stopped", "review"}:
+    if state == "stopped":
         return move_task_to_state(paths, task_slug, "running")
     if state == "running":
         return task_path
@@ -618,6 +525,16 @@ def phase_paths(paths: TaskPaths, task_slug: str, phase_name: str) -> dict[str, 
     }
 
 
+def ensure_phase_output_absent(paths: TaskPaths, task_slug: str, phase_name: str, label: str) -> dict[str, Path]:
+    """Return phase paths and fail if the phase output already exists."""
+    info = phase_paths(paths, task_slug, phase_name)
+    if info["output_path"].exists():
+        raise TaskWorkflowError(
+            f"Task '{task_slug}' already has {label} output at {info['output_path']}."
+        )
+    return info
+
+
 def build_phase_prompt(
     phase_name: str,
     *,
@@ -627,6 +544,7 @@ def build_phase_prompt(
     manifest: dict[str, Any],
     output_path: Path,
     user_prompt: str | None = None,
+    headless: bool = False,
 ) -> str:
     """Build the prompt for a given phase."""
     if phase_name == "planning":
@@ -639,6 +557,7 @@ def build_phase_prompt(
             task_path,
             normalize_cwd(manifest["worktree_path"]),
             output_path,
+            headless=headless,
         )
     if phase_name == "review":
         review_template_path = paths.templates_dir / "review.md"
@@ -660,42 +579,24 @@ def build_phase_prompt(
     raise TaskWorkflowError(f"Unsupported phase '{phase_name}'.")
 
 
-def parse_headless_session_id(stdout_text: str) -> str | None:
-    """Extract the thread id from codex exec JSON output."""
-    for raw_line in stdout_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "thread.started":
-            return event.get("thread_id")
-    return None
-
-
 def run_codex_interactive(
     *,
     argv: list[str],
     cwd: Path,
     env: dict[str, str],
     log_path: Path,
-    codex_home: Path,
-) -> tuple[int, str | None]:
+) -> int:
     """Run Codex in interactive mode in the current terminal."""
     process = subprocess.Popen(argv, cwd=cwd, env=env)
     exit_code = process.wait()
-    session_id = latest_codex_session_id_for_home(codex_home)
     write_phase_log(
         log_path,
         [
             f"[{utc_now()}] interactive command: {' '.join(argv[:4])} ...",
             f"[{utc_now()}] exit_code: {exit_code}",
-            f"[{utc_now()}] session_id: {session_id or 'unknown'}",
         ],
     )
-    return exit_code, session_id
+    return exit_code
 
 
 def run_codex_headless(
@@ -705,8 +606,8 @@ def run_codex_headless(
     env: dict[str, str],
     prompt_path: Path | None,
     log_path: Path,
-) -> tuple[int, str | None]:
-    """Run Codex in non-interactive exec mode and capture the session id."""
+) -> int:
+    """Run Codex in non-interactive exec mode."""
     stdin_handle = prompt_path.open("r", encoding="utf-8") if prompt_path is not None else None
     try:
         process = subprocess.run(
@@ -722,35 +623,7 @@ def run_codex_headless(
         if stdin_handle is not None:
             stdin_handle.close()
     log_path.write_text(process.stdout + process.stderr, encoding="utf-8")
-    return process.returncode, parse_headless_session_id(process.stdout)
-
-
-def phase_resume_command(
-    phase_name: str,
-    *,
-    session_id: str | None,
-    cwd: Path,
-    repo_root: Path,
-    headless: bool,
-) -> list[str]:
-    """Build the argv for a resumed phase session."""
-    if headless:
-        argv = ["codex", "exec", "resume"]
-        if session_id:
-            argv.append(session_id)
-        else:
-            argv.append("--last")
-        argv.append("--json")
-        return argv
-    argv = ["codex", "resume"]
-    if session_id:
-        argv.append(session_id)
-    else:
-        argv.append("--last")
-    argv.extend(["--no-alt-screen", "-C", str(cwd)])
-    if phase_name == "implementation":
-        argv.extend(["--add-dir", str(repo_root)])
-    return argv
+    return process.returncode
 
 
 def phase_new_command(
@@ -829,14 +702,12 @@ def run_phase_session(
     output_path: Path,
     log_path: Path,
     headless: bool,
-) -> tuple[int, str | None]:
-    """Run or resume a task phase session."""
+) -> int:
+    """Run a task phase session."""
     manifest = load_or_create_manifest(paths, task_slug)
     phase = phase_entry(manifest, phase_name)
     target_cwd = phase_target_directory(phase_name, paths, manifest)
     env = agent_environment(paths)
-    codex_home = prepare_phase_codex_home(paths, task_slug, phase_name)
-    env["CODEX_HOME"] = str(codex_home)
 
     if phase.get("status") == "running":
         pid = phase.get("pid")
@@ -844,28 +715,16 @@ def run_phase_session(
             raise TaskWorkflowError(f"Task '{task_slug}' phase '{phase_name}' is already running.")
         phase["status"] = "stopped"
 
-    session_id = phase.get("session_id")
-    resume_available = bool(session_id or phase.get("codex_home"))
-    if resume_available:
-        argv = phase_resume_command(
-            phase_name,
-            session_id=str(session_id) if session_id else None,
-            cwd=target_cwd,
-            repo_root=paths.repo_root,
-            headless=headless,
-        )
-        prompt_for_stdin = None
-    else:
-        prompt_text = prompt_path.read_text(encoding="utf-8")
-        argv, use_stdin = phase_new_command(
-            phase_name,
-            cwd=target_cwd,
-            repo_root=paths.repo_root,
-            prompt_text=prompt_text,
-            output_path=output_path,
-            headless=headless,
-        )
-        prompt_for_stdin = prompt_path if use_stdin else None
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    argv, use_stdin = phase_new_command(
+        phase_name,
+        cwd=target_cwd,
+        repo_root=paths.repo_root,
+        prompt_text=prompt_text,
+        output_path=output_path,
+        headless=headless,
+    )
+    prompt_for_stdin = prompt_path if use_stdin else None
 
     phase.update(
         {
@@ -880,40 +739,33 @@ def run_phase_session(
     write_manifest(paths, task_slug, manifest)
 
     if headless:
-        exit_code, new_session_id = run_codex_headless(
+        exit_code = run_codex_headless(
             argv=argv,
             cwd=target_cwd,
             env=env,
             prompt_path=prompt_for_stdin,
             log_path=log_path,
         )
-        if new_session_id is None:
-            new_session_id = latest_codex_session_id_for_home(codex_home)
     else:
         process = subprocess.Popen(argv, cwd=target_cwd, env=env)
         phase["pid"] = process.pid
         write_manifest(paths, task_slug, manifest)
         exit_code = process.wait()
-        new_session_id = latest_codex_session_id_for_home(codex_home)
         write_phase_log(
             log_path,
             [
                 f"[{utc_now()}] mode=interactive phase={phase_name}",
                 f"[{utc_now()}] cwd={target_cwd}",
                 f"[{utc_now()}] exit_code={exit_code}",
-                f"[{utc_now()}] session_id={new_session_id or phase.get('session_id') or 'unknown'}",
             ],
         )
 
-    if new_session_id:
-        phase["session_id"] = new_session_id
     phase["exit_code"] = exit_code
     phase["status"] = "succeeded" if exit_code == 0 else "failed"
     phase["completed_at"] = utc_now()
-    phase["codex_home"] = str(codex_home)
     phase.pop("pid", None)
     write_manifest(paths, task_slug, manifest)
-    return exit_code, phase.get("session_id")
+    return exit_code
 
 
 def git_output(worktree_path: Path, args: list[str]) -> str:
@@ -935,26 +787,24 @@ def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str | None = None, 
     ensure_task_layout(paths)
     task_path = get_or_create_open_task(paths, task_slug)
     manifest = load_or_create_manifest(paths, task_slug)
-    phase = phase_entry(manifest, "planning")
-    info = phase_paths(paths, task_slug, "planning")
+    info = ensure_phase_output_absent(paths, task_slug, "planning", "planning")
+    if user_prompt is None:
+        raise TaskWorkflowError("Planning prompt is required.")
+    info["prompt_path"].write_text(
+        build_phase_prompt(
+            "planning",
+            paths=paths,
+            task_slug=task_slug,
+            task_path=task_path,
+            manifest=manifest,
+            output_path=info["output_path"],
+            user_prompt=user_prompt,
+            headless=headless,
+        ),
+        encoding="utf-8",
+    )
 
-    if not phase.get("session_id"):
-        if user_prompt is None:
-            raise TaskWorkflowError("Planning prompt is required for a new planning session.")
-        info["prompt_path"].write_text(
-            build_phase_prompt(
-                "planning",
-                paths=paths,
-                task_slug=task_slug,
-                task_path=task_path,
-                manifest=manifest,
-                output_path=info["output_path"],
-                user_prompt=user_prompt,
-            ),
-            encoding="utf-8",
-        )
-
-    exit_code, _ = run_planning_agent(
+    exit_code = run_planning_agent(
         paths=paths,
         task_slug=task_slug,
         prompt_path=info["prompt_path"],
@@ -972,8 +822,9 @@ def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str | None = None, 
 
 
 def start_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> dict[str, Any]:
-    """Create a worktree if needed, then run or resume the implementation agent."""
+    """Create a worktree if needed, then run the implementation agent."""
     ensure_task_layout(paths)
+    info = ensure_phase_output_absent(paths, task_slug, "implementation", "implementation")
     task_path = ensure_task_for_start(paths, task_slug)
     manifest = load_or_create_manifest(paths, task_slug)
 
@@ -985,22 +836,20 @@ def start_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> dict
         manifest["base_ref"] = current_git_branch(paths.repo_root)
         write_manifest(paths, task_slug, manifest)
 
-    phase = phase_entry(manifest, "implementation")
-    info = phase_paths(paths, task_slug, "implementation")
-    if not phase.get("session_id"):
-        info["prompt_path"].write_text(
-            build_phase_prompt(
-                "implementation",
-                paths=paths,
-                task_slug=task_slug,
-                task_path=task_path,
-                manifest=manifest,
-                output_path=info["output_path"],
-            ),
-            encoding="utf-8",
-        )
+    info["prompt_path"].write_text(
+        build_phase_prompt(
+            "implementation",
+            paths=paths,
+            task_slug=task_slug,
+            task_path=task_path,
+            manifest=manifest,
+            output_path=info["output_path"],
+            headless=headless,
+        ),
+        encoding="utf-8",
+    )
 
-    exit_code, _ = run_implementation_agent(
+    exit_code = run_implementation_agent(
         paths=paths,
         task_slug=task_slug,
         prompt_path=info["prompt_path"],
@@ -1028,22 +877,21 @@ def review_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> Pat
     if not worktree_path.exists():
         raise TaskWorkflowError(f"Task worktree does not exist: {worktree_path}")
 
-    phase = phase_entry(manifest, "review")
-    info = phase_paths(paths, task_slug, "review")
-    if not phase.get("session_id"):
-        info["prompt_path"].write_text(
-            build_phase_prompt(
-                "review",
-                paths=paths,
-                task_slug=task_slug,
-                task_path=task_path,
-                manifest=manifest,
-                output_path=info["output_path"],
-            ),
-            encoding="utf-8",
-        )
+    info = ensure_phase_output_absent(paths, task_slug, "review", "review")
+    info["prompt_path"].write_text(
+        build_phase_prompt(
+            "review",
+            paths=paths,
+            task_slug=task_slug,
+            task_path=task_path,
+            manifest=manifest,
+            output_path=info["output_path"],
+            headless=headless,
+        ),
+        encoding="utf-8",
+    )
 
-    exit_code, _ = run_review_agent(
+    exit_code = run_review_agent(
         paths=paths,
         task_slug=task_slug,
         prompt_path=info["prompt_path"],
@@ -1068,8 +916,8 @@ def run_planning_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
-) -> tuple[int, str | None]:
-    """Run or resume the planning agent."""
+) -> int:
+    """Run the planning agent."""
     return run_phase_session(
         paths=paths,
         task_slug=task_slug,
@@ -1090,8 +938,8 @@ def run_implementation_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
-) -> tuple[int, str | None]:
-    """Run or resume the implementation agent."""
+) -> int:
+    """Run the implementation agent."""
     return run_phase_session(
         paths=paths,
         task_slug=task_slug,
@@ -1112,8 +960,8 @@ def run_review_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
-) -> tuple[int, str | None]:
-    """Run or resume the review agent."""
+) -> int:
+    """Run the review agent."""
     _, task_path = find_task_document(paths, task_slug)
     return run_phase_session(
         paths=paths,
@@ -1193,6 +1041,122 @@ def archive_task(paths: TaskPaths, task_slug: str) -> Path:
     return move_task_to_state(paths, task_slug, "archive")
 
 
+def task_has_running_phase(paths: TaskPaths, task_slug: str) -> bool:
+    """Return whether a task manifest indicates an active phase."""
+    try:
+        manifest = load_manifest(paths, task_slug)
+    except TaskWorkflowError:
+        return False
+    for phase in manifest.get("phases", {}).values():
+        if phase.get("status") == "running":
+            return True
+    return False
+
+
+def is_registered_worktree(repo_root: Path, worktree_path: Path) -> bool:
+    """Return whether a path is registered as a git worktree."""
+    process = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected = normalize_cwd(worktree_path)
+    for raw_line in process.stdout.splitlines():
+        if raw_line.startswith("worktree "):
+            listed = normalize_cwd(raw_line.removeprefix("worktree ").strip())
+            if listed == expected:
+                return True
+    return False
+
+
+def confirm_clean(task_slug: str) -> None:
+    """Ask the user to confirm a destructive task cleanup operation."""
+    warning = (
+        f"Warning: task clean will permanently remove the task document, run artifacts, "
+        f"git worktree, and branch for '{task_slug}'."
+    )
+    print(warning)
+    print("Type 'clean' to continue: ", end="", flush=True)
+    if sys.stdin.isatty():
+        response = input().strip()
+    else:
+        response = sys.stdin.read().strip()
+    if response != "clean":
+        raise TaskWorkflowError("Task clean cancelled.")
+
+
+def clean_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
+    """Remove all local artifacts associated with a task."""
+    state, task_path = find_task_document(paths, task_slug)
+    if state == "running" or task_has_running_phase(paths, task_slug):
+        raise TaskWorkflowError(f"Task '{task_slug}' is currently running. Stop it before cleaning.")
+
+    try:
+        manifest = load_manifest(paths, task_slug)
+    except TaskWorkflowError:
+        manifest = initial_manifest(paths, task_slug)
+
+    run_dir = run_dir_for_task(paths, task_slug)
+    worktree_path = normalize_cwd(manifest["worktree_path"])
+    branch_name = str(manifest.get("branch_name") or task_slug)
+    summary: dict[str, Any] = {
+        "task_slug": task_slug,
+        "removed_task_doc": False,
+        "removed_run_dir": False,
+        "removed_worktree": False,
+        "removed_branch": False,
+        "task_doc_path": str(task_path),
+        "run_dir_path": str(run_dir),
+        "worktree_path": str(worktree_path),
+        "branch_name": branch_name,
+    }
+
+    task_path.unlink()
+    summary["removed_task_doc"] = True
+
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+        summary["removed_run_dir"] = True
+
+    if worktree_path.exists():
+        if is_registered_worktree(paths.repo_root, worktree_path):
+            run_git(paths.repo_root, ["worktree", "remove", "--force", str(worktree_path)])
+        else:
+            shutil.rmtree(worktree_path)
+        summary["removed_worktree"] = True
+
+    branch_lookup = run_git(paths.repo_root, ["branch", "--list", branch_name]).stdout.strip()
+    if branch_lookup:
+        run_git(paths.repo_root, ["branch", "-D", branch_name])
+        summary["removed_branch"] = True
+
+    return summary
+
+
+def format_clean_summary(summary: dict[str, Any]) -> str:
+    """Render a human-readable cleanup summary."""
+    lines = [f"task: {summary['task_slug']}"]
+    if summary["removed_task_doc"]:
+        lines.append(f"removed task doc: {summary['task_doc_path']}")
+    else:
+        lines.append("removed task doc: no")
+    if summary["removed_run_dir"]:
+        lines.append(f"removed run dir: {summary['run_dir_path']}")
+    else:
+        lines.append("removed run dir: no")
+    if summary["removed_worktree"]:
+        lines.append(f"removed worktree: {summary['worktree_path']}")
+    else:
+        lines.append("removed worktree: no")
+    if summary["removed_branch"]:
+        lines.append(f"removed branch: {summary['branch_name']}")
+    else:
+        lines.append("removed branch: no")
+    return "\n".join(lines)
+
+
 def list_tasks(paths: TaskPaths) -> list[dict[str, Any]]:
     """List all known tasks grouped by current state."""
     tasks: dict[str, dict[str, Any]] = {}
@@ -1264,6 +1228,9 @@ def build_parser() -> argparse.ArgumentParser:
     archive = subparsers.add_parser("archive", help="Archive a task document")
     archive.add_argument("task_slug")
 
+    clean = subparsers.add_parser("clean", help="Delete a task document, run artifacts, worktree, and branch")
+    clean.add_argument("task_slug")
+
     status = subparsers.add_parser("status", help="Show task status")
     status.add_argument("task_slug")
 
@@ -1289,13 +1256,7 @@ def cli(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
             print(task_path)
             return 0
         if args.command == "plan":
-            manifest = load_or_create_manifest(paths, args.task_slug)
-            existing_phase = phase_entry(manifest, "planning")
-            user_prompt = (
-                None
-                if (existing_phase.get("session_id") or existing_phase.get("codex_home"))
-                else collect_plan_prompt()
-            )
+            user_prompt = collect_plan_prompt()
             task_path = plan_task(paths, args.task_slug, user_prompt=user_prompt, headless=args.headless)
             print(task_path)
             return 0
@@ -1314,12 +1275,18 @@ def cli(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
             archive_path = archive_task(paths, args.task_slug)
             print(archive_path)
             return 0
+        if args.command == "clean":
+            confirm_clean(args.task_slug)
+            summary = clean_task(paths, args.task_slug)
+            print(format_clean_summary(summary))
+            return 0
         if args.command == "status":
             print(format_status(task_runtime_status(paths, args.task_slug)))
             return 0
         if args.command == "list":
+            print(f"{'TASK':15s} {'STATE'}")
             for item in list_tasks(paths):
-                print(f"{item['task_slug']}\t{item['task_state']}\t{item['run_status']}")
+                print(f"{item['task_slug']:15s} {item['task_state']}")
             return 0
     except TaskWorkflowError as exc:
         print(str(exc), file=sys.stderr)
@@ -1335,9 +1302,6 @@ def main() -> None:
 
 
 __all__ = [
-    "DEFAULT_AGENT_CMD",
-    "DEFAULT_PLAN_CMD",
-    "DEFAULT_REVIEW_CMD",
     "PHASE_NAMES",
     "TASK_STATES",
     "TaskPaths",
@@ -1347,12 +1311,15 @@ __all__ = [
     "build_agent_prompt",
     "build_phase_prompt",
     "cli",
+    "clean_task",
+    "confirm_clean",
     "create_task",
     "collect_plan_prompt",
     "current_git_branch",
     "ensure_task_layout",
     "ensure_task_ready",
     "find_task_document",
+    "format_clean_summary",
     "format_status",
     "get_or_create_open_task",
     "get_task_paths",
@@ -1365,7 +1332,6 @@ __all__ = [
     "phase_entry",
     "phase_paths",
     "plan_task",
-    "render_agent_command",
     "review_task",
     "run_implementation_agent",
     "run_planning_agent",
@@ -1373,6 +1339,7 @@ __all__ = [
     "shared_venv_path",
     "start_task",
     "stop_task",
+    "task_has_running_phase",
     "task_runtime_status",
     "terminate_process",
     "validate_task_slug",
