@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 from pathlib import Path
@@ -27,6 +28,7 @@ from romjax.cli import (
     phase_paths,
     plan_task,
     review_task,
+    shared_venv_bin_dir,
     shared_venv_path,
     start_task,
     stop_task,
@@ -300,11 +302,12 @@ def test_agent_environment_uses_shared_repo_venv(tmp_path: Path):
     repo_root = init_repo(tmp_path)
     paths = get_task_paths(repo_root)
     venv_path = shared_venv_path(paths)
-    (venv_path / "bin").mkdir(parents=True)
+    bin_dir = shared_venv_bin_dir(paths)
+    bin_dir.mkdir(parents=True)
     env = agent_environment(paths)
     assert env["VIRTUAL_ENV"] == str(venv_path)
     assert env["UV_PROJECT_ENVIRONMENT"] == str(venv_path)
-    assert str(venv_path / "bin") in env["PATH"]
+    assert str(bin_dir) in env["PATH"].split(os.pathsep)
 
 
 def test_terminate_process_uses_kill_on_platform_without_killpg(monkeypatch: pytest.MonkeyPatch):

@@ -446,6 +446,11 @@ def shared_venv_path(paths: TaskPaths) -> Path:
     return paths.repo_root / ".venv"
 
 
+def shared_venv_bin_dir(paths: TaskPaths) -> Path:
+    """Return the executable directory inside the shared project virtual environment."""
+    return shared_venv_path(paths) / ("Scripts" if os.name == "nt" else "bin")
+
+
 def agent_environment(paths: TaskPaths) -> dict[str, str]:
     """Build an environment that lets task worktrees reuse the main repo .venv."""
     env = os.environ.copy()
@@ -453,7 +458,7 @@ def agent_environment(paths: TaskPaths) -> dict[str, str]:
     if venv_path.exists():
         env["VIRTUAL_ENV"] = str(venv_path)
         env["UV_PROJECT_ENVIRONMENT"] = str(venv_path)
-        bin_dir = venv_path / ("Scripts" if os.name == "nt" else "bin")
+        bin_dir = shared_venv_bin_dir(paths)
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
     return env
 
@@ -1336,6 +1341,7 @@ __all__ = [
     "run_implementation_agent",
     "run_planning_agent",
     "run_review_agent",
+    "shared_venv_bin_dir",
     "shared_venv_path",
     "start_task",
     "stop_task",
