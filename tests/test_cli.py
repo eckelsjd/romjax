@@ -9,6 +9,8 @@ import pytest
 from romjax.cli import (
     agent_environment,
     archive_task,
+    build_phase_prompt,
+    clean_task,
     cli,
     collect_plan_prompt,
     create_task,
@@ -18,14 +20,11 @@ from romjax.cli import (
     find_task_document,
     get_task_paths,
     git_output,
-    latest_codex_session_id_for_home,
     load_manifest,
     load_or_create_manifest,
     move_task_to_state,
-    phase_codex_home,
     phase_entry,
     phase_paths,
-    phase_resume_command,
     plan_task,
     review_task,
     shared_venv_path,
@@ -97,6 +96,16 @@ def test_create_task_uses_prefix_template(tmp_path: Path):
     assert "TODO: fill me" in task_path.read_text(encoding="utf-8")
 
 
+def test_create_task_rejects_existing_task_in_any_state(tmp_path: Path):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    create_task(paths, "feat-galerkin-rom")
+    move_task_to_state(paths, "feat-galerkin-rom", "archive")
+
+    with pytest.raises(Exception):
+        create_task(paths, "feat-galerkin-rom")
+
+
 def test_current_git_branch(tmp_path: Path):
     assert current_git_branch(init_repo(tmp_path)) == "main"
 
@@ -129,10 +138,9 @@ def test_plan_task_creates_missing_task_and_fills_template(tmp_path: Path, monke
         )
         manifest = load_or_create_manifest(paths, kwargs["task_slug"])
         phase = phase_entry(manifest, "planning")
-        phase["session_id"] = "plan-session"
         phase["status"] = "succeeded"
         write_manifest(paths, kwargs["task_slug"], manifest)
-        return 0, "plan-session"
+        return 0
 
     monkeypatch.setattr("romjax.cli.run_planning_agent", fake_run_planning_agent)
 
@@ -141,31 +149,20 @@ def test_plan_task_creates_missing_task_and_fills_template(tmp_path: Path, monke
     assert task_path.exists()
     assert "Implement a Galerkin ROM feature." in task_path.read_text(encoding="utf-8")
     manifest = load_manifest(paths, "feat-galerkin-rom")
-    assert manifest["phases"]["planning"]["session_id"] == "plan-session"
+    assert manifest["phases"]["planning"]["status"] == "succeeded"
     assert_task_state(paths, "feat-galerkin-rom", "open")
 
 
-def test_plan_task_resumes_existing_session_without_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_plan_task_rejects_existing_planning_output(tmp_path: Path):
     repo_root = prepare_repo(init_repo(tmp_path))
     paths = get_task_paths(repo_root)
-    task_path = create_task(paths, "fix-bug-1127")
-    manifest = load_or_create_manifest(paths, "fix-bug-1127")
-    phase = phase_entry(manifest, "planning")
-    phase["session_id"] = "existing-plan-session"
-    write_manifest(paths, "fix-bug-1127", manifest)
+    create_task(paths, "fix-bug-1127")
     info = phase_paths(paths, "fix-bug-1127", "planning")
-    info["prompt_path"].write_text("resume plan prompt\n", encoding="utf-8")
+    info["output_path"].parent.mkdir(parents=True, exist_ok=True)
+    info["output_path"].write_text("existing plan\n", encoding="utf-8")
 
-    def fake_run_planning_agent(**kwargs):
-        Path(kwargs["output_path"]).write_text("# fix-bug-1127\n\n## Problem\nFix issue 1127.\n", encoding="utf-8")
-        return 0, "existing-plan-session"
-
-    monkeypatch.setattr("romjax.cli.run_planning_agent", fake_run_planning_agent)
-
-    planned = plan_task(paths, "fix-bug-1127")
-
-    assert planned == task_path
-    assert "Fix issue 1127." in planned.read_text(encoding="utf-8")
+    with pytest.raises(Exception):
+        plan_task(paths, "fix-bug-1127", user_prompt="Fix issue 1127.")
 
 
 def test_start_task_creates_worktree_and_runs_implementation_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -178,11 +175,10 @@ def test_start_task_creates_worktree_and_runs_implementation_phase(tmp_path: Pat
         Path(kwargs["output_path"]).write_text("summary\n", encoding="utf-8")
         manifest = load_or_create_manifest(paths, kwargs["task_slug"])
         phase = phase_entry(manifest, "implementation")
-        phase["session_id"] = "impl-session"
         phase["status"] = "succeeded"
         phase["exit_code"] = 0
         write_manifest(paths, kwargs["task_slug"], manifest)
-        return 0, "impl-session"
+        return 0
 
     monkeypatch.setattr("romjax.cli.run_implementation_agent", fake_run_implementation_agent)
 
@@ -191,11 +187,24 @@ def test_start_task_creates_worktree_and_runs_implementation_phase(tmp_path: Pat
     assert Path(manifest["worktree_path"]).exists()
     assert_task_state(paths, "feat-galerkin-rom", "finished")
     stored = load_manifest(paths, "feat-galerkin-rom")
-    assert stored["phases"]["implementation"]["session_id"] == "impl-session"
+    assert stored["phases"]["implementation"]["status"] == "succeeded"
     info = phase_paths(paths, "feat-galerkin-rom", "implementation")
     assert info["prompt_path"].name == "feat-galerkin-rom-implementation-prompt.md"
     assert info["output_path"].name == "feat-galerkin-rom-implementation.md"
     assert info["log_path"].name == "feat-galerkin-rom-implementation.log"
+
+
+def test_start_task_rejects_existing_implementation_output(tmp_path: Path):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nDone\n", encoding="utf-8")
+    info = phase_paths(paths, "feat-galerkin-rom", "implementation")
+    info["output_path"].parent.mkdir(parents=True, exist_ok=True)
+    info["output_path"].write_text("existing implementation\n", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        start_task(paths, "feat-galerkin-rom")
 
 
 def test_review_task_creates_review_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -216,10 +225,9 @@ def test_review_task_creates_review_summary(tmp_path: Path, monkeypatch: pytest.
         )
         manifest = load_or_create_manifest(paths, kwargs["task_slug"])
         phase = phase_entry(manifest, "review")
-        phase["session_id"] = "review-session"
         phase["status"] = "succeeded"
         write_manifest(paths, kwargs["task_slug"], manifest)
-        return 0, "review-session"
+        return 0
 
     monkeypatch.setattr("romjax.cli.run_review_agent", fake_run_review_agent)
 
@@ -227,6 +235,59 @@ def test_review_task_creates_review_summary(tmp_path: Path, monkeypatch: pytest.
 
     assert "Updated the model." in review_path.read_text(encoding="utf-8")
     assert_task_state(paths, "feat-galerkin-rom", "review")
+
+
+def test_review_task_rejects_existing_review_output(tmp_path: Path):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nImplemented feature.\n", encoding="utf-8")
+    task_path.rename(paths.finished_dir / task_path.name)
+    manifest = load_or_create_manifest(paths, "feat-galerkin-rom")
+    Path(manifest["worktree_path"]).mkdir()
+    write_manifest(paths, "feat-galerkin-rom", manifest)
+    info = phase_paths(paths, "feat-galerkin-rom", "review")
+    info["output_path"].parent.mkdir(parents=True, exist_ok=True)
+    info["output_path"].write_text("existing review\n", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        review_task(paths, "feat-galerkin-rom")
+
+
+def test_implementation_prompt_uses_mode_appropriate_summary_instruction(tmp_path: Path):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nImplemented feature.\n", encoding="utf-8")
+    manifest = load_or_create_manifest(paths, "feat-galerkin-rom")
+    output_path = phase_paths(paths, "feat-galerkin-rom", "implementation")["output_path"]
+
+    interactive_prompt = build_phase_prompt(
+        "implementation",
+        paths=paths,
+        task_slug="feat-galerkin-rom",
+        task_path=task_path,
+        manifest=manifest,
+        output_path=output_path,
+        headless=False,
+    )
+    headless_prompt = build_phase_prompt(
+        "implementation",
+        paths=paths,
+        task_slug="feat-galerkin-rom",
+        task_path=task_path,
+        manifest=manifest,
+        output_path=output_path,
+        headless=True,
+    )
+
+    expected = (
+        "Write a concise final summary describing what changed and any blockers "
+        f"to {output_path}."
+    )
+    assert expected in interactive_prompt
+    assert "Return a concise final summary as your last assistant message" in headless_prompt
+    assert f"any blockers to {output_path}" not in headless_prompt
 
 
 def test_git_output_reads_git_state(tmp_path: Path):
@@ -244,48 +305,6 @@ def test_agent_environment_uses_shared_repo_venv(tmp_path: Path):
     assert env["VIRTUAL_ENV"] == str(venv_path)
     assert env["UV_PROJECT_ENVIRONMENT"] == str(venv_path)
     assert str(venv_path / "bin") in env["PATH"]
-
-
-def test_phase_codex_home_is_isolated_per_phase(tmp_path: Path):
-    repo_root = init_repo(tmp_path)
-    paths = get_task_paths(repo_root)
-
-    planning_home = phase_codex_home(paths, "feat-galerkin-rom", "planning")
-    review_home = phase_codex_home(paths, "feat-galerkin-rom", "review")
-
-    assert planning_home != review_home
-    assert planning_home.name == "feat-galerkin-rom-planning-codex-home"
-    assert review_home.name == "feat-galerkin-rom-review-codex-home"
-
-
-def test_latest_codex_session_id_for_home_falls_back_to_sessions(tmp_path: Path):
-    codex_home = tmp_path / "codex-home"
-    session_dir = codex_home / "sessions" / "2026" / "04" / "21"
-    session_dir.mkdir(parents=True)
-    session_file = session_dir / "rollout-test.jsonl"
-    session_file.write_text('{"id":"session-from-file"}\n{"type":"turn.started"}\n', encoding="utf-8")
-
-    assert latest_codex_session_id_for_home(codex_home) == "session-from-file"
-
-
-def test_phase_resume_command_uses_last_without_session_id():
-    interactive = phase_resume_command(
-        "planning",
-        session_id=None,
-        cwd=Path("/tmp"),
-        repo_root=Path("/tmp/repo"),
-        headless=False,
-    )
-    headless = phase_resume_command(
-        "planning",
-        session_id=None,
-        cwd=Path("/tmp"),
-        repo_root=Path("/tmp/repo"),
-        headless=True,
-    )
-
-    assert "--last" in interactive
-    assert "--last" in headless
 
 
 def test_terminate_process_uses_kill_on_platform_without_killpg(monkeypatch: pytest.MonkeyPatch):
@@ -341,6 +360,68 @@ def test_archive_task_rejects_running_phase(tmp_path: Path):
         archive_task(paths, "feat-galerkin-rom")
 
 
+def test_clean_task_removes_task_doc_run_dir_worktree_and_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nDone\n", encoding="utf-8")
+
+    def fake_run_implementation_agent(**kwargs):
+        Path(kwargs["output_path"]).write_text("summary\n", encoding="utf-8")
+        manifest = load_or_create_manifest(paths, kwargs["task_slug"])
+        phase = phase_entry(manifest, "implementation")
+        phase["status"] = "succeeded"
+        phase["exit_code"] = 0
+        write_manifest(paths, kwargs["task_slug"], manifest)
+        return 0
+
+    monkeypatch.setattr("romjax.cli.run_implementation_agent", fake_run_implementation_agent)
+    manifest = start_task(paths, "feat-galerkin-rom")
+    worktree_path = Path(manifest["worktree_path"])
+    run_dir = paths.runs_dir / "feat-galerkin-rom"
+
+    assert worktree_path.exists()
+    assert run_dir.exists()
+    assert "feat-galerkin-rom" in subprocess.run(
+        ["git", "branch", "--list", "feat-galerkin-rom"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    summary = clean_task(paths, "feat-galerkin-rom")
+
+    assert summary["removed_task_doc"] is True
+    assert summary["removed_run_dir"] is True
+    assert summary["removed_worktree"] is True
+    assert summary["removed_branch"] is True
+    assert not worktree_path.exists()
+    assert not run_dir.exists()
+    with pytest.raises(Exception):
+        find_task_document(paths, "feat-galerkin-rom")
+    assert subprocess.run(
+        ["git", "branch", "--list", "feat-galerkin-rom"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == ""
+
+
+def test_clean_task_rejects_running_task(tmp_path: Path):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    create_task(paths, "feat-galerkin-rom")
+    move_task_to_state(paths, "feat-galerkin-rom", "running")
+    manifest = load_or_create_manifest(paths, "feat-galerkin-rom")
+    phase_entry(manifest, "implementation")["status"] = "running"
+    write_manifest(paths, "feat-galerkin-rom", manifest)
+
+    with pytest.raises(Exception):
+        clean_task(paths, "feat-galerkin-rom")
+
+
 def test_cli_plan_command_passes_headless(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -366,32 +447,6 @@ def test_cli_plan_command_passes_headless(
     assert "feat-galerkin-rom.md" in capsys.readouterr().out
 
 
-def test_cli_plan_command_resumes_without_prompt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-):
-    repo_root = prepare_repo(init_repo(tmp_path))
-    paths = get_task_paths(repo_root)
-    create_task(paths, "feat-galerkin-rom")
-    manifest = load_or_create_manifest(paths, "feat-galerkin-rom")
-    phase_entry(manifest, "planning")["codex_home"] = str(phase_codex_home(paths, "feat-galerkin-rom", "planning"))
-    write_manifest(paths, "feat-galerkin-rom", manifest)
-    monkeypatch.setattr(
-        "romjax.cli.collect_plan_prompt",
-        lambda: (_ for _ in ()).throw(AssertionError("should not prompt")),
-    )
-    monkeypatch.setattr(
-        "romjax.cli.plan_task",
-        lambda paths, task_slug, user_prompt=None, headless=False: paths.open_dir / f"{task_slug}.md",
-    )
-
-    exit_code = cli(["plan", "feat-galerkin-rom"], repo_root=repo_root)
-
-    assert exit_code == 0
-    assert "feat-galerkin-rom.md" in capsys.readouterr().out
-
-
 def test_cli_start_command_returns_agent_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = prepare_repo(init_repo(tmp_path))
     monkeypatch.setattr(
@@ -399,6 +454,23 @@ def test_cli_start_command_returns_agent_exit_code(tmp_path: Path, monkeypatch: 
         lambda _paths, task_slug, headless=False: {"task_slug": task_slug, "exit_code": 7},
     )
     assert cli(["start", "feat-galerkin-rom", "--headless"], repo_root=repo_root) == 7
+
+
+def test_cli_clean_command_requires_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    monkeypatch.setattr("romjax.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "no")
+
+    exit_code = cli(["clean", "feat-galerkin-rom"], repo_root=repo_root)
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "Warning: task clean" in captured.out
+    assert "Task clean cancelled." in captured.err
 
 
 def test_cli_review_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -450,8 +522,10 @@ def test_list_includes_new_directory_backed_states(tmp_path: Path, capsys: pytes
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "feat-open\topen\topen" in output
-    assert "feat-running\trunning\trunning" in output
-    assert "feat-finished\tfinished\tfinished" in output
-    assert "feat-stopped\tstopped\tstopped" in output
-    assert "feat-review\treview\treview" in output
+    assert "TASK" in output
+    assert "STATE" in output
+    assert "feat-open" in output and "open" in output
+    assert "feat-running" in output and "running" in output
+    assert "feat-finished" in output and "finished" in output
+    assert "feat-stopped" in output and "stopped" in output
+    assert "feat-review" in output and "review" in output
