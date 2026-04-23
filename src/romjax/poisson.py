@@ -1,5 +1,6 @@
 """Example 2D Poisson solver."""
-from typing import Any, Callable, Literal, Mapping, TypedDict
+from collections.abc import Mapping
+from typing import Any, Callable, Literal, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -10,12 +11,19 @@ from pydantic import Field, PositiveInt, ValidationInfo, field_validator
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
 from romjax.pde import BoundarySpec, BoundaryType, Coordinates, UniformGrid, homogeneous_boundary
-from romjax.rng import Distribution, SamplerCallable, parametric_sampler
+from romjax.rng import (
+    Distribution,
+    SamplerCallable,
+    near_solution_sampler,
+    parametric_sampler,
+    validate_distribution_pytree,
+)
 from romjax.typing import AdjointMethod, DictModel, IterativeSolver
 from romjax.utils import merge_pytrees, to_pytree
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
-type SamplerName = Literal["parametric"]
+type InputSamplerName = Literal["parametric"]
+type OutputSamplerName = Literal["near_solution"]
 type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
 type BoundaryCallable = Callable[[PyTree], PyTree]
 type InitialCallable = Callable[[Coordinates], ArrayLike]
@@ -223,12 +231,28 @@ class Poisson2D(ImplicitModel, Sampleable):
             return value
         raise TypeError("forcing and conductivity must be a callable or a supported string literal.")
 
-    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", "outputs_sampler", mode="before")
+    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", mode="before")
     @classmethod
-    def _coerce_sampler(cls, value: SamplerCallable | SamplerName | None) -> SamplerCallable | None:
+    def _coerce_sampler(cls, value: SamplerCallable | InputSamplerName | None) -> SamplerCallable | None:
         if isinstance(value, str):
-            mapping: Mapping[SamplerName, SamplerCallable] = {
+            mapping: Mapping[InputSamplerName, SamplerCallable] = {
                 "parametric": parametric_sampler
+            }
+            if value not in mapping:
+                raise ValueError(f"Unknown sampler: {value!r}")
+            return mapping[value]
+        if value is None:
+            return value
+        if callable(value):
+            return value
+        raise TypeError("samplers must be either a valid name, callable, or none.")
+
+    @field_validator("outputs_sampler", mode="before")
+    @classmethod
+    def _coerce_outputs_sampler(cls, value: SamplerCallable | OutputSamplerName | None) -> SamplerCallable | None:
+        if isinstance(value, str):
+            mapping: Mapping[OutputSamplerName, SamplerCallable] = {
+                "near_solution": near_solution_sampler,
             }
             if value not in mapping:
                 raise ValueError(f"Unknown sampler: {value!r}")
@@ -242,7 +266,11 @@ class Poisson2D(ImplicitModel, Sampleable):
     @field_validator("forcing_sampler_opts", "conductivity_sampler_opts", 
                      "boundary_sampler_opts", "outputs_sampler_opts", mode="after")
     @classmethod
-    def _coerce_sampler_opts(cls, value: dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
+    def _coerce_sampler_opts(
+        cls,
+        value: dict[str, Any],
+        info: ValidationInfo,
+    ) -> dict[str, Any]:
         """Just provides validation for known sampler function params."""
         check_flag = False
         for s in ['forcing', 'conductivity', 'boundary', 'outputs']:
@@ -255,7 +283,24 @@ class Poisson2D(ImplicitModel, Sampleable):
                 if not isinstance(value[k], Mapping):
                     raise TypeError("Extra parametric sampler opts must be a Distribution-like mapping.")
                 value[k] = Distribution(**value[k])
-        
+
+        if info.field_name == "outputs_sampler_opts" and info.data["outputs_sampler"] is near_solution_sampler:
+            if not isinstance(value, Mapping):
+                raise TypeError("Near-solution sampler opts must be provided as a mapping.")
+            kwargs = dict(value)
+            noise = kwargs.pop("noise", None)
+            scale = kwargs.pop("scale", 1.0)
+            if kwargs:
+                if noise is None:
+                    noise = kwargs
+                else:
+                    noise.update(kwargs)
+
+            if noise is not None:
+                return {"noise": validate_distribution_pytree(noise), "scale": scale}
+            else:
+                return {"noise": noise, "scale": scale}
+
         return value
     
     @field_validator("forcing_defaults", "conductivity_defaults", mode="before")
@@ -440,10 +485,15 @@ class Poisson2D(ImplicitModel, Sampleable):
         :param solution: for efficiency, optionally condition on the precomputed solution of solve(inputs)=0
         :return: the outputs sample
         """
-        # TODO: how to handle stratified sampling
-        sample = {}
+        if self.outputs_sampler is None:
+            return {}
 
-        if self.outputs_sampler is not None:
-            sample["phi"] = self.outputs_sampler(key, inputs=inputs, solution=solution, **self.outputs_sampler_opts)
-        
-        return sample
+        sampler_solution = solution
+        sampler_opts = dict(self.outputs_sampler_opts)
+        if self.outputs_sampler is near_solution_sampler and sampler_solution is None:
+            sampler_solution = self.solve(inputs)
+
+        sample = self.outputs_sampler(key, inputs=inputs, solution=sampler_solution, **sampler_opts)
+        if isinstance(sample, Mapping):
+            return {"phi": jnp.asarray(sample["phi"])}
+        return {"phi": jnp.asarray(sample)}
