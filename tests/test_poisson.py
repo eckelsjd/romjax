@@ -12,10 +12,10 @@ from romjax.poisson import (
     GaussianForcingInputs,
     Poisson2D,
     PoissonConfig,
-    darcy_field,
     gaussian_forcing,
     nonlinear_conductivity,
 )
+from romjax.random_field import darcy
 from romjax.rng import gen_keys
 from romjax.typing import DictModel
 
@@ -241,7 +241,7 @@ def test_poisson_sample_inputs():
         assert np.isclose(sample["forcing"]["mu_x"], float(expected_mu_x), rtol=1e-5, atol=1e-6)
         assert np.isclose(sample["forcing"]["A0"], float(expected_a0), rtol=1e-5, atol=1e-6)
 
-        expected_k0 = darcy_field(
+        expected_k0 = darcy(
             jax.random.split(conductivity_key, 1)[0],
             shape=(50, 50),
             bounds=((0, 1), (0, 1)),

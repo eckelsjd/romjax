@@ -138,60 +138,6 @@ def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: Poisson
     return inputs['k0'] * (1 + inputs['alpha'] * (phi * phi))
 
 
-def darcy_field(
-        key: Key, 
-        nsamples: int = 1, 
-        bounds: tuple[tuple[int, int], tuple[int, int]] = ((0, 1), (0, 1)),
-        shape: tuple[int, int] = (16, 16),
-        nemytskii: tuple[float, float] = (3.0, 12.0),
-        cov_diag: float = 9.0
-    ) -> ArrayLike:
-    """Sample darcy flow conductivity field according to Sec 6.2 of Kovachki 2022.
-
-    https://arxiv.org/abs/2108.08481
-
-    :param key: the random key
-    :param nsamples: number of random fields to generate
-    :param bounds: 2d bounds of grid
-    :param shape: 2d shape of grid
-    :param nemytskii: the result of the nemytskii pushforward, term 0 if field < 0, term 1 if field > 0
-    :param cov_diag: additional amount to add to cov diagonal on top of Laplacian eigenvalues
-    :return: Array of shape [nsamples, W, H] giving the random field samples
-    """
-    (x0, x1), (y0, y1) = bounds
-    nx, ny = shape
-    x = jnp.linspace(x0, x1, nx)
-    y = jnp.linspace(y0, y1, ny)
-    xx, yy = jnp.meshgrid(x, y, indexing="ij")
-
-    kx = jnp.arange(nx)
-    ky = jnp.arange(ny)
-
-    scale_x = jnp.where(kx == 0, 1.0, jnp.sqrt(2.0))
-    scale_y = jnp.where(ky == 0, 1.0, jnp.sqrt(2.0))
-
-    lx = x1 - x0
-    ly = y1 - y0
-    x_hat = (xx[:, 0] - x0) / lx
-    y_hat = (yy[0, :] - y0) / ly
-    phi_x = jnp.cos(jnp.pi * x_hat[:, None] * kx[None, :]) * scale_x[None, :]
-    phi_y = jnp.cos(jnp.pi * y_hat[:, None] * ky[None, :]) * scale_y[None, :]
-
-    lap_eigs = (jnp.pi ** 2) * ((kx[:, None] / lx) ** 2 + (ky[None, :] / ly) ** 2)
-    cov_eigs = (lap_eigs + cov_diag) ** -2
-    sqrt_cov = jnp.sqrt(cov_eigs)
-
-    if nsamples == 1:
-        coeffs = jax.random.normal(key, (nx, ny)) * sqrt_cov
-        gauss_field = jnp.einsum("ik,jl,kl->ij", phi_x, phi_y, coeffs)
-    else:
-        coeffs = jax.random.normal(key, (nsamples, nx, ny)) * sqrt_cov[None, :, :]
-        gauss_field = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
-
-    low, high = nemytskii
-    return jnp.where(gauss_field >= 0.0, high, low)
-
-
 class PoissonConfig(DictModel):
     """Numerical configs for solving the Poisson PDE on a 2D grid.
 
