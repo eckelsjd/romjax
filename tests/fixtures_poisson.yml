@@ -25,6 +25,6 @@ solver: !rox:romjax.poisson.Poisson2D
   conductivity_sampler: parametric
   conductivity_sampler_opts:
     k0: 
-      distribution: !!python/name:romjax.poisson.darcy_field
+      distribution: !!python/name:romjax.random_field.darcy
       shape: *s
       bounds: *b
