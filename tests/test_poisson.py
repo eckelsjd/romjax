@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 
 from romjax import YamlLoader
 from romjax.pde import UniformGrid, homogeneous_boundary
@@ -16,7 +17,7 @@ from romjax.poisson import (
     nonlinear_conductivity,
 )
 from romjax.random_field import darcy
-from romjax.rng import gen_keys
+from romjax.rng import Distribution, gen_keys, near_solution_sampler
 from romjax.typing import DictModel
 
 
@@ -160,6 +161,24 @@ def get_laplace_solver():
     return laplace
 
 
+def get_small_poisson(
+    **kwargs,
+) -> Poisson2D:
+    """Construct a small Poisson model for sampling tests."""
+    return Poisson2D(
+        config={
+            "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(8, 8)),
+            "solver": {
+                "name": "Newton",
+                "opts": {"rtol": 1.0, "atol": 1e-4},
+            },
+            "max_steps": 5,
+            "throw": False,
+        },
+        **kwargs,
+    )
+
+
 def test_laplace_solve():
     """Run Poisson with no forcing and unity conductivity. Initial Gaussian bump should smooth to 0."""
     laplace = get_laplace_solver()
@@ -251,3 +270,107 @@ def test_poisson_sample_inputs():
         assert "k0" in sample["conductivity"]
         assert sample["conductivity"]["k0"].shape == (50, 50)
         assert np.allclose(np.asarray(sample["conductivity"]["k0"]), np.asarray(expected_k0))
+
+
+def test_poisson_outputs_sampler_resolution_and_validation() -> None:
+    model = get_small_poisson(
+        outputs_sampler="near_solution",
+        outputs_sampler_opts={
+            "phi": {
+                "distribution": "normal",
+                "std": 0.1,
+                "shape": (8, 8),
+            },
+        },
+    )
+
+    assert model.outputs_sampler is near_solution_sampler
+    assert isinstance(model.outputs_sampler_opts["phi"], Distribution)
+
+    with pytest.raises(TypeError):
+        get_small_poisson(
+            outputs_sampler="near_solution",
+            outputs_sampler_opts={"phi": 0.1},
+        )
+
+
+def test_poisson_sample_outputs_near_solution_is_deterministic() -> None:
+    model = get_small_poisson(
+        outputs_sampler="near_solution",
+        outputs_sampler_opts={"phi": {"distribution": "normal", "std": 0.1, "shape": (8, 8)}},
+    )
+    key = jax.random.key(7)
+    solution = {"phi": jnp.ones(model.config.grid.shape)}
+
+    sample_a = model.sample_outputs(key, solution=solution)
+    sample_b = model.sample_outputs(key, solution=solution)
+
+    assert sample_a["phi"].shape == model.config.grid.shape
+    assert jnp.allclose(sample_a["phi"], sample_b["phi"])
+
+
+def test_poisson_sample_outputs_smooth_mode_preserves_shape() -> None:
+    model = get_small_poisson(
+        outputs_sampler="near_solution",
+        outputs_sampler_opts={
+            "phi": {
+                "distribution": "uniform",
+                "minval": -0.2,
+                "maxval": 0.2,
+                "shape": (8, 8),
+            },
+        },
+    )
+    solution = {"phi": jnp.zeros(model.config.grid.shape)}
+    sample = model.sample_outputs(jax.random.key(3), solution=solution)
+
+    assert sample["phi"].shape == model.config.grid.shape
+    assert jnp.isfinite(sample["phi"]).all()
+
+
+def test_poisson_sample_outputs_reuses_solution_before_solving(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = get_small_poisson(
+        outputs_sampler="near_solution",
+        outputs_sampler_opts={"phi": {"distribution": "uniform", "minval": -0.1, "maxval": 0.1, "shape": (8, 8)}},
+    )
+    calls = {"count": 0}
+    solved = {"phi": 2.0 * jnp.ones(model.config.grid.shape)}
+
+    def solve_spy(self, inputs=None, residuals=None, return_sol=False):
+        del inputs, residuals, return_sol
+        calls["count"] += 1
+        return solved
+
+    monkeypatch.setattr(Poisson2D, "solve", solve_spy)
+
+    provided = {"phi": jnp.ones(model.config.grid.shape)}
+    sample_with_solution = model.sample_outputs(jax.random.key(0), solution=provided)
+    assert calls["count"] == 0
+    assert not jnp.allclose(sample_with_solution["phi"], solved["phi"])
+
+    sample_without_solution = model.sample_outputs(jax.random.key(0))
+    assert calls["count"] == 1
+    assert sample_without_solution["phi"].shape == model.config.grid.shape
+
+
+def test_poisson_sample_outputs_custom_callable_support() -> None:
+    seen: dict[str, object] = {}
+
+    def custom_sampler(key, *, inputs=None, solution=None, bias=0.0):
+        del key
+        seen["inputs"] = inputs
+        seen["solution"] = solution
+        return jnp.asarray(solution["phi"]) + bias
+
+    model = get_small_poisson(
+        outputs_sampler=custom_sampler,
+        outputs_sampler_opts={"bias": 0.25},
+    )
+    inputs = {"forcing": {"const": 1.5}}
+    solution = {"phi": jnp.zeros(model.config.grid.shape)}
+
+    sample = model.sample_outputs(jax.random.key(9), inputs=inputs, solution=solution)
+
+    assert seen["inputs"] == inputs
+    assert seen["solution"] == solution
+    assert jnp.allclose(sample["phi"], 0.25)

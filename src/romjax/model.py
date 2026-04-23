@@ -33,6 +33,9 @@ class Sampleable(ABC):
         """
         Produce one sample of outputs for the given key.
 
+        Implementations may delegate to configurable samplers with the conditioning contract
+        ``sampler(key, inputs=..., solution=..., **opts)``.
+
         :param key: random key
         :param inputs: optional conditioning inputs
         :param solution: optional precomputed solution of ``solve(inputs)=0``

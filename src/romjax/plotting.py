@@ -70,6 +70,7 @@ class PlotOpts:
     
     :ivar xlabel: the x-axis label
     :ivar ylabel: the y-axis label
+    :ivar title: the axis title
     :ivar xscale: scale for x-axis
     :ivar yscale: scale for y-axis
     :ivar xlim: limits for x-axis (defaults to autoscale if None)
@@ -82,6 +83,7 @@ class PlotOpts:
     """
     xlabel: str = ""
     ylabel: str = ""
+    title: str = ""
     xscale: str | None = None
     yscale: str | None = None
     xlim: tuple[float, float] | None = None
@@ -317,7 +319,7 @@ def gridplot(
                 cb.outline.set_edgecolor(text_color)
                 cbars[i][j] = cb
 
-            xlabel, ylabel, xscale, yscale, xlim, ylim = None, None, None, None, None, None
+            xlabel, ylabel, xscale, yscale, xlim, ylim, title = None, None, None, None, None, None, None
             for s in plots[i][j]:
                 if xlabel is None or xlabel == "":
                     xlabel = s.opts.xlabel
@@ -331,6 +333,8 @@ def gridplot(
                     xlim = s.opts.xlim
                 if ylim is None:
                     ylim = s.opts.ylim
+                if title is None or title == "":
+                    title = s.opts.title
             ax_visible = any(s.opts.ax_visible for s in plots[i][j])
             animate = animate or any(s.opts.animate for s in plots[i][j])
             legends[i][j] = all(s.opts.leg_label is not None for s in plots[i][j])
@@ -347,6 +351,8 @@ def gridplot(
                 ax.set_xlabel(xlabel, color=text_color)
             if ax_visible and ylabel is not None:
                 ax.set_ylabel(ylabel, color=text_color)
+            if ax_visible and title is not None:
+                ax.set_title(title, color=text_color)
             if xscale is not None:
                 ax.set_xscale(xscale)
             if yscale is not None:

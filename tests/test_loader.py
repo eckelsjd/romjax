@@ -9,6 +9,7 @@ import pytest
 from romjax import YamlLoader
 from romjax.model import ImplicitModel
 from romjax.poisson import Poisson2D
+from romjax.rng import Distribution, near_solution_sampler
 
 
 def example_forcing(inputs: dict, outputs: dict):
@@ -123,6 +124,29 @@ def test_custom_model_load_and_dump() -> None:
     assert isinstance(data_space["solver"], Poisson2D)
     assert data_space["solver"].forcing is example_forcing
     _assert_round_trip(data_space)
+
+
+def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
+    yaml_text = (
+        "solver: !rox:romjax.poisson.Poisson2D\n"
+        "  outputs_sampler: near_solution\n"
+        "  outputs_sampler_opts:\n"
+        "    phi:\n"
+        "      distribution: normal\n"
+        "      std: 0.1\n"
+        "      shape: [4, 4]\n"
+        "  config:\n"
+        "    grid:\n"
+        "      shape: [4, 4]\n"
+        "      bounds: [[0, 1], [0, 1]]\n"
+    )
+    data = YamlLoader.load(yaml_text)
+    solver = data["solver"]
+
+    assert isinstance(solver, Poisson2D)
+    assert solver.outputs_sampler is near_solution_sampler
+    assert isinstance(solver.outputs_sampler_opts["phi"], Distribution)
+    _assert_round_trip(data)
 
 
 def test_yaml_invalid_cases() -> None:

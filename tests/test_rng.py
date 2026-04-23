@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from romjax.random_field import KLEConfig, kle
-from romjax.rng import Distribution, gen_keys, parametric_sampler
+from romjax.rng import Distribution, gen_keys, near_solution_sampler, parametric_sampler, pytree_sampler
 
 
 def test_distribution():
@@ -109,6 +109,98 @@ def test_parametric_sampler():
 
     assert np.isclose(float(scalar["x"]), float(expected_x))
     assert np.isclose(float(scalar["y"]), float(expected_y))
+
+
+def test_pytree_sampler() -> None:
+    key = jax.random.key(5)
+    template = {
+        "phi": {"distribution": "normal", "mean": 1.0, "std": 0.25, "shape": (2, 3)},
+        "aux": (
+            {"distribution": "uniform", "minval": -1.0, "maxval": 1.0, "shape": ()},
+        ),
+    }
+    sample = pytree_sampler(key, template)
+    aux_key, phi_key = jax.random.split(key, 2)
+    expected_aux = jax.random.uniform(aux_key, minval=-1.0, maxval=1.0, shape=())
+    expected_phi = jax.random.normal(phi_key, shape=(2, 3)) * 0.25 + 1.0
+
+    assert sample["phi"].shape == (2, 3)
+    assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
+    assert np.isclose(float(sample["aux"][0]), float(expected_aux))
+
+    with pytest.raises(TypeError):
+        pytree_sampler(key, {"phi": 1.0})
+
+
+def test_near_solution_sampler_with_noise_wrapper() -> None:
+    key = jax.random.key(13)
+    solution = {
+        "phi": jnp.ones((3, 4)),
+        "stats": {"mean": jnp.asarray(2.0)},
+    }
+    sample = near_solution_sampler(
+        key,
+        solution=solution,
+        noise={
+            "phi": {"distribution": "normal", "std": 0.2, "shape": (3, 4)},
+            "stats": {"mean": {"distribution": "normal", "std": 0.5, "shape": ()}},
+        },
+        scale={"phi": 0.5, "stats": {"mean": 2.0}},
+    )
+    noise_keys = jax.random.split(key, 2)
+    expected_phi = solution["phi"] + 0.5 * (jax.random.normal(noise_keys[0], shape=(3, 4)) * 0.2)
+    expected_mean = solution["stats"]["mean"] + 2.0 * (jax.random.normal(noise_keys[1], shape=()) * 0.5)
+
+    assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
+    assert np.isclose(float(sample["stats"]["mean"]), float(expected_mean))
+
+
+def test_near_solution_sampler_broadcast_relative_scale_spec() -> None:
+    key = jax.random.key(17)
+    solution = {
+        "phi": jnp.full((2, 2), 4.0),
+        "psi": jnp.asarray([3.0, 1.0]),
+    }
+    sample = near_solution_sampler(
+        key,
+        solution=solution,
+        noise={
+            "phi": {"distribution": "normal", "std": 1.0, "shape": (2, 2)},
+            "psi": {"distribution": "normal", "std": 1.0, "shape": (2,)},
+        },
+        scale=("max_abs", 0.1),
+    )
+    phi_key, psi_key = jax.random.split(key, 2)
+    expected_phi = solution["phi"] + 0.4 * jax.random.normal(phi_key, shape=(2, 2))
+    expected_psi = solution["psi"] + 0.3 * jax.random.normal(psi_key, shape=(2,))
+
+    assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
+    assert np.allclose(np.asarray(sample["psi"]), np.asarray(expected_psi))
+
+
+def test_near_solution_sampler_per_leaf_relative_scale_specs() -> None:
+    key = jax.random.key(23)
+    solution = {
+        "phi": jnp.full((2, 2), 4.0),
+        "stats": {"mean": jnp.asarray(3.0)},
+    }
+    sample = near_solution_sampler(
+        key,
+        solution=solution,
+        noise={
+            "phi": {"distribution": "normal", "std": 0.5, "shape": (2, 2)},
+            "stats": {"mean": {"distribution": "normal", "std": 1.0, "shape": ()}},
+        },
+        scale={"phi": ("rms", 0.25), "stats": {"mean": (jnp.mean, 0.1)}},
+    )
+    phi_key, mean_key = jax.random.split(key, 2)
+    expected_phi_scale = jnp.sqrt(jnp.mean(jnp.square(solution["phi"]))) * 0.25
+    expected_mean_scale = jnp.mean(solution["stats"]["mean"]) * 0.1
+    expected_phi = solution["phi"] + expected_phi_scale * (jax.random.normal(phi_key, shape=(2, 2)) * 0.5)
+    expected_mean = solution["stats"]["mean"] + expected_mean_scale * jax.random.normal(mean_key, shape=())
+
+    assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
+    assert np.isclose(float(sample["stats"]["mean"]), float(expected_mean))
 
 
 def test_kle_deterministic_and_shapes() -> None:
