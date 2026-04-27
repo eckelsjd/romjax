@@ -42,7 +42,7 @@ output_keys = jax.random.split(out_key, nsamples)
 output_samples = sample_outputs(output_keys, outputs)
 residual_samples = evaluate(inputs, output_samples)
 
-in_tree = {'inputs': pytree_at(inputs, 0), 'outputs': pytree_at(output_samples, 0), 'filters': [pod]}
+in_tree = {'inputs': pytree_at(inputs, 0), 'outputs': pytree_at(output_samples, 0), 'call_args': pod}
 out_tree, aux_forward = transform.forward_aux(in_tree)
 back_tree, aux_back = transform.backward_aux(out_tree, aux_forward)
 

@@ -1,13 +1,13 @@
 """Random field samplers for reproducible PDE inputs."""
-from typing import Callable, Literal, Any
+from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
 from pydantic import PositiveFloat, PositiveInt, model_validator
 
-from romjax.typing import DictModel
 from romjax.pde import Coordinates
+from romjax.typing import DictModel
 
 __all__ = ["KLEConfig", "kle", "darcy"]
 

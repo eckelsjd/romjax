@@ -75,39 +75,45 @@ def backward_expect_pruned_view(x: dict, _: object | None = None) -> dict:
     return {"pde1": {"inputs": {"forcing": x["latent"]["z"]}}}
 
 
+def identity_callable(x):
+    return x
+
+
 def _model_yaml() -> str:
     return (
         "model: !rox:romjax.model.FilterModel\n"
         "  source: pde1_state\n"
         "  target: pde2_state\n"
         "  filters:\n"
-        "    - in_paths:\n"
-        "        - path: [pde1, inputs, forcing]\n"
-        "        - path: [pde1, outputs, phi]\n"
-        "        - path: [pde1, inputs, alpha]\n"
-        "        - path: [meta, tag]\n"
-        "      out_paths:\n"
-        "        - path: [latent, pair]\n"
-        "        - path: [latent, alpha]\n"
-        "        - path: [meta, tag]\n"
-        "      forward: !!python/name:tests.test_model.forward_pack_fields\n"
-        "      backward: !!python/name:tests.test_model.backward_unpack_fields\n"
-        "      forward_routes:\n"
-        "        - source: [features, pair]\n"
-        "          target: [latent, pair]\n"
-        "        - source: [carry, alpha]\n"
-        "          target: [latent, alpha]\n"
-        "        - source: [meta, tag]\n"
-        "          target: [meta, tag]\n"
-        "      backward_routes:\n"
-        "        - source: [recovered, forcing]\n"
-        "          target: [pde1, inputs, forcing]\n"
-        "        - source: [recovered, phi]\n"
-        "          target: [pde1, outputs, phi]\n"
-        "        - source: [recovered, alpha]\n"
-        "          target: [pde1, inputs, alpha]\n"
-        "        - source: [recovered, tag]\n"
-        "          target: [meta, tag]\n"
+        "    - forward:\n"
+        "        callable: !!python/name:tests.test_model.forward_pack_fields\n"
+        "        input_routes:\n"
+        "          - [pde1, inputs, forcing]\n"
+        "          - [pde1, outputs, phi]\n"
+        "          - [pde1, inputs, alpha]\n"
+        "          - [meta, tag]\n"
+        "        output_routes:\n"
+        "          - inner: [features, pair]\n"
+        "            outer: [latent, pair]\n"
+        "          - inner: [carry, alpha]\n"
+        "            outer: [latent, alpha]\n"
+        "          - inner: [meta, tag]\n"
+        "            outer: [meta, tag]\n"
+        "      backward:\n"
+        "        callable: !!python/name:tests.test_model.backward_unpack_fields\n"
+        "        input_routes:\n"
+        "          - [latent, pair]\n"
+        "          - [latent, alpha]\n"
+        "          - [meta, tag]\n"
+        "        output_routes:\n"
+        "          - inner: [recovered, forcing]\n"
+        "            outer: [pde1, inputs, forcing]\n"
+        "          - inner: [recovered, phi]\n"
+        "            outer: [pde1, outputs, phi]\n"
+        "          - inner: [recovered, alpha]\n"
+        "            outer: [pde1, inputs, alpha]\n"
+        "          - inner: [recovered, tag]\n"
+        "            outer: [meta, tag]\n"
     )
 
 
@@ -255,27 +261,30 @@ def test_filter_model_integration_with_toy_pde_graph() -> None:
         target="low_state",
         filters=[
             {
-                "in_paths": [
-                    {"path": ["high", "inputs", "forcing"]},
-                    {"path": ["high", "outputs", "phi"]},
-                ],
-                "out_paths": [
-                    {"path": ["low", "inputs", "x_inputs"]},
-                    {"path": ["low", "inputs", "x_outputs"]},
-                    {"path": ["low", "inputs", "x_shared"]},
-                ],
-                "forward": high_to_low,
-                "backward": low_to_high,
-                "forward_routes": [
-                    {"source": ["features", "x_inputs"], "target": ["low", "inputs", "x_inputs"]},
-                    {"source": ["features", "x_outputs"], "target": ["low", "inputs", "x_outputs"]},
-                    {"source": ["features", "x_shared"], "target": ["low", "inputs", "x_shared"]},
-                ],
-                "backward_routes": [
-                    {"source": ["recovered", "forcing"], "target": ["high", "inputs", "forcing"]},
-                    {"source": ["recovered", "phi"], "target": ["high", "outputs", "phi"]},
-                    {"source": ["recovered", "alpha"], "target": ["high", "inputs", "alpha"]},
-                ],
+                "forward": {
+                    "callable": high_to_low,
+                    "input_routes": [
+                        ["high", "inputs", "forcing"],
+                        ["high", "outputs", "phi"],
+                    ],
+                    "output_routes": [
+                        {"inner": ["features", "x_inputs"], "outer": ["low", "inputs", "x_inputs"]},
+                        {"inner": ["features", "x_outputs"], "outer": ["low", "inputs", "x_outputs"]},
+                        {"inner": ["features", "x_shared"], "outer": ["low", "inputs", "x_shared"]},
+                    ],
+                },
+                "backward": {
+                    "callable": low_to_high,
+                    "input_routes": [
+                        ["low", "inputs", "x_inputs"],
+                        ["low", "inputs", "x_outputs"],
+                    ],
+                    "output_routes": [
+                        {"inner": ["recovered", "forcing"], "outer": ["high", "inputs", "forcing"]},
+                        {"inner": ["recovered", "phi"], "outer": ["high", "outputs", "phi"]},
+                        {"inner": ["recovered", "alpha"], "outer": ["high", "inputs", "alpha"]},
+                    ],
+                },
             }
         ],
     )
@@ -323,14 +332,18 @@ def test_linear_projection() -> None:
         target="latent",
         filters=[
             {
-                "forward": eqx_evaluate,
-                "backward": eqx_evaluate,
-                "in_paths": [{"path": ["full", "x"]}],
-                "out_paths": [{"path": ["latent", "z"]}],
-                "forward_opts": {"gather": "flat", "method": "reduce"},
-                "backward_opts": {"gather": "flat", "method": "reconstruct", "scatter": "flat"},
-                "forward_routes": [{"source": [], "target": ["latent", "z"]}],
-                "backward_routes": [{"source": ["full", "x"], "target": ["full", "x"]}],
+                "forward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [{"outer": ["full", "x"], "inner": []}],
+                    "output_routes": [{"outer": ["latent", "z"]}],
+                    "opts": {"method": "reduce"},
+                },
+                "backward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [{"outer": ["latent", "z"], "inner": []}],
+                    "output_routes": [{"outer": ["full", "x"]}],
+                    "opts": {"method": "reconstruct"},
+                },
             }
         ],
     )
@@ -341,8 +354,8 @@ def test_linear_projection() -> None:
 
     @eqx.filter_jit
     def loss_fn(module: LinearProjection) -> jax.Array:
-        z_tree, aux = model.forward_aux({"full": {"x": data}, "filters": [module]})
-        x_hat, _ = model.backward_aux({"latent": {"z": z_tree["latent"]["z"]}, "filters": [module]}, aux=aux)
+        z_tree, aux = model.forward_aux({"full": {"x": data}, "call_args": module})
+        x_hat, _ = model.backward_aux({"latent": {"z": z_tree["latent"]["z"]}, "call_args": module}, aux=aux)
         return jnp.mean((x_hat["full"]["x"] - data) ** 2)
 
     @eqx.filter_jit
@@ -385,16 +398,30 @@ def test_filter_model_in_graph() -> None:
         target="latent",
         filters=[
             {
-                "forward": eqx_evaluate,
-                "backward": eqx_evaluate,
-                "in_paths": [["full", "field1"], ["full", "field2"]],
-                "out_paths": [["latent", "z1"], ["latent", "z2"]],
-                "forward_opts": {"gather": "stack", "method": "reduce"},
-                "backward_opts": {"gather": "stack", "method": "reconstruct", "scatter": "stack"},
-                "forward_routes": [
-                    {"source": [0], "target": ["latent", "z1"]},
-                    {"source": [1], "target": ["latent", "z2"]},
-                ],
+                "forward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [
+                        {"outer": ["full", "field1"], "inner": ["field1"]},
+                        {"outer": ["full", "field2"], "inner": ["field2"]},
+                    ],
+                    "output_routes": [
+                        {"inner": [0], "outer": ["latent", "z1"]},
+                        {"inner": [1], "outer": ["latent", "z2"]},
+                    ],
+                    "opts": {"gather": "stack", "method": "reduce"},
+                },
+                "backward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [
+                        {"outer": ["latent", "z1"], "inner": ["z1"]},
+                        {"outer": ["latent", "z2"], "inner": ["z2"]},
+                    ],
+                    "output_routes": [
+                        {"inner": ["field1"], "outer": ["full", "field1"]},
+                        {"inner": ["field2"], "outer": ["full", "field2"]},
+                    ],
+                    "opts": {"gather": "stack", "method": "reconstruct", "scatter": "stack"},
+                },
             }
         ],
     )
@@ -407,7 +434,7 @@ def test_filter_model_in_graph() -> None:
     @eqx.filter_jit
     def loss_fn(curr_module: LinearProjection) -> jax.Array:
         decoded = graph.push_path(
-            {"full": {"field1": field1, "field2": field2}, "filters": [curr_module]},
+            {"full": {"field1": field1, "field2": field2}, "call_args": curr_module},
             path=["filter", "filter"],
             start="full",
         )
@@ -433,13 +460,14 @@ def test_filter_model_in_graph() -> None:
     assert final_loss < init_loss * 0.45
 
     encoded, aux_cache = graph.push_path(
-        {"full": {"field1": field1, "field2": field2}, "filters": [module]},
+        {"full": {"field1": field1, "field2": field2}, "call_args": module},
         path=["filter"],
         start="full",
         return_aux=True,
     )
+    assert aux_cache["full->latent"]["backward"]["cached_states"][0]["template"]["field1"].shape == field1.shape
     decoded = graph.push_path(
-        {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
+        {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "call_args": module},
         path=["filter"],
         start="latent",
         aux=aux_cache,
@@ -449,7 +477,7 @@ def test_filter_model_in_graph() -> None:
 
     with pytest.raises(ValueError):
         graph.push_path(
-            {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
+            {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "call_args": module},
             path=["filter"],
             start="latent",
         )
@@ -461,10 +489,14 @@ def test_filter_model_prunes_none_leaves_from_views() -> None:
         target="latent",
         filters=[
             {
-                "forward": forward_expect_pruned_view,
-                "backward": backward_expect_pruned_view,
-                "in_paths": [["pde1", "inputs", "forcing"]],
-                "out_paths": [["latent", "z"]],
+                "forward": {
+                    "callable": forward_expect_pruned_view,
+                    "input_routes": [["pde1", "inputs", "forcing"]],
+                },
+                "backward": {
+                    "callable": backward_expect_pruned_view,
+                    "input_routes": [["latent", "z"]],
+                },
             }
         ],
     )
@@ -474,6 +506,110 @@ def test_filter_model_prunes_none_leaves_from_views() -> None:
 
     decoded = model.backward({"latent": {"z": encoded["latent"]["z"]}})
     assert jnp.array_equal(decoded["pde1"]["inputs"]["forcing"], encoded["latent"]["z"])
+
+
+def test_filter_model_runtime_input_normalization_and_errors() -> None:
+    shared_model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "forward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [{"outer": ["full", "x"], "inner": []}],
+                    "output_routes": [["latent", "z"]],
+                    "opts": {"method": "reduce"},
+                },
+                "backward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [{"outer": ["latent", "z"], "inner": []}],
+                    "output_routes": [["full", "x"]],
+                    "opts": {"method": "reconstruct"},
+                },
+            }
+        ],
+    )
+    multi_model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {"forward": {"input_routes": [{"outer": ["full", "x"], "inner": []}], "output_routes": [["latent", "z1"]]}},
+            {"forward": {"input_routes": [{"outer": ["full", "x"], "inner": []}], "output_routes": [["latent", "z2"]]}},
+        ],
+    )
+    module = LinearProjection(n_latent=2, n_full=3, key=jax.random.PRNGKey(0))
+    data = jnp.ones((4, 3))
+
+    encoded = shared_model.forward({"full": {"x": data}, "call_args": module})
+    assert encoded["latent"]["z"].shape == (4, 2)
+
+    encoded_shared = multi_model.forward({"full": {"x": jnp.array([1.0, 2.0])}, "call_args": {"shared": 3.0}})
+    assert jnp.array_equal(encoded_shared["latent"]["z1"], jnp.array([1.0, 2.0]))
+    assert jnp.array_equal(encoded_shared["latent"]["z2"], jnp.array([1.0, 2.0]))
+
+    with pytest.raises(ValueError):
+        multi_model.forward({"full": {"x": jnp.array([1.0, 2.0])}, "call_args": [1.0]})
+
+    with pytest.raises(ValueError):
+        multi_model.forward(
+            {"full": {"x": jnp.array([1.0, 2.0])}, "call_args": {"shared": 1.0, "per_spec": [1.0, 2.0]}}
+        )
+
+
+def test_filter_model_missing_cached_state_and_aux_shape_errors() -> None:
+    model = FilterModel(
+        source="inputs",
+        target="latent",
+        filters=[
+            {
+                "forward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [["left"], ["right"]],
+                    "output_routes": [["latent", "z"]],
+                    "opts": {"gather": "stack"},
+                },
+                "backward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [{"outer": ["latent", "z"], "inner": []}],
+                    "opts": {"scatter": "stack"},
+                },
+            }
+        ],
+    )
+    data = {"left": jnp.array([1.0, 2.0]), "right": jnp.array([3.0, 4.0])}
+    encoded, aux = model.forward_aux({"left": data["left"], "right": data["right"], "call_args": identity_callable})
+
+    with pytest.raises(ValueError):
+        model.backward({"latent": {"z": encoded["latent"]["z"]}, "call_args": identity_callable})
+
+    with pytest.raises(ValueError):
+        model.backward_aux({"latent": {"z": encoded["latent"]["z"]}, "call_args": identity_callable}, aux=[aux])
+
+
+def test_filter_model_invalid_routes_raise() -> None:
+    bad_input_model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[{"forward": {"input_routes": [["full", "missing"]], "output_routes": [["latent", "z"]]}}],
+    )
+    with pytest.raises(KeyError):
+        bad_input_model.forward({"full": {"x": jnp.array([1.0, 2.0])}})
+
+    bad_output_model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "forward": {
+                    "callable": lambda x, _: {"present": x["full"]["x"]},
+                    "input_routes": [["full", "x"]],
+                    "output_routes": [{"inner": ["missing"], "outer": ["latent", "z"]}],
+                }
+            }
+        ],
+    )
+    with pytest.raises(KeyError):
+        bad_output_model.forward({"full": {"x": jnp.array([1.0, 2.0])}})
 
 
 # def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
