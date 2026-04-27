@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import Field, PositiveInt, ValidationInfo, field_validator
+from pydantic import Field, PositiveInt, ValidationInfo, field_validator, ConfigDict
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
@@ -133,17 +133,27 @@ def sinusoid_forcing(inputs: SinusoidForcingInputs, outputs: PoissonOutputs) -> 
     return -2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
 
 
-def nonlinear_conductivity(inputs: NonlinearConductivityInputs, outputs: PoissonOutputs) -> ArrayLike:
+def nonlinear_conductivity(
+        inputs: NonlinearConductivityInputs, 
+        outputs: PoissonOutputs, 
+        amplitude: Callable[[ArrayLike], ArrayLike] | Literal["exp"] | None = None,
+    ) -> ArrayLike:
     r"""Nonlinear conductivity.
 
-        $k(x,y) = k_0(1 + \alpha \phi^2)$
+        $k(x,y) = amp(k_0) * (1 + \alpha \phi^2)$
     
     :param inputs: the input parameters
     :param outputs: the scalar potential on the grid
+    :param amplitude: function to apply to k0 
     :return: the conductivity on the grid
     """
+    if amplitude is None:
+        amplitude = lambda x: x
+    if amplitude == 'exp':
+        amplitude = jnp.exp
+
     phi = outputs['phi']
-    return inputs['k0'] * (1 + inputs['alpha'] * (phi * phi))
+    return amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
 
 
 class PoissonConfig(DictModel):
@@ -178,6 +188,7 @@ class PoissonConfig(DictModel):
 
 
 class Poisson2D(ImplicitModel, Sampleable):
+    model_config = ConfigDict(extra='forbid')
 
     # Required (and static once set)
     config: PoissonConfig
@@ -190,6 +201,10 @@ class Poisson2D(ImplicitModel, Sampleable):
     forcing: ForcingCallable = constant_forcing
     conductivity: ForcingCallable = constant_forcing
     boundary: BoundaryCallable = boundary_pass_through
+
+    forcing_opts: dict[str, Any] = Field(default_factory=dict)
+    conductivity_opts: dict[str, Any] = Field(default_factory=dict)
+    boundary_opts: dict[str, Any] = Field(default_factory=dict)
 
     forcing_sampler: SamplerCallable | None = None
     conductivity_sampler: SamplerCallable | None = None
@@ -338,7 +353,8 @@ class Poisson2D(ImplicitModel, Sampleable):
         coords = {'coords': self.config['grid']['coords']}
         forcing_inputs = _merge_defaults(self.forcing_defaults, coords, inputs.get("forcing"))
         conductivity_inputs = _merge_defaults(self.conductivity_defaults, coords, inputs.get("conductivity"))
-        boundary_inputs = self.boundary(_merge_defaults(self.boundary_defaults, coords, inputs.get("boundary")))
+        boundary_inputs = self.boundary(_merge_defaults(self.boundary_defaults, coords, inputs.get("boundary")),
+                                        **self.boundary_opts)
         # boundary is assumed constant, so compute once up front (if applicable)
 
         return {'forcing': forcing_inputs, 'conductivity': conductivity_inputs, 'boundary': boundary_inputs}
@@ -347,8 +363,9 @@ class Poisson2D(ImplicitModel, Sampleable):
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
         phi = jnp.asarray(outputs["phi"])
         dx, dy = self.config['grid']['spacing']
-        forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
-        conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs), phi.shape)
+        forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs, **self.forcing_opts))
+        conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs, **self.conductivity_opts), 
+                                        phi.shape)
         xbds, ybds = inputs['boundary']['boundary']  # constant
 
         def _ghost_for_side(

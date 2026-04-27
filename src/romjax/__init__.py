@@ -5,7 +5,7 @@
 """
 __version__ = "0.0.1"
 __all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ListModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
-           'gen_keys', 'train', 'random']
+           'gen_keys', 'train', 'random', 'FunctionGraph']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -23,6 +23,7 @@ from typing import Union as _Union
 import yaml as _yaml
 
 from . import rng as random
+from .graph import FunctionGraph
 from .optim import train
 from .plotting import gridplot
 from .rng import gen_keys

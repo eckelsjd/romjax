@@ -215,9 +215,9 @@ class FunctionGraph(BaseModel, RoxObject):
     def push_path(
         self,
         x: PyTree,
-        *,
-        start: Node | str,
         path: list[str | Edge],
+        *,
+        start: Node | str | None = None,
         aux: Mapping[str, Mapping[str, PyTree]] | None = None,
         return_aux: bool = False,
     ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
@@ -232,14 +232,16 @@ class FunctionGraph(BaseModel, RoxObject):
         - when traversing an edge backward, any produced auxiliary data is stored for that edge's forward direction
 
         :param x: payload to propagate along the path
-        :param start: starting node for the path
         :param path: ordered edges to traverse (edge names or edge objects)
-        :param target: optional expected final node
+        :param start: starting node for the path (defaults to first node of first edge in path)
         :param aux: optional precomputed auxiliary cache
         :param return_aux: if True, return both payload and updated auxiliary cache
         :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
         """
-        curr_node = start if isinstance(start, Node) else Node(name=start)
+        if start is None:
+            curr_node = self._resolve_edge(path[0]).source
+        else:
+            curr_node = start if isinstance(start, Node) else Node(name=start)
         payload = x
         aux_cache = self._copy_aux_cache(aux)
 
