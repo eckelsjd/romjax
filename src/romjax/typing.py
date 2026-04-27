@@ -15,6 +15,7 @@ from pydantic import (
     SerializationInfo,
     TypeAdapter,
     model_serializer,
+    model_validator
 )
 from pydantic_core import core_schema
 
@@ -98,12 +99,12 @@ class ListModel[T: BaseModel](DictModel):
             self._adapter = TypeAdapter(self._item_type())
         return self._adapter
     
-    # @model_validator(mode='before')
-    # @classmethod
-    # def _from_list(cls, value):
-    #     if isinstance(value, list):
-    #         return cls(value)  # avoids dict unpacking
-    #     return value
+    @model_validator(mode='before')
+    @classmethod
+    def _from_list(cls, value):
+        if isinstance(value, list):
+            return cls(value)  # avoids dict unpacking
+        return value
     
     @model_serializer(mode="plain")
     def _serialize_as_list(self, info: SerializationInfo) -> list[Any]:

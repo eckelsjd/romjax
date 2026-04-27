@@ -123,7 +123,7 @@ def pytree_sampler(key: jaxtyping.Key, template: jaxtyping.PyTree) -> jaxtyping.
 def _is_relative_scale_spec(value: Any) -> bool:
     """Return True when ``value`` is a ``(reducer, factor)`` relative-scale specification."""
     return (
-        isinstance(value, tuple)
+        isinstance(value, tuple | list)
         and len(value) == 2
         and (callable(value[0]) or value[0] in {"mean", "rms", "max_abs"})
     )

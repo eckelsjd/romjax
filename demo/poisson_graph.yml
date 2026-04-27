@@ -1,0 +1,65 @@
+!rox:romjax.graph.FunctionGraph
+nodes: [hf_coord, lf_coord, lf_res, hf_res]
+edges:
+  - !rox:romjax.poisson.Poisson2D
+    source: hf_coord
+    target: hf_res
+    name: poisson
+    config:
+      grid:
+        shape: &shape [32, 32]
+        bounds: &bounds [[0, 1], [0, 1]]
+      solver:
+        name: Newton
+        opts:
+          rtol: 1
+          atol: 1.0e-4
+        max_steps: 200
+        throw: true
+    forcing: constant
+    forcing_defaults: { const: -1.0 }
+    conductivity: nonlinear
+    conductivity_defaults: { k0: 1.0, alpha: 1.0 }
+    conductivity_opts: { amplitude: exp }
+    conductivity_sampler: parametric
+    conductivity_sampler_opts:
+      k0: 
+        distribution: !!python/name:romjax.random_field.kle
+        bounds: *bounds
+        shape: *shape
+        truncation: [8, 8]
+        correlation_lengths: [0.2, 0.2]
+        variance: 1
+    outputs_sampler: near_solution
+    outputs_sampler_opts:
+      scale: [max_abs, 0.15]  # 10% relative
+      phi:
+        distribution: !!python/name:romjax.random_field.kle
+        bounds: *bounds
+        shape: *shape
+        truncation: [8, 8]
+        correlation_lengths: [0.2, 0.2]
+        variance: 1
+        weight: smooth
+        weight_opts: { length_rel: 0.25 }
+  - !rox:romjax.model.FilterModel
+    source: hf_coord
+    target: lf_coord
+    name: coordinate transform
+    filters:
+      # POD on outputs only
+      - forward: !!python/name:romjax.model.eqx_evaluate
+        backward: !!python/name:romjax.model.eqx_evaluate
+        forward_opts: { gather: flat, method: reduce }
+        backward_opts: { gather: flat, scatter: flat, method: reconstruct }
+        in_paths: [ [outputs] ]
+        out_paths: [ [outputs] ]
+        # forward_routes: [ { target: [outputs, latent] } ]
+      # Pass inputs through
+      - forward: !!python/name:romjax.model.identity_filter
+        backward: !!python/name:romjax.model.identity_filter
+        in_paths: [ [inputs] ]
+        out_paths: [ [inputs] ]
+        # forward_routes: [ { source: [inputs], target: [inputs] } ]
+        # backward_routes: [ { source: [inputs], target: [inputs] } ]
+

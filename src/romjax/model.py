@@ -7,17 +7,17 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator, BaseModel, ConfigDict
 
 from romjax.graph import Edge, Node
-from romjax.typing import DictModel
 from romjax.utils import merge_pytrees
 
 type FilterSpec = bool | Callable[[Any], bool]
 type PathToken = str | int
 type TreePath = tuple[PathToken, ...]
 
-__all__ = ['Sampleable', 'eqx_evaluate', 'ImplicitModel', 'ExplicitModel', 'FilterModel']
+
+__all__ = ['Sampleable', 'eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel']
 
 
 class Sampleable(ABC):
@@ -110,7 +110,7 @@ class ExplicitModel(ImplicitModel, ABC):
         raise NotImplementedError
 
 
-class PathSpec(DictModel):
+class PathSpec(BaseModel):
     """Path-based override for one subtree in an Equinox filter-spec tree."""
 
     path: TreePath
@@ -129,7 +129,7 @@ class PathSpec(DictModel):
         return _coerce_path(value)
 
 
-class TreeRoute(DictModel):
+class TreeRoute(BaseModel):
     """
     Route one subtree from callable output into a destination path in the assembled output tree.
 
@@ -144,6 +144,10 @@ class TreeRoute(DictModel):
     @classmethod
     def _coerce_paths(cls, value: Any) -> TreePath:
         return _coerce_path(value)
+
+
+def identity_filter(x: PyTree, args: Any, **kwargs):
+    return x
 
 
 def eqx_evaluate(
@@ -232,7 +236,7 @@ def eqx_evaluate(
     return reconstructed
 
 
-class FilterModelSpec(DictModel):
+class FilterModelSpec(BaseModel):
     """
     One configurable filter component used by :class:`FilterModel`.
 
@@ -254,8 +258,10 @@ class FilterModelSpec(DictModel):
     :param backward_opts: keyword args passed to ``backward``
     """
 
-    forward: Callable[[PyTree, Any], PyTree] = eqx_evaluate
-    backward: Callable[[PyTree, Any], PyTree] = eqx_evaluate
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    forward: Callable[[PyTree, Any], PyTree] = identity_filter
+    backward: Callable[[PyTree, Any], PyTree] = identity_filter
 
     in_spec: PyTree[FilterSpec] | None = None
     out_spec: PyTree[FilterSpec] | None = None
@@ -453,7 +459,7 @@ class FilterModel(Edge):
             args = runtime_arg if runtime_arg is not None else aux_runtime_arg
 
             if direction == "forward":
-                view = eqx.filter(payload, spec.resolve_in_spec(payload))
+                view = _prune_none_leaves(eqx.filter(payload, spec.resolve_in_spec(payload)))
                 candidate, aux_out = _call_filter_spec(
                     spec.forward,
                     view,
@@ -464,7 +470,7 @@ class FilterModel(Edge):
                 )
                 patch = spec.route_forward(candidate)
             else:
-                view = eqx.filter(payload, spec.resolve_out_spec(payload))
+                view = _prune_none_leaves(eqx.filter(payload, spec.resolve_out_spec(payload)))
                 candidate, aux_out = _call_filter_spec(
                     spec.backward,
                     view,
@@ -605,14 +611,15 @@ def _get_callable_signature(fn: Callable[..., Any]) -> Signature | None:
 
 
 def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
-    """Return True if callable supports a named kwarg or ``**kwargs``."""
+    """Return True if callable explicitly lists a named kwarg."""
     sig = _get_callable_signature(fn)
     if sig is None:
         return False
-    for param in sig.parameters.values():
-        if param.kind == param.VAR_KEYWORD or param.name == name:
-            return True
-    return False
+    param = sig.parameters.get(name)
+    return param is not None and param.kind in {
+        param.POSITIONAL_OR_KEYWORD,
+        param.KEYWORD_ONLY,
+    }
 
 
 def _call_filter_spec(
@@ -649,6 +656,26 @@ def _shape_template_like(tree: PyTree, leaf_filter: Callable[[Any], bool]) -> Py
     )
 
 
+def _prune_none_leaves(tree: PyTree) -> PyTree:
+    """Remove ``None`` leaves introduced by ``eqx.filter`` from common pytree containers."""
+    if tree is None:
+        return None
+    if isinstance(tree, Mapping):
+        pruned = tree.__class__(
+            (key, child)
+            for key, value in tree.items()
+            if (child := _prune_none_leaves(value)) is not None
+        )
+        return pruned or None
+    if isinstance(tree, list):
+        pruned = [child for value in tree if (child := _prune_none_leaves(value)) is not None]
+        return pruned or None
+    if isinstance(tree, tuple):
+        pruned = tuple(child for value in tree if (child := _prune_none_leaves(value)) is not None)
+        return pruned or None
+    return tree
+
+
 def _gather_tree_array(
     tree: PyTree,
     mode: Literal["flat", "stack"],
@@ -661,7 +688,7 @@ def _gather_tree_array(
 
     if mode == "flat":
         if len(selected_leaves) == 1:
-            return selected_leaves[0]
+            return jnp.ravel(selected_leaves[0])
         return jnp.concatenate([jnp.ravel(leaf) for leaf in selected_leaves], axis=0)
 
     ref_shape = selected_leaves[0].shape

@@ -62,6 +62,19 @@ def backward_unpack_fields(y: dict, _: object | None = None) -> dict:
     }
 
 
+def forward_expect_pruned_view(x: dict, _: object | None = None) -> dict:
+    assert "meta" not in x
+    assert "outputs" not in x["pde1"]
+    assert set(x["pde1"]["inputs"]) == {"forcing"}
+    return {"latent": {"z": x["pde1"]["inputs"]["forcing"]}}
+
+
+def backward_expect_pruned_view(x: dict, _: object | None = None) -> dict:
+    assert set(x) == {"latent"}
+    assert set(x["latent"]) == {"z"}
+    return {"pde1": {"inputs": {"forcing": x["latent"]["z"]}}}
+
+
 def _model_yaml() -> str:
     return (
         "model: !rox:romjax.model.FilterModel\n"
@@ -310,6 +323,8 @@ def test_linear_projection() -> None:
         target="latent",
         filters=[
             {
+                "forward": eqx_evaluate,
+                "backward": eqx_evaluate,
                 "in_paths": [{"path": ["full", "x"]}],
                 "out_paths": [{"path": ["latent", "z"]}],
                 "forward_opts": {"gather": "flat", "method": "reduce"},
@@ -370,6 +385,8 @@ def test_filter_model_in_graph() -> None:
         target="latent",
         filters=[
             {
+                "forward": eqx_evaluate,
+                "backward": eqx_evaluate,
                 "in_paths": [["full", "field1"], ["full", "field2"]],
                 "out_paths": [["latent", "z1"], ["latent", "z2"]],
                 "forward_opts": {"gather": "stack", "method": "reduce"},
@@ -391,8 +408,8 @@ def test_filter_model_in_graph() -> None:
     def loss_fn(curr_module: LinearProjection) -> jax.Array:
         decoded = graph.push_path(
             {"full": {"field1": field1, "field2": field2}, "filters": [curr_module]},
-            start="full",
             path=["filter", "filter"],
+            start="full",
         )
         field1_mse = jnp.mean((decoded["full"]["field1"] - field1) ** 2)
         field2_mse = jnp.mean((decoded["full"]["field2"] - field2) ** 2)
@@ -417,14 +434,14 @@ def test_filter_model_in_graph() -> None:
 
     encoded, aux_cache = graph.push_path(
         {"full": {"field1": field1, "field2": field2}, "filters": [module]},
-        start="full",
         path=["filter"],
+        start="full",
         return_aux=True,
     )
     decoded = graph.push_path(
         {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
-        start="latent",
         path=["filter"],
+        start="latent",
         aux=aux_cache,
     )
     assert decoded["full"]["field1"].shape == field1.shape
@@ -433,9 +450,30 @@ def test_filter_model_in_graph() -> None:
     with pytest.raises(ValueError):
         graph.push_path(
             {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "filters": [module]},
-            start="latent",
             path=["filter"],
+            start="latent",
         )
+
+
+def test_filter_model_prunes_none_leaves_from_views() -> None:
+    model = FilterModel(
+        source="pde1",
+        target="latent",
+        filters=[
+            {
+                "forward": forward_expect_pruned_view,
+                "backward": backward_expect_pruned_view,
+                "in_paths": [["pde1", "inputs", "forcing"]],
+                "out_paths": [["latent", "z"]],
+            }
+        ],
+    )
+
+    encoded = model.forward(_tree_input())
+    assert jnp.array_equal(encoded["latent"]["z"], _tree_input()["pde1"]["inputs"]["forcing"])
+
+    decoded = model.backward({"latent": {"z": encoded["latent"]["z"]}})
+    assert jnp.array_equal(decoded["pde1"]["inputs"]["forcing"], encoded["latent"]["z"])
 
 
 # def test_conv_autoencoder_filter_model_with_joint_graph_optimization() -> None:
