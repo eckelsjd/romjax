@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import Field, PositiveInt, ValidationInfo, field_validator, ConfigDict
+from pydantic import ConfigDict, Field, PositiveInt, ValidationInfo, field_validator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable

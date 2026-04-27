@@ -4,8 +4,8 @@ import jax
 import numpy as np
 import pytest
 
-from romjax.random_field import kle, KLEConfig
-from romjax.rng import parametric_sampler, Distribution
+from romjax.random_field import KLEConfig, kle
+from romjax.rng import Distribution, parametric_sampler
 
 
 def test_kle_supports_1d_bounds() -> None:

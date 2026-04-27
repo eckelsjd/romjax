@@ -15,7 +15,7 @@ from pydantic import (
     SerializationInfo,
     TypeAdapter,
     model_serializer,
-    model_validator
+    model_validator,
 )
 from pydantic_core import core_schema
 

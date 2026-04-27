@@ -48,18 +48,16 @@ edges:
     name: coordinate transform
     filters:
       # POD on outputs only
-      - forward: !!python/name:romjax.model.eqx_evaluate
-        backward: !!python/name:romjax.model.eqx_evaluate
-        forward_opts: { gather: flat, method: reduce }
-        backward_opts: { gather: flat, scatter: flat, method: reconstruct }
-        in_paths: [ [outputs] ]
-        out_paths: [ [outputs] ]
-        # forward_routes: [ { target: [outputs, latent] } ]
+      - forward: 
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [ [outputs] ]
+          output_routes: [ [outputs] ]
+          opts: { gather: flat, method: reduce }
+        backward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [ [outputs] ]
+          opts: { gather: flat, scatter: flat, method: reconstruct }
       # Pass inputs through
-      - forward: !!python/name:romjax.model.identity_filter
-        backward: !!python/name:romjax.model.identity_filter
-        in_paths: [ [inputs] ]
-        out_paths: [ [inputs] ]
-        # forward_routes: [ { source: [inputs], target: [inputs] } ]
-        # backward_routes: [ { source: [inputs], target: [inputs] } ]
+      - forward:  { input_routes: [ [inputs] ] }
+        backward: { input_routes: [ [inputs] ] }
 
