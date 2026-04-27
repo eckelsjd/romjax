@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from romjax import YamlLoader
-from romjax.graph import Edge, EdgeList, FunctionGraph, IdentityEdge, Node, NodeList
+from romjax.graph import CompositeEdge, Edge, EdgeList, FunctionGraph, IdentityEdge, Node, NodeList
 
 
 def test_node_list():
@@ -212,3 +212,128 @@ def test_jit_grad_vmap_graph_push_path():
     assert jnp.allclose(jit_round_trip, x0)
     assert jnp.allclose(grad_out, jnp.array(1.0))
     assert jnp.allclose(vmap_out, vmap_in)
+
+
+class AffineIntEdge(Edge):
+    scale: int = 1
+    shift: int = 0
+
+    def forward(self, x):
+        return self.scale * x + self.shift
+
+    def backward(self, x):
+        return (x - self.shift) // self.scale
+
+
+def test_composite_edge_matches_explicit_path_forward_and_backward() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": AffineIntEdge(source="a", target="b", name="ab", scale=2, shift=3),
+            "bc": AffineIntEdge(source="b", target="c", name="bc", scale=5, shift=7),
+            "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "bc"]),
+        }
+    )
+
+    composite = graph.edges["ac"]
+    x = jnp.array(4, dtype=jnp.int32)
+
+    explicit_forward = graph.push_path(x, path=["ab", "bc"], start="a")
+    explicit_backward = graph.push_path(explicit_forward, path=["bc", "ab"], start="c")
+
+    assert composite.forward(x) == explicit_forward
+    assert composite.backward(explicit_forward) == explicit_backward
+    assert explicit_backward == x
+
+
+def test_composite_edge_preserves_graph_aux_behavior() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": AuxShiftEdge(source="a", target="b", name="ab"),
+            "bc": IdentityEdge(source="b", target="c", name="bc"),
+            "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "bc"]),
+        }
+    )
+
+    composite = graph.edges["ac"]
+    value = jnp.array(3.0)
+
+    forward_out, composite_aux = composite.forward_aux(value)
+    explicit_out, explicit_aux = graph.push_path(value, path=["ab", "bc"], start="a", return_aux=True)
+
+    assert jnp.allclose(forward_out, explicit_out)
+    assert jnp.allclose(composite_aux["ab"]["backward"]["offset"], explicit_aux["ab"]["backward"]["offset"])
+
+    backward_out, backward_aux = composite.backward_aux(forward_out, composite_aux)
+    explicit_back, explicit_back_aux = graph.push_path(
+        explicit_out,
+        path=["bc", "ab"],
+        start="c",
+        aux=explicit_aux,
+        return_aux=True,
+    )
+
+    assert jnp.allclose(backward_out, value)
+    assert jnp.allclose(backward_out, explicit_back)
+    assert backward_aux == explicit_back_aux
+
+
+def test_composite_edge_yaml_load_and_validation() -> None:
+    yaml_text = """
+!rox:romjax.graph.FunctionGraph
+edges:
+  - !rox:tests.test_graph.AffineIntEdge
+    source: a
+    target: b
+    name: ab
+    scale: 2
+    shift: 3
+  - !rox:tests.test_graph.AffineIntEdge
+    source: b
+    target: c
+    name: bc
+    scale: 5
+    shift: 7
+  - !rox:romjax.graph.CompositeEdge
+    source: a
+    target: c
+    name: ac
+    path: [ab, bc]
+"""
+    graph = YamlLoader.load(yaml_text)
+    composite = graph.edges["ac"]
+
+    assert isinstance(composite, CompositeEdge)
+    assert composite.path == ["ab", "bc"]
+    assert composite.forward(jnp.array(1, dtype=jnp.int32)) == jnp.array(32, dtype=jnp.int32)
+
+
+def test_composite_edge_rejects_invalid_paths() -> None:
+    with pytest.raises(ValidationError, match="unknown edge"):
+        FunctionGraph(
+            edges={
+                "ab": IdentityEdge(source="a", target="b", name="ab"),
+                "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "missing"]),
+            }
+        )
+
+    with pytest.raises(ValidationError, match="cannot include itself"):
+        FunctionGraph(edges={"ac": CompositeEdge(source="a", target="a", name="ac", path=["ac"])})
+
+    with pytest.raises(ValidationError, match="Path discontinuity"):
+        FunctionGraph(
+            edges={
+                "ab": IdentityEdge(source="a", target="b", name="ab"),
+                "cd": IdentityEdge(source="c", target="d", name="cd"),
+                "ad": CompositeEdge(source="a", target="d", name="ad", path=["ab", "cd"]),
+            }
+        )
+
+    with pytest.raises(ValidationError, match="recursion cycle"):
+        FunctionGraph(
+            edges={
+                "ab": IdentityEdge(source="a", target="b", name="ab"),
+                "ba": IdentityEdge(source="b", target="a", name="ba"),
+                "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "ba", "ca"]),
+                "ca": CompositeEdge(source="c", target="a", name="ca", path=["ac"]),
+            }
+        )

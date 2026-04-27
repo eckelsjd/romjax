@@ -60,4 +60,24 @@ edges:
       # Pass inputs through
       - forward:  { input_routes: [ [inputs] ] }
         backward: { input_routes: [ [inputs] ] }
-
+  - !rox:romjax.model.FilterModel
+    source: hf_res
+    target: lf_res
+    name: residual transform
+    filters:
+      - forward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [ [residuals] ]
+          output_routes: [ [residuals] ]
+          opts: { gather: flat, method: reduce }
+        backward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [ [residuals] ]
+          opts: { gather: flat, scatter: flat, method: reconstruct }
+      - forward:  { input_routes: [ [inputs] ] }
+        backward: { input_routes: [ [inputs] ] }
+  - !rox:romjax.graph.CompositeEdge
+    source: lf_coord
+    target: lf_res
+    name: galerkin rom
+    path: [coordinate transform, poisson, residual transform]

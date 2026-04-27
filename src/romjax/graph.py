@@ -4,7 +4,7 @@ from typing import Any, Hashable, Literal
 
 import networkx as nx
 from jaxtyping import PyTree
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from romjax.typing import ListModel, RoxObject
 
@@ -145,7 +145,88 @@ class IdentityEdge(Edge):
 
     def backward(self, x: PyTree) -> PyTree:
         return x
-    
+
+
+class CompositeEdge(Edge):
+    """
+    Reusable graph-native edge defined as a path through existing graph edges.
+
+    The configured ``path`` is interpreted with the same mixed forward/backward semantics as
+    :meth:`FunctionGraph.push_path`.
+
+    :param source: composite path start node
+    :param target: composite path end node
+    :param name: edge identifier
+    :param path: ordered list of existing graph edge names
+    """
+
+    path: list[str]
+
+    _graph: "FunctionGraph | None" = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _validate_path_config(self):
+        if len(self.path) == 0:
+            raise ValueError("CompositeEdge path must contain at least one edge name.")
+        return self
+
+    def _bind_graph(self, graph: "FunctionGraph") -> None:
+        """Bind the parent graph after construction."""
+        self._graph = graph
+
+    def _require_graph(self) -> "FunctionGraph":
+        if self._graph is None:
+            raise ValueError(f"Composite edge {self.name!r} is not bound to a FunctionGraph.")
+        return self._graph
+
+    def _run_path(
+        self,
+        x: PyTree,
+        *,
+        path: list[str] | None = None,
+        start: Node,
+        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        return_aux: bool = False,
+        composite_stack: tuple[str, ...] = (),
+    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+        graph = self._require_graph()
+        return graph._push_path_internal(
+            x,
+            self.path if path is None else path,
+            start=start,
+            aux=aux,
+            return_aux=return_aux,
+            composite_stack=composite_stack + (self.name,),
+        )
+
+    def forward(self, x: PyTree) -> PyTree:
+        """Evaluate the configured path from ``source`` to ``target``."""
+        return self._run_path(x, start=self.source)
+
+    def backward(self, x: PyTree) -> PyTree:
+        """Evaluate the configured path from ``target`` back to ``source``."""
+        return self._run_path(x, path=list(reversed(self.path)), start=self.target)
+
+    def forward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+        """
+        Evaluate the forward composite path and return the graph-managed auxiliary cache.
+
+        :param x: payload at ``source``
+        :param aux: optional precomputed graph aux cache
+        :return: ``(payload, aux_cache)``
+        """
+        return self._run_path(x, start=self.source, aux=aux, return_aux=True)
+
+    def backward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+        """
+        Evaluate the backward composite path and return the graph-managed auxiliary cache.
+
+        :param x: payload at ``target``
+        :param aux: optional precomputed graph aux cache
+        :return: ``(payload, aux_cache)``
+        """
+        return self._run_path(x, path=list(reversed(self.path)), start=self.target, aux=aux, return_aux=True)
+
 
 # Equivalent to the alias NodeList = ListModel[Node], but now others can use this by importing it
 class NodeList(ListModel[Node]):
@@ -182,6 +263,18 @@ class FunctionGraph(BaseModel, RoxObject):
         
         return self
 
+    @model_validator(mode="after")
+    def _bind_and_validate_composite_edges(self):
+        for edge in self.edges.values():
+            if isinstance(edge, CompositeEdge):
+                edge._bind_graph(self)
+
+        for edge in self.edges.values():
+            if isinstance(edge, CompositeEdge):
+                self._validate_composite_edge(edge)
+
+        return self
+
     def graph(self) -> nx.DiGraph:
         graph = nx.DiGraph()
         graph.add_nodes_from(self.nodes.values())
@@ -212,6 +305,124 @@ class FunctionGraph(BaseModel, RoxObject):
             out[edge_name] = dict(edge_aux)
         return out
 
+    def _step_path_node(self, curr_node: Node, edge: Edge) -> Node:
+        """Advance one graph step using ``push_path`` connectivity semantics."""
+        if edge.source == curr_node:
+            return edge.target
+        if edge.target == curr_node:
+            return edge.source
+        raise ValueError(
+            f"Path discontinuity at edge {edge.name!r}: edge does not connect to current node {curr_node!r}."
+        )
+
+    def _validate_composite_edge(self, edge: CompositeEdge, stack: tuple[str, ...] = ()) -> None:
+        """
+        Validate one composite edge against graph connectivity and recursive composition rules.
+
+        :param edge: composite edge to validate
+        :param stack: active composite recursion stack for cycle detection
+        """
+        if edge.name in stack:
+            cycle = " -> ".join((*stack, edge.name))
+            raise ValueError(f"Composite edge recursion cycle detected: {cycle}")
+
+        curr_node = edge.source
+        for edge_name in edge.path:
+            if edge_name == edge.name:
+                raise ValueError(f"Composite edge {edge.name!r} cannot include itself in its own path.")
+
+            try:
+                step_edge = self._resolve_edge(edge_name)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Composite edge {edge.name!r} references unknown edge {edge_name!r}."
+                ) from exc
+
+            curr_node = self._step_path_node(curr_node, step_edge)
+
+            if isinstance(step_edge, CompositeEdge):
+                self._validate_composite_edge(step_edge, stack=stack + (edge.name,))
+
+        if curr_node != edge.target:
+            raise ValueError(
+                f"Composite edge {edge.name!r} ends at node {curr_node!r}, expected target {edge.target!r}."
+            )
+
+    def _push_path_internal(
+        self,
+        x: PyTree,
+        path: list[str | Edge],
+        *,
+        start: Node | str | None = None,
+        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        return_aux: bool = False,
+        composite_stack: tuple[str, ...] = (),
+    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+        """Internal path executor with recursive composite-edge cycle tracking."""
+        if len(path) == 0:
+            raise ValueError("Path must contain at least one edge.")
+
+        if start is None:
+            curr_node = self._resolve_edge(path[0]).source
+        else:
+            curr_node = start if isinstance(start, Node) else Node(name=start)
+        payload = x
+        aux_cache = self._copy_aux_cache(aux)
+
+        for edge_ref in path:
+            edge = self._resolve_edge(edge_ref)
+
+            if edge.source == curr_node:
+                direction: Literal["forward", "backward"] = "forward"
+                next_node = edge.target
+                produced_key = "backward"
+            elif edge.target == curr_node:
+                direction = "backward"
+                next_node = edge.source
+                produced_key = "forward"
+            else:
+                raise ValueError(
+                    f"Path discontinuity at edge {edge.name!r}: edge does not connect to current node {curr_node!r}."
+                )
+
+            if isinstance(edge, CompositeEdge) and edge.name in composite_stack:
+                cycle = " -> ".join((*composite_stack, edge.name))
+                raise ValueError(f"Composite edge recursion cycle detected: {cycle}")
+
+            edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
+            if direction == "forward":
+                if isinstance(edge, CompositeEdge):
+                    payload, edge_aux_out = edge._run_path(
+                        payload,
+                        start=edge.source,
+                        aux=edge_aux_in,
+                        return_aux=True,
+                        composite_stack=composite_stack,
+                    )
+                else:
+                    payload, edge_aux_out = edge.forward_aux(payload, edge_aux_in)
+            else:
+                if isinstance(edge, CompositeEdge):
+                    payload, edge_aux_out = edge._run_path(
+                        payload,
+                        start=edge.target,
+                        aux=edge_aux_in,
+                        return_aux=True,
+                        composite_stack=composite_stack,
+                    )
+                else:
+                    payload, edge_aux_out = edge.backward_aux(payload, edge_aux_in)
+
+            if edge_aux_out is not None:
+                edge_cache = aux_cache.setdefault(edge.name, {})
+                edge_cache[produced_key] = edge_aux_out
+
+            curr_node = next_node
+
+        if return_aux:
+            return payload, aux_cache
+        return payload
+
     def push_path(
         self,
         x: PyTree,
@@ -238,41 +449,4 @@ class FunctionGraph(BaseModel, RoxObject):
         :param return_aux: if True, return both payload and updated auxiliary cache
         :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
         """
-        if start is None:
-            curr_node = self._resolve_edge(path[0]).source
-        else:
-            curr_node = start if isinstance(start, Node) else Node(name=start)
-        payload = x
-        aux_cache = self._copy_aux_cache(aux)
-
-        for edge_ref in path:
-            edge = self._resolve_edge(edge_ref)
-
-            if edge.source == curr_node:
-                direction: Literal["forward", "backward"] = "forward"
-                next_node = edge.target
-                produced_key = "backward"
-            elif edge.target == curr_node:
-                direction = "backward"
-                next_node = edge.source
-                produced_key = "forward"
-            else:
-                raise ValueError(
-                    f"Path discontinuity at edge {edge.name!r}: edge does not connect to current node {curr_node!r}."
-                )
-
-            edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
-            if direction == "forward":
-                payload, edge_aux_out = edge.forward_aux(payload, edge_aux_in)
-            else:
-                payload, edge_aux_out = edge.backward_aux(payload, edge_aux_in)
-
-            if edge_aux_out is not None:
-                edge_cache = aux_cache.setdefault(edge.name, {})
-                edge_cache[produced_key] = edge_aux_out
-
-            curr_node = next_node
-
-        if return_aux:
-            return payload, aux_cache
-        return payload
+        return self._push_path_internal(x, path, start=start, aux=aux, return_aux=return_aux)
