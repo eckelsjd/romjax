@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from romjax.cli import (
+from romjax.task_cli import (
     agent_environment,
     archive_task,
     build_phase_prompt,
@@ -123,7 +123,7 @@ def test_ensure_task_ready_rejects_unfilled_template(tmp_path: Path):
 
 
 def test_collect_plan_prompt_raises_on_empty(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("romjax.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("romjax.task_cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "   ")
     with pytest.raises(Exception):
         collect_plan_prompt()
@@ -144,7 +144,7 @@ def test_plan_task_creates_missing_task_and_fills_template(tmp_path: Path, monke
         write_manifest(paths, kwargs["task_slug"], manifest)
         return 0
 
-    monkeypatch.setattr("romjax.cli.run_planning_agent", fake_run_planning_agent)
+    monkeypatch.setattr("romjax.task_cli.run_planning_agent", fake_run_planning_agent)
 
     task_path = plan_task(paths, "feat-galerkin-rom", user_prompt="Add a Galerkin ROM feature")
 
@@ -182,7 +182,7 @@ def test_start_task_creates_worktree_and_runs_implementation_phase(tmp_path: Pat
         write_manifest(paths, kwargs["task_slug"], manifest)
         return 0
 
-    monkeypatch.setattr("romjax.cli.run_implementation_agent", fake_run_implementation_agent)
+    monkeypatch.setattr("romjax.task_cli.run_implementation_agent", fake_run_implementation_agent)
 
     manifest = start_task(paths, "feat-galerkin-rom")
 
@@ -231,7 +231,7 @@ def test_review_task_creates_review_summary(tmp_path: Path, monkeypatch: pytest.
         write_manifest(paths, kwargs["task_slug"], manifest)
         return 0
 
-    monkeypatch.setattr("romjax.cli.run_review_agent", fake_run_review_agent)
+    monkeypatch.setattr("romjax.task_cli.run_review_agent", fake_run_review_agent)
 
     review_path = review_task(paths, "feat-galerkin-rom")
 
@@ -312,8 +312,8 @@ def test_agent_environment_uses_shared_repo_venv(tmp_path: Path):
 
 def test_terminate_process_uses_kill_on_platform_without_killpg(monkeypatch: pytest.MonkeyPatch):
     calls: list[tuple[int, int]] = []
-    monkeypatch.delattr("romjax.cli.os.killpg", raising=False)
-    monkeypatch.setattr("romjax.cli.os.kill", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.delattr("romjax.task_cli.os.killpg", raising=False)
+    monkeypatch.setattr("romjax.task_cli.os.kill", lambda pid, sig: calls.append((pid, sig)))
     terminate_process(1234)
     assert calls == [(1234, signal.SIGTERM)]
 
@@ -339,8 +339,8 @@ def test_stop_task_updates_running_phase(tmp_path: Path, monkeypatch: pytest.Mon
     write_manifest(paths, "feat-galerkin-rom", manifest)
 
     killed: list[tuple[int, int]] = []
-    monkeypatch.setattr("romjax.cli.process_exists", lambda pid: True)
-    monkeypatch.setattr("romjax.cli.terminate_process", lambda pid: killed.append((pid, signal.SIGTERM)))
+    monkeypatch.setattr("romjax.task_cli.process_exists", lambda pid: True)
+    monkeypatch.setattr("romjax.task_cli.terminate_process", lambda pid: killed.append((pid, signal.SIGTERM)))
 
     updated = stop_task(paths, "feat-galerkin-rom")
 
@@ -378,7 +378,7 @@ def test_clean_task_removes_task_doc_run_dir_worktree_and_branch(tmp_path: Path,
         write_manifest(paths, kwargs["task_slug"], manifest)
         return 0
 
-    monkeypatch.setattr("romjax.cli.run_implementation_agent", fake_run_implementation_agent)
+    monkeypatch.setattr("romjax.task_cli.run_implementation_agent", fake_run_implementation_agent)
     manifest = start_task(paths, "feat-galerkin-rom")
     worktree_path = Path(manifest["worktree_path"])
     run_dir = paths.runs_dir / "feat-galerkin-rom"
@@ -431,7 +431,7 @@ def test_cli_plan_command_passes_headless(
     capsys: pytest.CaptureFixture[str],
 ):
     repo_root = prepare_repo(init_repo(tmp_path))
-    monkeypatch.setattr("romjax.cli.collect_plan_prompt", lambda: "Plan a new Galerkin ROM feature")
+    monkeypatch.setattr("romjax.task_cli.collect_plan_prompt", lambda: "Plan a new Galerkin ROM feature")
 
     def fake_plan_task(paths, task_slug: str, user_prompt: str | None = None, headless: bool = False):
         assert task_slug == "feat-galerkin-rom"
@@ -442,7 +442,7 @@ def test_cli_plan_command_passes_headless(
         task_path.write_text("# feat-galerkin-rom\n", encoding="utf-8")
         return task_path
 
-    monkeypatch.setattr("romjax.cli.plan_task", fake_plan_task)
+    monkeypatch.setattr("romjax.task_cli.plan_task", fake_plan_task)
 
     exit_code = cli(["plan", "feat-galerkin-rom", "--headless"], repo_root=repo_root)
 
@@ -453,7 +453,7 @@ def test_cli_plan_command_passes_headless(
 def test_cli_start_command_returns_agent_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = prepare_repo(init_repo(tmp_path))
     monkeypatch.setattr(
-        "romjax.cli.start_task",
+        "romjax.task_cli.start_task",
         lambda _paths, task_slug, headless=False: {"task_slug": task_slug, "exit_code": 7},
     )
     assert cli(["start", "feat-galerkin-rom", "--headless"], repo_root=repo_root) == 7
@@ -465,7 +465,7 @@ def test_cli_clean_command_requires_confirmation(
     capsys: pytest.CaptureFixture[str],
 ):
     repo_root = prepare_repo(init_repo(tmp_path))
-    monkeypatch.setattr("romjax.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("romjax.task_cli.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda: "no")
 
     exit_code = cli(["clean", "feat-galerkin-rom"], repo_root=repo_root)
@@ -486,7 +486,7 @@ def test_cli_review_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap
         review_path.write_text("# Review Summary: feat-galerkin-rom\n", encoding="utf-8")
         return review_path
 
-    monkeypatch.setattr("romjax.cli.review_task", fake_review_task)
+    monkeypatch.setattr("romjax.task_cli.review_task", fake_review_task)
 
     assert cli(["review", "feat-galerkin-rom"], repo_root=repo_root) == 0
     assert "feat-galerkin-rom-review.md" in capsys.readouterr().out

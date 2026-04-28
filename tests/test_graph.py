@@ -225,6 +225,28 @@ class AffineIntEdge(Edge):
         return (x - self.shift) // self.scale
 
 
+class RuntimeDeltaEdge(Edge):
+    source: Node = Node(name="a")
+    target: Node = Node(name="b")
+
+    def forward(self, x):
+        return {"value": x["value"] + x["call_args"]["delta"]}
+
+    def backward(self, x):
+        return {"value": x["value"] - x["call_args"]["delta"]}
+
+
+class RuntimeScaleEdge(Edge):
+    source: Node = Node(name="b")
+    target: Node = Node(name="c")
+
+    def forward(self, x):
+        return {"value": x["value"] * x["call_args"]["scale"]}
+
+    def backward(self, x):
+        return {"value": x["value"] / x["call_args"]["scale"]}
+
+
 def test_composite_edge_matches_explicit_path_forward_and_backward() -> None:
     graph = FunctionGraph(
         edges={
@@ -243,6 +265,48 @@ def test_composite_edge_matches_explicit_path_forward_and_backward() -> None:
     assert composite.forward(x) == explicit_forward
     assert composite.backward(explicit_forward) == explicit_backward
     assert explicit_backward == x
+
+
+def test_function_graph_push_path_edge_payload_patches() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": RuntimeDeltaEdge(source="a", target="b", name="ab"),
+            "bc": RuntimeScaleEdge(source="b", target="c", name="bc"),
+        }
+    )
+    patches = {
+        "ab": {"call_args": {"delta": jnp.array(3.0)}},
+        "bc": {"call_args": {"scale": jnp.array(5.0)}},
+        "unused": {"call_args": {"delta": jnp.array(100.0)}},
+    }
+
+    forward = graph.push_path({"value": jnp.array(2.0)}, path=["ab", "bc"], start="a", edge_payload_patches=patches)
+    backward = graph.push_path(forward, path=["bc", "ab"], start="c", edge_payload_patches=patches)
+
+    assert jnp.allclose(forward["value"], jnp.array(25.0))
+    assert jnp.allclose(backward["value"], jnp.array(2.0))
+
+
+def test_composite_edge_propagates_edge_payload_patches() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": RuntimeDeltaEdge(source="a", target="b", name="ab"),
+            "bc": RuntimeScaleEdge(source="b", target="c", name="bc"),
+            "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "bc"]),
+        }
+    )
+    patches = {
+        "ab": {"call_args": {"delta": jnp.array(4.0)}},
+        "bc": {"call_args": {"scale": jnp.array(6.0)}},
+    }
+
+    explicit = graph.push_path({"value": jnp.array(1.0)}, path=["ab", "bc"], start="a", edge_payload_patches=patches)
+    composite = graph.push_path({"value": jnp.array(1.0)}, path=["ac"], start="a", edge_payload_patches=patches)
+    round_trip = graph.push_path(composite, path=["ac"], start="c", edge_payload_patches=patches)
+
+    assert jnp.allclose(composite["value"], explicit["value"])
+    assert jnp.allclose(composite["value"], jnp.array(30.0))
+    assert jnp.allclose(round_trip["value"], jnp.array(1.0))
 
 
 def test_composite_edge_preserves_graph_aux_behavior() -> None:
