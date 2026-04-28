@@ -361,6 +361,9 @@ class FilterModel(Edge):
 
     The runtime payload may include an optional top-level ``"call_args"`` entry. ``call_args`` supplies
     runtime call inputs for the spec callables and is kept distinct from graph-transported auxiliary state.
+    When :meth:`romjax.graph.FunctionGraph.push_path` is used with ``edge_payload_patches``, those graph-level
+    patches choose which ``call_args`` payload reaches this edge. This class still only handles the per-edge
+    normalization and distribution of ``call_args`` across its own filter specs.
 
     ``call_args`` accepts either:
 

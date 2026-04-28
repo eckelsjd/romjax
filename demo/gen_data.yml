@@ -1,0 +1,16 @@
+!rox:romjax.config.GenDataConfig
+root: demo/dataset
+graph: demo/poisson_graph.yml
+train:
+  input_samples: 10
+  outputs_per_input: 5
+  input_seed: 0
+  output_seed: 1
+validation:
+  input_samples: 5
+  outputs_per_input: 2
+  input_seed: 2
+  output_seed: 3
+logger:
+  stdout: true
+batch_size: 4

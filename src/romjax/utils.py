@@ -12,10 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 __all__ = ['to_pytree', 'merge_pytrees', 'iter_pytree', 'pytree_at', 'get_logger', 'tree_l2_norm', 
-           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
+           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'Logger']
 
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
@@ -131,6 +131,29 @@ def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,
 
     return logger
 
+
+class Logger(BaseModel):
+    """Simple logging with pydantic validation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    name: str
+    stdout: bool = True
+    file: Path | None = None
+    _logger: logging.Logger | None = PrivateAttr(default=None)
+
+    @model_validator(mode='after')
+    def _set_logger(self):
+        self._logger = get_logger(self.name, self.stdout, self.file)
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the underlying ``logging.Logger``."""
+        logger = self.__pydantic_private__.get("_logger")
+        if logger is not None:
+            return getattr(logger, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+    
 
 def format_time_engineering(seconds: float):
     """Helper to format times in common engineering magnitudes."""

@@ -7,6 +7,7 @@ from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from romjax.typing import ListModel, RoxObject
+from romjax.utils import merge_pytrees
 
 
 class Node(BaseModel, Hashable, RoxObject):
@@ -186,6 +187,7 @@ class CompositeEdge(Edge):
         path: list[str] | None = None,
         start: Node,
         aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
         return_aux: bool = False,
         composite_stack: tuple[str, ...] = (),
     ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
@@ -195,6 +197,7 @@ class CompositeEdge(Edge):
             self.path if path is None else path,
             start=start,
             aux=aux,
+            edge_payload_patches=edge_payload_patches,
             return_aux=return_aux,
             composite_stack=composite_stack + (self.name,),
         )
@@ -355,6 +358,7 @@ class FunctionGraph(BaseModel, RoxObject):
         *,
         start: Node | str | None = None,
         aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
         return_aux: bool = False,
         composite_stack: tuple[str, ...] = (),
     ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
@@ -389,31 +393,44 @@ class FunctionGraph(BaseModel, RoxObject):
                 cycle = " -> ".join((*composite_stack, edge.name))
                 raise ValueError(f"Composite edge recursion cycle detected: {cycle}")
 
+            payload_in = payload
+            edge_payload_patch = None if edge_payload_patches is None else edge_payload_patches.get(edge.name)
+            if edge_payload_patch is not None:
+                if not isinstance(payload_in, Mapping):
+                    raise TypeError(
+                        f"Edge payload patches require mapping payloads, but edge {edge.name!r} received "
+                        f"{type(payload_in).__name__}."
+                    )
+                payload_in = merge_pytrees(payload_in, edge_payload_patch)
+
             edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
             if direction == "forward":
                 if isinstance(edge, CompositeEdge):
-                    payload, edge_aux_out = edge._run_path(
-                        payload,
+                    payload, aux_cache = edge._run_path(
+                        payload_in,
                         start=edge.source,
-                        aux=edge_aux_in,
+                        aux=aux_cache,
+                        edge_payload_patches=edge_payload_patches,
                         return_aux=True,
                         composite_stack=composite_stack,
                     )
                 else:
-                    payload, edge_aux_out = edge.forward_aux(payload, edge_aux_in)
+                    payload, edge_aux_out = edge.forward_aux(payload_in, edge_aux_in)
             else:
                 if isinstance(edge, CompositeEdge):
-                    payload, edge_aux_out = edge._run_path(
-                        payload,
+                    payload, aux_cache = edge._run_path(
+                        payload_in,
+                        path=list(reversed(edge.path)),
                         start=edge.target,
-                        aux=edge_aux_in,
+                        aux=aux_cache,
+                        edge_payload_patches=edge_payload_patches,
                         return_aux=True,
                         composite_stack=composite_stack,
                     )
                 else:
-                    payload, edge_aux_out = edge.backward_aux(payload, edge_aux_in)
+                    payload, edge_aux_out = edge.backward_aux(payload_in, edge_aux_in)
 
-            if edge_aux_out is not None:
+            if not isinstance(edge, CompositeEdge) and edge_aux_out is not None:
                 edge_cache = aux_cache.setdefault(edge.name, {})
                 edge_cache[produced_key] = edge_aux_out
 
@@ -430,6 +447,7 @@ class FunctionGraph(BaseModel, RoxObject):
         *,
         start: Node | str | None = None,
         aux: Mapping[str, Mapping[str, PyTree]] | None = None,
+        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
         return_aux: bool = False,
     ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
         """
@@ -441,12 +459,22 @@ class FunctionGraph(BaseModel, RoxObject):
         The cache is maintained by the graph:
         - when traversing an edge forward, any produced auxiliary data is stored for that edge's backward direction
         - when traversing an edge backward, any produced auxiliary data is stored for that edge's forward direction
+        - when ``edge_payload_patches`` provides a patch for an edge name, that patch is merged into the current
+          payload only for that edge evaluation, including recursive traversals inside :class:`CompositeEdge`
 
         :param x: payload to propagate along the path
         :param path: ordered edges to traverse (edge names or edge objects)
         :param start: starting node for the path (defaults to first node of first edge in path)
         :param aux: optional precomputed auxiliary cache
+        :param edge_payload_patches: optional payload patches keyed by edge name
         :param return_aux: if True, return both payload and updated auxiliary cache
         :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
         """
-        return self._push_path_internal(x, path, start=start, aux=aux, return_aux=return_aux)
+        return self._push_path_internal(
+            x,
+            path,
+            start=start,
+            aux=aux,
+            edge_payload_patches=edge_payload_patches,
+            return_aux=return_aux,
+        )

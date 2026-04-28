@@ -79,6 +79,18 @@ def identity_callable(x):
     return x
 
 
+def scale_value(x: jax.Array, scale: float | jax.Array | None = None) -> jax.Array:
+    if scale is None:
+        raise ValueError("scale_value requires a runtime scale.")
+    return jnp.asarray(scale) * jnp.asarray(x)
+
+
+def combine_latents(x: dict, bias: float | jax.Array | None = None) -> dict:
+    if bias is None:
+        raise ValueError("combine_latents requires a runtime bias.")
+    return {"y": x["z1"] + x["z2"] + jnp.asarray(bias)}
+
+
 def _model_yaml() -> str:
     return (
         "model: !rox:romjax.model.FilterModel\n"
@@ -554,6 +566,60 @@ def test_filter_model_runtime_input_normalization_and_errors() -> None:
         multi_model.forward(
             {"full": {"x": jnp.array([1.0, 2.0])}, "call_args": {"shared": 1.0, "per_spec": [1.0, 2.0]}}
         )
+
+
+def test_graph_edge_payload_patches_route_distinct_filter_model_call_args() -> None:
+    encode = FilterModel(
+        source="full",
+        target="latent",
+        name="encode",
+        filters=[
+            {
+                "forward": {
+                    "callable": scale_value,
+                    "input_routes": [{"outer": ["full", "x"], "inner": []}],
+                    "output_routes": [["latent", "z1"]],
+                }
+            },
+            {
+                "forward": {
+                    "callable": scale_value,
+                    "input_routes": [{"outer": ["full", "x"], "inner": []}],
+                    "output_routes": [["latent", "z2"]],
+                }
+            },
+        ],
+    )
+    decode = FilterModel(
+        source="latent",
+        target="summary",
+        name="decode",
+        filters=[
+            {
+                "forward": {
+                    "callable": combine_latents,
+                    "input_routes": [
+                        {"outer": ["latent", "z1"], "inner": ["z1"]},
+                        {"outer": ["latent", "z2"], "inner": ["z2"]},
+                    ],
+                    "output_routes": [{"inner": ["y"], "outer": ["summary", "y"]}],
+                }
+            }
+        ],
+    )
+    graph = FunctionGraph(edges={"encode": encode, "decode": decode})
+    patches = {
+        "encode": {"call_args": {"per_spec": [jnp.array(2.0), jnp.array(3.0)]}},
+        "decode": {"call_args": {"shared": jnp.array(7.0)}},
+    }
+
+    out = graph.push_path(
+        {"full": {"x": jnp.array([1.0, -2.0])}},
+        path=["encode", "decode"],
+        edge_payload_patches=patches,
+    )
+
+    assert jnp.array_equal(out["summary"]["y"], jnp.array([12.0, -3.0]))
 
 
 def test_filter_model_missing_cached_state_and_aux_shape_errors() -> None:
