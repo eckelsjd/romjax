@@ -43,6 +43,21 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def active_worktree_path(paths: TaskPaths, task_slug: str) -> Path:
+    """Return the standard sibling worktree path for an active task."""
+    return paths.repo_root.parent / task_slug
+
+
+def archived_worktree_root(paths: TaskPaths) -> Path:
+    """Return the sibling directory that stores archived task worktrees."""
+    return paths.repo_root.parent / "archive"
+
+
+def archived_worktree_path(paths: TaskPaths, task_slug: str) -> Path:
+    """Return the standard archived worktree path for a task."""
+    return archived_worktree_root(paths) / task_slug
+
+
 def get_task_paths(repo_root: Path | None = None) -> TaskPaths:
     """Return workflow paths for a repository root.
 
@@ -104,7 +119,7 @@ def task_metadata(paths: TaskPaths, task_slug: str) -> dict[str, str]:
     """Build standard metadata available to task templates."""
     task_type, task_name = validate_task_slug(task_slug)
     task_doc = paths.open_dir / f"{task_slug}.md"
-    worktree_path = paths.repo_root.parent / task_slug
+    worktree_path = active_worktree_path(paths, task_slug)
     return {
         "task_slug": task_slug,
         "task_type": task_type,
@@ -120,7 +135,7 @@ def task_metadata(paths: TaskPaths, task_slug: str) -> dict[str, str]:
 
 def initial_manifest(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
     """Build a default manifest structure for a task."""
-    worktree_path = paths.repo_root.parent / task_slug
+    worktree_path = active_worktree_path(paths, task_slug)
     return {
         "task_slug": task_slug,
         "repo_root": str(paths.repo_root),
@@ -258,7 +273,7 @@ def ensure_git_worktree(paths: TaskPaths, task_slug: str) -> Path:
     :param task_slug: task identifier
     :return: worktree path
     """
-    worktree_path = paths.repo_root.parent / task_slug
+    worktree_path = active_worktree_path(paths, task_slug)
     if worktree_path.exists():
         raise TaskWorkflowError(f"Worktree path already exists: {worktree_path}")
 
@@ -407,7 +422,7 @@ def load_or_create_manifest(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
     manifest.setdefault("phases", {})
     manifest.setdefault("task_slug", task_slug)
     manifest.setdefault("repo_root", str(paths.repo_root))
-    manifest.setdefault("worktree_path", str(paths.repo_root.parent / task_slug))
+    manifest.setdefault("worktree_path", str(active_worktree_path(paths, task_slug)))
     manifest.setdefault("branch_name", task_slug)
     manifest.setdefault("base_ref", current_git_branch(paths.repo_root))
     return manifest
@@ -1029,6 +1044,7 @@ def archive_task(paths: TaskPaths, task_slug: str) -> Path:
 
     Running tasks must be stopped before archiving.
     """
+    ensure_task_layout(paths)
     state, task_path = find_task_document(paths, task_slug)
     if state == "archive":
         return task_path
@@ -1042,6 +1058,22 @@ def archive_task(paths: TaskPaths, task_slug: str) -> Path:
         for phase in manifest.get("phases", {}).values():
             if phase.get("status") == "running":
                 raise TaskWorkflowError(f"Task '{task_slug}' is still running. Stop it before archiving.")
+
+    if isinstance(manifest, dict):
+        old_worktree_path = normalize_cwd(manifest["worktree_path"])
+        new_worktree_path = archived_worktree_path(paths, task_slug)
+        if old_worktree_path != new_worktree_path and old_worktree_path.exists():
+            new_worktree_path.parent.mkdir(parents=True, exist_ok=True)
+            if new_worktree_path.exists():
+                raise TaskWorkflowError(f"Archived worktree path already exists: {new_worktree_path}")
+            if is_registered_worktree(paths.repo_root, old_worktree_path):
+                run_git(paths.repo_root, ["worktree", "move", str(old_worktree_path), str(new_worktree_path)])
+            else:
+                shutil.move(str(old_worktree_path), str(new_worktree_path))
+            manifest["worktree_path"] = str(new_worktree_path)
+            write_manifest(paths, task_slug, manifest)
+            task_text = task_path.read_text(encoding="utf-8")
+            task_path.write_text(task_text.replace(str(old_worktree_path), str(new_worktree_path)), encoding="utf-8")
 
     return move_task_to_state(paths, task_slug, "archive")
 
@@ -1105,6 +1137,10 @@ def clean_task(paths: TaskPaths, task_slug: str) -> dict[str, Any]:
 
     run_dir = run_dir_for_task(paths, task_slug)
     worktree_path = normalize_cwd(manifest["worktree_path"])
+    if state == "archive" and not worktree_path.exists():
+        archived_path = archived_worktree_path(paths, task_slug)
+        if archived_path.exists():
+            worktree_path = archived_path
     branch_name = str(manifest.get("branch_name") or task_slug)
     summary: dict[str, Any] = {
         "task_slug": task_slug,

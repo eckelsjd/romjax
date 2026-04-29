@@ -363,6 +363,48 @@ def test_archive_task_rejects_running_phase(tmp_path: Path):
         archive_task(paths, "feat-galerkin-rom")
 
 
+def test_archive_task_moves_worktree_and_updates_references(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text(
+        "# feat-galerkin-rom\n\n- Worktree: "
+        f"`{repo_root.parent / 'feat-galerkin-rom'}`\n\n## Summary\nDone\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_implementation_agent(**kwargs):
+        Path(kwargs["output_path"]).write_text("summary\n", encoding="utf-8")
+        manifest = load_or_create_manifest(paths, kwargs["task_slug"])
+        phase = phase_entry(manifest, "implementation")
+        phase["status"] = "succeeded"
+        phase["exit_code"] = 0
+        write_manifest(paths, kwargs["task_slug"], manifest)
+        return 0
+
+    monkeypatch.setattr("romjax.task_cli.run_implementation_agent", fake_run_implementation_agent)
+    manifest = start_task(paths, "feat-galerkin-rom")
+    original_worktree_path = Path(manifest["worktree_path"])
+    archived_worktree_path = repo_root.parent / "archive" / "feat-galerkin-rom"
+
+    archived_task_path = archive_task(paths, "feat-galerkin-rom")
+
+    assert archived_task_path == paths.archive_dir / "feat-galerkin-rom.md"
+    assert not original_worktree_path.exists()
+    assert archived_worktree_path.exists()
+    stored = load_manifest(paths, "feat-galerkin-rom")
+    assert Path(stored["worktree_path"]) == archived_worktree_path
+    assert str(archived_worktree_path) in archived_task_path.read_text(encoding="utf-8")
+    worktree_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {archived_worktree_path.resolve()}" in worktree_list
+
+
 def test_clean_task_removes_task_doc_run_dir_worktree_and_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = prepare_repo(init_repo(tmp_path))
     paths = get_task_paths(repo_root)
@@ -410,6 +452,50 @@ def test_clean_task_removes_task_doc_run_dir_worktree_and_branch(tmp_path: Path,
         capture_output=True,
         text=True,
     ).stdout.strip() == ""
+
+
+def test_clean_task_falls_back_to_archived_worktree_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    task_path.write_text("# feat-galerkin-rom\n\n## Summary\nDone\n", encoding="utf-8")
+
+    def fake_run_implementation_agent(**kwargs):
+        Path(kwargs["output_path"]).write_text("summary\n", encoding="utf-8")
+        manifest = load_or_create_manifest(paths, kwargs["task_slug"])
+        phase = phase_entry(manifest, "implementation")
+        phase["status"] = "succeeded"
+        phase["exit_code"] = 0
+        write_manifest(paths, kwargs["task_slug"], manifest)
+        return 0
+
+    monkeypatch.setattr("romjax.task_cli.run_implementation_agent", fake_run_implementation_agent)
+    manifest = start_task(paths, "feat-galerkin-rom")
+    active_worktree_path = Path(manifest["worktree_path"])
+    archived_worktree_path = repo_root.parent / "archive" / "feat-galerkin-rom"
+    archived_worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    run_dir = paths.runs_dir / "feat-galerkin-rom"
+
+    run_git = subprocess.run(
+        ["git", "worktree", "move", str(active_worktree_path), str(archived_worktree_path)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert run_git.returncode == 0
+    move_task_to_state(paths, "feat-galerkin-rom", "archive")
+
+    stale_manifest = load_manifest(paths, "feat-galerkin-rom")
+    stale_manifest["worktree_path"] = str(active_worktree_path)
+    write_manifest(paths, "feat-galerkin-rom", stale_manifest)
+
+    summary = clean_task(paths, "feat-galerkin-rom")
+
+    assert summary["removed_worktree"] is True
+    assert summary["worktree_path"] == str(archived_worktree_path.resolve())
+    assert not archived_worktree_path.exists()
+    assert not run_dir.exists()
 
 
 def test_clean_task_rejects_running_task(tmp_path: Path):
