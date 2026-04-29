@@ -1,3 +1,4 @@
+"""Maintain configuration schemas for various romjax utilities, especially the rom CLI."""
 from typing import Literal, Sequence, Mapping
 from pathlib import Path
 import os
@@ -9,17 +10,23 @@ from pydantic import (
     ValidationInfo, 
     model_validator, 
     ValidatorFunctionWrapHandler,
-    Field
 ) 
 
 from romjax.typing import RoxObject
 from romjax.graph import FunctionGraph
 from romjax.model import Sampleable
 from romjax import YamlLoader
-from romjax.utils import Logger
 
 
 class SampleConfig(BaseModel):
+    """
+    Sampling configuration for a nested input/output sampling strategy.
+
+    :ivar input_samples: number of input samples
+    :ivar outputs_per_input: number of output samples for each input sample
+    :ivar input_seed: random seed for inputs
+    :ivar output_seed: random seed for outputs
+    """
 
     input_samples: int
     outputs_per_input: int
@@ -28,7 +35,18 @@ class SampleConfig(BaseModel):
         
 
 class GenDataConfig(BaseModel, RoxObject):
-    """Data generation config."""
+    """
+    Data generation config for a FunctionGraph.
+    
+    :ivar root: root directory for saving data
+    :ivar graph: the FunctionGraph object specifying all models and connections. 
+                 May point to a yaml file with the FunctionGraph spec implemented at the top-level
+    :ivar train: sampling configuration for each model (see `SampleConfig`) for training dataset
+    :ivar validation: sampling configurations for validation dataset
+    :ivar to_sample: the names of the models to sample. Each must implement the `Sampleable` protocol
+    :ivar format: the data format to save samples. Only `h5` supported.
+    :ivar dataset_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
@@ -36,12 +54,10 @@ class GenDataConfig(BaseModel, RoxObject):
     graph: FunctionGraph
     train: Sequence[SampleConfig]
     validation: Sequence[SampleConfig]
-    batch_size: int = 1
     to_sample: list[str] | None = None
-    use_solution: Sequence[bool] = True
+    batch_size: int = 1
     format: Literal["h5"] = "h5"
     dataset_policy: Literal["reuse", "overwrite", "error"] = "reuse"
-    logger: Logger = Field(default_factory=Logger)
 
     @field_validator("root", mode="after")
     @classmethod
@@ -97,23 +113,6 @@ class GenDataConfig(BaseModel, RoxObject):
                                  f"'sample_outputs' methods, so it cannot be sampled.")
         return value
     
-    @field_validator("use_solution", mode="before")
-    @classmethod
-    def _allow_single_use_solution(cls, value):
-        if not isinstance(value, Sequence):
-            return [value]
-        return value
-    
-    @field_validator("logger", mode="before")
-    @classmethod
-    def _add_logger_name(cls, value):
-        if hasattr(value, "name"):
-            value.name = "Data generation"
-        elif isinstance(value, Mapping):
-            value['name'] = "Data generation"
-        
-        return value
-    
     @model_validator(mode="after")
     def _validate_sequences(self):
         """Make sure train, validation configs match the length of sampleables (will broadcast len=1)."""
@@ -134,16 +133,10 @@ class GenDataConfig(BaseModel, RoxObject):
                     new_config = self.validation[0].copy()
                     new_config.seed += i
                     self.validation.append(new_config)
-            
-            if len(self.use_solution) == 1:
-                for i in range(1, num_sample):
-                    self.use_solution.append(self.use_solution[0])
         
         if len(self.train) != num_sample:
             raise ValueError(f"Number of training configs: {len(self.train)}. Expected {num_sample}")
         if len(self.validation) != num_sample:
             raise ValueError(f"Number of validation configs: {len(self.validation)}. Expected {num_sample}")
-        if len(self.use_solution) != num_sample:
-            raise ValueError(f"Number of use_solution configs: {len(self.use_solution)}. Expected {num_sample}")
         
         return self

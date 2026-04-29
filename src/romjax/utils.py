@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
 __all__ = ['to_pytree', 'merge_pytrees', 'iter_pytree', 'pytree_at', 'get_logger', 'tree_l2_norm', 
            'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'Logger']
@@ -345,4 +345,5 @@ def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r', jax
         # Selectively load requested data (supports nested dict patterns)
         else:
             _recursively_fill(data, f)
-            
+    
+    return data
