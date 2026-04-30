@@ -1,7 +1,7 @@
 solver: !romx:Poisson2D
   config:
     grid:
-      shape: &s [50, 50]
+      shape: &s [8, 8]
       bounds: &b [[0, 1], [0, 1]]
     solver:
       name: Newton

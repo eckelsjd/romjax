@@ -152,7 +152,7 @@ def nonlinear_conductivity(
     if amplitude == 'exp':
         amplitude = jnp.exp
 
-    phi = outputs['phi']
+    phi = next(iter(outputs.values()))
     return amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
 
 
@@ -196,6 +196,9 @@ class Poisson2D(ImplicitModel, Sampleable):
     # To satisfy criteria for being a graph edge
     source: Node = Node(name="poisson_in")
     target: Node = Node(name="poisson_out")
+
+    field_name: str = "phi"
+    residual_name: str = "phi_residual"
 
     # Optional/default (and optionally variable online)
     forcing: ForcingCallable = constant_forcing
@@ -303,18 +306,17 @@ class Poisson2D(ImplicitModel, Sampleable):
             if not isinstance(value, Mapping):
                 raise TypeError("Near-solution sampler opts must be provided as a mapping.")
             kwargs = dict(value)
+            scale = kwargs.pop("scale", None)
             noise = kwargs.pop("noise", None)
-            scale = kwargs.pop("scale", 1.0)
-            if kwargs:
-                if noise is None:
-                    noise = kwargs
-                else:
-                    noise.update(kwargs)
 
-            if noise is not None:
-                return {"noise": validate_distribution_pytree(noise), "scale": scale}
-            else:
-                return {"noise": noise, "scale": scale}
+            validated_noise = validate_distribution_pytree(noise) if noise is not None else None
+            validated_kwargs = validate_distribution_pytree(kwargs) if kwargs else {}
+
+            if validated_noise is not None:
+                validated_kwargs["noise"] = validated_noise
+            if scale is not None:
+                validated_kwargs["scale"] = scale
+            return validated_kwargs
 
         return value
     
@@ -361,7 +363,7 @@ class Poisson2D(ImplicitModel, Sampleable):
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
-        phi = jnp.asarray(outputs["phi"])
+        phi = jnp.asarray(outputs[self.field_name])
         dx, dy = self.config['grid']['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs, **self.forcing_opts))
         conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs, **self.conductivity_opts), 
@@ -423,7 +425,7 @@ class Poisson2D(ImplicitModel, Sampleable):
 
         phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
 
-        return {"phi_residual": phi_residual}
+        return {self.residual_name: phi_residual}
 
     def evaluate(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Evalute the Poisson residual on a 2D grid.
@@ -449,16 +451,16 @@ class Poisson2D(ImplicitModel, Sampleable):
         """
         inputs = {} if inputs is None else inputs
         residuals = {} if residuals is None else residuals
-        if "phi_residual" in residuals:
-            target = jnp.asarray(residuals["phi_residual"])
+        if self.residual_name in residuals:
+            target = jnp.asarray(residuals[self.residual_name])
         else:
             target = jnp.zeros_like(self.config.grid.coords[0])
         merged_inputs = self._merge_inputs(inputs)
         args = {'inputs': merged_inputs, 'target': target}
 
         def residual_fn(phi: ArrayLike, args: PyTree) -> ArrayLike:
-            residual = self._compute_residual(args['inputs'], {'phi': phi})
-            return residual['phi_residual'] - args['target']
+            residual = self._compute_residual(args['inputs'], {self.field_name: phi})
+            return residual[self.residual_name] - args['target']
         
         solution = optx.root_find(
             residual_fn,
@@ -471,7 +473,7 @@ class Poisson2D(ImplicitModel, Sampleable):
             throw=self.config.throw,
         )
 
-        ret = solution if return_sol else {"phi": solution.value} 
+        ret = solution if return_sol else {self.field_name: solution.value} 
         return ret
     
     def sample_inputs(self, key: Key) -> PoissonInputs:
@@ -512,5 +514,5 @@ class Poisson2D(ImplicitModel, Sampleable):
 
         sample = self.outputs_sampler(key, inputs=inputs, solution=sampler_solution, **sampler_opts)
         if isinstance(sample, Mapping):
-            return {"phi": jnp.asarray(sample["phi"])}
-        return {"phi": jnp.asarray(sample)}
+            return {self.field_name: jnp.asarray(sample[self.field_name])}
+        return {self.field_name: jnp.asarray(sample)}

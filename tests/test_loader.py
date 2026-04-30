@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from romjax import DictModel, YamlLoader, train
+from romjax import YamlLoader
 from romjax.model import ImplicitModel
 from romjax.poisson import Poisson2D
 from romjax.rng import Distribution, near_solution_sampler
@@ -89,7 +89,7 @@ def test_poisson_model_load_and_dump() -> None:
     solver = data["solver"]
     assert isinstance(solver, Poisson2D)
     assert isinstance(solver.forcing, Callable)
-    assert solver.config.grid.shape == (50, 50)
+    assert solver.config.grid.shape == (8, 8)
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None

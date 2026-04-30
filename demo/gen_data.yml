@@ -8,7 +8,7 @@ train:
   output_seed: 1
 validation:
   input_samples: 256
-  outputs_per_input: 8
+  outputs_per_input: 16
   input_seed: 2
   output_seed: 3
 dataset_policy: reuse

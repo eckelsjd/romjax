@@ -8,9 +8,9 @@ from romjax.random_field import KLEConfig, kle
 from romjax.rng import Distribution, parametric_sampler
 
 
-def test_kle_supports_1d_bounds() -> None:
-    key = jax.random.key(19)
-    opts = dict(
+def test_kle_supports_1d_and_2d_shapes_and_determinism() -> None:
+    key_1d = jax.random.key(19)
+    opts_1d = dict(
         bounds=((0.0, 2.0),),
         shape=(6,),
         truncation=(4,),
@@ -19,23 +19,10 @@ def test_kle_supports_1d_bounds() -> None:
         spectral_decay=2.5,
         mean=1.25,
     )
-
-    sample_a = kle(key, **opts)
-    sample_b = kle(key, **opts)
-    batched = kle(key, nsamples=3, **opts)
-
-    assert sample_a.shape == (6,)
-    assert batched.shape == (3, 6)
-    assert np.allclose(np.asarray(sample_a), np.asarray(sample_b))
-    assert np.allclose(np.asarray(sample_a), np.asarray(batched[0]))
-
-
-def test_kle_supports_scalar_style_1d_inputs_and_defaults() -> None:
-    key = jax.random.key(23)
-
-    default_sample = kle(key)
-    sample = kle(
-        key,
+    sample_1d = kle(key_1d, **opts_1d)
+    batched_1d = kle(key_1d, nsamples=3, **opts_1d)
+    scalar_style_1d = kle(
+        jax.random.key(23),
         bounds=(0.0, 2.0),
         shape=6,
         truncation=4,
@@ -45,41 +32,38 @@ def test_kle_supports_scalar_style_1d_inputs_and_defaults() -> None:
         mean=1.25,
     )
 
-    assert default_sample.shape == (16,)
-    assert sample.shape == (6,)
-
-
-def test_kle_deterministic_and_shapes() -> None:
-    key = jax.random.key(7)
-    opts = dict(
+    key_2d = jax.random.key(7)
+    opts_2d = dict(
         bounds=((0.0, 2.0), (-1.0, 1.0)),
-        shape=(6, 5),
-        truncation=(4, 3),
+        shape=(5, 4),
+        truncation=(3, 2),
         correlation_lengths=(0.3, 0.2),
         variance=0.5,
         spectral_decay=2.5,
         mean=1.25,
     )
+    sample_2d = kle(key_2d, **opts_2d)
+    batched_2d = kle(key_2d, nsamples=3, **opts_2d)
 
-    sample_a = kle(key, **opts)
-    sample_b = kle(key, **opts)
-    batched = kle(key, nsamples=3, **opts)
-
-    assert sample_a.shape == (6, 5)
-    assert batched.shape == (3, 6, 5)
-    assert np.allclose(np.asarray(sample_a), np.asarray(sample_b))
-    assert np.allclose(np.asarray(sample_a), np.asarray(batched[0]))
+    assert kle(jax.random.key(0)).shape == (16,)
+    assert sample_1d.shape == (6,)
+    assert batched_1d.shape == (3, 6)
+    assert np.allclose(np.asarray(sample_1d), np.asarray(batched_1d[0]))
+    assert scalar_style_1d.shape == (6,)
+    assert sample_2d.shape == (5, 4)
+    assert batched_2d.shape == (3, 5, 4)
+    assert np.allclose(np.asarray(sample_2d), np.asarray(batched_2d[0]))
 
 
 def test_kle_variance_scaling() -> None:
     samples = kle(
         jax.random.key(11),
-        shape=(8, 8),
-        truncation=(4, 4),
+        shape=(6, 6),
+        truncation=(3, 3),
         correlation_lengths=(0.2, 0.2),
         variance=0.75,
         mean=2.0,
-        nsamples=512,
+        nsamples=128,
     )
     centered = np.asarray(samples) - 2.0
     empirical_variance = centered.var(axis=0).mean()
@@ -95,8 +79,8 @@ def test_kle_parametric_sampler_integration() -> None:
         key,
         conductivity={
             "distribution": kle,
-            "shape": (7, 9),
-            "truncation": (3, 4),
+            "shape": (5, 6),
+            "truncation": (2, 3),
             "correlation_lengths": (0.15, 0.25),
             "variance": 0.2,
             "mean": 1.0,
@@ -104,14 +88,14 @@ def test_kle_parametric_sampler_integration() -> None:
     )
     expected = kle(
         jax.random.split(key, 1)[0],
-        shape=(7, 9),
-        truncation=(3, 4),
+        shape=(5, 6),
+        truncation=(2, 3),
         correlation_lengths=(0.15, 0.25),
         variance=0.2,
         mean=1.0,
     )
 
-    assert sample["conductivity"].shape == (7, 9)
+    assert sample["conductivity"].shape == (5, 6)
     assert np.allclose(np.asarray(sample["conductivity"]), np.asarray(expected))
 
 

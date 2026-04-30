@@ -18,26 +18,25 @@ from types import BuiltinFunctionType as _BuiltinFunctionType
 from types import FunctionType as _FunctionType
 from typing import IO as _IO
 from typing import Any as _Any
+from typing import Literal as _Literal
 from typing import Optional as _Optional
 from typing import Type as _Type
 from typing import Union as _Union
-from typing import Literal as _Literal
 
 import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
 
 from . import rng as random
 from .config import GenDataConfig
-from .graph import FunctionGraph, CompositeEdge
-from .model import FilterModel, ImplicitModel, ExplicitModel, eqx_evaluate, Sampleable
+from .graph import CompositeEdge, FunctionGraph
+from .model import ExplicitModel, FilterModel, ImplicitModel, Sampleable, eqx_evaluate
 from .nn import LinearProjection
 from .optim import train
-from .poisson import Poisson2D
 from .plotting import gridplot
+from .poisson import Poisson2D
 from .rng import gen_keys
 from .typing import DictModel, ListModel
 from .utils import load_h5, save_h5
-
 
 type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 

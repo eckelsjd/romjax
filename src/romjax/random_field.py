@@ -49,17 +49,34 @@ class KLEConfig(DictModel):
             return data
 
         normalized = dict(data)
-        bounds = normalized.get("bounds")
-        if isinstance(bounds, tuple) and len(bounds) == 2 and not isinstance(bounds[0], tuple | list):
-            normalized["bounds"] = (bounds,)
+        default_bounds = cls.model_fields["bounds"].default
 
-        bounds = normalized.get("bounds", cls.model_fields["bounds"].default)
-        ndim = len(bounds) if isinstance(bounds, tuple | list) else 0
-        if ndim == 1:
-            for name in ("shape", "truncation", "correlation_lengths"):
-                value = normalized.get(name)
-                if value is not None and not isinstance(value, tuple | list):
-                    normalized[name] = (value,)
+        def _is_interval(value: Any) -> bool:
+            return isinstance(value, tuple | list) and len(value) == 2 and not isinstance(value[0], tuple | list)
+
+        def _sequence_ndim(value: Any) -> int | None:
+            return len(value) if isinstance(value, tuple | list) else None
+
+        inferred_ndims = [
+            ndim for ndim in (
+                _sequence_ndim(normalized.get("shape")),
+                _sequence_ndim(normalized.get("truncation")),
+                _sequence_ndim(normalized.get("correlation_lengths")),
+            )
+            if ndim is not None
+        ]
+        target_ndim = max(inferred_ndims, default=1)
+
+        bounds = normalized.get("bounds", default_bounds)
+        if _is_interval(bounds):
+            normalized["bounds"] = tuple(tuple(bounds) for _ in range(target_ndim))
+        elif isinstance(bounds, tuple | list):
+            normalized["bounds"] = tuple(tuple(bound) for bound in bounds)
+
+        for name in ("shape", "truncation", "correlation_lengths"):
+            value = normalized.get(name, cls.model_fields[name].default)
+            if value is not None and not isinstance(value, tuple | list):
+                normalized[name] = (value,) * target_ndim
 
         return normalized
 
