@@ -205,10 +205,10 @@ def test_list_model():
     assert "_adapter" not in repr(nodes)
 
     yaml_text = (
-        "nodes: !rox:tests.test_typing.NodeListModel\n"
+        "nodes: !romx:tests.test_typing.NodeListModel\n"
         "  a: a\n"
         "  b: {name: b}\n"
-        "edges: !rox:tests.test_typing.EdgeListModel\n"
+        "edges: !romx:tests.test_typing.EdgeListModel\n"
         "  ab: {src: a, dst: b}\n"
         "  bc: {src: b, dst: c}\n"
     )

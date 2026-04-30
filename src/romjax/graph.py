@@ -6,11 +6,11 @@ import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from romjax.typing import ListModel, RoxObject
+from romjax.typing import ListModel
 from romjax.utils import merge_pytrees
 
 
-class Node(BaseModel, Hashable, RoxObject):
+class Node(BaseModel, Hashable):
     """
     A Node in a FunctionGraph represents a vector space. At the moment, this is essentially just a string identifier.
 
@@ -43,7 +43,7 @@ class Node(BaseModel, Hashable, RoxObject):
         return self.__str__()
 
 
-class Edge(BaseModel, Hashable, RoxObject, ABC):
+class Edge(BaseModel, Hashable, ABC):
     """
     An Edge is the abstract class for function mappings between nodes (vector spaces) in a FunctionGraph.
 
@@ -249,7 +249,7 @@ class EdgeList(ListModel[Edge]):
         super().__setitem__(key, value)
 
 
-class FunctionGraph(BaseModel, RoxObject):
+class FunctionGraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
     nodes: NodeList = Field(default_factory=NodeList)

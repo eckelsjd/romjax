@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import optax
 import yaml
 
-import romjax as rox
+import romjax as romx
 from romjax.graph import FunctionGraph
 from romjax.nn import LinearProjection
 from romjax.poisson import Poisson2D
@@ -359,7 +359,7 @@ def train_demo(graph: FunctionGraph, config: DemoConfig, root: Path, logger: log
     loss_fn = lambda params, batch: total_loss(graph, config, params, batch)
     test_fn = lambda params: evaluate_descriptors(graph, config, params, validation_descriptors)["total"]
 
-    modules = rox.train(
+    modules = romx.train(
         loss_fn=jax.jit(loss_fn),
         params0=modules0,
         optimizer=optimizer,

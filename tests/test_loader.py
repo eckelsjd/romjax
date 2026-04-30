@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from romjax import YamlLoader
+from romjax import DictModel, YamlLoader, train
 from romjax.model import ImplicitModel
 from romjax.poisson import Poisson2D
 from romjax.rng import Distribution, near_solution_sampler
@@ -35,7 +35,7 @@ class CustomModel(ImplicitModel):
 
 def _basic_yaml() -> str:
     return (
-        "solver: !rox:tests.test_loader.CustomModel\n"
+        "solver: !romx:tests.test_loader.CustomModel\n"
         "  opts: {a: 1, b: 2}\n"
         "  detail: hello\n"
     )
@@ -71,12 +71,12 @@ def test_basic_model_load_and_dump(tmp_path: Path) -> None:
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
-    assert "!rox:tests.test_loader.CustomModel" in dumped
+    assert "!romx:tests.test_loader.CustomModel" in dumped
     _assert_round_trip(data)
 
     sio = StringIO()
     assert YamlLoader.dump(data, sio) is None
-    assert "!rox:tests.test_loader.CustomModel" in sio.getvalue()
+    assert "!romx:tests.test_loader.CustomModel" in sio.getvalue()
 
     out_path = tmp_path / "out.yml"
     assert YamlLoader.dump(data, out_path) is None
@@ -93,14 +93,14 @@ def test_poisson_model_load_and_dump() -> None:
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
-    assert "!rox:romjax.poisson.Poisson2D" in dumped
+    assert "!romx:romjax.poisson.Poisson2D" in dumped
     assert "!!python/name" in dumped
     _assert_round_trip(data)
 
 
 def test_custom_model_load_and_dump() -> None:
     yaml_text_colon = (
-        "solver: !rox:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.poisson.Poisson2D\n"
         "  forcing: !!python/name:tests.test_loader.example_forcing\n"
         "  config:\n"
         "    grid:\n"
@@ -113,7 +113,7 @@ def test_custom_model_load_and_dump() -> None:
     _assert_round_trip(data_colon)
 
     yaml_text_space = (
-        "solver: !rox:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.poisson.Poisson2D\n"
         "  forcing: !!python/name tests.test_loader.example_forcing\n"
         "  config:\n"
         "    grid:\n"
@@ -128,7 +128,7 @@ def test_custom_model_load_and_dump() -> None:
 
 def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     yaml_text = (
-        "solver: !rox:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.poisson.Poisson2D\n"
         "  outputs_sampler: near_solution\n"
         "  outputs_sampler_opts:\n"
         "    phi:\n"
@@ -160,7 +160,7 @@ def test_yaml_invalid_cases() -> None:
         YamlLoader.load("tests/does_not_exist.yml")
 
     with pytest.raises(ValueError):
-        YamlLoader.load("solver: !rox:badpath\n  opts: {a: 1}\n  detail: x\n")
+        YamlLoader.load("solver: !romx:badpath\n  opts: {a: 1}\n  detail: x\n")
 
     with pytest.raises(TypeError):
-        YamlLoader.load("solver: !rox:builtins.dict\n  a: 1\n")
+        YamlLoader.load("solver: !romx:builtins.dict\n  a: 1\n")

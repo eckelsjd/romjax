@@ -4,8 +4,10 @@
 - License - MIT
 """
 __version__ = "0.0.1"
-__all__ = ['ConfigLoader', 'YamlLoader', 'DictModel', 'ListModel', 'ImplicitModel', 'gridplot', 'load_h5', 'save_h5',
-           'gen_keys', 'train', 'random', 'FunctionGraph']
+__all__ = ['ConfigLoader', 'YamlLoader', 'load', 'dump', 'DictModel', 'ListModel', 'load_h5', 'save_h5',
+           'gridplot', 'gen_keys', 'train', 'random', 'FunctionGraph', 'Poisson2D', 'LinearProjection',
+           'FilterModel', 'ImplicitModel', 'ExplicitModel', 'eqx_evaluate', 'Sampleable', 'CompositeEdge',
+           'GenDataConfig']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -19,16 +21,25 @@ from typing import Any as _Any
 from typing import Optional as _Optional
 from typing import Type as _Type
 from typing import Union as _Union
+from typing import Literal as _Literal
 
 import yaml as _yaml
+from pydantic import BaseModel as _BaseModel
 
 from . import rng as random
-from .graph import FunctionGraph
+from .config import GenDataConfig
+from .graph import FunctionGraph, CompositeEdge
+from .model import FilterModel, ImplicitModel, ExplicitModel, eqx_evaluate, Sampleable
+from .nn import LinearProjection
 from .optim import train
+from .poisson import Poisson2D
 from .plotting import gridplot
 from .rng import gen_keys
-from .typing import DictModel, ListModel, RoxObject
+from .typing import DictModel, ListModel
 from .utils import load_h5, save_h5
+
+
+type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 
 
 class ConfigLoader(_ABC):
@@ -36,13 +47,13 @@ class ConfigLoader(_ABC):
 
     @classmethod
     @_abstractmethod
-    def load(cls, stream: _Any, **kwargs: _Any) -> _Any:
+    def load(cls, stream: _Stream, **kwargs: _Any) -> _Any:
         """Load an object from a stream. If a file path is given, will attempt to open the file."""
         raise NotImplementedError
 
     @classmethod
     @_abstractmethod
-    def dump(cls, obj: _Any, stream: _Any, **kwargs: _Any) -> _Any:
+    def dump(cls, obj: _Any, stream: _Stream, **kwargs: _Any) -> _Any:
         """Save an object to a stream. If a file path is given, will attempt to write to the file."""
         raise NotImplementedError
 
@@ -51,14 +62,21 @@ class YamlLoader(ConfigLoader):
     """YAML configs. 
     
     **romjax objects**
-    - Represent `romjax` objects with `!rox:path.to.Subclass` tag. Must be subclass of `RoxObject`
+    - Represent pydantic classes with `!romx:Path.To.SubClass`. Must be subclass of BaseModel
+    - Represent any root-level builtin `romjax` object with just `!romx:SomeObject`
     - Supports basic Pydantic model_dump() to dictionary.
     - Supports !!python/name tag for functions and other importable names
     """
+    TAG = "!romx:"
 
-    @staticmethod
-    def _yaml_loader() -> _Type[_yaml.SafeLoader]:
-        """Return a custom yaml loader that handles romtool objects and callables."""
+    @classmethod
+    def get_tag(cls, data: _Any) -> str:
+        t = type(data)
+        return f"{cls.TAG}{t.__module__}.{t.__name__}"
+
+    @classmethod
+    def get_loader(cls) -> _Type[_yaml.SafeLoader]:
+        """Return a custom yaml loader that handles callables and pydantic models."""
         class _Loader(_yaml.SafeLoader):
             pass
 
@@ -78,19 +96,25 @@ class YamlLoader(ConfigLoader):
             value = loader.construct_scalar(node)
             return _construct_python_name_multi(loader, value, node)
 
-        def _construct_romjax_object(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> RoxObject:
-            """Essentially just a convenience to automatically construct dataclasses when loading."""
+        def _construct_base_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _BaseModel:
+            """Essentially just a convenience to automatically construct Pydantic models when loading."""
             if not tag_suffix:
                 raise ValueError("Missing class path in YAML tag.")
             module_name, _, class_name = tag_suffix.rpartition(".")
+            
+            if module_name == '':
+                module_name = "romjax"  # Try to load from root by default
             if not module_name or not class_name:
                 raise ValueError(f"Invalid romjax tag: {tag_suffix!r}")
+            
             module = _import_module(module_name)
             cls_obj = getattr(module, class_name, None)
+
             if cls_obj is None:
                 raise ValueError(f"Class not found: {tag_suffix!r}")
-            if not isinstance(cls_obj, type) or not issubclass(cls_obj, RoxObject):
-                raise TypeError(f"Tagged class is not an instance of required RoxObject: {tag_suffix!r}")
+            if not isinstance(cls_obj, type) or not issubclass(cls_obj, _BaseModel):
+                raise TypeError(f"Tagged class is not an instance of required pydantic BaseModel: {tag_suffix!r}")
+            
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
                 return cls_obj(**data)
@@ -98,16 +122,17 @@ class YamlLoader(ConfigLoader):
                 data = loader.construct_sequence(node, deep=True)
                 return cls_obj(data)
             data = loader.construct_scalar(node)
+
             return cls_obj(data)
 
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
-        _Loader.add_multi_constructor(RoxObject.YAML_TAG, _construct_romjax_object)
+        _Loader.add_multi_constructor(cls.TAG, _construct_base_model)
         return _Loader
 
-    @staticmethod
-    def _yaml_dumper() -> _Type[_yaml.SafeDumper]:
-        """Return a custom yaml dumper that handles romtool objects and callables."""
+    @classmethod
+    def get_dumper(cls) -> _Type[_yaml.SafeDumper]:
+        """Return a custom yaml dumper that handles callables and pydantic models."""
         class _Dumper(_yaml.SafeDumper):
             pass
 
@@ -115,8 +140,9 @@ class YamlLoader(ConfigLoader):
             name = f"{data.__module__}.{data.__qualname__}"
             return dumper.represent_scalar("tag:yaml.org,2002:python/name", name)
 
-        def _represent_romjax_object(dumper: _yaml.SafeDumper, data: RoxObject) -> _yaml.Node:
-            tag = data.yaml_tag()
+        def _represent_base_model(dumper: _yaml.SafeDumper, data: _BaseModel) -> _yaml.Node:
+            """Essentially a convenience that defers serialization to pydantic model_dump"""
+            tag = cls.get_tag(data)
             payload = data.model_dump()
             if isinstance(payload, list | tuple):
                 return dumper.represent_sequence(tag, payload)
@@ -124,23 +150,22 @@ class YamlLoader(ConfigLoader):
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
-        _Dumper.add_multi_representer(RoxObject, _represent_romjax_object)
+        _Dumper.add_multi_representer(_BaseModel, _represent_base_model)
         return _Dumper
 
     @classmethod
-    def load(cls, 
-             stream: _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]], 
-             **kwargs: _Any
-             ) -> _Any:
-        """Load a configuration from a yaml-like stream.
+    def load(cls, stream: _Stream, **kwargs: _Any) -> _Any:
+        """Load a configuration from a yaml-like stream. Small wrapper around yaml.load
         
         :param stream: A string, path, file-stream, byte-stream, or similar.
         :return: the configuration
         """
-        loader = cls._yaml_loader()
+        if "Loader" not in kwargs:
+            kwargs["Loader"] = cls.get_loader()
+
         if isinstance(stream, (_PathLike, _Path)):
             with _Path(stream).open("r", encoding="utf-8") as fh:
-                return _yaml.load(fh, Loader=loader, **kwargs)
+                return _yaml.load(fh, **kwargs)
         if isinstance(stream, str):
             try:
                 exists = _Path(stream).exists()
@@ -150,37 +175,52 @@ class YamlLoader(ConfigLoader):
                     or stream.startswith(".")
                 )
             except OSError:
-                return _yaml.load(stream, Loader=loader, **kwargs)
+                return _yaml.load(stream, **kwargs)
             else: 
                 if exists or looks_like_path:
                     with _Path(stream).open("r", encoding="utf-8") as fh:
-                        return _yaml.load(fh, Loader=loader, **kwargs)
-            return _yaml.load(stream, Loader=loader, **kwargs)
+                        return _yaml.load(fh, **kwargs)
+            return _yaml.load(stream, **kwargs)
         if isinstance(stream, (bytes, bytearray)):
-            return _yaml.load(stream.decode("utf-8"), Loader=loader, **kwargs)
+            return _yaml.load(stream.decode("utf-8"), **kwargs)
         if hasattr(stream, "read"):
-            return _yaml.load(stream, Loader=loader, **kwargs)
+            return _yaml.load(stream, **kwargs)
         raise TypeError("Unsupported stream type for YAML load.")
 
     @classmethod
-    def dump(cls,
-             obj: _Any,
-             stream: _Optional[_Union[str, _PathLike[str], _IO[_Any]]] = None,
-             **kwargs: _Any,
-             ) -> _Optional[str]:
-        """Dump a configuration to a yaml-like stream.
+    def dump(cls, obj: _Any, stream: _Stream | None = None, **kwargs: _Any) -> _Optional[str]:
+        """Dump a configuration to a yaml-like stream. Small wrapper around yaml.dump
         
         :param obj: the yaml configuration
         :param stream: A string, path, file-stream, byte-stream, or similar.
         """
-        dumper = cls._yaml_dumper()
+        if "Dumper" not in kwargs:
+            kwargs["Dumper"] = cls.get_dumper()
+
         if stream is None:
-            return _yaml.dump(obj, Dumper=dumper, **kwargs)
+            return _yaml.dump(obj, **kwargs)
         if isinstance(stream, (_PathLike, _Path)) or isinstance(stream, str):
             with _Path(stream).open("w", encoding="utf-8") as fh:
-                _yaml.dump(obj, fh, Dumper=dumper, **kwargs)
+                _yaml.dump(obj, fh, **kwargs)
             return None
         if hasattr(stream, "write"):
-            _yaml.dump(obj, stream, Dumper=dumper, **kwargs)
+            _yaml.dump(obj, stream, **kwargs)
             return None
         raise TypeError("Unsupported stream type for YAML dump.")
+
+
+def load(stream: _Stream, method: _Literal["yaml"] = "yaml", **kwargs):
+    """Load an object from a stream. If a file path is given, will attempt to open the file. Only yaml supported."""
+    if method == "yaml":
+        return YamlLoader.load(stream, **kwargs)
+    else:
+        raise ValueError(f"Load method '{method}' unknown")
+
+
+def dump(obj: _Any, stream: _Stream, method: _Literal["yaml"] = "yaml", **kwargs):
+    """Save an object to a stream. If a file path is given, will attempt to write to the file. Only yaml supported."""
+    if method == "yaml":
+        return YamlLoader.dump(obj, stream, **kwargs)
+    else:
+        raise ValueError(f"Dump method '{method}' unknown")
+    

@@ -12,10 +12,8 @@ from pydantic import (
     ValidatorFunctionWrapHandler,
 ) 
 
-from romjax.typing import RoxObject
 from romjax.graph import FunctionGraph
 from romjax.model import Sampleable
-from romjax import YamlLoader
 
 
 class SampleConfig(BaseModel):
@@ -34,7 +32,7 @@ class SampleConfig(BaseModel):
     output_seed: int
         
 
-class GenDataConfig(BaseModel, RoxObject):
+class GenDataConfig(BaseModel):
     """
     Data generation config for a FunctionGraph.
     
@@ -73,7 +71,8 @@ class GenDataConfig(BaseModel, RoxObject):
     def _load_graph(cls, value: str | Path | FunctionGraph) -> FunctionGraph:
         """Load a graph from a yaml file."""
         if isinstance(value, str | Path) and value.endswith((".yml", ".yaml")):
-            return YamlLoader.load(value)
+            import romjax
+            return romjax.load(value)
         return value
     
     @field_validator("train", "validation", mode="before")

@@ -93,7 +93,7 @@ def combine_latents(x: dict, bias: float | jax.Array | None = None) -> dict:
 
 def _model_yaml() -> str:
     return (
-        "model: !rox:romjax.model.FilterModel\n"
+        "model: !romx:romjax.model.FilterModel\n"
         "  source: pde1_state\n"
         "  target: pde2_state\n"
         "  filters:\n"
