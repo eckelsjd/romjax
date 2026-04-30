@@ -19,20 +19,10 @@ from pydantic import (
 )
 from pydantic_core import core_schema
 
-__all__ = ['RoxObject', 'DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
 
 
-class RoxObject:
-    """Subclass this if you want your classes to be recognized and loaded by romjax.YamlLoader."""
-    YAML_TAG = "!rox:"
-
-    @classmethod
-    def yaml_tag(cls) -> str:
-        """YAML tag used by romjax.YamlLoader"""
-        return f"{cls.YAML_TAG}{cls.__module__}.{cls.__name__}"
-    
-
-class DictModel(BaseModel, MutableMapping, RoxObject):
+class DictModel(BaseModel, MutableMapping):
     """Allow dict-like access of pydantic models."""
 
     model_config = ConfigDict(

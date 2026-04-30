@@ -1,8 +1,8 @@
-settings: !rox:tests.test_typing.CustomSettings
+settings: !romx:tests.test_typing.CustomSettings
   one: hello
   two: there
   four: 4
-configs: !rox:romjax.typing.DictModel
+configs: !romx:romjax.typing.DictModel
   one: goodbye
   two: here
   four: 4

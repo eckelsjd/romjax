@@ -22,7 +22,7 @@ Since our primary goal is comparison to state-of-the-art and publication, there 
 
 ## Coding rules
 
-Use YAML-friendly configuration for public, file-loaded objects. Prefer `romjax.typing.DictModel` for user-facing config schemas and preserve the `YAML -> Pydantic model -> runtime object` workflow. YAML configs may reference callables with `!!python/name` and classes with `!rox:module.path`.
+Use YAML-friendly configuration for public, file-loaded objects. Prefer `romjax.typing.DictModel` for user-facing config schemas and preserve the `YAML -> Pydantic model -> runtime object` workflow. YAML configs may reference callables with `!!python/name` and classes with `!romx:module.path`.
 
 * Use modern Python typing (prefer `dict` over `Dict`, `type1 | type2` over `Union[type1, type2]`, `type MyType = ...`, etc.)
 * Avoid `Any` unless unavoidable

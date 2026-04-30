@@ -1,4 +1,4 @@
-!rox:romjax.config.GenDataConfig
+!romx:GenDataConfig
 root: demo/dataset
 graph: demo/poisson_graph.yml
 train:

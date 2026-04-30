@@ -1,7 +1,7 @@
-!rox:romjax.graph.FunctionGraph
+!romx:FunctionGraph
 nodes: [hf_coord, lf_coord, lf_res, hf_res]
 edges:
-  - !rox:romjax.poisson.Poisson2D
+  - !romx:Poisson2D
     source: hf_coord
     target: hf_res
     name: poisson
@@ -42,7 +42,7 @@ edges:
         variance: 1
         weight: smooth
         weight_opts: { length_rel: 0.25 }
-  - !rox:romjax.model.FilterModel
+  - !romx:FilterModel
     source: hf_coord
     target: lf_coord
     name: coordinate transform
@@ -60,7 +60,7 @@ edges:
       # Pass inputs through
       - forward:  { input_routes: [ [inputs] ] }
         backward: { input_routes: [ [inputs] ] }
-  - !rox:romjax.model.FilterModel
+  - !romx:FilterModel
     source: hf_res
     target: lf_res
     name: residual transform
@@ -76,7 +76,7 @@ edges:
           opts: { gather: flat, scatter: flat, method: reconstruct }
       - forward:  { input_routes: [ [inputs] ] }
         backward: { input_routes: [ [inputs] ] }
-  - !rox:romjax.graph.CompositeEdge
+  - !romx:CompositeEdge
     source: lf_coord
     target: lf_res
     name: galerkin rom

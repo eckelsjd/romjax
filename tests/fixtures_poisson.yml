@@ -1,4 +1,4 @@
-solver: !rox:romjax.poisson.Poisson2D
+solver: !romx:Poisson2D
   config:
     grid:
       shape: &s [50, 50]

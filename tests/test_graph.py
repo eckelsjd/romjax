@@ -42,7 +42,7 @@ def test_node_list():
     assert {node: 1}["omega"] == 1
 
     yaml_text = (
-        "nodes: !rox:romjax.graph.NodeList\n"
+        "nodes: !romx:romjax.graph.NodeList\n"
         "  a: a\n"
         "  b: {name: b}\n"
         "  c:\n"
@@ -95,7 +95,7 @@ def test_edge_list():
     assert {edge: 1}["omega->psi"] == 1
 
     yaml_text = (
-        "edges: !rox:romjax.graph.EdgeList\n"
+        "edges: !romx:romjax.graph.EdgeList\n"
         "  a->b: {source: a, target: b, name: a->b}\n"
         "  b->c: {source: b, target: c, name: b->c}\n"
         "  c->d:\n"
@@ -343,21 +343,21 @@ def test_composite_edge_preserves_graph_aux_behavior() -> None:
 
 def test_composite_edge_yaml_load_and_validation() -> None:
     yaml_text = """
-!rox:romjax.graph.FunctionGraph
+!romx:romjax.graph.FunctionGraph
 edges:
-  - !rox:tests.test_graph.AffineIntEdge
+  - !romx:tests.test_graph.AffineIntEdge
     source: a
     target: b
     name: ab
     scale: 2
     shift: 3
-  - !rox:tests.test_graph.AffineIntEdge
+  - !romx:tests.test_graph.AffineIntEdge
     source: b
     target: c
     name: bc
     scale: 5
     shift: 7
-  - !rox:romjax.graph.CompositeEdge
+  - !romx:romjax.graph.CompositeEdge
     source: a
     target: c
     name: ac
