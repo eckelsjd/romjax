@@ -34,7 +34,7 @@ Repository = "https://github.com/eckelsjd/romjax.git"
 
 [project.scripts]
 task = "romjax.task_cli:main"
-rom = "romjax.rom_cli:main"
+romx = "romjax.rom_cli:main"
 
 [project.optional-dependencies]
 cpu = [

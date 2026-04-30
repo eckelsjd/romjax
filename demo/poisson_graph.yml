@@ -32,7 +32,7 @@ edges:
         variance: 1
     outputs_sampler: near_solution
     outputs_sampler_opts:
-      scale: [max_abs, 0.15]  # 10% relative
+      scale: [max_abs, 0.1]  # 10% relative
       phi:
         distribution: !!python/name:romjax.random_field.kle
         bounds: *bounds

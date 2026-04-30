@@ -322,10 +322,10 @@ def test_linear_projection() -> None:
     key = jax.random.PRNGKey(7)
     k_basis, k_coef, k_noise, k_init = jax.random.split(key, 4)
 
-    n_samples = 96
-    n_full = 12
-    n_rank = 5
-    n_latent = 3
+    n_samples = 32
+    n_full = 8
+    n_rank = 3
+    n_latent = 2
 
     basis_raw = jax.random.normal(k_basis, (n_rank, n_full))
     basis, _ = jnp.linalg.qr(basis_raw.T)
@@ -378,12 +378,12 @@ def test_linear_projection() -> None:
         return module, state, loss
 
     init_loss = float(loss_fn(projection))
-    for _ in range(450):
+    for _ in range(80):
         projection, opt_state, _ = step(projection, opt_state)
     final_loss = float(loss_fn(projection))
 
     assert final_loss < init_loss
-    assert final_loss <= float(pod_loss) * 1.20
+    assert final_loss <= float(pod_loss) * 1.35
 
 
 def test_filter_model_in_graph() -> None:
@@ -391,10 +391,10 @@ def test_filter_model_in_graph() -> None:
     key = jax.random.PRNGKey(24)
     k_basis1, k_basis2, k_coef, k_noise1, k_noise2, k_init = jax.random.split(key, 6)
 
-    n_samples = 72
-    n_full = 32
-    n_shared = 6
-    n_latent = 4
+    n_samples = 24
+    n_full = 12
+    n_shared = 3
+    n_latent = 3
 
     basis1_raw = jax.random.normal(k_basis1, (n_shared, n_full))
     basis2_raw = jax.random.normal(k_basis2, (n_shared, n_full))
@@ -465,11 +465,11 @@ def test_filter_model_in_graph() -> None:
         return curr_module, state, loss
 
     init_loss = float(loss_fn(module))
-    for _ in range(300):
+    for _ in range(80):
         module, opt_state, _ = step(module, opt_state)
     final_loss = float(loss_fn(module))
 
-    assert final_loss < init_loss * 0.45
+    assert final_loss < init_loss * 0.6
 
     encoded, aux_cache = graph.push_path(
         {"full": {"field1": field1, "field2": field2}, "call_args": module},

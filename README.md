@@ -19,7 +19,6 @@ uv sync --all-groups --extra cpu  # or cu13 for gpu-support
 
 Right now, we have the basic `FunctionGraph` API up and running with the `Poisson2D` model as a good PDE test case. The following list summarizes where we are heading next.
 
-- Sampling and data generation for the Poisson system. KLE sampling. How to sample output/residual space. How to save/structure samples on disk.
 - Dataloading interface. How to be memory efficient and repeatable in loading and using mini-batches for training. Is there a common format for the data used in training so we can use the same dataloading interface across models and data save files/locations. How about train versus test splitting.
 - Testing dataloading and optimization of simple linear projection on some Poisson data.
 - Implementing a Galerkin projection ROM ImplicitModel.

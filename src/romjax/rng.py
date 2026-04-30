@@ -234,7 +234,7 @@ def gen_keys(
         indices = range(indices)
 
     if skip == 'existing':
-        skip = lambda p: Path(p).exists() and len(os.listdir(p)) > 0
+        skip = lambda p: Path(p).exists()
     if skip is None:
         skip = lambda p: False
 
