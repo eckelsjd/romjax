@@ -19,15 +19,7 @@ from jaxtyping import PyTree, ArrayLike
 
 from romjax.graph import FunctionGraph, EdgePyTree
 from romjax.model import Sampleable
-from romjax.utils import (
-    pytree_batch_size, 
-    pytree_at, 
-    pytree_error,
-    ArrayReducerName, 
-    ErrorReducerName,
-    ArrayReducer,
-    ErrorReducer
-)
+from romjax.tree import pytree_iter, pytree_size, get_tree_operator, TreeErrorOperator
 
 
 type LossFunction = Callable[[PyTree, Any], float]
@@ -53,13 +45,13 @@ class GraphLossSpec(BaseModel):
     graph: Annotated[FunctionGraph, BeforeValidator(romjax_from_file)]
 
 
+@jax.jit
 def reconstruction_error(
     params: EdgePyTree, 
     batch_data: PyTree, 
     graph: FunctionGraph, 
     edge: str,
-    leaf_error: ErrorReducer | ErrorReducerName = "relative",
-    leaf_reducer: ArrayReducer | ArrayReducerName = "mean"
+    error_fn: TreeErrorOperator = "mean-relative"
 ) -> float:
     """
     Push data through a graph edge and back, and return the reconstruction error.
@@ -72,17 +64,18 @@ def reconstruction_error(
     :param leaf_reducer: how to combine all leaf errors into final result
     :return: the reconstruction error
     """
-    batch_size = pytree_batch_size(batch_data)
+    batch_size = pytree_size(batch_data)
+    error_fn = get_tree_operator(error_fn)
+    gen_pytree = pytree_iter(batch_data)
 
     def body(i, acc):
-        payload = pytree_at(batch_data, i)
+        payload = next(gen_pytree)
         reconstructed = graph.push_path(payload, [edge, edge], edge_payload_patches={edge: params[edge]})
-        return acc + pytree_error(payload, reconstructed, leaf_error, leaf_reducer)
+        return acc + error_fn(payload, reconstructed)
     
     total = jax.lax.fori_loop(0, batch_size, body, 0.0)
 
-    return total / ntrain
-    reconstructed = graph.push_path(payload, [edge, edge])
+    return total / batch_size
 
 
 class TrainConfig(BaseModel):
