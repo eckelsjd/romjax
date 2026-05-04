@@ -5,105 +5,17 @@ import sys
 import threading
 from os import PathLike
 from pathlib import Path
-from typing import Any, Generator, Mapping
+from typing import Any
 
 import h5py
-import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
-__all__ = ['to_pytree', 'merge_pytrees', 'iter_pytree', 'pytree_at', 'get_logger', 'tree_l2_norm', 
-           'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'Logger']
+__all__ = ['get_logger', 'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'Logger']
 
 
 LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
-
-# TODO: maybe some interesting ideas with a custom PyTree object that implements magic methods
-# could support iter, index, len as well as add, sub, mult, broadcast and other array operations
-
-@jax.jit
-def tree_l2_norm(tree: PyTree):
-    return jnp.sqrt(jax.tree.reduce(lambda acc, x: acc + jnp.sum(x**2), tree, 0.0))
-
-
-def to_pytree(value: PyTree) -> PyTree:
-    """Convert nested pydantic models and dicts to a PyTree of just 
-    dicts,tuples,lists -- anything else is left as a leaf node (i.e. jax arrays)."""
-    if isinstance(value, BaseModel):
-        data = value.model_dump()
-        return {k: to_pytree(v) for k, v in data.items()}
-    if isinstance(value, Mapping):
-        return {k: to_pytree(v) for k, v in value.items()}
-    if isinstance(value, tuple):
-        return tuple(to_pytree(v) for v in value)
-    if isinstance(value, list):
-        return [to_pytree(v) for v in value]
-    
-    return value
-
-
-def merge_pytrees(defaults: PyTree, overrides: PyTree) -> PyTree:
-    """Merge pytrees, overwriting existing paths and adding any new ones.
-    
-    :param defaults: the existing pytree
-    :param overrides: the pytree to merge
-    :return: a new merged pytree
-    """
-    if overrides is None:
-        return defaults
-    if defaults is None:
-        return overrides
-    
-    if isinstance(defaults, Mapping) and isinstance(overrides, Mapping):
-        merged: dict = dict(defaults)
-        for key, value in overrides.items():
-            if key in merged:
-                merged[key] = merge_pytrees(merged[key], value)
-            else:
-                merged[key] = value
-        return merged
-    
-    if isinstance(defaults, tuple) and isinstance(overrides, tuple):
-        merged = []
-        common = min(len(defaults), len(overrides))
-        for idx in range(common):
-            merged.append(merge_pytrees(defaults[idx], overrides[idx]))
-        if len(defaults) > common:
-            merged.extend(defaults[common:])
-        if len(overrides) > common:
-            merged.extend(overrides[common:])
-        return tuple(merged)
-    
-    if isinstance(defaults, list) and isinstance(overrides, list):
-        merged_list: list = []
-        common = min(len(defaults), len(overrides))
-        for idx in range(common):
-            merged_list.append(merge_pytrees(defaults[idx], overrides[idx]))
-        if len(defaults) > common:
-            merged_list.extend(defaults[common:])
-        if len(overrides) > common:
-            merged_list.extend(overrides[common:])
-        return merged_list
-    
-    return overrides
-
-
-def iter_pytree(tree: PyTree) -> Generator[PyTree, None, None]:
-    """Yield per-sample pytrees from a batched pytree with a leading batch axis."""
-    leaves, treedef = jax.tree_util.tree_flatten(tree)
-    if not leaves:
-        return
-    batch_size = leaves[0].shape[0]
-    for i in range(batch_size):
-        yield jax.tree_util.tree_unflatten(treedef, [leaf[i] for leaf in leaves])
-
-
-def pytree_at(tree: PyTree, index: int) -> PyTree:
-    """Return a pytree with each leaf at the provided index."""
-    leaves, treedef = jax.tree_util.tree_flatten(tree)
-    return jax.tree_util.tree_unflatten(treedef, [leaf[index] for leaf in leaves])
 
 
 def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,

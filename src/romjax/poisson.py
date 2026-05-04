@@ -19,7 +19,7 @@ from romjax.rng import (
     validate_distribution_pytree,
 )
 from romjax.typing import AdjointMethod, DictModel, IterativeSolver
-from romjax.utils import merge_pytrees, to_pytree
+from romjax.tree import pytree_merge, to_pytree
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
 type InputSamplerName = Literal["parametric"]
@@ -349,7 +349,7 @@ class Poisson2D(ImplicitModel, Sampleable):
             for override in overrides:
                 if override is None:
                     continue
-                merged = merge_pytrees(merged, to_pytree(override))
+                merged = pytree_merge(merged, to_pytree(override))
             return merged
         
         coords = {'coords': self.config['grid']['coords']}

@@ -16,7 +16,8 @@ import numpy as np
 import optax
 from jaxtyping import PyTree
 
-from romjax.utils import tree_l2_norm
+from romjax.tree import pytree_norm
+
 
 __all__ = ['train', 'load_train_file']
 
@@ -149,7 +150,7 @@ def train(
         loss = jax.block_until_ready(loss)
         dt = time.perf_counter() - t0
         loss_val = float(loss)
-        grad_norm = tree_l2_norm(grads) if grad_tol > 0 else -1
+        grad_norm = pytree_norm(grads) if grad_tol > 0 else -1
 
         if hist_interval > 0 and (curr_step % hist_interval == 0):
             history["iter"].append(curr_step)
@@ -204,7 +205,7 @@ def train(
                     logger.info(f"Termination criteria reached: gradient norm {grad_norm:.2e} < {grad_tol:.2e}")
                 break
         if param_tol > 0:
-            param_norm = tree_l2_norm(jax.tree.map(
+            param_norm = pytree_norm(jax.tree.map(
                 lambda x, y: x - y, 
                 eqx.filter(params, eqx.is_array), 
                 eqx.filter(prev_params, eqx.is_array)

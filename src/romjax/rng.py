@@ -13,6 +13,7 @@ from jax.typing import ArrayLike
 from pydantic import field_validator
 
 from romjax.typing import DictModel
+from romjax.tree import UnaryOperator, get_unary_operator
 
 __all__ = ['Distribution', 'parametric_sampler', 'validate_distribution_pytree', 'pytree_sampler',
            'near_solution_sampler', 'gen_keys', 'SamplerCallable']
@@ -20,9 +21,7 @@ __all__ = ['Distribution', 'parametric_sampler', 'validate_distribution_pytree',
 
 type DistributionName = Literal['uniform', 'normal']
 type ParamName = str
-type ScaleReducerName = Literal['mean', 'rms', 'max_abs']
-type ScaleReducer = Callable[[ArrayLike], ArrayLike]
-type RelativeScale = tuple[ScaleReducer | ScaleReducerName, float]
+type RelativeScale = tuple[UnaryOperator, float]
 
 
 @runtime_checkable
@@ -122,43 +121,22 @@ def pytree_sampler(key: jaxtyping.Key, template: jaxtyping.PyTree) -> jaxtyping.
 
 def _is_relative_scale_spec(value: Any) -> bool:
     """Return True when ``value`` is a ``(reducer, factor)`` relative-scale specification."""
-    return (
-        isinstance(value, tuple | list)
-        and len(value) == 2
-        and (callable(value[0]) or value[0] in {"mean", "rms", "max_abs"})
-    )
-
-
-def _coerce_scale_reducer(reducer: ScaleReducer | ScaleReducerName) -> ScaleReducer:
-    """Resolve supported relative-scale reducers from callables or string names."""
-    if callable(reducer):
-        return reducer
-    mapping: Mapping[ScaleReducerName, ScaleReducer] = {
-        "mean": jnp.mean,
-        "rms": lambda x: jnp.sqrt(jnp.mean(jnp.square(x))),
-        "max_abs": lambda x: jnp.max(jnp.abs(x)),
-    }
-    if reducer not in mapping:
-        raise ValueError(f"Unknown relative scale reducer: {reducer!r}")
-    return mapping[reducer]
+    return isinstance(value, tuple | list) and len(value) == 2 and (isinstance(value[0], str | UnaryOperator) 
+                                                                    or callable(value[0]))
 
 
 def _resolve_scale_leaf(reference: ArrayLike, scale_spec: ArrayLike | RelativeScale) -> ArrayLike:
     """Resolve one scale leaf, supporting both absolute and relative scale specifications."""
     if _is_relative_scale_spec(scale_spec):
         reducer, factor = scale_spec
-        reducer_fn = _coerce_scale_reducer(reducer)
+        reducer_fn = get_unary_operator(reducer)
         return jnp.asarray(reducer_fn(jnp.asarray(reference))) * jnp.asarray(factor)
     return jnp.asarray(scale_spec)
 
 
 def _broadcast_like(template: jaxtyping.PyTree, value: ArrayLike | jaxtyping.PyTree) -> jaxtyping.PyTree:
     """Broadcast a scalar or pytree ``value`` across the structure of ``template`` when needed."""
-    if _is_relative_scale_spec(value):
-        return jax.tree.map(lambda _: value, template)
-    if isinstance(value, Mapping):
-        return value
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+    if isinstance(value, Mapping) or (isinstance(value, Sequence) and not isinstance(value, str | bytes)):
         return value
     return jax.tree.map(lambda _: value, template)
 

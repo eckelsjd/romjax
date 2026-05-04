@@ -1,8 +1,10 @@
 """Maintain configuration schemas for various romjax utilities, especially the rom CLI."""
 import os
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Sequence, Callable, Any, Annotated
 
+import jax
+import jax.numpy as jnp
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -10,10 +12,95 @@ from pydantic import (
     ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
+    BeforeValidator,
+    AfterValidator,
+)
+from jaxtyping import PyTree, ArrayLike
+
+from romjax.graph import FunctionGraph, EdgePyTree
+from romjax.model import Sampleable
+from romjax.utils import (
+    pytree_batch_size, 
+    pytree_at, 
+    pytree_error,
+    ArrayReducerName, 
+    ErrorReducerName,
+    ArrayReducer,
+    ErrorReducer
 )
 
-from romjax.graph import FunctionGraph
-from romjax.model import Sampleable
+
+type LossFunction = Callable[[PyTree, Any], float]
+
+
+def romjax_from_file(value: str | Path | Any) -> Any:
+    """Try to load a romjax object from config file. Useful as a pydantic validator."""
+    if isinstance(value, str | Path):
+        import romjax
+        return romjax.load(value)
+    return value
+
+
+def ensure_path_exists(value: Path):
+    if not value.exists():
+        os.makedirs(value, exist_ok=True)
+
+
+class GraphLossSpec(BaseModel):
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    graph: Annotated[FunctionGraph, BeforeValidator(romjax_from_file)]
+
+
+def reconstruction_error(
+    params: EdgePyTree, 
+    batch_data: PyTree, 
+    graph: FunctionGraph, 
+    edge: str,
+    leaf_error: ErrorReducer | ErrorReducerName = "relative",
+    leaf_reducer: ArrayReducer | ArrayReducerName = "mean"
+) -> float:
+    """
+    Push data through a graph edge and back, and return the reconstruction error.
+    
+    :param params: pytree containing a map of edge->params. The params are patched into the payload at runtime.
+    :param batch_data: batched training data compatible with the starting node of the specified edge
+    :param graph: the function graph object that knows how to evaluate edges
+    :param edge: the edge name to be used as the reconstruction pathway
+    :param leaf_error: how to compute per-leaf errors (see `pytree_error`)
+    :param leaf_reducer: how to combine all leaf errors into final result
+    :return: the reconstruction error
+    """
+    batch_size = pytree_batch_size(batch_data)
+
+    def body(i, acc):
+        payload = pytree_at(batch_data, i)
+        reconstructed = graph.push_path(payload, [edge, edge], edge_payload_patches={edge: params[edge]})
+        return acc + pytree_error(payload, reconstructed, leaf_error, leaf_reducer)
+    
+    total = jax.lax.fori_loop(0, batch_size, body, 0.0)
+
+    return total / ntrain
+    reconstructed = graph.push_path(payload, [edge, edge])
+
+
+class TrainConfig(BaseModel):
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    root: Annotated[Path, AfterValidator(ensure_path_exists)]
+    loss_fn: LossFunction
+
+    @field_validator("loss_fn", mode="before")
+    @classmethod
+    def _from_graph_spec(cls, value: LossFunction | GraphLossSpec) -> LossFunction:
+        """Generate a preset loss function for a FunctionGraph."""
+        if not callable(value):
+            spec = GraphLossSpec.model_validate(value)
+        
+        else:
+            return value
 
 
 class SampleConfig(BaseModel):
@@ -49,7 +136,7 @@ class GenDataConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
     root: Path 
-    graph: FunctionGraph
+    graph: Annotated[FunctionGraph, BeforeValidator(romjax_from_file)]
     train: Sequence[SampleConfig]
     validation: Sequence[SampleConfig]
     to_sample: list[str] | None = None
@@ -64,15 +151,6 @@ class GenDataConfig(BaseModel):
             os.makedirs(value, exist_ok=True)
         os.makedirs(value / "train", exist_ok=True)
         os.makedirs(value / "validation", exist_ok=True)
-        return value
-
-    @field_validator("graph", mode="before")
-    @classmethod
-    def _load_graph(cls, value: str | Path | FunctionGraph) -> FunctionGraph:
-        """Load a graph from a yaml file."""
-        if isinstance(value, str | Path) and value.endswith((".yml", ".yaml")):
-            import romjax
-            return romjax.load(value)
         return value
     
     @field_validator("train", "validation", mode="before")

@@ -1,0 +1,5 @@
+!romx:TrainConfig
+root: demo/training
+loss_fn:
+  graph: demo/poisson_graph.yml
+  

@@ -7,7 +7,7 @@ __version__ = "0.0.1"
 __all__ = ['ConfigLoader', 'YamlLoader', 'load', 'dump', 'DictModel', 'ListModel', 'load_h5', 'save_h5',
            'gridplot', 'gen_keys', 'train', 'random', 'FunctionGraph', 'Poisson2D', 'LinearProjection',
            'FilterModel', 'ImplicitModel', 'ExplicitModel', 'eqx_evaluate', 'Sampleable', 'CompositeEdge',
-           'GenDataConfig']
+           'GenDataConfig', 'tree']
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -26,7 +26,7 @@ from typing import Union as _Union
 import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
 
-from . import rng as random
+from . import rng as random, tree as tree
 from .config import GenDataConfig
 from .graph import CompositeEdge, FunctionGraph
 from .model import ExplicitModel, FilterModel, ImplicitModel, Sampleable, eqx_evaluate
