@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, Hashable, Literal
 
+import jax
 import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -56,7 +57,7 @@ class Node(BaseModel, Hashable):
     def __repr__(self) ->str:
         return self.__str__()
 
-    def error(self, value: PyTree, value_hat: PyTree):
+    def error(self, value: PyTree, value_hat: PyTree) -> jax.Array:
         """Compute the pytree error at this node."""
         return self.error_op(value, value_hat)
 
@@ -315,6 +316,16 @@ class FunctionGraph(BaseModel):
                 return edge
         raise KeyError(f"Edge {edge_like!r} not found in graph.")
 
+    def _resolve_node(self, node_like: Node | str) -> Node:
+        """Resolve a node handle to the canonical graph node when available."""
+        if isinstance(node_like, Node):
+            node_name = node_like.name
+        else:
+            node_name = node_like
+        if node_name in self.nodes:
+            return self.nodes[node_name]
+        return node_like if isinstance(node_like, Node) else Node(name=node_name)
+
     @staticmethod
     def _copy_aux_cache(aux: EdgePatch | None) -> EdgePatch:
         if aux is None:
@@ -324,12 +335,35 @@ class FunctionGraph(BaseModel):
             out[edge_name] = dict(edge_aux)
         return out
 
+    @staticmethod
+    def _normalize_path(path: list[str | Edge] | tuple[str | Edge, ...] | None) -> list[str | Edge]:
+        """Normalize a path-like input to a concrete edge list."""
+        if path is None:
+            raise ValueError("Path may not be None.")
+        return list(path)
+
+    def _resolve_start_node(self, path: list[str | Edge], start: Node | str | None) -> Node:
+        """Resolve the start node for a path, including empty loopback paths."""
+        if start is not None:
+            return self._resolve_node(start)
+        if len(path) == 0:
+            raise ValueError("Loopback paths require an explicit start node.")
+        return self._resolve_node(self._resolve_edge(path[0]).source)
+
+    def _path_end_node(self, path: list[str | Edge], start: Node | str | None = None) -> Node:
+        """Resolve the terminal node reached by following a path from ``start``."""
+        normalized = self._normalize_path(path)
+        curr_node = self._resolve_start_node(normalized, start)
+        for edge_ref in normalized:
+            curr_node = self._step_path_node(curr_node, self._resolve_edge(edge_ref))
+        return curr_node
+
     def _step_path_node(self, curr_node: Node, edge: Edge) -> Node:
         """Advance one graph step using ``push_path`` connectivity semantics."""
         if edge.source == curr_node:
-            return edge.target
+            return self._resolve_node(edge.target)
         if edge.target == curr_node:
-            return edge.source
+            return self._resolve_node(edge.source)
         raise ValueError(
             f"Path discontinuity at edge {edge.name!r}: edge does not connect to current node {curr_node!r}."
         )
@@ -379,14 +413,13 @@ class FunctionGraph(BaseModel):
         composite_stack: tuple[str, ...] = (),
     ) -> PyTree | tuple[PyTree, EdgePatch]:
         """Internal path executor with recursive composite-edge cycle tracking."""
-        if len(path) == 0:
-            raise ValueError("Path must contain at least one edge.")
-
-        if start is None:
-            curr_node = self._resolve_edge(path[0]).source
-        else:
-            curr_node = start if isinstance(start, Node) else Node(name=start)
+        curr_node = self._resolve_start_node(path, start)
         aux_cache = self._copy_aux_cache(aux)
+
+        if len(path) == 0:
+            if return_aux:
+                return payload, aux_cache
+            return payload
 
         for edge_ref in path:
             edge = self._resolve_edge(edge_ref)
@@ -458,7 +491,7 @@ class FunctionGraph(BaseModel):
     def push_path(
         self,
         payload: PyTree,
-        path: list[str | Edge],
+        path: list[str | Edge] | tuple[str | Edge, ...],
         *,
         start: Node | str | None = None,
         aux: EdgePatch | None = None,
@@ -485,11 +518,88 @@ class FunctionGraph(BaseModel):
         :param return_aux: if True, return both payload and updated auxiliary cache
         :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
         """
+        normalized_path = self._normalize_path(path)
         return self._push_path_internal(
             payload,
-            path,
+            normalized_path,
             start=start,
             aux=aux,
             edge_payload_patches=edge_payload_patches,
             return_aux=return_aux,
         )
+
+    def path_error(
+        self,
+        payload: PyTree,
+        path_a: list[str | Edge] | tuple[str | Edge, ...],
+        path_b: list[str | Edge] | tuple[str | Edge, ...],
+        *,
+        start: Node | str | None = None,
+        aux_a: EdgePatch | None = None,
+        aux_b: EdgePatch | None = None,
+        edge_payload_patches: EdgePatch | None = None,
+    ) -> jax.Array:
+        """
+        Propagate one payload along two paths and compare the results at the common destination node.
+
+        Empty paths are treated as loopbacks and require an explicit ``start`` node.
+        """
+        normalized_a = self._normalize_path(path_a)
+        normalized_b = self._normalize_path(path_b)
+        start_node = self._resolve_start_node(normalized_a if normalized_a else normalized_b, start)
+        end_a = self._path_end_node(normalized_a, start=start_node)
+        end_b = self._path_end_node(normalized_b, start=start_node)
+        if end_a != end_b:
+            raise ValueError(
+                f"Path error requires matching destinations, but got {end_a!r} and {end_b!r}."
+            )
+
+        out_a = self.push_path(
+            payload,
+            normalized_a,
+            start=start_node,
+            aux=aux_a,
+            edge_payload_patches=edge_payload_patches,
+        )
+        out_b = self.push_path(
+            payload,
+            normalized_b,
+            start=start_node,
+            aux=aux_b,
+            edge_payload_patches=edge_payload_patches,
+        )
+        return end_a.error(out_a, out_b)
+
+    def reconstruction_error(
+        self,
+        payload: PyTree,
+        path: list[str | Edge] | tuple[str | Edge, ...],
+        *,
+        start: Node | str | None = None,
+        aux: EdgePatch | None = None,
+        edge_payload_patches: EdgePatch | None = None,
+    ) -> jax.Array:
+        """
+        Compute reconstruction error by comparing a loopback path against forward-then-backward traversal.
+
+        The payload is pushed forward along ``path`` and then backward along the reversed path back to its start.
+        """
+        normalized_path = self._normalize_path(path)
+        start_node = self._resolve_start_node(normalized_path, start)
+        forward_out, aux_cache = self.push_path(
+            payload,
+            normalized_path,
+            start=start_node,
+            aux=aux,
+            edge_payload_patches=edge_payload_patches,
+            return_aux=True,
+        )
+        destination = self._path_end_node(normalized_path, start=start_node)
+        reconstructed = self.push_path(
+            forward_out,
+            list(reversed(normalized_path)),
+            start=destination,
+            aux=aux_cache,
+            edge_payload_patches=edge_payload_patches,
+        )
+        return start_node.error(payload, reconstructed)

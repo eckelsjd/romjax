@@ -263,6 +263,28 @@ class RuntimeScaleEdge(Edge):
         return {"value": x["value"] / x["call_args"]["scale"]}
 
 
+class FloorEdge(Edge):
+    source: Node = Node(name="a")
+    target: Node = Node(name="b")
+
+    def forward(self, x):
+        return jnp.floor(x)
+
+    def backward(self, x):
+        return x
+
+
+class ShiftOneEdge(Edge):
+    source: Node = Node(name="a")
+    target: Node = Node(name="c")
+
+    def forward(self, x):
+        return x + 1.0
+
+    def backward(self, x):
+        return x - 1.0
+
+
 def test_composite_edge_matches_explicit_path_forward_and_backward() -> None:
     graph = FunctionGraph(
         edges={
@@ -355,6 +377,61 @@ def test_composite_edge_preserves_graph_aux_behavior() -> None:
     assert jnp.allclose(backward_out, value)
     assert jnp.allclose(backward_out, explicit_back)
     assert backward_aux == explicit_back_aux
+
+
+def test_push_path_loopback_returns_payload() -> None:
+    graph = FunctionGraph(nodes={"a": {"name": "a"}})
+    value = {"u": jnp.array([1.0, 2.0])}
+
+    out, aux = graph.push_path(value, [], start="a", return_aux=True)
+
+    assert out == value
+    assert aux == {}
+
+
+def test_path_error_matches_destination_node_metric() -> None:
+    graph = FunctionGraph(
+        nodes={"c": {"name": "c", "error_op": "mse"}},
+        edges={
+            "ab": AuxShiftEdge(source="a", target="b", name="ab"),
+            "bc": IdentityEdge(source="b", target="c", name="bc"),
+            "ac": CompositeEdge(source="a", target="c", name="ac", path=["ab", "bc"]),
+            "ac_shift": ShiftOneEdge(source="a", target="c", name="ac_shift"),
+        },
+    )
+    value = jnp.array([1.0, 3.0])
+
+    zero_error = graph.path_error(value, ["ab", "bc"], ["ac"], start="a")
+    mismatch_error = graph.path_error(value, ["ac"], ["ac_shift"], start="a")
+
+    expected = jnp.mean(jnp.square((value + 2.0) - (value + 1.0)))
+
+    assert jnp.allclose(zero_error, 0.0)
+    assert jnp.allclose(mismatch_error, expected)
+
+
+def test_path_error_rejects_mismatched_destinations() -> None:
+    graph = FunctionGraph(
+        edges={
+            "ab": IdentityEdge(source="a", target="b", name="ab"),
+            "ac": IdentityEdge(source="a", target="c", name="ac"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="matching destinations"):
+        graph.path_error(jnp.array(1.0), ["ab"], ["ac"], start="a")
+
+
+def test_reconstruction_error_uses_round_trip_to_start_node() -> None:
+    graph = FunctionGraph(
+        nodes={"a": {"name": "a", "error_op": "mae"}},
+        edges={"ab": FloorEdge(source="a", target="b", name="ab")},
+    )
+    value = jnp.array([1.2, 2.8])
+
+    error = graph.reconstruction_error(value, ["ab"], start="a")
+
+    assert jnp.allclose(error, jnp.mean(jnp.abs(value - jnp.floor(value))))
 
 
 def test_composite_edge_yaml_load_and_validation() -> None:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 import jax
+import equinox as eqx
 import jax.numpy as jnp
 from alive_progress import alive_bar
 from jaxtyping import Key
@@ -58,7 +59,7 @@ def _build_batched_sample_outputs(model):
         def _sample_outputs(keys, *_):
             return jax.vmap(model.sample_outputs)(keys)
 
-    return jax.jit(_sample_outputs)
+    return eqx.filter_jit(_sample_outputs)
 
 
 def generate_data_batch(config: GenDataConfig):
@@ -212,10 +213,11 @@ def generate_data_batch(config: GenDataConfig):
                 working_dir.mkdir(parents=True, exist_ok=True)
 
                 model = config.graph.edges[edge_name]
-                sample_inputs = jax.jit(jax.vmap(model.sample_inputs))
-                solve = jax.jit(jax.vmap(model.solve)) if hasattr(model, "solve") else None
+                sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
+                solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
                 sample_outputs = _build_batched_sample_outputs(model)
-                evaluate = jax.jit(jax.vmap(model.evaluate, in_axes=(None, 0))) if hasattr(model, "evaluate") else None
+                evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
+                            if hasattr(model, "evaluate") else None)
 
                 input_batch: list[tuple[Key, Path]] = []
 
@@ -284,23 +286,23 @@ def generate_data_serial(config: GenDataConfig):
                 working_dir.mkdir(parents=True, exist_ok=True)
 
                 model = config.graph.edges[edge_name]
-                sample_inputs = jax.jit(model.sample_inputs)
-                solve = jax.jit(model.solve) if hasattr(model, "solve") else None
-                evaluate = jax.jit(model.evaluate) if hasattr(model, "evaluate") else None
+                sample_inputs = eqx.filter_jit(model.sample_inputs)
+                solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") else None
+                evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") else None
 
                 sample_output_kwargs = _get_kwargs(model.sample_outputs)
                 if all(arg in sample_output_kwargs for arg in ["inputs", "solution"]):
-                    sample_outputs = jax.jit(
+                    sample_outputs = eqx.filter_jit(
                         lambda key, one_input, one_solution: model.sample_outputs(
                             key, inputs=one_input, solution=one_solution
                         )
                     )
                 elif "solution" in sample_output_kwargs:
-                    sample_outputs = jax.jit(
+                    sample_outputs = eqx.filter_jit(
                         lambda key, _, one_solution: model.sample_outputs(key, solution=one_solution)
                     )
                 else:
-                    sample_outputs = jax.jit(lambda key, *_: model.sample_outputs(key))
+                    sample_outputs = eqx.filter_jit(lambda key, *_: model.sample_outputs(key))
 
                 for input_key, input_dir in gen_keys(
                     sample_config.input_samples, sample_config.input_seed, path=working_dir
