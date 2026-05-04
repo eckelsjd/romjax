@@ -4,11 +4,10 @@ from typing import Any, Hashable, Literal
 
 import networkx as nx
 from jaxtyping import PyTree
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from romjax.tree import TreeErrorOperator, get_tree_operator, pytree_merge
 from romjax.typing import ListModel
-from romjax.tree import pytree_merge
-
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
 type EdgePyTree = Mapping[Edge, PyTree]               # Maps edge names to more general pytree data
@@ -16,11 +15,15 @@ type EdgePyTree = Mapping[Edge, PyTree]               # Maps edge names to more 
 
 class Node(BaseModel, Hashable):
     """
-    A Node in a FunctionGraph represents a vector space. At the moment, this is essentially just a string identifier.
+    A Node in a FunctionGraph represents a vector space. This is essentially just a string identifier and
+    a way to compute the size of errors in the space.
 
-    Must be hashable to be usable with networkx. Just hashes using the string identifier currently.
+    Error defaults to `mean-relative`, which averages per-leaf relative error.
+
+    Must be hashable to be usable with networkx. Just hashes using the string identifier.
     """
-    name: str 
+    name: str
+    error_op: TreeErrorOperator = Field(default_factory=lambda: get_tree_operator("mean-relative"))
 
     @model_validator(mode="before")
     @classmethod
@@ -28,6 +31,13 @@ class Node(BaseModel, Hashable):
         if isinstance(value, str):
             return {"name": value}
         return value
+
+    @field_validator("error_op", mode="before")
+    @classmethod
+    def _coerce_error_op(cls, value):
+        if isinstance(value, TreeErrorOperator):
+            return value
+        return get_tree_operator(value)
 
     def __hash__(self):
         return hash(self.name)
@@ -45,6 +55,10 @@ class Node(BaseModel, Hashable):
     
     def __repr__(self) ->str:
         return self.__str__()
+
+    def error(self, value: PyTree, value_hat: PyTree):
+        """Compute the pytree error at this node."""
+        return self.error_op(value, value_hat)
 
 
 class Edge(BaseModel, Hashable, ABC):

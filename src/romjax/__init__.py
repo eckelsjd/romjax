@@ -26,19 +26,39 @@ from typing import Union as _Union
 import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
 
-from . import rng as random, tree as tree
-from .config import GenDataConfig
-from .graph import CompositeEdge, FunctionGraph
-from .model import ExplicitModel, FilterModel, ImplicitModel, Sampleable, eqx_evaluate
-from .nn import LinearProjection
-from .optim import train
-from .plotting import gridplot
-from .poisson import Poisson2D
-from .rng import gen_keys
-from .typing import DictModel, ListModel
-from .utils import load_h5, save_h5
-
 type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
+
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+    "random": ("romjax.rng", None),
+    "tree": ("romjax.tree", None),
+    "GenDataConfig": ("romjax.config", "GenDataConfig"),
+    "CompositeEdge": ("romjax.graph", "CompositeEdge"),
+    "FunctionGraph": ("romjax.graph", "FunctionGraph"),
+    "ExplicitModel": ("romjax.model", "ExplicitModel"),
+    "FilterModel": ("romjax.model", "FilterModel"),
+    "ImplicitModel": ("romjax.model", "ImplicitModel"),
+    "Sampleable": ("romjax.model", "Sampleable"),
+    "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
+    "LinearProjection": ("romjax.nn", "LinearProjection"),
+    "train": ("romjax.optim", "train"),
+    "gridplot": ("romjax.plotting", "gridplot"),
+    "Poisson2D": ("romjax.poisson", "Poisson2D"),
+    "gen_keys": ("romjax.rng", "gen_keys"),
+    "DictModel": ("romjax.typing", "DictModel"),
+    "ListModel": ("romjax.typing", "ListModel"),
+    "load_h5": ("romjax.utils", "load_h5"),
+    "save_h5": ("romjax.utils", "save_h5"),
+}
+
+
+def __getattr__(name: str) -> _Any:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    module = _import_module(module_name)
+    value = module if attr_name is None else getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
 
 class ConfigLoader(_ABC):
@@ -79,8 +99,7 @@ class YamlLoader(ConfigLoader):
         class _Loader(_yaml.SafeLoader):
             pass
 
-        def _construct_python_name_multi(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _Any:
-            value = tag_suffix or loader.construct_scalar(node)
+        def _import_python_name(value: str) -> _Any:
             module_name, _, attr_path = value.rpartition(".")
             if not module_name or not attr_path:
                 raise ValueError(f"Invalid python/name tag: {value!r}")
@@ -89,6 +108,10 @@ class YamlLoader(ConfigLoader):
             for attr in attr_path.split("."):
                 obj = getattr(obj, attr)
             return obj
+
+        def _construct_python_name_multi(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _Any:
+            value = tag_suffix or loader.construct_scalar(node)
+            return _import_python_name(value)
 
         def _construct_python_name(loader: _yaml.SafeLoader, node: _yaml.Node) -> _Any:
             """Any importable name (e.g. functions)."""
@@ -121,6 +144,11 @@ class YamlLoader(ConfigLoader):
                 data = loader.construct_sequence(node, deep=True)
                 return cls_obj(data)
             data = loader.construct_scalar(node)
+            if isinstance(data, str):
+                try:
+                    data = _import_python_name(data)
+                except Exception:
+                    pass
 
             return cls_obj(data)
 
@@ -145,6 +173,11 @@ class YamlLoader(ConfigLoader):
             payload = data.model_dump()
             if isinstance(payload, list | tuple):
                 return dumper.represent_sequence(tag, payload)
+            if isinstance(payload, _FunctionType | _BuiltinFunctionType):
+                name = f"{payload.__module__}.{payload.__qualname__}"
+                return dumper.represent_scalar(tag, name)
+            if isinstance(payload, (str, int, float, bool)) or payload is None:
+                return dumper.represent_scalar(tag, str(payload) if payload is not None else "null")
             return dumper.represent_mapping(tag, payload)
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)

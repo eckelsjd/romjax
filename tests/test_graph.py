@@ -54,6 +54,22 @@ def test_node_list():
     assert [n.name for n in data["nodes"].values()] == ["a", "b", "c"]
 
 
+def test_node_error_operator_on_graph_node() -> None:
+    graph = FunctionGraph(
+        nodes={
+            "state": {"name": "state", "error_op": "relative"},
+        }
+    )
+    node = graph.nodes["state"]
+    value = {"u": jnp.array([3.0, 4.0])}
+    value_hat = {"u": jnp.array([0.0, 0.0])}
+
+    error = node.error(value, value_hat)
+
+    assert node.error_op.reduce_op.op_str == "norm"
+    assert jnp.allclose(error, jnp.array(1.0))
+
+
 def test_edge_list():
     edges = EdgeList(
         [

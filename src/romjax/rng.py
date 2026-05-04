@@ -12,8 +12,8 @@ import jaxtyping
 from jax.typing import ArrayLike
 from pydantic import field_validator
 
-from romjax.typing import DictModel
 from romjax.tree import UnaryOperator, get_unary_operator
+from romjax.typing import DictModel
 
 __all__ = ['Distribution', 'parametric_sampler', 'validate_distribution_pytree', 'pytree_sampler',
            'near_solution_sampler', 'gen_keys', 'SamplerCallable']
@@ -136,6 +136,8 @@ def _resolve_scale_leaf(reference: ArrayLike, scale_spec: ArrayLike | RelativeSc
 
 def _broadcast_like(template: jaxtyping.PyTree, value: ArrayLike | jaxtyping.PyTree) -> jaxtyping.PyTree:
     """Broadcast a scalar or pytree ``value`` across the structure of ``template`` when needed."""
+    if _is_relative_scale_spec(value):
+        return jax.tree.map(lambda _: value, template)
     if isinstance(value, Mapping) or (isinstance(value, Sequence) and not isinstance(value, str | bytes)):
         return value
     return jax.tree.map(lambda _: value, template)
