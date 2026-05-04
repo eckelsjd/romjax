@@ -10,7 +10,7 @@ from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from romjax.graph import Edge, Node
-from romjax.utils import merge_pytrees
+from romjax.tree import pytree_merge
 
 type PathToken = str | int
 type TreePath = tuple[PathToken, ...]
@@ -473,7 +473,7 @@ class FilterModel(Edge):
             assembled_outer = (
                 outer_patch
                 if assembled_outer is None
-                else _merge_filtered_trees(assembled_outer, outer_patch)
+                else pytree_merge(assembled_outer, outer_patch)
             )
             if produced_cached_states is not None:
                 produced_cached_states.append(cached_state_out)
@@ -592,11 +592,6 @@ def _assemble_outer_patch(inner_output: PyTree, routes: list[InnerToOuterRoute])
         source_value = inner_output if len(route.inner) == 0 else _get_subtree(inner_output, route.inner)
         patch = _set_subtree(patch, route.outer, source_value)
     return {} if patch is None else patch
-
-
-def _merge_filtered_trees(base: PyTree, patch: PyTree) -> PyTree:
-    """Merge patch into base, recursively overriding only paths present in patch."""
-    return merge_pytrees(base, patch)
 
 
 def _get_callable_signature(fn: Callable[..., Any]) -> Signature | None:

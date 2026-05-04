@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import pytest
 
 from romjax.pde import BoundaryType, UniformGrid, homogeneous_boundary
-from romjax.utils import merge_pytrees
+from romjax.tree import pytree_merge
 
 
 def test_merge_boundary_conditions():
@@ -21,7 +21,7 @@ def test_merge_boundary_conditions():
         ]
     }
 
-    merged = merge_pytrees(defaults, overrides)
+    merged = pytree_merge(defaults, overrides)
 
     assert merged["boundary"][0][0]["type"] == BoundaryType.dirichlet
     assert merged["boundary"][1][0]["type"] == BoundaryType.neumann

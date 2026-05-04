@@ -15,7 +15,8 @@ from jaxtyping import Key
 from romjax import YamlLoader
 from romjax.config import GenDataConfig
 from romjax.rng import gen_keys
-from romjax.utils import iter_pytree, load_h5, save_h5
+from romjax.utils import load_h5, save_h5
+from romjax.tree import pytree_iter
 
 
 class RomWorkflowError(RuntimeError):
@@ -100,8 +101,8 @@ def generate_data_batch(config: GenDataConfig):
         outputs = jax.device_get(outputs)
         residuals = jax.device_get(residuals) if residuals is not None else None
 
-        residual_iter = iter_pytree(residuals) if residuals is not None else None
-        for one_output, output_path in zip(iter_pytree(outputs), output_paths):
+        residual_iter = pytree_iter(residuals) if residuals is not None else None
+        for one_output, output_path in zip(pytree_iter(outputs), output_paths):
             one_residual = next(residual_iter) if residual_iter is not None else None
 
             if config.format == "h5":
@@ -142,8 +143,8 @@ def generate_data_batch(config: GenDataConfig):
             generated_solutions = solve(generated_inputs) if solve is not None else None
             generated_inputs = jax.device_get(generated_inputs)
             generated_solutions = jax.device_get(generated_solutions) if generated_solutions is not None else None
-            input_samples = list(iter_pytree(generated_inputs))
-            solution_samples = list(iter_pytree(generated_solutions)) if generated_solutions is not None else None
+            input_samples = list(pytree_iter(generated_inputs))
+            solution_samples = list(pytree_iter(generated_solutions)) if generated_solutions is not None else None
 
             for batch_index, input_index in enumerate(missing_indices):
                 inputs_by_index[input_index] = input_samples[batch_index]

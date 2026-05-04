@@ -7,7 +7,11 @@ from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from romjax.typing import ListModel
-from romjax.utils import merge_pytrees
+from romjax.tree import pytree_merge
+
+
+type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
+type EdgePyTree = Mapping[Edge, PyTree]               # Maps edge names to more general pytree data
 
 
 class Node(BaseModel, Hashable):
@@ -186,11 +190,11 @@ class CompositeEdge(Edge):
         *,
         path: list[str] | None = None,
         start: Node,
-        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
-        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
+        aux: EdgePatch | None = None,
+        edge_payload_patches: EdgePatch | None = None,
         return_aux: bool = False,
         composite_stack: tuple[str, ...] = (),
-    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+    ) -> PyTree | tuple[PyTree, EdgePatch]:
         graph = self._require_graph()
         return graph._push_path_internal(
             x,
@@ -298,9 +302,7 @@ class FunctionGraph(BaseModel):
         raise KeyError(f"Edge {edge_like!r} not found in graph.")
 
     @staticmethod
-    def _copy_aux_cache(
-        aux: Mapping[str, Mapping[str, PyTree]] | None,
-    ) -> dict[str, dict[str, PyTree]]:
+    def _copy_aux_cache(aux: EdgePatch | None) -> EdgePatch:
         if aux is None:
             return {}
         out: dict[str, dict[str, PyTree]] = {}
@@ -353,15 +355,15 @@ class FunctionGraph(BaseModel):
 
     def _push_path_internal(
         self,
-        x: PyTree,
+        payload: PyTree,
         path: list[str | Edge],
         *,
         start: Node | str | None = None,
-        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
-        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
+        aux: EdgePatch | None = None,
+        edge_payload_patches: EdgePatch | None = None,
         return_aux: bool = False,
         composite_stack: tuple[str, ...] = (),
-    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+    ) -> PyTree | tuple[PyTree, EdgePatch]:
         """Internal path executor with recursive composite-edge cycle tracking."""
         if len(path) == 0:
             raise ValueError("Path must contain at least one edge.")
@@ -370,7 +372,6 @@ class FunctionGraph(BaseModel):
             curr_node = self._resolve_edge(path[0]).source
         else:
             curr_node = start if isinstance(start, Node) else Node(name=start)
-        payload = x
         aux_cache = self._copy_aux_cache(aux)
 
         for edge_ref in path:
@@ -401,7 +402,7 @@ class FunctionGraph(BaseModel):
                         f"Edge payload patches require mapping payloads, but edge {edge.name!r} received "
                         f"{type(payload_in).__name__}."
                     )
-                payload_in = merge_pytrees(payload_in, edge_payload_patch)
+                payload_in = pytree_merge(payload_in, edge_payload_patch)
 
             edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
             if direction == "forward":
@@ -442,14 +443,14 @@ class FunctionGraph(BaseModel):
 
     def push_path(
         self,
-        x: PyTree,
+        payload: PyTree,
         path: list[str | Edge],
         *,
         start: Node | str | None = None,
-        aux: Mapping[str, Mapping[str, PyTree]] | None = None,
-        edge_payload_patches: Mapping[str, Mapping[str, PyTree]] | None = None,
+        aux: EdgePatch | None = None,
+        edge_payload_patches: EdgePatch | None = None,
         return_aux: bool = False,
-    ) -> PyTree | tuple[PyTree, dict[str, dict[str, PyTree]]]:
+    ) -> PyTree | tuple[PyTree, EdgePatch]:
         """
         Push one payload along a path of graph edges with transparent auxiliary-data handling.
 
@@ -462,7 +463,7 @@ class FunctionGraph(BaseModel):
         - when ``edge_payload_patches`` provides a patch for an edge name, that patch is merged into the current
           payload only for that edge evaluation, including recursive traversals inside :class:`CompositeEdge`
 
-        :param x: payload to propagate along the path
+        :param payload: payload to propagate along the path
         :param path: ordered edges to traverse (edge names or edge objects)
         :param start: starting node for the path (defaults to first node of first edge in path)
         :param aux: optional precomputed auxiliary cache
@@ -471,7 +472,7 @@ class FunctionGraph(BaseModel):
         :return: payload at path end, or ``(payload, aux_cache)`` when ``return_aux=True``
         """
         return self._push_path_internal(
-            x,
+            payload,
             path,
             start=start,
             aux=aux,
