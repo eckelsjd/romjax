@@ -18,6 +18,7 @@ dependencies = [
     "jaxtyping>=0.3.9",
     "networkx>=3.6.1",
     "alive-progress>=3.3.0",
+    "jax>=0.9.1",
 ]
 requires-python = ">=3.12"
 readme = "README.md"
@@ -34,12 +35,9 @@ Repository = "https://github.com/eckelsjd/romjax.git"
 
 [project.scripts]
 task = "romjax.task_cli:main"
-romx = "romjax.rom_cli:main"
+romx = "romjax.romx_cli:main"
 
 [project.optional-dependencies]
-cpu = [
-    "jax>=0.9.1",
-]
 cu12 = [
     "jax[cuda12]>=0.9.1",
 ]
@@ -66,7 +64,6 @@ test = [
 [tool.pyproject-runner.tasks]
 test = { cmd = "pytest --cov=romjax --cov-report html:htmlcov tests", cwd = "!" }
 lint = { cmd = "ruff check src tests", cwd = "!" }
-task = { cmd = "task", cwd = "!" }
 
 [tool.uv]
 package = true

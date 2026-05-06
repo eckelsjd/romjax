@@ -1,15 +1,15 @@
-!romx:GenDataConfig
+!romx:DataGeneration
 root: demo/dataset
 graph: demo/poisson_graph.yml
 train:
-  input_samples: 256
-  outputs_per_input: 16
+  input_samples: 64
+  outputs_per_input: 4
   input_seed: 0
   output_seed: 1
 validation:
-  input_samples: 256
-  outputs_per_input: 16
+  input_samples: 32
+  outputs_per_input: 2
   input_seed: 2
   output_seed: 3
-dataset_policy: reuse
-batch_size: 16
+write_policy: reuse
+batch_size: 4

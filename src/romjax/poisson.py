@@ -18,8 +18,8 @@ from romjax.rng import (
     parametric_sampler,
     validate_distribution_pytree,
 )
-from romjax.typing import AdjointMethod, DictModel, IterativeSolver
 from romjax.tree import pytree_merge, to_pytree
+from romjax.typing import AdjointMethod, DictModel, IterativeSolver
 
 type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
 type InputSamplerName = Literal["parametric"]

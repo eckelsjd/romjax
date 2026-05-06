@@ -4,10 +4,7 @@
 - License - MIT
 """
 __version__ = "0.0.1"
-__all__ = ['ConfigLoader', 'YamlLoader', 'load', 'dump', 'DictModel', 'ListModel', 'load_h5', 'save_h5',
-           'gridplot', 'gen_keys', 'train', 'random', 'FunctionGraph', 'Poisson2D', 'LinearProjection',
-           'FilterModel', 'ImplicitModel', 'ExplicitModel', 'eqx_evaluate', 'Sampleable', 'CompositeEdge',
-           'GenDataConfig', 'tree']
+
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
@@ -31,7 +28,7 @@ type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
     "tree": ("romjax.tree", None),
-    "GenDataConfig": ("romjax.config", "GenDataConfig"),
+    "routines": ("romjax.routines", None),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
@@ -46,9 +43,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "gen_keys": ("romjax.rng", "gen_keys"),
     "DictModel": ("romjax.typing", "DictModel"),
     "ListModel": ("romjax.typing", "ListModel"),
+    "Routine": ("romjax.typing", "Routine"),
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
+    "DataGeneration": ("romjax.data_gen", "DataGeneration"),
 }
+
+__all__ = list(_LAZY_EXPORTS.keys())
 
 
 def __getattr__(name: str) -> _Any:

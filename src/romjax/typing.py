@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from inspect import Parameter, signature
+from pathlib import Path
 from typing import Annotated, Any, Iterator, Mapping, MutableMapping, Protocol, get_args
 from weakref import WeakKeyDictionary
 
@@ -19,8 +21,31 @@ from pydantic import (
 )
 from pydantic_core import core_schema
 
-__all__ = ['DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod']
+__all__ = ['DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod',
+           'romjax_from_file', 'Routine', 'RoutineError']
 
+
+def romjax_from_file(value: str | Path | bytes | Any) -> Any:
+    """Try to load a romjax object from config file. Useful as a pydantic validator."""
+    if isinstance(value, str | Path | bytes):
+        import romjax
+        return romjax.load(value)
+    return value
+
+
+class Routine(BaseModel, ABC):
+    """Base class mixin that provides the `run()` method."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    @abstractmethod
+    def run(self) -> int:
+        raise NotImplementedError
+
+
+class RoutineError(RuntimeError):
+    """Raised when routines encounter invalid local state."""
+    
 
 class DictModel(BaseModel, MutableMapping):
     """Allow dict-like access of pydantic models."""
