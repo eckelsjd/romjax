@@ -5,7 +5,6 @@ from jax.typing import ArrayLike
 
 from romjax.utils import load_h5, save_h5
 
-
 # def test_lineax_gmres_matrix_free():
 #     A = jnp.array([[3.0, 1.0], [0.0, 2.0]])
 #     b = jnp.array([4.0, 2.0])

@@ -2,10 +2,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from romjax.config import GenDataConfig
+from romjax.data_gen import DataGeneration
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, Sampleable
-from romjax.rom_cli import generate_data_batch, generate_data_serial
 
 
 class _ToySampleableEdge(Edge, Sampleable):
@@ -44,15 +43,9 @@ def _get_graph():
     return graph
 
 
-@pytest.mark.parametrize(
-    ("batch_size", "generate_data"),
-    [
-        (1, generate_data_serial),
-        (2, generate_data_batch),
-    ],
-)
-def test_generate_data(tmp_path, batch_size, generate_data):
-    config = GenDataConfig(
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_data(tmp_path, batch_size):
+    config = DataGeneration(
         root=tmp_path,
         graph=_get_graph(),
         train=[
@@ -65,7 +58,7 @@ def test_generate_data(tmp_path, batch_size, generate_data):
         ],
         batch_size=batch_size,
     )
-    generate_data(config)
+    config.run()
 
     for dataset_name, seed, input_samples in (("train", 3, 2), ("validation", 7, 1)):
         for edge_name in ("low", "high"):

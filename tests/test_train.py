@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import PyTree
 
-from romjax.optim import train
+from romjax.train import train
 from romjax.utils import get_logger
 
 

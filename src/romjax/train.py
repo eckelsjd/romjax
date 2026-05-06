@@ -1,4 +1,4 @@
-"""Optimization stuff."""
+"""Reduced-order model training routine."""
 import logging
 import os
 import pickle
@@ -6,7 +6,7 @@ import re
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Annotated, Any, Callable, Iterator
 
 import equinox as eqx
 import jax
@@ -15,11 +15,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from jaxtyping import PyTree
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    field_validator,
+)
 
+from romjax.graph import FunctionGraph
 from romjax.tree import pytree_norm
+from romjax.typing import romjax_from_file
+
+type LossFunction = Callable[[PyTree, Any], float]
 
 
-__all__ = ['train', 'load_train_file']
+def ensure_path_exists(value: Path):
+    if not value.exists():
+        os.makedirs(value, exist_ok=True)
 
 
 def _prettify_timedelta(delta: float) -> str:
@@ -276,3 +289,61 @@ def train(
                 test_fig.savefig(Path(save) / f"{save_prefix}opt-test.pdf", bbox_inches='tight')
     
     return params
+
+
+class GraphLossSpec(BaseModel):
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    graph: Annotated[FunctionGraph, BeforeValidator(romjax_from_file)]
+
+
+class TrainConfig(BaseModel):
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    root: Annotated[Path, AfterValidator(ensure_path_exists)]
+    loss_fn: LossFunction
+
+    @field_validator("loss_fn", mode="before")
+    @classmethod
+    def _from_graph_spec(cls, value: LossFunction | GraphLossSpec) -> LossFunction:
+        """Generate a preset loss function for a FunctionGraph."""
+        if not callable(value):
+            GraphLossSpec.model_validate(value)
+        
+        else:
+            return value
+
+
+# @jax.jit
+# def reconstruction_error(
+#     params: EdgePyTree, 
+#     batch_data: PyTree, 
+#     graph: FunctionGraph, 
+#     edge: str,
+#     error_fn: TreeErrorOperator = "mean-relative"
+# ) -> float:
+#     """
+#     Push data through a graph edge and back, and return the reconstruction error.
+    
+#     :param params: pytree containing a map of edge->params. The params are patched into the payload at runtime.
+#     :param batch_data: batched training data compatible with the starting node of the specified edge
+#     :param graph: the function graph object that knows how to evaluate edges
+#     :param edge: the edge name to be used as the reconstruction pathway
+#     :param leaf_error: how to compute per-leaf errors (see `pytree_error`)
+#     :param leaf_reducer: how to combine all leaf errors into final result
+#     :return: the reconstruction error
+#     """
+#     batch_size = pytree_size(batch_data)
+#     error_fn = get_tree_operator(error_fn)
+#     gen_pytree = pytree_iter(batch_data)
+
+#     def body(i, acc):
+#         payload = next(gen_pytree)
+#         reconstructed = graph.push_path(payload, [edge, edge], edge_payload_patches={edge: params[edge]})
+#         return acc + error_fn(payload, reconstructed)
+    
+#     total = jax.lax.fori_loop(0, batch_size, body, 0.0)
+
+#     return total / batch_size

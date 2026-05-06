@@ -1686,6 +1686,7 @@ dependencies = [
     { name = "alive-progress" },
     { name = "equinox" },
     { name = "h5py" },
+    { name = "jax" },
     { name = "jaxtyping" },
     { name = "lineax" },
     { name = "matplotlib" },
@@ -1698,9 +1699,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-cpu = [
-    { name = "jax" },
-]
 cu12 = [
     { name = "jax", extra = ["cuda12"] },
 ]
@@ -1725,7 +1723,7 @@ requires-dist = [
     { name = "alive-progress", specifier = ">=3.3.0" },
     { name = "equinox", specifier = ">=0.13.6" },
     { name = "h5py", specifier = ">=3.14" },
-    { name = "jax", marker = "extra == 'cpu'", specifier = ">=0.9.1" },
+    { name = "jax", specifier = ">=0.9.1" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cu12'", specifier = ">=0.9.1" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cu13'", specifier = ">=0.9.1" },
     { name = "jaxtyping", specifier = ">=0.3.9" },
@@ -1738,7 +1736,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
-provides-extras = ["cpu", "cu12", "cu13"]
+provides-extras = ["cu12", "cu13"]
 
 [package.metadata.requires-dev]
 dev = [

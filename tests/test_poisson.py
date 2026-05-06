@@ -135,7 +135,7 @@ def test_poisson_evaluate_and_autodiff() -> None:
         }
         return jnp.sum(model.evaluate(local_inputs, {"phi": phi})['phi_residual'])
 
-    jit_out = jax.jit(eval_sum)(inputs["forcing"]["A0"], phi0)
+    jax.jit(eval_sum)(inputs["forcing"]["A0"], phi0)
     grad_forcing = jax.grad(lambda a0: eval_sum(a0, phi0))(inputs["forcing"]["A0"])
     grad_phi = jax.grad(lambda p: eval_sum(inputs["forcing"]["A0"], p))(phi0)
 
