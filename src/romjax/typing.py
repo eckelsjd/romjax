@@ -1,31 +1,45 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
+from importlib import import_module
 from inspect import Parameter, signature
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Protocol, TypeVar, get_args
+from types import BuiltinFunctionType, FunctionType, ModuleType
+from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
 import lineax as lx
+import optax
 import optimistix as optx
 from pydantic import (
-    AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
-    Field,
+    PlainSerializer,
     PrivateAttr,
     SerializationInfo,
     TypeAdapter,
     model_serializer,
     model_validator,
 )
-from pydantic_core import core_schema
 
-__all__ = ['DictModel', 'ListModel', 'CallableModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod',
-           'romjax_from_file', 'Routine', 'RoutineError', 'from_registry']
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'Routine', 'RoutineError', 'ThirdPartyType',
+           'romjax_from_file', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
 
+
+_SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
+_SPEC_ID_REGISTRY: dict[int, tuple[type, dict[str, Any]]] = {}
+_THIRD_PARTY_MODULES = (lx, optx, optax)
 
 T = TypeVar("T")
+
+
+def require_type(required_type: type, value: Any):
+    if not isinstance(value, required_type):
+        raise ValueError(f"Expected {required_type}, got {type(value).__name__}")
+    return value
+
 
 def romjax_from_file(value: str | Path | bytes | Any) -> Any:
     """Try to load a romjax object from config file. Useful as a pydantic validator."""
@@ -260,152 +274,271 @@ class ListModel[T: BaseModel](DictModel):
             if k == key:
                 return i
         raise ValueError(f"'{key}' is not in list")
+    
 
+# Three ways to try and store/retrieve a spec: 1) by ID, 2) by weak ref, 3) by monkeypatch special __romjax attr
+def _store_spec(value: object, spec: dict[str, Any]) -> None:
+    """Attach a normalized construction spec to a validated object when possible."""
+    _SPEC_ID_REGISTRY[id(value)] = (type(value), deepcopy(spec))
 
-class ModuleObjectSpec(BaseModel):
-    """Specification for constructing module objects from configs."""
-
-    name: str
-    opts: dict[str, Any] = Field(default_factory=dict)
-
-
-class ModuleObjectBuilder(Protocol):
-    """Callable protocol for constructing an object from name and opts."""
-
-    def __call__(self, name: str, opts: dict[str, Any]) -> Any: ...
-
-
-_SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
-
-
-def build_from_module(module) -> ModuleObjectBuilder:
-    """
-    Create a builder that constructs objects from a Python module by name.
-
-    :param module: Python module containing the target classes.
-    :return: Builder callable.
-    """
-    def _build(name: str, opts: dict[str, Any]) -> Any:
-        if not hasattr(module, name):
-            raise ValueError(f"Module '{module.__name__}' does not contain attribute '{name}'")
-        return getattr(module, name)(**opts)
-    return _build
-
-
-def _store_spec(obj: object, name: str, opts: dict[str, Any]) -> None:
-    spec = {"name": name, "opts": opts}
     try:
-        _SPEC_REGISTRY[obj] = spec
+        _SPEC_REGISTRY[value] = spec
     except TypeError:
         pass
+
     try:
-        setattr(obj, "__romjax_spec__", spec)
+        setattr(value, "__romjax_third_party_spec__", spec)
     except Exception:
         pass
 
 
-def _get_spec(obj: object) -> dict[str, Any] | None:
-    if hasattr(obj, "__romjax_spec__"):
-        return getattr(obj, "__romjax_spec__")
+def _get_spec(value: object) -> dict[str, Any] | None:
+    """Retrieve a previously cached construction spec."""
+    if hasattr(value, "__romjax_third_party_spec__"):
+        return deepcopy(getattr(value, "__romjax_third_party_spec__"))
+
+    spec_entry = _SPEC_ID_REGISTRY.get(id(value))
+    if spec_entry is not None:
+        spec_type, spec = spec_entry
+        if type(value) is spec_type:
+            return deepcopy(spec)
+
     try:
-        return _SPEC_REGISTRY.get(obj)
+        spec = _SPEC_REGISTRY.get(value)
     except TypeError:
+        spec = None
+
+    return deepcopy(spec) if spec is not None else None
+
+
+def _is_primitive(value: Any) -> bool:
+    return isinstance(value, str | int | float | bool | type(None))
+
+
+def _qualname(value: Any) -> str:
+    return f"{value.__module__}.{value.__qualname__}"
+
+
+def _public_qualname(value: Any) -> str:
+    module_name = value.__module__.split(".", maxsplit=1)[0]
+    return f"{module_name}.{value.__qualname__}"
+
+
+def _is_importable_object(value: Any) -> bool:
+    if not isinstance(value, FunctionType | BuiltinFunctionType | type):
+        return False
+
+    try:
+        module = import_module(value.__module__)
+    except ModuleNotFoundError:
+        return False
+
+    resolved: Any = module
+    for attr in value.__qualname__.split("."):
+        if attr == "<locals>" or not hasattr(resolved, attr):
+            return False
+        resolved = getattr(resolved, attr)
+
+    return resolved is value
+
+
+def _resolve_name(name: str, *, default_module: str | None = None) -> Any:
+    """Resolve an import path, optionally using a parent module as context."""
+    if "." in name:
+        module_name, _, attr_path = name.rpartition(".")
+        module = import_module(module_name)
+        resolved: Any = module
+        for attr in attr_path.split("."):
+            resolved = getattr(resolved, attr)
+        return resolved
+
+    if default_module is not None:
+        module = import_module(default_module)
+        if hasattr(module, name):
+            return getattr(module, name)
+
+    matches = [
+        getattr(module, name)
+        for module in _THIRD_PARTY_MODULES
+        if isinstance(module, ModuleType) and hasattr(module, name)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous third-party name {name!r}; use a fully qualified import path.")
+
+    raise ValueError(f"Could not resolve third-party name {name!r}.")
+
+
+def _try_normalize_spec_string(value: str, *, default_module: str | None = None) -> dict[str, Any] | None:
+    try:
+        _resolve_name(value, default_module=default_module)
+    except Exception:
         return None
 
+    return {"name": value}
 
-def _serialize_value(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool, type(None))):
+
+def _normalize_value(value: Any, *, default_module: str | None = None) -> Any:
+    """Normalize nested values, converting nested specs and cached objects recursively."""
+    if _is_primitive(value):
+        if isinstance(value, str):
+            spec = _try_normalize_spec_string(value, default_module=default_module)
+            if spec is not None:
+                return spec
         return value
-    if isinstance(value, dict):
-        return {k: _serialize_value(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_serialize_value(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_serialize_value(v) for v in value)
 
     spec = _get_spec(value)
-    if spec is None:
+    if spec is not None:
+        return spec
+
+    if isinstance(value, Mapping):
+        if "name" in value:
+            return _normalize_spec_data(value, default_module=default_module)
+        return {str(key): _normalize_value(val, default_module=default_module) for key, val in value.items()}
+
+    if isinstance(value, list):
+        return [_normalize_value(item, default_module=default_module) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_normalize_value(item, default_module=default_module) for item in value)
+
+    if _is_importable_object(value):
+        return {"name": _qualname(value), "args": [], "kwargs": {}}
+
+    return value
+
+
+def _normalize_spec_data(data: str | Mapping[str, Any], *, default_module: str | None = None) -> dict[str, Any]:
+    """Normalize shorthand or mapping specs into a canonical recursive form."""
+    if isinstance(data, str):
+        spec = _try_normalize_spec_string(data, default_module=default_module)
+        if spec is None:
+            raise ValueError(f"Could not resolve third-party shorthand {data!r}.")
+        return spec
+
+    if not isinstance(data, Mapping):
+        raise TypeError(f"Expected third-party spec mapping or string, got {type(data).__name__}")
+
+    if "name" not in data:
+        raise ValueError("Third-party spec mappings must include a 'name' field.")
+
+    target = _resolve_name(str(data["name"]), default_module=default_module)
+    nested_default_module = getattr(target, "__module__", None)
+
+    spec: dict[str, Any] = {"name": str(data["name"])}
+    if "args" in data:
+        spec["args"] = [_normalize_value(arg, default_module=nested_default_module) for arg in data.get("args", ())]
+    if "kwargs" in data:
+        spec["kwargs"] = {
+            str(key): _normalize_value(val, default_module=nested_default_module)
+            for key, val in data.get("kwargs", {}).items()
+        }
+    return spec
+
+
+def _construct_value(value: Any, *, default_module: str | None = None) -> Any:
+    """Recursively construct nested spec values."""
+    if _is_primitive(value):
+        if isinstance(value, str):
+            spec = _try_normalize_spec_string(value, default_module=default_module)
+            if spec is None:
+                return value
+            return _construct_spec(spec)
+        return value
+
+    spec = _get_spec(value)
+    if spec is not None:
+        return value
+
+    if isinstance(value, Mapping):
+        if "name" in value:
+            return _construct_spec(_normalize_spec_data(value, default_module=default_module))
+        return {str(key): _construct_value(val, default_module=default_module) for key, val in value.items()}
+
+    if isinstance(value, list):
+        return [_construct_value(item, default_module=default_module) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_construct_value(item, default_module=default_module) for item in value)
+
+    return value
+
+
+def _construct_spec(spec: dict[str, Any]) -> Any:
+    """Construct an object from a normalized spec and cache its serialized form."""
+    target = _resolve_name(spec["name"])
+    target_module = getattr(target, "__module__", None)
+    args = [_construct_value(arg, default_module=target_module) for arg in spec.get("args", ())]
+    kwargs = {
+        key: _construct_value(val, default_module=target_module)
+        for key, val in spec.get("kwargs", {}).items()
+    }
+    value = target(*args, **kwargs)
+    _store_spec(value, spec)
+    return value
+
+
+def from_module_spec(value: Any):
+    """Recursively convert a module spec into a third-party object."""
+    if isinstance(value, str | Mapping):
         try:
-            return _serialize_value(_infer_spec(value))
+            spec = _normalize_spec_data(value)
         except Exception:
             return value
-    return {
-        "name": spec["name"],
-        "opts": {k: _serialize_value(v) for k, v in spec["opts"].items()},
-    }
+        return _construct_spec(spec)
+    return value
+
+
+def to_module_spec(value: Any):
+    """Recursively serialize a third-party object into a module spec."""
+    if _is_primitive(value):
+        return value
+
+    spec = _get_spec(value)
+    if spec is not None:
+        return spec
+
+    if isinstance(value, list):
+        return [to_module_spec(item) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(to_module_spec(item) for item in value)
+
+    if isinstance(value, Mapping):
+        return {str(key): to_module_spec(val) for key, val in value.items()}
+
+    if _is_importable_object(value):
+        return {"name": _qualname(value), "args": [], "kwargs": {}}
+
+    try:
+        return _infer_spec(value)
+    except Exception:
+        return value
 
 
 def _infer_spec(value: Any) -> dict[str, Any]:
-    name = value.__class__.__name__
-    opts: dict[str, Any] = {}
+    """Best-effort serialization for third-party objects without cached specs."""
+    kwargs: dict[str, Any] = {}
     try:
-        sig = signature(value.__class__.__init__)
+        init_params = signature(type(value).__init__).parameters.values()
     except (TypeError, ValueError):
-        return {"name": name, "opts": opts}
+        init_params = ()
 
-    for param in sig.parameters.values():
+    for param in init_params:
         if param.name == "self":
             continue
         if param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
             continue
+        if not hasattr(value, param.name):
+            continue
+
         try:
-            if hasattr(value, param.name):
-                opts[param.name] = _serialize_value(getattr(value, param.name))
+            kwargs[param.name] = to_module_spec(getattr(value, param.name))
         except Exception:
             continue
 
-    return {"name": name, "opts": opts}
+    return {"name": _public_qualname(type(value)), "kwargs": kwargs}
 
 
-def _module_object_schema(builder: ModuleObjectBuilder, opts_adapter: TypeAdapter | None) -> core_schema.CoreSchema:
-    def validate(value: Any) -> Any:
-        if isinstance(value, dict):
-            spec = ModuleObjectSpec.model_validate(value)
-            opts = spec.opts
-            if opts_adapter is not None:
-                opts = opts_adapter.validate_python(opts)
-            obj = builder(spec.name, opts)
-            _store_spec(obj, spec.name, opts)
-            return obj
-        return value
-
-    def serialize(value: Any) -> Any:
-        spec = _get_spec(value)
-        if spec is None:
-            spec = _infer_spec(value)
-        return _serialize_value(spec)
-
-    return core_schema.no_info_plain_validator_function(
-        validate,
-        serialization=core_schema.plain_serializer_function_ser_schema(serialize),
-    )
-
-
-def module_object_type(builder: ModuleObjectBuilder, *, opts_adapter: TypeAdapter | None = None) -> type:
-    """
-    Create a Pydantic-compatible type that constructs module objects from dict specs.
-
-    :param builder: Callable that constructs an object from name and opts.
-    :param opts_adapter: Optional adapter to validate nested opts.
-    :return: A custom type usable in Pydantic models.
-    """
-    class ModuleObject:
-        @classmethod
-        def __get_pydantic_core_schema__(cls, _source, _handler):
-            return _module_object_schema(builder, opts_adapter)
-
-    return ModuleObject
-
-
-def _require_type(value: Any, required_type: type):
-    if not isinstance(value, required_type):
-        raise TypeError(f"Expected {required_type}, got {type(value).__name__}")
-    return value
-
-
-# Probably a thousand better ways to do this, but here we are
-# Essentially I just wanted custom pydantic validation/serialization for third-party objects
-type LxObject = module_object_type(build_from_module(lx))
-type OptxObject = module_object_type(build_from_module(optx), opts_adapter=TypeAdapter(dict[str, LxObject | Any]))    
-type IterativeSolver = Annotated[OptxObject, AfterValidator(lambda v: _require_type(v, optx.AbstractIterativeSolver))]
-type AdjointMethod = Annotated[OptxObject, AfterValidator(lambda v: _require_type(v, optx.AbstractAdjoint))]
+type ThirdPartyType = Annotated[Any, BeforeValidator(from_module_spec), PlainSerializer(to_module_spec)]

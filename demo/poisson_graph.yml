@@ -10,12 +10,12 @@ edges:
         shape: &shape [32, 32]
         bounds: &bounds [[0, 1], [0, 1]]
       solver:
-        name: Newton
-        opts:
+        name: optimistix.Newton
+        kwargs:
           rtol: 1
           atol: 5.0e-4
-        max_steps: 250
-        throw: true
+      max_steps: 250
+      throw: true
     forcing: !pd:romjax.poisson.ConstantForcing
       inputs_default: { const: -1.0 }
     conductivity: !pd:romjax.poisson.NonlinearConductivity

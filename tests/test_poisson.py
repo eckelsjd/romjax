@@ -87,7 +87,7 @@ def test_poisson_evaluate_and_autodiff() -> None:
     model = Poisson2D(
         config={
             "grid": {"shape": (8, 8), "bounds": ((0, 1), (0, 1))},
-            "solver": {"name": "Newton", "opts": {"rtol": 1.0, "atol": 1e-4}},
+            "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1.0, "atol": 1e-4}},
             "max_steps": 6,
             "throw": False,
         },
@@ -138,7 +138,7 @@ def get_laplace_solver() -> Poisson2D:
     return Poisson2D(
         config={
             "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(12, 12)),
-            "solver": {"name": "Newton", "opts": {"rtol": 1, "atol": 1e-4}},
+            "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1, "atol": 1e-4}},
             "max_steps": 10,
             "initial_guess": lambda coords: jnp.ones_like(coords[0]),
         }
@@ -149,7 +149,7 @@ def get_small_poisson(**kwargs) -> Poisson2D:
     return Poisson2D(
         config={
             "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(6, 6)),
-            "solver": {"name": "Newton", "opts": {"rtol": 1.0, "atol": 1e-4}},
+            "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1.0, "atol": 1e-4}},
             "max_steps": 5,
             "throw": False,
         },
@@ -185,7 +185,7 @@ def test_poisson_manufactured_solve(show_plot: bool = False) -> None:
         config={
             "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
             "max_steps": 15,
-            "solver": {"name": "Newton", "opts": {"rtol": 1e2, "atol": dx_error * 1.5}},
+            "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1e2, "atol": dx_error * 1.5}},
             "initial_guess": lambda coords: jnp.ones_like(coords[0]),
             "throw": False,
         },

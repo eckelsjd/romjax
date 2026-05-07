@@ -1,12 +1,117 @@
+from functools import partial
 from pathlib import Path
+from typing import Annotated
 
 import lineax as lx
+import optax
 import optimistix as optx
 import pytest
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import AfterValidator, BaseModel, TypeAdapter, ValidationError, model_validator
 
 from romjax import DictModel, YamlLoader
-from romjax.typing import ListModel, LxObject, OptxObject
+from romjax.typing import ListModel, ThirdPartyType, require_type
+
+type GradientTransformation = Annotated[
+    ThirdPartyType,
+    AfterValidator(partial(require_type, optax.GradientTransformation)),
+]
+
+
+class GradientConfig(BaseModel):
+    transform: GradientTransformation
+
+
+def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
+    data = {
+        "name": "optax.chain",
+        "args": [
+            {"name": "optax.clip_by_global_norm", "args": [1.0]},
+            {"name": "scale_by_adam"},
+            {
+                "name": "scale_by_schedule",
+                "args": [
+                    {
+                        "name": "optax.exponential_decay",
+                        "kwargs": {
+                            "init_value": 0.01,
+                            "transition_steps": 1000,
+                            "decay_rate": 0.99,
+                        },
+                    }
+                ],
+            },
+            {"name": "optax.scale", "args": [-1.0]},
+        ],
+    }
+
+    adapter = TypeAdapter(ThirdPartyType)
+    transform = adapter.validate_python(data)
+    dumped = adapter.dump_python(transform)
+
+    assert isinstance(transform, optax.GradientTransformation)
+    assert dumped == data
+
+
+def test_third_party_type_accepts_partially_validated_nested_objects():
+    adapter = TypeAdapter(ThirdPartyType)
+    clip = adapter.validate_python({"name": "optax.clip_by_global_norm", "args": [1.0]})
+    schedule = adapter.validate_python(
+        {
+            "name": "optax.exponential_decay",
+            "kwargs": {
+                "init_value": 0.01,
+                "transition_steps": 1000,
+                "decay_rate": 0.99,
+            },
+        }
+    )
+
+    transform = adapter.validate_python(
+        {
+            "name": "optax.chain",
+            "args": [
+                clip,
+                {"name": "optax.scale_by_schedule", "args": [schedule]},
+                {"name": "optax.scale", "args": [-1.0]},
+            ],
+        }
+    )
+    dumped = adapter.dump_python(transform)
+
+    assert isinstance(transform, optax.GradientTransformation)
+    assert dumped["args"][0] == {"name": "optax.clip_by_global_norm", "args": [1.0]}
+    assert dumped["args"][1]["args"][0] == {
+        "name": "optax.exponential_decay",
+        "kwargs": {
+            "init_value": 0.01,
+            "transition_steps": 1000,
+            "decay_rate": 0.99,
+        },
+    }
+
+
+def test_gradient_transformation_type_rejects_wrong_object_type():
+    with pytest.raises(ValidationError):
+        GradientConfig.model_validate({"transform": {"name": "optax.exponential_decay", "args": [0.1, 10, 0.9]}})
+
+
+def test_gradient_transformation_model_round_trip():
+    data = {
+        "transform": {
+            "name": "optax.chain",
+            "args": [
+                {"name": "optax.clip_by_global_norm", "args": [1.0]},
+                {"name": "scale_by_adam"},
+                {"name": "optax.scale", "args": [-1.0]},
+            ],
+        }
+    }
+
+    config = GradientConfig.model_validate(data)
+    dumped = config.model_dump()
+
+    assert isinstance(config.transform, optax.GradientTransformation)
+    assert dumped == data
 
 
 class CustomSettings(DictModel, extra='forbid'):
@@ -82,11 +187,11 @@ def test_from_yaml():
 
 
 class SolverConfig(BaseModel):
-    solver: OptxObject
+    solver: ThirdPartyType
 
 
 class LinearSolverConfig(BaseModel):
-    solver: LxObject
+    solver: ThirdPartyType
 
 
 class ListNode(BaseModel):
@@ -122,13 +227,13 @@ class EdgeListModel(ListModel[ListEdge]):
 
 def test_module_object_nested_validation():
     data = {
-        "name": "Newton",
-        "opts": {
+        "name": "optimistix.Newton",
+        "kwargs": {
             "rtol": 1e-3,
             "atol": 1e-6,
             "linear_solver": {
-                "name": "CG",
-                "opts": {
+                "name": "lineax.CG",
+                "kwargs": {
                     "rtol": 1e-2,
                     "atol": 1e4,
                 },
@@ -142,9 +247,9 @@ def test_module_object_nested_validation():
     assert cfg.solver.linear_solver.__class__.__name__ == "CG"
 
     dumped = cfg.model_dump()
-    assert dumped["solver"]["name"] == "Newton"
-    assert dumped["solver"]["opts"]["linear_solver"]["name"] == "CG"
-    assert dumped["solver"]["opts"]["linear_solver"]["opts"]["rtol"] == 1e-2
+    assert dumped["solver"]["name"] == "optimistix.Newton"
+    assert dumped["solver"]["kwargs"]["linear_solver"]["name"] == "lineax.CG"
+    assert dumped["solver"]["kwargs"]["linear_solver"]["kwargs"]["rtol"] == 1e-2
 
 
 def test_module_object_external_serialization():
@@ -156,19 +261,19 @@ def test_module_object_external_serialization():
     cfg = SolverConfig(solver=solver)
     dumped = cfg.model_dump()
 
-    assert dumped["solver"]["name"] == "Newton"
-    assert isinstance(dumped["solver"]["opts"], dict)
-    if "linear_solver" in dumped["solver"]["opts"]:
-        assert dumped["solver"]["opts"]["linear_solver"]["name"] == "CG"
+    assert dumped["solver"]["name"] == "optimistix.Newton"
+    assert isinstance(dumped["solver"]["kwargs"], dict)
+    if "linear_solver" in dumped["solver"]["kwargs"]:
+        assert dumped["solver"]["kwargs"]["linear_solver"]["name"] == "lineax.CG"
     
     solver = lx.CG(rtol=1e-2, atol=1e4)
     cfg = LinearSolverConfig(solver=solver)
     dumped = cfg.model_dump()
 
-    assert dumped["solver"]["name"] == "CG"
-    assert isinstance(dumped["solver"]["opts"], dict)
-    assert "rtol" in dumped["solver"]["opts"]
-    assert "atol" in dumped["solver"]["opts"]
+    assert dumped["solver"]["name"] == "lineax.CG"
+    assert isinstance(dumped["solver"]["kwargs"], dict)
+    assert "rtol" in dumped["solver"]["kwargs"]
+    assert "atol" in dumped["solver"]["kwargs"]
     
 
 def test_list_model():
