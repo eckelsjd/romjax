@@ -52,6 +52,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ListModel": ("romjax.typing", "ListModel"),
     "CallableModel": ("romjax.typing", "CallableModel"),
     "Routine": ("romjax.typing", "Routine"),
+    "ThirdPartyType": ("romjax.typing", "ThirdPartyType"),
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),

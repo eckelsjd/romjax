@@ -2,11 +2,12 @@
 import functools
 from collections.abc import Mapping
 from typing import Annotated, Any, Callable, Literal, TypedDict
+from functools import partial
 
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import BeforeValidator, ConfigDict, Field, PositiveInt, field_validator
+from pydantic import BeforeValidator, ConfigDict, Field, PositiveInt, field_validator, AfterValidator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
@@ -21,7 +22,8 @@ from romjax.pde import (
 )
 from romjax.rng import RomjaxSampler
 from romjax.tree import to_pytree
-from romjax.typing import AdjointMethod, DictModel, IterativeSolver, from_registry
+from romjax.typing import DictModel, from_registry, ThirdPartyType, require_type
+
 
 __all__ = ["Poisson2D"]
 
@@ -176,6 +178,8 @@ _initialize_registry = {
 type PoissonForcing = Annotated[ForcingCallable, BeforeValidator(functools.partial(from_registry, _forcing_registry))]
 type PoissonInitialize = Annotated[InitializeCallable, 
                                    BeforeValidator(functools.partial(from_registry, _initialize_registry))]
+type IterativeSolver = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractIterativeSolver))]
+type AdjointMethod = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractAdjoint))]
 
 
 class PoissonConfig(DictModel):
@@ -192,12 +196,17 @@ class PoissonConfig(DictModel):
     :ivar throw: whether to throw failures as errors (default True)
     """
     grid: UniformGrid
-    solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
-                                    validate_default=True)
+    solver: IterativeSolver = Field(
+        default_factory=lambda: dict(name='optimistix.Newton', kwargs={'rtol': 1e-2, 'atol': 1e-4}), 
+        validate_default=True
+    )
     initial_guess: PoissonInitialize = Field(default_factory=ConstantInitialize)
     options: dict[str, Any] = Field(default_factory=dict)
     max_steps: PositiveInt = 100
-    adjoint: AdjointMethod = Field(default_factory=lambda: dict(name='ImplicitAdjoint'), validate_default=True)
+    adjoint: AdjointMethod = Field(
+        default_factory=lambda: dict(name='optimistix.ImplicitAdjoint'), 
+        validate_default=True
+    )
     throw: bool = True
 
     @field_validator("grid", mode="after")

@@ -4,8 +4,8 @@ solver: !romx:Poisson2D
       shape: &s [8, 8]
       bounds: &b [[0, 1], [0, 1]]
     solver:
-      name: Newton
-      opts:
+      name: optimistix.Newton
+      kwargs:
         rtol: 1.0e-2
         atol: 1.0e-6
   forcing:
