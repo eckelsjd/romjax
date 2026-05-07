@@ -4,10 +4,11 @@ from typing import Any, Callable, Literal
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
-from pydantic import PositiveFloat, PositiveInt, model_validator
+from pydantic import PositiveFloat, PositiveInt, model_validator, field_validator, Field
 
 from romjax.pde import Coordinates
 from romjax.typing import DictModel
+
 
 __all__ = ["KLEConfig", "kle", "darcy"]
 
@@ -32,15 +33,34 @@ class KLEConfig(DictModel):
     :param variance: target average marginal variance across the grid
     :param spectral_decay: exponent controlling modal energy decay
     :param mean: scalar or array-like mean field broadcastable to ``shape``
+    :param nsamples: number of fields to draw. ``1`` returns a single 2D field.
+    :param random_override: use these samples of N(0,1) rather than the provided key (default: ignored).
+                            essentially just to check convergence for truncation
+    :param weight: optional weighting field to reduce noise near boundaries
+    :param weight_opts: options to pass to weight function
     """
 
     bounds: tuple[tuple[float, float], ...] | tuple[float, float] = (0.0, 1.0)
     shape: tuple[PositiveInt, ...] | PositiveInt = 16
     truncation: tuple[PositiveInt, ...] | PositiveInt | None = None
     correlation_lengths: tuple[PositiveFloat, ...] | PositiveFloat = 0.2
-    variance: float = 1.0
+    variance: PositiveFloat = 1.0
     spectral_decay: PositiveFloat = 2.0
     mean: ArrayLike = 0.0
+    nsamples: PositiveInt = 1,
+    random_override: ArrayLike | None = None,
+    weight: Callable[[Coordinates], ArrayLike] | Literal["smooth"] | None = None,
+    weight_opts: dict = Field(default_factory=dict)
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def _validate_weight(cls, weight):
+        if isinstance(weight, str):
+            if weight == "smooth":
+                weight = _smooth_ramp
+            else:
+                raise ValueError(f"Unknown weighting function: {weight}")
+        return weight
 
     @model_validator(mode="before")
     @classmethod
@@ -104,9 +124,6 @@ class KLEConfig(DictModel):
         if any(mode > size for mode, size in zip(self.truncation, self.shape)):
             raise ValueError("truncation must not exceed the output grid shape.")
 
-        if self.variance < 0.0:
-            raise ValueError("variance must be nonnegative.")
-
         return self
 
 
@@ -162,20 +179,7 @@ def _smooth_ramp(
     return low + (high - low) * weight
 
 
-def kle(
-    key: Key,
-    bounds: tuple[tuple[float, float], ...] | tuple[float, float] = (0.0, 1.0),
-    shape: tuple[int, ...] | int = 16,
-    truncation: tuple[int, ...] | int | None = None,
-    correlation_lengths: tuple[float, ...] | float = 0.2,
-    variance: float = 1.0,
-    spectral_decay: float = 2.0,
-    mean: ArrayLike = 0.0,
-    nsamples: int = 1,
-    random_override: ArrayLike | None = None,
-    weight: Callable[[Coordinates], ArrayLike] | Literal["smooth"] | None = None,
-    weight_opts: dict[str, Any] | None = None
-) -> ArrayLike:
+def kle(key: Key, **config: KLEConfig) -> ArrayLike:
     r"""Sample a scalar 1D or 2D random field from a truncated KLE on a uniform grid.
 
     This callable is designed to be used directly in :class:`romjax.rng.Distribution`,
@@ -195,31 +199,11 @@ def kle(
     can be expected to be about +/-4*sqrt(variance), but depends on truncation.
 
     :param key: JAX random key
-    :param bounds: domain bounds ``((x0, x1), ...)``
-    :param shape: output grid shape ``(n0, ...)``
-    :param truncation: retained cosine modes along each axis. Defaults to ``shape``.
-    :param correlation_lengths: smoothness controls for the spectrum along each axis
-    :param variance: target average marginal variance across the grid
-    :param spectral_decay: exponent controlling modal energy decay
-    :param mean: scalar or array-like mean field broadcastable to ``shape``
-    :param nsamples: number of fields to draw. ``1`` returns a single 2D field.
-    :param random_override: use these samples of N(0,1) rather than the provided key (default: ignored).
-                            essentially just to check convergence for truncation
-    :param weight: optional weighting field to reduce noise near boundaries
-    :param weight_opts: options to pass to weight function
+    :param config: see KLEConfig
     :return: ``shape`` when ``nsamples == 1``, otherwise ``(nsamples, *shape)``
     """
-    config = KLEConfig(
-        bounds=bounds,
-        shape=shape,
-        truncation=truncation,
-        correlation_lengths=correlation_lengths,
-        variance=variance,
-        spectral_decay=spectral_decay,
-        mean=mean,
-    )
-
-    ndim = len(config.bounds)
+    cfg = KLEConfig(**config)
+    ndim = len(cfg.bounds)
 
     # Some annoying things:
     # - typically always avoid solving the exact eigenvalue problem -- exp kernel simplifies nicely to cosine basis
@@ -228,31 +212,31 @@ def kle(
     # - the proportionality const for eigs is different wherever you look (pi^2, avg_var, etc.)
 
     if ndim == 1:
-        (x0, x1), = config.bounds
-        nx, = config.shape
-        mx, = config.truncation
-        ell_x, = config.correlation_lengths
+        (x0, x1), = cfg.bounds
+        nx, = cfg.shape
+        mx, = cfg.truncation
+        ell_x, = cfg.correlation_lengths
         lx = x1 - x0
 
         x = _cell_centered_axis(x0, x1, nx)
         phi_x = _cosine_basis(x, x0, x1, mx)
         kx = jnp.arange(mx)
-        raw_eigs = (1.0 + (jnp.pi * ell_x * kx / lx) ** 2) ** (-config.spectral_decay)
+        raw_eigs = (1.0 + (jnp.pi * ell_x * kx / lx) ** 2) ** (-cfg.spectral_decay)
         pointwise_var = jnp.einsum("ik,k->i", phi_x**2, raw_eigs)
         avg_var = jnp.mean(pointwise_var)
-        scale = jnp.where(avg_var > 0.0, config.variance / avg_var, 0.0)
+        scale = jnp.where(avg_var > 0.0, cfg.variance / avg_var, 0.0)
         sqrt_cov = jnp.sqrt(scale * raw_eigs)
 
-        coeff_shape = (nsamples, mx)
-        coeffs = random_override if random_override is not None else jax.random.normal(key, coeff_shape)
+        coeff_shape = (cfg.nsamples, mx)
+        coeffs = cfg.random_override if cfg.random_override is not None else jax.random.normal(key, coeff_shape)
         coeffs = coeffs * sqrt_cov[None, :]
         samples = jnp.einsum("ik,bk->bi", phi_x, coeffs)
         coords = (x,)
     else:
-        (x0, x1), (y0, y1) = config.bounds
-        nx, ny = config.shape
-        mx, my = config.truncation
-        ell_x, ell_y = config.correlation_lengths
+        (x0, x1), (y0, y1) = cfg.bounds
+        nx, ny = cfg.shape
+        mx, my = cfg.truncation
+        ell_x, ell_y = cfg.correlation_lengths
         lx = x1 - x0
         ly = y1 - y0
 
@@ -266,31 +250,25 @@ def kle(
             1.0
             + (jnp.pi * ell_x * kx / lx)[:, None] ** 2
             + (jnp.pi * ell_y * ky / ly)[None, :] ** 2
-        ) ** (-config.spectral_decay)
+        ) ** (-cfg.spectral_decay)
         pointwise_var = jnp.einsum("ik,jl,kl->ij", phi_x**2, phi_y**2, raw_eigs)
         avg_var = jnp.mean(pointwise_var)
-        scale = jnp.where(avg_var > 0.0, config.variance / avg_var, 0.0)
+        scale = jnp.where(avg_var > 0.0, cfg.variance / avg_var, 0.0)
         sqrt_cov = jnp.sqrt(scale * raw_eigs)
 
-        coeff_shape = (nsamples, mx, my)
-        coeffs = random_override if random_override is not None else jax.random.normal(key, coeff_shape)
+        coeff_shape = (cfg.nsamples, mx, my)
+        coeffs = cfg.random_override if cfg.random_override is not None else jax.random.normal(key, coeff_shape)
         coeffs = coeffs * sqrt_cov[None, :, :]
         samples = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
         coords = jnp.meshgrid(x, y, indexing="ij")
 
-    samples = samples + jnp.asarray(config.mean)
+    samples = samples + jnp.asarray(cfg.mean)
 
     # Scale the samples by a weighting matrix (e.g. to make 0 near boundaries)
-    if weight is not None:
-        weight_opts = {} if weight_opts is None else weight_opts
-        if weight == "smooth":
-            samples = _smooth_ramp(coords, **weight_opts)[jnp.newaxis, ...] * samples
-        elif callable(weight):
-            samples = weight(coords, **weight_opts)[jnp.newaxis, ...] * samples
-        else:
-            raise ValueError(f"Unknown weighting function: {weight}")
+    if cfg.weight is not None:
+        samples = cfg.weight(coords, **cfg.weight_opts)[jnp.newaxis, ...] * samples
 
-    if nsamples == 1:
+    if cfg.nsamples == 1:
         return samples[0]
     return samples
 

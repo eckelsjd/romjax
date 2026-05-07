@@ -1,80 +1,42 @@
 """Example 2D Poisson solver."""
 from collections.abc import Mapping
-from typing import Any, Callable, Literal, TypedDict
+from typing import Any, Callable, Literal, TypedDict, Annotated
+import functools
 
-import jax
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import ConfigDict, Field, PositiveInt, ValidationInfo, field_validator
+from pydantic import ConfigDict, Field, PositiveInt, field_validator, BeforeValidator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
-from romjax.pde import BoundarySpec, BoundaryType, Coordinates, UniformGrid, homogeneous_boundary
-from romjax.rng import (
-    Distribution,
-    SamplerCallable,
-    near_solution_sampler,
-    parametric_sampler,
-    validate_distribution_pytree,
+from romjax.pde import (
+    BoundarySpec, 
+    BoundaryType, 
+    Coordinates, 
+    UniformGrid, 
+    homogeneous_boundary, 
+    ForcingCallable,
+    InitializeCallable,
 )
-from romjax.tree import pytree_merge, to_pytree
-from romjax.typing import AdjointMethod, DictModel, IterativeSolver
-
-type ForcingName = Literal["gaussian", "nonlinear", "sinusoid", "constant"]
-type InputSamplerName = Literal["parametric"]
-type OutputSamplerName = Literal["near_solution"]
-type ForcingCallable = Callable[[PyTree, PyTree], ArrayLike]
-type BoundaryCallable = Callable[[PyTree], PyTree]
-type InitialCallable = Callable[[Coordinates], ArrayLike]
+from romjax.rng import RomjaxSampler
+from romjax.tree import to_pytree
+from romjax.typing import AdjointMethod, DictModel, IterativeSolver, from_registry
 
 
-class SinusoidForcingInputs(DictModel):
-    """Method of manufactured solutions sinusoid forcing."""
-    coords: Coordinates = (0., 0.)
+__all__ = ["Poisson2D"]
 
 
-class ConstantForcingInputs(DictModel):
-    """Constant forcing."""
-    const: ArrayLike = 0.0
-
-
-class GaussianForcingInputs(DictModel):
-    """Inputs for Gaussian forcing function.
-
-    :ivar A0: amplitude
-    :ivar sigma: symmetric width of Gaussian
-    :ivar mu_x: center of Gaussian in x-direction
-    :ivar mu_y: center of Gaussian in y-direction
-    :ivar coords: (x,y) coordinates to evaluate at
-    """
-    A0: ArrayLike = 1.0
-    sigma: ArrayLike = 1.0
-    mu_x: ArrayLike = 0.0
-    mu_y: ArrayLike = 0.0
-    coords: Coordinates = (0., 0.)
-
-
-class NonlinearConductivityInputs(DictModel):
-    """Inputs for nonlinear conductivity function.
-    
-    :ivar k0: the background random field conductivity (2D)
-    :ivar alpha: the strength of the nonlinearity
-    """
-    k0: ArrayLike = 1.0
-    alpha: ArrayLike = 1.0
-
-
-class PoissonInputs(DictModel):
+class PoissonInputs(TypedDict):
     """Inputs for the Poisson equation.
     
     :ivar forcing: forcing inputs
     :ivar conductivity: conductivity inputs
     :ivar boundary: boundary condition parameters
     """
-    forcing: DictModel = Field(default_factory=lambda: ConstantForcingInputs(const=0.0))
-    conductivity: DictModel = Field(default_factory=lambda: ConstantForcingInputs(const=1.0))
-    boundary: DictModel = Field(default_factory=lambda: homogeneous_boundary(ndim=2))
+    forcing: dict
+    conductivity: dict
+    boundary: dict
 
 
 class PoissonOutputs(TypedDict):
@@ -93,67 +55,128 @@ class PoissonResiduals(TypedDict):
     phi_residual: ArrayLike
 
 
-def const_initial_guess(const: float) -> InitialCallable:
-    return lambda coords: const * jnp.ones_like(coords[0])
+class GaussianForcing(ForcingCallable):
+    class Inputs(DictModel):
+        """Inputs for Gaussian forcing function.
 
-
-def boundary_pass_through(inputs: PyTree) -> PyTree:
-    """Simple boundary that uses boundary input params directly (just pass them through)."""
-    return inputs
-
-
-def gaussian_forcing(inputs: GaussianForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
-    r"""Symmetric Gaussian bump.
-
-        $f(x,y) = A_0 \exp(-1/(2\sigma) ((x-\mu_x)^2 + (y-\mu_y)^2))$
+        :ivar A0: amplitude
+        :ivar sigma: symmetric width of Gaussian
+        :ivar mu_x: center of Gaussian in x-direction
+        :ivar mu_y: center of Gaussian in y-direction
+        :ivar coords: (x,y) coordinates to evaluate at
+        """
+        A0: ArrayLike = 1.0
+        sigma: ArrayLike = 1.0
+        mu_x: ArrayLike = 0.0
+        mu_y: ArrayLike = 0.0
+        coords: Coordinates = (0., 0.)
     
-    :param inputs: the input parameters
-    :param outputs: the scalar potential on the grid (not used)
-    :return: the forcing on the grid
-    """
-    dx = inputs['coords'][0] - inputs['mu_x']
-    dy = inputs['coords'][1] - inputs['mu_y']
-    return inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
+    def callable(inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
+        r"""Symmetric Gaussian bump.
+
+            $f(x,y) = A_0 \exp(-1/(2\sigma) ((x-\mu_x)^2 + (y-\mu_y)^2))$
+        
+        :param inputs: the input parameters
+        :param outputs: the scalar potential on the grid (not used)
+        :return: the forcing on the grid
+        """
+        dx = inputs['coords'][0] - inputs['mu_x']
+        dy = inputs['coords'][1] - inputs['mu_y']
+        return inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
 
 
-def constant_forcing(inputs: ConstantForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
-    """Just a constant forcing (inputs/outputs not used)."""
-    return inputs['const']
+class NonlinearConductivity(ForcingCallable):
 
+    amplitude: Callable[[ArrayLike], ArrayLike] | Literal["exp"] | None = None
 
-def sinusoid_forcing(inputs: SinusoidForcingInputs, outputs: PoissonOutputs) -> ArrayLike:
-    r"""Sinusoid forcing. Used in method of manufactured solutions.
+    class Inputs(DictModel):
+        """Inputs for nonlinear conductivity function.
     
-        $f(x,y) = -2 \pi^2 \sin{\pi x}\sin{\pi y}$
-
-    :param inputs: just uses (x,y) coords
-    :param outputs: the scalar potential on grid (not used)
-    :return: the forcing on the grid.
-    """
-    return -2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
-
-
-def nonlinear_conductivity(
-        inputs: NonlinearConductivityInputs, 
-        outputs: PoissonOutputs, 
-        amplitude: Callable[[ArrayLike], ArrayLike] | Literal["exp"] | None = None,
-    ) -> ArrayLike:
-    r"""Nonlinear conductivity.
-
-        $k(x,y) = amp(k_0) * (1 + \alpha \phi^2)$
+        :ivar k0: the background random field conductivity (2D)
+        :ivar alpha: the strength of the nonlinearity
+        """
+        k0: ArrayLike = 1.0
+        alpha: ArrayLike = 1.0
     
-    :param inputs: the input parameters
-    :param outputs: the scalar potential on the grid
-    :param amplitude: function to apply to k0 
-    :return: the conductivity on the grid
-    """
-    if amplitude is None:
-        amplitude = lambda x: x
-    if amplitude == 'exp':
-        amplitude = jnp.exp
+    @field_validator("amplitude", mode="before")
+    @classmethod
+    def _validate_amplitude(cls, amplitude):
+        if amplitude is None:
+            amplitude = lambda x: x
+        if amplitude == 'exp':
+            amplitude = jnp.exp
+        
+        return amplitude
+    
+    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
+        r"""Nonlinear conductivity.
 
-    phi = next(iter(outputs.values()))
-    return amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
+            $k(x,y) = amp(k_0) * (1 + \alpha \phi^2)$
+        
+        :param inputs: the input parameters
+        :param outputs: the scalar potential on the grid
+        :param amplitude: function to apply to k0 
+        :return: the conductivity on the grid
+        """
+        phi = next(iter(outputs.values()))
+        return self.amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
+
+
+class ConstantForcing(ForcingCallable):
+
+    class Inputs(DictModel):
+        const: ArrayLike = 0.0
+    
+    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
+        """Just a constant forcing (inputs/outputs not used)."""
+        return inputs['const']
+
+
+class SinusoidForcing(ForcingCallable):
+
+    class Inputs(DictModel):
+        coords: Coordinates = (0., 0.)
+    
+    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
+        r"""Sinusoid forcing. Used in method of manufactured solutions.
+    
+            $f(x,y) = -2 \pi^2 \sin{\pi x}\sin{\pi y}$
+
+        :param inputs: just uses (x,y) coords
+        :param outputs: the scalar potential on grid (not used)
+        :return: the forcing on the grid.
+        """
+        return -2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
+
+
+class IdentityInputs(ForcingCallable):
+
+    def callable(self, inputs, outputs):
+        """Simple boundary that uses boundary input params directly (just pass them through)."""
+        return inputs
+
+
+class ConstantInitialize(InitializeCallable):
+    const: ArrayLike = 0.0
+
+    def callable(self, coords: Coordinates) -> ArrayLike:
+        return self.const * jnp.ones_like(coords[0])
+    
+
+_forcing_registry = {
+    "gaussian": GaussianForcing,
+    "nonlinear": NonlinearConductivity,
+    "sinusoid": SinusoidForcing,
+    "constant": ConstantForcing,
+    "identity": IdentityInputs
+}
+_initialize_registry = {
+    "constant": ConstantInitialize
+}
+
+type PoissonForcing = Annotated[ForcingCallable, BeforeValidator(functools.partial(from_registry, _forcing_registry))]
+type PoissonInitialize = Annotated[InitializeCallable, 
+                                   BeforeValidator(functools.partial(from_registry, _initialize_registry))]
 
 
 class PoissonConfig(DictModel):
@@ -172,7 +195,7 @@ class PoissonConfig(DictModel):
     grid: UniformGrid
     solver: IterativeSolver = Field(default_factory=lambda: dict(name='Newton', opts={'rtol': 1e-2, 'atol': 1e-4}),
                                     validate_default=True)
-    initial_guess: InitialCallable = Field(default_factory=lambda: const_initial_guess(0.0), exclude=True)
+    initial_guess: PoissonInitialize = Field(default_factory=ConstantInitialize)
     options: dict[str, Any] = Field(default_factory=dict)
     max_steps: PositiveInt = 100
     adjoint: AdjointMethod = Field(default_factory=lambda: dict(name='ImplicitAdjoint'), validate_default=True)
@@ -200,175 +223,29 @@ class Poisson2D(ImplicitModel, Sampleable):
     field_name: str = "phi"
     residual_name: str = "phi_residual"
 
-    # Optional/default (and optionally variable online)
-    forcing: ForcingCallable = constant_forcing
-    conductivity: ForcingCallable = constant_forcing
-    boundary: BoundaryCallable = boundary_pass_through
+    forcing: PoissonForcing = Field(default_factory=ConstantForcing)
+    conductivity: PoissonForcing = Field(default_factory=lambda: ConstantForcing(inputs_default=dict(const=1.0)))
+    boundary: PoissonForcing = Field(default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2)))
 
-    forcing_opts: dict[str, Any] = Field(default_factory=dict)
-    conductivity_opts: dict[str, Any] = Field(default_factory=dict)
-    boundary_opts: dict[str, Any] = Field(default_factory=dict)
-
-    forcing_sampler: SamplerCallable | None = None
-    conductivity_sampler: SamplerCallable | None = None
-    boundary_sampler: SamplerCallable | None = None
-    outputs_sampler: SamplerCallable | None = None
-
-    forcing_sampler_opts: dict[str, Any] = Field(default_factory=dict)
-    conductivity_sampler_opts: dict[str, Any] = Field(default_factory=dict)
-    boundary_sampler_opts: dict[str, Any] = Field(default_factory=dict)
-    outputs_sampler_opts: dict[str, Any] = Field(default_factory=dict)
-
-    forcing_defaults: DictModel = Field(
-        default_factory=lambda: ConstantForcingInputs(const=0.0),
-        description="Default inputs for the forcing function (any PyTree).",
-    )
-    conductivity_defaults: DictModel = Field(
-        default_factory=lambda: ConstantForcingInputs(const=1.0),
-        description="Default inputs for the conductivity function (any PyTree).",
-    )
-    boundary_defaults: DictModel = Field(
-        default_factory=lambda: homogeneous_boundary(ndim=2),
-        description="Default inputs for the boundary condition (any PyTree).",
-    )
+    inputs_sampler: RomjaxSampler | None = None
+    outputs_sampler: RomjaxSampler | None = None
     
-    @field_validator("forcing", "conductivity", mode="before")
-    @classmethod
-    def _coerce_forcing(cls, value: ForcingCallable | ForcingName, info: ValidationInfo) -> ForcingCallable:
-        if isinstance(value, str):
-            mapping: Mapping[ForcingName, ForcingCallable] = {
-                "gaussian": gaussian_forcing,
-                "nonlinear": nonlinear_conductivity,
-                "constant": constant_forcing,
-                "sinusoid": sinusoid_forcing,
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown forcing function: {value!r}")
-            return mapping[value]
-        if callable(value):
-            return value
-        raise TypeError("forcing and conductivity must be a callable or a supported string literal.")
-
-    @field_validator("forcing_sampler", "conductivity_sampler", "boundary_sampler", mode="before")
-    @classmethod
-    def _coerce_sampler(cls, value: SamplerCallable | InputSamplerName | None) -> SamplerCallable | None:
-        if isinstance(value, str):
-            mapping: Mapping[InputSamplerName, SamplerCallable] = {
-                "parametric": parametric_sampler
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown sampler: {value!r}")
-            return mapping[value]
-        if value is None:
-            return value
-        if callable(value):
-            return value
-        raise TypeError("samplers must be either a valid name, callable, or none.")
-
-    @field_validator("outputs_sampler", mode="before")
-    @classmethod
-    def _coerce_outputs_sampler(cls, value: SamplerCallable | OutputSamplerName | None) -> SamplerCallable | None:
-        if isinstance(value, str):
-            mapping: Mapping[OutputSamplerName, SamplerCallable] = {
-                "near_solution": near_solution_sampler,
-            }
-            if value not in mapping:
-                raise ValueError(f"Unknown sampler: {value!r}")
-            return mapping[value]
-        if value is None:
-            return value
-        if callable(value):
-            return value
-        raise TypeError("samplers must be either a valid name, callable, or none.")
-    
-    @field_validator("forcing_sampler_opts", "conductivity_sampler_opts", 
-                     "boundary_sampler_opts", "outputs_sampler_opts", mode="after")
-    @classmethod
-    def _coerce_sampler_opts(
-        cls,
-        value: dict[str, Any],
-        info: ValidationInfo,
-    ) -> dict[str, Any]:
-        """Just provides validation for known sampler function params."""
-        check_flag = False
-        for s in ['forcing', 'conductivity', 'boundary', 'outputs']:
-            s_flag = info.field_name == f"{s}_sampler_opts" and info.data[f"{s}_sampler"] is parametric_sampler
-            check_flag = check_flag or s_flag
-
-        # Validate distributions for parametric sampling
-        if check_flag:
-            for k in list(value.keys()):
-                if not isinstance(value[k], Mapping):
-                    raise TypeError("Extra parametric sampler opts must be a Distribution-like mapping.")
-                value[k] = Distribution(**value[k])
-
-        if info.field_name == "outputs_sampler_opts" and info.data["outputs_sampler"] is near_solution_sampler:
-            if not isinstance(value, Mapping):
-                raise TypeError("Near-solution sampler opts must be provided as a mapping.")
-            kwargs = dict(value)
-            scale = kwargs.pop("scale", None)
-            noise = kwargs.pop("noise", None)
-
-            validated_noise = validate_distribution_pytree(noise) if noise is not None else None
-            validated_kwargs = validate_distribution_pytree(kwargs) if kwargs else {}
-
-            if validated_noise is not None:
-                validated_kwargs["noise"] = validated_noise
-            if scale is not None:
-                validated_kwargs["scale"] = scale
-            return validated_kwargs
-
-        return value
-    
-    @field_validator("forcing_defaults", "conductivity_defaults", mode="before")
-    @classmethod
-    def _coerce_defaults(cls, value: object, info: ValidationInfo) -> DictModel:
-        """Just provides default values for known forcing functions params."""
-        if info.field_name == 'forcing_defaults':
-            if info.data['forcing'] is gaussian_forcing:
-                return GaussianForcingInputs(**value)
-            if info.data['forcing'] is constant_forcing:
-                return ConstantForcingInputs(**value)
-            if info.data['forcing'] is sinusoid_forcing:
-                return SinusoidForcingInputs(**value)
-        
-        if info.field_name == 'conductivity_defaults':
-            if info.data['conductivity'] is nonlinear_conductivity:
-                return NonlinearConductivityInputs(**value)
-            if info.data['conductivity'] is constant_forcing:
-                return ConstantForcingInputs(**value)
-            
-        return value
-    
-    def _merge_inputs(self, inputs: PoissonInputs) -> PoissonInputs:
-        """Merge incoming inputs with default values and coords. Also converts all to pytrees for jax.
-        Arrays are just moved around by reference, so computational graph is not broken.
-        """
-        def _merge_defaults(defaults: DictModel, *overrides: PyTree | None) -> dict:
-            merged = to_pytree(defaults)
-            for override in overrides:
-                if override is None:
-                    continue
-                merged = pytree_merge(merged, to_pytree(override))
-            return merged
-        
+    def _merge_coords(self, inputs: PoissonInputs) -> PoissonInputs:
+        """Merge grid coords into incoming inputs."""
+        inputs = to_pytree(inputs)
         coords = {'coords': self.config['grid']['coords']}
-        forcing_inputs = _merge_defaults(self.forcing_defaults, coords, inputs.get("forcing"))
-        conductivity_inputs = _merge_defaults(self.conductivity_defaults, coords, inputs.get("conductivity"))
-        boundary_inputs = self.boundary(_merge_defaults(self.boundary_defaults, coords, inputs.get("boundary")),
-                                        **self.boundary_opts)
-        # boundary is assumed constant, so compute once up front (if applicable)
-
-        return {'forcing': forcing_inputs, 'conductivity': conductivity_inputs, 'boundary': boundary_inputs}
+        for k in inputs:
+            inputs[k].update(coords)
+        
+        return inputs
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
         phi = jnp.asarray(outputs[self.field_name])
         dx, dy = self.config['grid']['spacing']
-        forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs, **self.forcing_opts))
-        conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs, **self.conductivity_opts), 
-                                        phi.shape)
-        xbds, ybds = inputs['boundary']['boundary']  # constant
+        forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
+        conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs), phi.shape)
+        xbds, ybds = self.boundary(inputs['boundary'], outputs)['boundary']
 
         def _ghost_for_side(
             spec: BoundarySpec,
@@ -434,14 +311,14 @@ class Poisson2D(ImplicitModel, Sampleable):
         :param outputs: the scalar potential on a 2D grid
         :return: the scalar residual on the 2D grid
         """
-        return self._compute_residual(self._merge_inputs(inputs), outputs)
+        return self._compute_residual(self._merge_coords(inputs), outputs)
 
     def solve(
-            self, 
-            inputs: PoissonInputs | None = None, 
-            residuals: PoissonResiduals | None = None,
-            return_sol: bool = False
-        ) -> PoissonOutputs | optx.Solution:
+        self, 
+        inputs: PoissonInputs | None = None, 
+        residuals: PoissonResiduals | None = None,
+        return_sol: bool = False
+    ) -> PoissonOutputs | optx.Solution:
         """Solve the Poisson equation for a target residual.
         
         :param inputs: params for forcing, conductivity, and boundary conditions (use defaults if None)
@@ -455,8 +332,7 @@ class Poisson2D(ImplicitModel, Sampleable):
             target = jnp.asarray(residuals[self.residual_name])
         else:
             target = jnp.zeros_like(self.config.grid.coords[0])
-        merged_inputs = self._merge_inputs(inputs)
-        args = {'inputs': merged_inputs, 'target': target}
+        args = {'inputs': self._merge_coords(inputs), 'target': target}
 
         def residual_fn(phi: ArrayLike, args: PyTree) -> ArrayLike:
             residual = self._compute_residual(args['inputs'], {self.field_name: phi})
@@ -478,24 +354,16 @@ class Poisson2D(ImplicitModel, Sampleable):
     
     def sample_inputs(self, key: Key) -> PoissonInputs:
         """Produce one sample of inputs for the given key."""
-        sample = {}
-        forcing_key, conductivity_key, boundary_key = jax.random.split(key, 3)
-
-        if self.forcing_sampler is not None:
-            sample['forcing'] = self.forcing_sampler(forcing_key, **self.forcing_sampler_opts)
-        if self.conductivity_sampler is not None:
-            sample['conductivity'] = self.conductivity_sampler(conductivity_key, **self.conductivity_sampler_opts)
-        if self.boundary_sampler is not None:
-            sample['boundary'] = self.boundary_sampler(boundary_key, **self.boundary_sampler_opts)
-        
-        return sample
+        if self.inputs_sampler is not None:
+            return self.inputs_sampler(key)
+        return {}
     
     def sample_outputs(
-            self, 
-            key: Key, 
-            inputs: PoissonInputs | None = None, 
-            solution: PoissonOutputs | None = None
-        ) -> PoissonOutputs:
+        self, 
+        key: Key, 
+        inputs: PoissonInputs | None = None, 
+        solution: PoissonOutputs | None = None
+    ) -> PoissonOutputs:
         """
         Produce one sample of outputs for the given key.
         
@@ -507,12 +375,10 @@ class Poisson2D(ImplicitModel, Sampleable):
         if self.outputs_sampler is None:
             return {}
 
-        sampler_solution = solution
-        sampler_opts = dict(self.outputs_sampler_opts)
-        if self.outputs_sampler is near_solution_sampler and sampler_solution is None:
-            sampler_solution = self.solve(inputs)
+        if solution is None:
+            solution = self.solve(inputs)
 
-        sample = self.outputs_sampler(key, inputs=inputs, solution=sampler_solution, **sampler_opts)
+        sample = self.outputs_sampler(key, inputs=inputs, solution=solution)
         if isinstance(sample, Mapping):
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}

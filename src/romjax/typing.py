@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from inspect import Parameter, signature
 from pathlib import Path
-from typing import Annotated, Any, Iterator, Mapping, MutableMapping, Protocol, get_args
+from typing import Annotated, Any, Iterator, Mapping, MutableMapping, Protocol, get_args, Callable, TypeVar
 from weakref import WeakKeyDictionary
 
 import lineax as lx
@@ -21,9 +21,12 @@ from pydantic import (
 )
 from pydantic_core import core_schema
 
-__all__ = ['DictModel', 'ListModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod',
-           'romjax_from_file', 'Routine', 'RoutineError']
 
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod',
+           'romjax_from_file', 'Routine', 'RoutineError', 'from_registry']
+
+
+T = TypeVar("T")
 
 def romjax_from_file(value: str | Path | bytes | Any) -> Any:
     """Try to load a romjax object from config file. Useful as a pydantic validator."""
@@ -31,6 +34,20 @@ def romjax_from_file(value: str | Path | bytes | Any) -> Any:
         import romjax
         return romjax.load(value)
     return value
+
+
+def from_registry(registry: dict[str, T], key: str | Any) -> T:
+    """Try to load an object by key from a registry. Useful as a pydantic before validator."""
+    if not isinstance(key, str):
+        return key
+    
+    if key not in registry:
+        raise KeyError(f"Option '{key}' not found in registry: {list(registry.keys())}")
+
+    if isinstance(registry[key], type):
+        return registry[key]()
+    
+    return registry[key]
 
 
 class Routine(BaseModel, ABC):
@@ -45,7 +62,45 @@ class Routine(BaseModel, ABC):
 
 class RoutineError(RuntimeError):
     """Raised when routines encounter invalid local state."""
+    pass
     
+
+class CallableModel(BaseModel):
+    """
+    Parent class for a pydantic callable. Allows configuration of a callable and kwargs via extra pydantic fields.
+    
+    When calling a child class, the flow will go `child(*args)->super(**extra)->child.callable(*args, **extra)`,
+    effectively storing kwargs via pydantic extra fields at creation, then using them at runtime.
+
+    The intended use case is to allow configuring a whole function f(**kwargs) in a single object, and then still have
+    the usual call syntax f() at runtime. Can think of this as a validated callable pydantic model.
+    """
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, 
+        validate_assignment=True, 
+        validate_default=True,
+        extra="allow"
+    )
+
+    callable: Callable
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_callable(cls, value):
+        if callable(value):
+            return {"callable": value}
+        return value
+    
+    @property
+    def opts(self):
+        return self.model_extra
+    
+    def __call__(self, *args, **kwargs):
+        opts = dict(self.opts)
+        opts.update(kwargs)
+        return self.callable(*args, **opts)
+
 
 class DictModel(BaseModel, MutableMapping):
     """Allow dict-like access of pydantic models."""

@@ -8,6 +8,7 @@ __version__ = "0.0.1"
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
+from functools import partial as _partial
 from importlib import import_module as _import_module
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
@@ -37,12 +38,17 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "Sampleable": ("romjax.model", "Sampleable"),
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
-    "train": ("romjax.optim", "train"),
     "gridplot": ("romjax.plotting", "gridplot"),
     "Poisson2D": ("romjax.poisson", "Poisson2D"),
     "gen_keys": ("romjax.rng", "gen_keys"),
+    "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
+    "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
+    "get_unary_operator": ("romjax.tree", "get_unary_operator"),
+    "get_error_operator": ("romjax.tree", "get_error_operator"),
+    "get_tree_operator": ("romjax.tree", "get_tree_operator"),
     "DictModel": ("romjax.typing", "DictModel"),
     "ListModel": ("romjax.typing", "ListModel"),
+    "CallableModel": ("romjax.typing", "CallableModel"),
     "Routine": ("romjax.typing", "Routine"),
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
@@ -80,19 +86,21 @@ class ConfigLoader(_ABC):
 
 class YamlLoader(ConfigLoader):
     """YAML configs. 
-    
-    **romjax objects**
-    - Represent pydantic classes with `!romx:Path.To.SubClass`. Must be subclass of BaseModel
-    - Represent any root-level builtin `romjax` object with just `!romx:SomeObject`
+
+    - Represent pydantic classes with `!pd:Path.To.SubClass`. Must be subclass of BaseModel.
+    - Represent any root-level builtin `romjax` object with `!romx:SomeObject`
     - Supports basic Pydantic model_dump() to dictionary.
     - Supports !!python/name tag for functions and other importable names
     """
-    TAG = "!romx:"
+    PYDANTIC_TAG = "!pd:"
+    ROMX_TAG = "!romx:"
 
     @classmethod
     def get_tag(cls, data: _Any) -> str:
         t = type(data)
-        return f"{cls.TAG}{t.__module__}.{t.__name__}"
+        import romjax
+        tag = cls.ROMX_TAG if hasattr(romjax, t.__name__) else cls.PYDANTIC_TAG
+        return f"{tag}{t.__module__}.{t.__name__}"
 
     @classmethod
     def get_loader(cls) -> _Type[_yaml.SafeLoader]:
@@ -119,16 +127,17 @@ class YamlLoader(ConfigLoader):
             value = loader.construct_scalar(node)
             return _construct_python_name_multi(loader, value, node)
 
-        def _construct_base_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _BaseModel:
+        def _construct_base_model(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node,
+                                  default_module: str = "__main__") -> _BaseModel:
             """Essentially just a convenience to automatically construct Pydantic models when loading."""
             if not tag_suffix:
                 raise ValueError("Missing class path in YAML tag.")
             module_name, _, class_name = tag_suffix.rpartition(".")
             
             if module_name == '':
-                module_name = "romjax"  # Try to load from root by default
+                module_name = default_module  # Try to load from a default module
             if not module_name or not class_name:
-                raise ValueError(f"Invalid romjax tag: {tag_suffix!r}")
+                raise ValueError(f"Invalid pydantic tag suffix: {tag_suffix!r}")
             
             module = _import_module(module_name)
             cls_obj = getattr(module, class_name, None)
@@ -155,7 +164,8 @@ class YamlLoader(ConfigLoader):
 
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
-        _Loader.add_multi_constructor(cls.TAG, _construct_base_model)
+        _Loader.add_multi_constructor(cls.PYDANTIC_TAG, _construct_base_model)
+        _Loader.add_multi_constructor(cls.ROMX_TAG, _partial(_construct_base_model, default_module="romjax"))
         return _Loader
 
     @classmethod
