@@ -4,17 +4,17 @@ import os
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Generator, Iterable, Literal, Optional, Annotated
+from typing import Annotated, Any, Callable, Generator, Iterable, Literal, Optional
 
 import jax
 import jax.numpy as jnp
 import jaxtyping
 from jax.typing import ArrayLike
-from pydantic import BeforeValidator, model_validator, Field
+from pydantic import BeforeValidator, Field, model_validator
 
+from romjax.random_field import darcy, kle
 from romjax.tree import UnaryOperator, get_unary_operator, pytree_merge
 from romjax.typing import CallableModel, from_registry
-from romjax.random_field import kle, darcy
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
            'NearSolutionSampler', 'RomjaxSampler', 'gen_keys']
@@ -27,7 +27,7 @@ class SamplerCallable(CallableModel):
     """Take in a random key and return a single pytree sample. May take any kwargs."""
 
     def __call__(self, key: jaxtyping.Key, **kwargs: dict[str, Any]) -> jaxtyping.PyTree:
-        super().__call__(key, **kwargs)
+        return super().__call__(key, **kwargs)
 
 
 def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs) -> ArrayLike:
@@ -77,12 +77,22 @@ type DistributionPyTree = Annotated[jaxtyping.PyTree, BeforeValidator(validate_d
 class PyTreeSampler(SamplerCallable):
 
     template: DistributionPyTree = Field(default_factory=dict)
-    __pydantic_extra__: DistributionPyTree = Field(init=False, default_factory=dict)
+    __pydantic_extra__: dict[str, Any] = Field(init=False, default_factory=dict)
 
     @model_validator(mode="after")
     def _merge_distributions(self):
-        self.model_extra = pytree_merge(self.model_extra, self.template)
+        validated_extra = validate_distribution_pytree(self.model_extra)
+        object.__setattr__(self, "template", pytree_merge(validated_extra, self.template))
+        object.__setattr__(self, "__pydantic_extra__", {})
         return self
+
+    def __call__(self, key: jaxtyping.Key, **kwargs: dict[str, Any]) -> jaxtyping.PyTree:
+        runtime_template = kwargs.pop("template", {})
+        if runtime_template:
+            runtime_template = validate_distribution_pytree(runtime_template)
+        template = pytree_merge(runtime_template, self.template)
+        callable_fn = type(self).model_fields["callable"].default
+        return callable_fn(self, key, **kwargs, **template)
     
     def callable(self, key: jaxtyping.Key, **template) -> jaxtyping.PyTree:
         """
@@ -98,12 +108,12 @@ class PyTreeSampler(SamplerCallable):
         return jax.tree.unflatten(treedef, samples)
 
     def sample(self, key: jaxtyping.Key):  # alias
-        super().__call__(key)
+        return self(key)
 
 
 class NearSolutionSampler(PyTreeSampler):
 
-    scale: jaxtyping.PyTree[ArrayLike | RelativeScale] = 1.0,
+    scale: jaxtyping.PyTree[ArrayLike | RelativeScale] = 1.0
 
     def _scale_noise(self, noise: jaxtyping.Pytree, solution: jaxtyping.Pytree) -> jaxtyping.Pytree:
         """Scale noise using a reference solution."""
@@ -157,7 +167,7 @@ class NearSolutionSampler(PyTreeSampler):
         if solution is None:
             raise ValueError("NearSolutionSampler requires a reference solution.")
         
-        noise = super().callable(key, **template)
+        noise = PyTreeSampler.model_fields["callable"].default(self, key, **template)
         scaled_noise = self._scale_noise(noise, solution)
         return jax.tree.map(lambda ref, delta: jnp.asarray(ref) + delta, solution, scaled_noise)
     
@@ -168,7 +178,7 @@ class NearSolutionSampler(PyTreeSampler):
         solution: jaxtyping.PyTree | None = None
     ) -> jaxtyping.PyTree:
         """Just a convenience alias."""
-        return super().__call__(key, inputs=inputs, solution=solution)
+        return self(key, inputs=inputs, solution=solution)
 
 
 _sampler_registry = {

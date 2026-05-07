@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 
@@ -8,8 +7,8 @@ import pytest
 
 from romjax import YamlLoader
 from romjax.model import ImplicitModel
-from romjax.poisson import Poisson2D
-from romjax.rng import Distribution, near_solution_sampler
+from romjax.poisson import GaussianForcing, Poisson2D
+from romjax.rng import Distribution, NearSolutionSampler
 
 
 def example_forcing(inputs: dict, outputs: dict):
@@ -45,10 +44,8 @@ def _assert_round_trip(data: dict) -> None:
     assert dumped is not None
     reloaded = YamlLoader.load(dumped)
     assert type(reloaded["solver"]) is type(data["solver"])
-
-    orig_solver = data["solver"]
-    new_solver = reloaded["solver"]
-    assert orig_solver.model_dump() == new_solver.model_dump()
+    redumped = YamlLoader.dump(reloaded)
+    assert redumped == dumped
 
 
 def test_basic_model_load_and_dump(tmp_path: Path) -> None:
@@ -71,12 +68,12 @@ def test_basic_model_load_and_dump(tmp_path: Path) -> None:
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
-    assert "!romx:tests.test_loader.CustomModel" in dumped
+    assert "!pd:tests.test_loader.CustomModel" in dumped
     _assert_round_trip(data)
 
     sio = StringIO()
     assert YamlLoader.dump(data, sio) is None
-    assert "!romx:tests.test_loader.CustomModel" in sio.getvalue()
+    assert "!pd:tests.test_loader.CustomModel" in sio.getvalue()
 
     out_path = tmp_path / "out.yml"
     assert YamlLoader.dump(data, out_path) is None
@@ -88,20 +85,23 @@ def test_poisson_model_load_and_dump() -> None:
     data = YamlLoader.load(fixture_path)
     solver = data["solver"]
     assert isinstance(solver, Poisson2D)
-    assert isinstance(solver.forcing, Callable)
+    assert isinstance(solver.forcing, GaussianForcing)
     assert solver.config.grid.shape == (8, 8)
+    assert solver.forcing.inputs_default["A0"] == 0.5
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
     assert "!romx:romjax.poisson.Poisson2D" in dumped
-    assert "!!python/name" in dumped
     _assert_round_trip(data)
 
 
 def test_custom_model_load_and_dump() -> None:
     yaml_text_colon = (
         "solver: !romx:romjax.poisson.Poisson2D\n"
-        "  forcing: !!python/name:tests.test_loader.example_forcing\n"
+        "  forcing:\n"
+        "    callable: !!python/name:tests.test_loader.example_forcing\n"
+        "    inputs_default:\n"
+        "      value: 4\n"
         "  config:\n"
         "    grid:\n"
         "      shape: [2, 4]\n"
@@ -109,12 +109,16 @@ def test_custom_model_load_and_dump() -> None:
     )
     data_colon = YamlLoader.load(yaml_text_colon)
     assert isinstance(data_colon["solver"], Poisson2D)
-    assert data_colon["solver"].forcing is example_forcing
+    assert data_colon["solver"].forcing.callable is example_forcing
+    assert data_colon["solver"].forcing({"value": 5}, {"phi": 0}) == 5
     _assert_round_trip(data_colon)
 
     yaml_text_space = (
         "solver: !romx:romjax.poisson.Poisson2D\n"
-        "  forcing: !!python/name tests.test_loader.example_forcing\n"
+        "  forcing:\n"
+        "    callable: !!python/name tests.test_loader.example_forcing\n"
+        "    inputs_default:\n"
+        "      value: 2\n"
         "  config:\n"
         "    grid:\n"
         "      shape: [2, 4]\n"
@@ -122,17 +126,41 @@ def test_custom_model_load_and_dump() -> None:
     )
     data_space = YamlLoader.load(yaml_text_space)
     assert isinstance(data_space["solver"], Poisson2D)
-    assert data_space["solver"].forcing is example_forcing
+    assert data_space["solver"].forcing.callable is example_forcing
+    assert data_space["solver"].forcing({}, {"phi": 0}) == 2
     _assert_round_trip(data_space)
+
+
+def test_poisson_registered_callable_inline_load_and_dump() -> None:
+    yaml_text = (
+        "solver: !romx:romjax.poisson.Poisson2D\n"
+        "  forcing:\n"
+        "    callable: gaussian\n"
+        "    inputs_default:\n"
+        "      A0: 0.75\n"
+        "      sigma: 0.2\n"
+        "  config:\n"
+        "    grid:\n"
+        "      shape: [2, 4]\n"
+        "      bounds: [[0, 1], [0, 1]]\n"
+    )
+    data = YamlLoader.load(yaml_text)
+    solver = data["solver"]
+
+    assert isinstance(solver, Poisson2D)
+    assert isinstance(solver.forcing, GaussianForcing)
+    assert solver.forcing.inputs_default["A0"] == 0.75
+    assert solver.forcing.inputs_default["sigma"] == 0.2
+    _assert_round_trip(data)
 
 
 def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     yaml_text = (
         "solver: !romx:romjax.poisson.Poisson2D\n"
-        "  outputs_sampler: near_solution\n"
-        "  outputs_sampler_opts:\n"
+        "  outputs_sampler:\n"
+        "    callable: near_solution\n"
         "    phi:\n"
-        "      distribution: normal\n"
+        "      callable: normal\n"
         "      std: 0.1\n"
         "      shape: [4, 4]\n"
         "  config:\n"
@@ -144,8 +172,8 @@ def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     solver = data["solver"]
 
     assert isinstance(solver, Poisson2D)
-    assert solver.outputs_sampler is near_solution_sampler
-    assert isinstance(solver.outputs_sampler_opts["phi"], Distribution)
+    assert isinstance(solver.outputs_sampler, NearSolutionSampler)
+    assert isinstance(solver.outputs_sampler.template["phi"], Distribution)
     _assert_round_trip(data)
 
 

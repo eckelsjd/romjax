@@ -3,10 +3,10 @@ from enum import IntEnum
 
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, PyTree
-from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator, field_serializer
+from pydantic import Field, PositiveFloat, PositiveInt, field_serializer, field_validator, model_validator
 
-from romjax.typing import DictModel, CallableModel
 from romjax.tree import pytree_merge
+from romjax.typing import CallableModel, DictModel
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'InitializeCallable', 'ForcingCallable']
@@ -23,8 +23,11 @@ class InitializeCallable(CallableModel):
 
 class ForcingCallable(CallableModel):
 
-    class Inputs(DictModel): pass
-    class Outputs(DictModel): pass
+    class Inputs(DictModel):
+        pass
+
+    class Outputs(DictModel):
+        pass
 
     inputs_default: DictModel = Field(default_factory=dict)
     outputs_default: DictModel = Field(default_factory=dict)
@@ -37,7 +40,7 @@ class ForcingCallable(CallableModel):
         return schema.model_validate(value)
     
     @field_serializer("inputs_default", "outputs_default")
-    def _dump_defaults(cls, value):
+    def _dump_defaults(self, value):
         return value.model_dump()
 
     def __call__(self, inputs: PyTree, outputs: PyTree) -> ArrayLike:

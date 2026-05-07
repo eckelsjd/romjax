@@ -1,28 +1,27 @@
 """Example 2D Poisson solver."""
-from collections.abc import Mapping
-from typing import Any, Callable, Literal, TypedDict, Annotated
 import functools
+from collections.abc import Mapping
+from typing import Annotated, Any, Callable, Literal, TypedDict
 
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import ConfigDict, Field, PositiveInt, field_validator, BeforeValidator
+from pydantic import BeforeValidator, ConfigDict, Field, PositiveInt, field_validator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
 from romjax.pde import (
-    BoundarySpec, 
-    BoundaryType, 
-    Coordinates, 
-    UniformGrid, 
-    homogeneous_boundary, 
+    BoundarySpec,
+    BoundaryType,
+    Coordinates,
     ForcingCallable,
     InitializeCallable,
+    UniformGrid,
+    homogeneous_boundary,
 )
 from romjax.rng import RomjaxSampler
 from romjax.tree import to_pytree
 from romjax.typing import AdjointMethod, DictModel, IterativeSolver, from_registry
-
 
 __all__ = ["Poisson2D"]
 
@@ -225,7 +224,9 @@ class Poisson2D(ImplicitModel, Sampleable):
 
     forcing: PoissonForcing = Field(default_factory=ConstantForcing)
     conductivity: PoissonForcing = Field(default_factory=lambda: ConstantForcing(inputs_default=dict(const=1.0)))
-    boundary: PoissonForcing = Field(default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2)))
+    boundary: PoissonForcing = Field(
+        default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2))
+    )
 
     inputs_sampler: RomjaxSampler | None = None
     outputs_sampler: RomjaxSampler | None = None
@@ -233,6 +234,8 @@ class Poisson2D(ImplicitModel, Sampleable):
     def _merge_coords(self, inputs: PoissonInputs) -> PoissonInputs:
         """Merge grid coords into incoming inputs."""
         inputs = to_pytree(inputs)
+        for name in ("forcing", "conductivity", "boundary"):
+            inputs.setdefault(name, {})
         coords = {'coords': self.config['grid']['coords']}
         for k in inputs:
             inputs[k].update(coords)

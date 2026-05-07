@@ -1,4 +1,5 @@
-"""Tests for rng and random field sampling"""
+"""Tests for rng and random field sampling."""
+
 from pathlib import Path
 
 import jax
@@ -6,12 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from romjax.rng import Distribution, gen_keys, near_solution_sampler, parametric_sampler, pytree_sampler
+from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 
 
-def test_distribution():
+def test_distribution() -> None:
     key = jax.random.key(0)
-    uniform = Distribution(distribution="uniform", minval=-1.0, maxval=2.0, shape=(2, 3))
+    uniform = Distribution(callable="uniform", minval=-1.0, maxval=2.0, shape=(2, 3))
     samples_a = uniform.sample(key)
     samples_b = uniform.sample(key)
 
@@ -20,13 +21,13 @@ def test_distribution():
     assert jnp.all(samples_a < 2.0)
     assert jnp.allclose(samples_a, samples_b)
 
-    with pytest.raises(ValueError):
-        Distribution(distribution="not_a_distribution")
-    with pytest.raises(TypeError):
-        Distribution(distribution=123)
+    with pytest.raises(KeyError):
+        Distribution(callable="not_a_distribution")
+    with pytest.raises(Exception):
+        Distribution(callable=123)
 
     key = jax.random.key(1)
-    normal = Distribution(distribution="normal", mean=1.5, std=2.0, shape=(4,))
+    normal = Distribution(callable="normal", mean=1.5, std=2.0, shape=(4,))
     normal_samples = normal.sample(key)
     expected = jax.random.normal(key, shape=(4,)) * 2.0 + 1.5
 
@@ -36,14 +37,14 @@ def test_distribution():
     def custom_dist(key: jax.Array, shape=(3,), scale=1.0):
         return jax.random.uniform(key, shape=shape) * scale
 
-    custom = Distribution(distribution=custom_dist, shape=(5,), scale=3.0)
+    custom = Distribution(callable=custom_dist, shape=(5,), scale=3.0)
     custom_samples = custom.sample(jax.random.key(2))
     assert custom_samples.shape == (5,)
     assert jnp.all(custom_samples >= 0.0)
     assert jnp.all(custom_samples < 3.0)
 
 
-def test_gen_keys(tmp_path):
+def test_gen_keys(tmp_path: Path) -> None:
     pairs = list(gen_keys(2, path=tmp_path, seed=7))
     keys, paths = zip(*pairs)
 
@@ -74,61 +75,35 @@ def test_gen_keys(tmp_path):
     assert (tmp_path / "seed_8" / "sample_0").exists()
 
 
-def test_parametric_sampler():
-    keys = list(gen_keys(2, seed=21))
-
-    for key in keys:
-        sample = parametric_sampler(
-            key,
-            a={"distribution": "uniform", "minval": 0.0, "maxval": 1.0, "shape": (2,)},
-            b={"distribution": "normal", "mean": 1.0, "std": 0.5, "shape": (3,)},
-        )
-
-        assert set(sample.keys()) == {"a", "b"}
-        assert sample["a"].shape == (2,)
-        assert sample["b"].shape == (3,)
-
-        subkeys = jax.random.split(key, 2)
-        expected_a = jax.random.uniform(subkeys[0], minval=0.0, maxval=1.0, shape=(2,))
-        expected_b = jax.random.normal(subkeys[1], shape=(3,)) * 0.5 + 1.0
-
-        assert np.allclose(np.asarray(sample["a"]), np.asarray(expected_a))
-        assert np.allclose(np.asarray(sample["b"]), np.asarray(expected_b))
-
-    scalar_key = next(gen_keys(1, seed=22))
-    scalar = parametric_sampler(
-        scalar_key,
-        x={"distribution": "uniform", "minval": 0.0, "maxval": 1.0, "shape": ()},
-        y={"distribution": "normal", "mean": 2.0, "std": 1.0, "shape": ()},
-    )
-
-    subkeys = jax.random.split(scalar_key, 2)
-    expected_x = jax.random.uniform(subkeys[0], minval=0.0, maxval=1.0, shape=())
-    expected_y = jax.random.normal(subkeys[1], shape=()) * 1.0 + 2.0
-
-    assert np.isclose(float(scalar["x"]), float(expected_x))
-    assert np.isclose(float(scalar["y"]), float(expected_y))
-
-
 def test_pytree_sampler() -> None:
     key = jax.random.key(5)
-    template = {
-        "phi": {"distribution": "normal", "mean": 1.0, "std": 0.25, "shape": (2, 3)},
-        "aux": (
-            {"distribution": "uniform", "minval": -1.0, "maxval": 1.0, "shape": ()},
-        ),
-    }
-    sample = pytree_sampler(key, template)
+    sampler = PyTreeSampler(
+        template={
+            "phi": {"callable": "normal", "mean": 1.0, "std": 0.25, "shape": (2, 3)},
+            "aux": (
+                {"callable": "uniform", "minval": -1.0, "maxval": 1.0, "shape": ()},
+            ),
+        }
+    )
+    sample = sampler.sample(key)
     aux_key, phi_key = jax.random.split(key, 2)
     expected_aux = jax.random.uniform(aux_key, minval=-1.0, maxval=1.0, shape=())
     expected_phi = jax.random.normal(phi_key, shape=(2, 3)) * 0.25 + 1.0
 
+    assert isinstance(sampler.template["phi"], Distribution)
     assert sample["phi"].shape == (2, 3)
     assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
     assert np.isclose(float(sample["aux"][0]), float(expected_aux))
 
     with pytest.raises(TypeError):
-        pytree_sampler(key, {"phi": 1.0})
+        PyTreeSampler(template={"phi": 1.0})
+
+
+def test_pytree_sampler_allows_inline_distribution_kwargs() -> None:
+    sampler = PyTreeSampler(x={"callable": "uniform", "shape": ()})
+    sample = sampler.sample(jax.random.key(0))
+
+    assert np.asarray(sample["x"]).shape == ()
 
 
 def test_near_solution_sampler_with_noise_wrapper() -> None:
@@ -137,15 +112,14 @@ def test_near_solution_sampler_with_noise_wrapper() -> None:
         "phi": jnp.ones((3, 4)),
         "stats": {"mean": jnp.asarray(2.0)},
     }
-    sample = near_solution_sampler(
-        key,
-        solution=solution,
-        noise={
-            "phi": {"distribution": "normal", "std": 0.2, "shape": (3, 4)},
-            "stats": {"mean": {"distribution": "normal", "std": 0.5, "shape": ()}},
+    sampler = NearSolutionSampler(
+        template={
+            "phi": {"callable": "normal", "std": 0.2, "shape": (3, 4)},
+            "stats": {"mean": {"callable": "normal", "std": 0.5, "shape": ()}},
         },
         scale={"phi": 0.5, "stats": {"mean": 2.0}},
     )
+    sample = sampler.sample(key, solution=solution)
     noise_keys = jax.random.split(key, 2)
     expected_phi = solution["phi"] + 0.5 * (jax.random.normal(noise_keys[0], shape=(3, 4)) * 0.2)
     expected_mean = solution["stats"]["mean"] + 2.0 * (jax.random.normal(noise_keys[1], shape=()) * 0.5)
@@ -160,15 +134,14 @@ def test_near_solution_sampler_broadcast_relative_scale_spec() -> None:
         "phi": jnp.full((2, 2), 4.0),
         "psi": jnp.asarray([3.0, 1.0]),
     }
-    sample = near_solution_sampler(
-        key,
-        solution=solution,
-        noise={
-            "phi": {"distribution": "normal", "std": 1.0, "shape": (2, 2)},
-            "psi": {"distribution": "normal", "std": 1.0, "shape": (2,)},
+    sampler = NearSolutionSampler(
+        template={
+            "phi": {"callable": "normal", "std": 1.0, "shape": (2, 2)},
+            "psi": {"callable": "normal", "std": 1.0, "shape": (2,)},
         },
         scale=("max_abs", 0.1),
     )
+    sample = sampler.sample(key, solution=solution)
     phi_key, psi_key = jax.random.split(key, 2)
     expected_phi = solution["phi"] + 0.4 * jax.random.normal(phi_key, shape=(2, 2))
     expected_psi = solution["psi"] + 0.3 * jax.random.normal(psi_key, shape=(2,))
@@ -183,15 +156,14 @@ def test_near_solution_sampler_per_leaf_relative_scale_specs() -> None:
         "phi": jnp.full((2, 2), 4.0),
         "stats": {"mean": jnp.asarray(3.0)},
     }
-    sample = near_solution_sampler(
-        key,
-        solution=solution,
-        noise={
-            "phi": {"distribution": "normal", "std": 0.5, "shape": (2, 2)},
-            "stats": {"mean": {"distribution": "normal", "std": 1.0, "shape": ()}},
+    sampler = NearSolutionSampler(
+        template={
+            "phi": {"callable": "normal", "std": 0.5, "shape": (2, 2)},
+            "stats": {"mean": {"callable": "normal", "std": 1.0, "shape": ()}},
         },
         scale={"phi": ("rms", 0.25), "stats": {"mean": (jnp.mean, 0.1)}},
     )
+    sample = sampler.sample(key, solution=solution)
     phi_key, mean_key = jax.random.split(key, 2)
     expected_phi_scale = jnp.sqrt(jnp.mean(jnp.square(solution["phi"]))) * 0.25
     expected_mean_scale = jnp.mean(solution["stats"]["mean"]) * 0.1

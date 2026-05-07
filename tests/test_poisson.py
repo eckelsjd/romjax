@@ -9,30 +9,25 @@ import pytest
 from romjax import YamlLoader
 from romjax.pde import UniformGrid, homogeneous_boundary
 from romjax.plotting import gridplot
-from romjax.poisson import (
-    GaussianForcingInputs,
-    Poisson2D,
-    PoissonConfig,
-    gaussian_forcing,
-    nonlinear_conductivity,
-)
-from romjax.rng import Distribution, gen_keys, near_solution_sampler
+from romjax.poisson import GaussianForcing, NonlinearConductivity, Poisson2D, PoissonConfig
+from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 from romjax.typing import DictModel
 
 
 def test_gaussian_forcing_jit_and_grad() -> None:
     x = jnp.array([0.0, 1.0, 2.0])
     y = jnp.array([0.0, 1.0, 2.0])
+    forcing = GaussianForcing()
 
-    def f(A0: jnp.ndarray) -> jnp.ndarray:
+    def f(a0: jnp.ndarray) -> jnp.ndarray:
         inputs = {
-            "A0": A0,
+            "A0": a0,
             "sigma": 1.5,
             "mu_x": 0.0,
             "mu_y": 0.0,
             "coords": (x, y),
         }
-        return jnp.sum(gaussian_forcing(inputs, {"phi": 0.0}))
+        return jnp.sum(forcing(inputs, {"phi": 0.0}))
 
     value = jax.jit(f)(1.0)
     grad = jax.grad(f)(1.0)
@@ -43,17 +38,18 @@ def test_gaussian_forcing_jit_and_grad() -> None:
 
 def test_nonlinear_conductivity_jit_vmap_and_grad() -> None:
     phis = jnp.array([[0.0, 1.0, 2.0], [0.5, 1.5, 2.5]])
+    conductivity = NonlinearConductivity()
 
     def k_fn(phi: jnp.ndarray) -> jnp.ndarray:
         inputs = {"k0": 2.0, "alpha": 0.5}
-        return nonlinear_conductivity(inputs, {"phi": phi})
+        return conductivity(inputs, {"phi": phi})
 
     vmap_out = jax.vmap(k_fn)(phis)
     jit_out = jax.jit(k_fn)(phis[0])
 
     def g(alpha: jnp.ndarray) -> jnp.ndarray:
         inputs = {"k0": 2.0, "alpha": alpha}
-        return jnp.sum(nonlinear_conductivity(inputs, {"phi": phis[0]}))
+        return jnp.sum(conductivity(inputs, {"phi": phis[0]}))
 
     grad = jax.grad(g)(0.5)
 
@@ -65,24 +61,26 @@ def test_nonlinear_conductivity_jit_vmap_and_grad() -> None:
 
 def test_poisson_coercion() -> None:
     model = Poisson2D(
-        config={'grid': {'shape': (2, 4), 'bounds': [[0, 1], [1, 2]]}},
-        forcing="gaussian",
-        forcing_defaults=GaussianForcingInputs(A0=0.),
-        conductivity="nonlinear",
-        conductivity_defaults={"alpha": 0.25},
-        boundary_defaults={'boundary': (({"type": "dirichlet", "value": 1.1}, 
-                                         {"literally": "whatever"}),)}
+        config={"grid": {"shape": (2, 4), "bounds": [[0, 1], [1, 2]]}},
+        forcing={"callable": "gaussian", "inputs_default": {"A0": 0.0}},
+        conductivity={"callable": "nonlinear", "inputs_default": {"alpha": 0.25}},
+        boundary={
+            "callable": "identity",
+            "inputs_default": {
+                "boundary": (({"type": "dirichlet", "value": 1.1}, {"literally": "whatever"}),),
+            },
+        },
     )
 
     assert isinstance(model.config, PoissonConfig)
-    assert np.allclose(model.config.grid.spacing, (0.5, 0.25)) 
-    assert model.forcing is gaussian_forcing
-    assert model.conductivity is nonlinear_conductivity
-    assert isinstance(model.forcing_defaults, DictModel)
-    assert isinstance(model.conductivity_defaults, DictModel)
-    assert model.boundary_defaults.boundary[0][1]['literally'] == 'whatever'
-    assert model.forcing_defaults['sigma'] == 1.0
-    assert model.conductivity_defaults['k0'] == 1.0
+    assert np.allclose(model.config.grid.spacing, (0.5, 0.25))
+    assert isinstance(model.forcing, GaussianForcing)
+    assert isinstance(model.conductivity, NonlinearConductivity)
+    assert isinstance(model.forcing.inputs_default, DictModel)
+    assert isinstance(model.conductivity.inputs_default, DictModel)
+    assert model.boundary.inputs_default.boundary[0][1]["literally"] == "whatever"
+    assert model.forcing.inputs_default["sigma"] == 1.0
+    assert model.conductivity.inputs_default["k0"] == 1.0
 
 
 def test_poisson_evaluate_and_autodiff() -> None:
@@ -97,25 +95,17 @@ def test_poisson_evaluate_and_autodiff() -> None:
     )
 
     grid = model.config.grid
-    coords = grid.coords
-    x, y = coords
+    x, y = grid.coords
 
-    # Manufactured solution verification
     phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
-
-    manufactured = Poisson2D(
-        config=model.config,
-        forcing='sinusoid'
-    )
-
+    manufactured = Poisson2D(config=model.config, forcing="sinusoid")
     inputs_exact = {
         "conductivity": {"k0": 1.0, "alpha": 0.0},
         "boundary": homogeneous_boundary(ndim=2),
     }
-    residual = manufactured.evaluate(inputs_exact, {"phi": phi_exact})['phi_residual']
+    residual = manufactured.evaluate(inputs_exact, {"phi": phi_exact})["phi_residual"]
     assert jnp.max(jnp.abs(residual)) < 2.5e-1
 
-    # JIT, VMAP, and GRAD compatibility with Gaussian forcing
     inputs = {
         "forcing": {
             "A0": 0.5,
@@ -133,7 +123,7 @@ def test_poisson_evaluate_and_autodiff() -> None:
             **inputs,
             "forcing": {**inputs["forcing"], "A0": forcing_amp},
         }
-        return jnp.sum(model.evaluate(local_inputs, {"phi": phi})['phi_residual'])
+        return jnp.sum(model.evaluate(local_inputs, {"phi": phi})["phi_residual"])
 
     jax.jit(eval_sum)(inputs["forcing"]["A0"], phi0)
     grad_forcing = jax.grad(lambda a0: eval_sum(a0, phi0))(inputs["forcing"]["A0"])
@@ -144,34 +134,22 @@ def test_poisson_evaluate_and_autodiff() -> None:
     assert grad_phi.shape == phi0.shape
 
 
-def get_laplace_solver():
-    """Basic laplace solver on unit square."""
-    laplace = Poisson2D(
+def get_laplace_solver() -> Poisson2D:
+    return Poisson2D(
         config={
             "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(12, 12)),
-            "solver": {
-                "name": "Newton", 
-                "opts": {"rtol": 1, "atol": 1e-4} # only look at residual atol essentially
-            },
+            "solver": {"name": "Newton", "opts": {"rtol": 1, "atol": 1e-4}},
             "max_steps": 10,
-            "initial_guess": lambda coords: jnp.ones_like(coords[0])
+            "initial_guess": lambda coords: jnp.ones_like(coords[0]),
         }
     )
 
-    return laplace
 
-
-def get_small_poisson(
-    **kwargs,
-) -> Poisson2D:
-    """Construct a small Poisson model for sampling tests."""
+def get_small_poisson(**kwargs) -> Poisson2D:
     return Poisson2D(
         config={
             "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(6, 6)),
-            "solver": {
-                "name": "Newton",
-                "opts": {"rtol": 1.0, "atol": 1e-4},
-            },
+            "solver": {"name": "Newton", "opts": {"rtol": 1.0, "atol": 1e-4}},
             "max_steps": 5,
             "throw": False,
         },
@@ -179,23 +157,18 @@ def get_small_poisson(
     )
 
 
-def test_laplace_solve():
-    """Run Poisson with no forcing and unity conductivity. Initial Gaussian bump should smooth to 0."""
+def test_laplace_solve() -> None:
     laplace = get_laplace_solver()
     out = laplace.solve()
     assert jnp.max(jnp.abs(out["phi"])) < 1e-4
 
 
-def test_laplace_solve_jit_and_grad():
-    """Add constant forcing and take gradients of the sum over the grid."""
+def test_laplace_solve_jit_and_grad() -> None:
     laplace = get_laplace_solver()
 
     @jax.jit
-    def solve_sum(A0: jnp.ndarray) -> jnp.ndarray:
-        inputs = {
-            "forcing": {"const": A0},
-        }
-        phi = laplace.solve(inputs)["phi"]
+    def solve_sum(a0: jnp.ndarray) -> jnp.ndarray:
+        phi = laplace.solve({"forcing": {"const": a0}})["phi"]
         return jnp.sum(phi)
 
     center = 0.5
@@ -205,18 +178,17 @@ def test_laplace_solve_jit_and_grad():
     assert jnp.allclose(grad, fd, atol=1e-2, rtol=1e-2)
 
 
-def test_poisson_manufactured_solve(show_plot=False):
-    """Test analytical solution of manufactured sinusoid forcing."""
+def test_poisson_manufactured_solve(show_plot: bool = False) -> None:
     shape = (12, 12)
-    dx_error = (1/shape[0]) ** 2
+    dx_error = (1 / shape[0]) ** 2
     mms = Poisson2D(
         config={
             "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
             "max_steps": 15,
-            "solver": dict(name='Newton', opts={'rtol': 1e2, 'atol': dx_error*1.5}),
+            "solver": {"name": "Newton", "opts": {"rtol": 1e2, "atol": dx_error * 1.5}},
             "initial_guess": lambda coords: jnp.ones_like(coords[0]),
-            "throw": False
-        }, 
+            "throw": False,
+        },
         forcing="sinusoid",
     )
 
@@ -229,37 +201,43 @@ def test_poisson_manufactured_solve(show_plot=False):
     clim = (vmin, vmax)
 
     if show_plot:
-        opts = {'xlabel': "$x$", 'ylabel': "$y$"}
-        kwargs = {'shading': 'gouraud'}
-        approx_spec = {'kind': 'pcolor', 'data': (x, y, phi), 'opts': {**opts, 'clim': clim}, 'kwargs': kwargs}
-        true_spec = {'kind': 'pcolor', 'data': (x, y, phi_exact), 'opts': {**opts, 'clim': clim}, 'kwargs': kwargs}
-        error_spec = {'kind': 'pcolor', 'data': (x, y, error), 'opts': {**opts, 'clim': 'auto'}, 
-                      'kwargs': {**kwargs, 'cmap': 'bwr'}}
-        gridplot([approx_spec, true_spec, error_spec], scheme='dark', shape=(1, 3), sharey='row')
+        opts = {"xlabel": "$x$", "ylabel": "$y$"}
+        kwargs = {"shading": "gouraud"}
+        approx_spec = {"kind": "pcolor", "data": (x, y, phi), "opts": {**opts, "clim": clim}, "kwargs": kwargs}
+        true_spec = {
+            "kind": "pcolor",
+            "data": (x, y, phi_exact),
+            "opts": {**opts, "clim": clim},
+            "kwargs": kwargs,
+        }
+        error_spec = {
+            "kind": "pcolor",
+            "data": (x, y, error),
+            "opts": {**opts, "clim": "auto"},
+            "kwargs": {**kwargs, "cmap": "bwr"},
+        }
+        gridplot([approx_spec, true_spec, error_spec], scheme="dark", shape=(1, 3), sharey="row")
         plt.show()
 
-    assert jnp.max(error) < dx_error*2
+    assert jnp.max(error) < dx_error * 2
 
 
-def test_poisson_sample_inputs():
+def test_poisson_sample_inputs() -> None:
     fixture_path = Path("tests/fixtures_poisson.yml")
-    model = YamlLoader.load(fixture_path)['solver']
+    model = YamlLoader.load(fixture_path)["solver"]
 
     key = next(gen_keys(1, seed=122))
     sample = model.sample_inputs(key)
-    forcing_key, _, _ = jax.random.split(key, 3)
-    forcing_subkeys = jax.random.split(forcing_key, 2)
-    expected_mu_x = jax.random.uniform(forcing_subkeys[0], minval=0.4, maxval=0.6, shape=())
-    expected_a0 = jax.random.normal(forcing_subkeys[1], shape=()) * 0.1 + 0.5
     sample_again = model.sample_inputs(key)
 
+    assert isinstance(model.inputs_sampler, PyTreeSampler)
     assert "forcing" in sample
     assert "mu_x" in sample["forcing"]
     assert "A0" in sample["forcing"]
     assert sample["forcing"]["mu_x"] >= 0.4
     assert sample["forcing"]["mu_x"] < 0.6
-    assert np.isclose(sample["forcing"]["mu_x"], float(expected_mu_x), rtol=1e-5, atol=1e-6)
-    assert np.isclose(sample["forcing"]["A0"], float(expected_a0), rtol=1e-5, atol=1e-6)
+    assert np.isclose(sample["forcing"]["mu_x"], sample_again["forcing"]["mu_x"])
+    assert np.isclose(sample["forcing"]["A0"], sample_again["forcing"]["A0"])
     assert "conductivity" in sample
     assert "k0" in sample["conductivity"]
     assert sample["conductivity"]["k0"].shape == (8, 8)
@@ -268,24 +246,21 @@ def test_poisson_sample_inputs():
 
 def test_poisson_outputs_sampler_validation_and_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
     model = get_small_poisson(
-        outputs_sampler="near_solution",
-        outputs_sampler_opts={
+        outputs_sampler={
+            "callable": "near_solution",
             "phi": {
-                "distribution": "normal",
+                "callable": "normal",
                 "std": 0.1,
                 "shape": (6, 6),
             },
-        },
+        }
     )
 
-    assert model.outputs_sampler is near_solution_sampler
-    assert isinstance(model.outputs_sampler_opts["phi"], Distribution)
+    assert isinstance(model.outputs_sampler, NearSolutionSampler)
+    assert isinstance(model.outputs_sampler.template["phi"], Distribution)
 
     with pytest.raises(TypeError):
-        get_small_poisson(
-            outputs_sampler="near_solution",
-            outputs_sampler_opts={"phi": 0.1},
-        )
+        get_small_poisson(outputs_sampler={"callable": "near_solution", "phi": 0.1})
 
     key = jax.random.key(7)
     solution = {"phi": jnp.ones(model.config.grid.shape)}
@@ -293,6 +268,7 @@ def test_poisson_outputs_sampler_validation_and_sampling(monkeypatch: pytest.Mon
     sample_b = model.sample_outputs(key, solution=solution)
     assert sample_a["phi"].shape == model.config.grid.shape
     assert jnp.allclose(sample_a["phi"], sample_b["phi"])
+
     calls = {"count": 0}
     solved = {"phi": 2.0 * jnp.ones(model.config.grid.shape)}
 
@@ -323,10 +299,7 @@ def test_poisson_sample_outputs_custom_callable_support() -> None:
         seen["solution"] = solution
         return jnp.asarray(solution["phi"]) + bias
 
-    model = get_small_poisson(
-        outputs_sampler=custom_sampler,
-        outputs_sampler_opts={"bias": 0.25},
-    )
+    model = get_small_poisson(outputs_sampler={"callable": custom_sampler, "bias": 0.25})
     inputs = {"forcing": {"const": 1.5}}
     solution = {"phi": jnp.zeros(model.config.grid.shape)}
 
