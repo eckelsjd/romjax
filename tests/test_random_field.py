@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from romjax.random_field import KLEConfig, kle
-from romjax.rng import Distribution, parametric_sampler
+from romjax.rng import Distribution, PyTreeSampler
 
 
 def test_kle_supports_1d_and_2d_shapes_and_determinism() -> None:
@@ -75,17 +75,18 @@ def test_kle_variance_scaling() -> None:
 
 def test_kle_parametric_sampler_integration() -> None:
     key = jax.random.key(3)
-    sample = parametric_sampler(
-        key,
-        conductivity={
-            "distribution": kle,
-            "shape": (5, 6),
-            "truncation": (2, 3),
-            "correlation_lengths": (0.15, 0.25),
-            "variance": 0.2,
-            "mean": 1.0,
-        },
-    )
+    sample = PyTreeSampler(
+        template={
+            "conductivity": {
+                "callable": kle,
+                "shape": (5, 6),
+                "truncation": (2, 3),
+                "correlation_lengths": (0.15, 0.25),
+                "variance": 0.2,
+                "mean": 1.0,
+            },
+        }
+    ).sample(key)
     expected = kle(
         jax.random.split(key, 1)[0],
         shape=(5, 6),
@@ -104,4 +105,4 @@ def test_kle_distribution_validation() -> None:
         KLEConfig(shape=(4, 4), truncation=(5, 2))
 
     with pytest.raises(ValueError):
-        Distribution(distribution=kle, shape=(4, 4), variance=-1.0).sample(jax.random.key(0))
+        Distribution(callable=kle, shape=(4, 4), variance=-1.0).sample(jax.random.key(0))

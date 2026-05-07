@@ -8,23 +8,25 @@ solver: !romx:Poisson2D
       opts:
         rtol: 1.0e-2
         atol: 1.0e-6
-  forcing: gaussian
-  conductivity: nonlinear
-  forcing_defaults:
-    mu_x: 0.5
-    mu_y: 0.5
-    sigma: 0.1
-    A0: 0.5
-  conductivity_defaults:
-    alpha: 0.0
-    k0: 1.0
-  forcing_sampler: parametric
-  forcing_sampler_opts:
-    mu_x: { distribution: uniform, minval: 0.4, maxval: 0.6 }
-    A0: { distribution: normal, mean: 0.5, std: 0.1 }
-  conductivity_sampler: parametric
-  conductivity_sampler_opts:
-    k0: 
-      distribution: !!python/name:romjax.random_field.darcy
-      shape: *s
-      bounds: *b
+  forcing:
+    callable: gaussian
+    inputs_default:
+      mu_x: 0.5
+      mu_y: 0.5
+      sigma: 0.1
+      A0: 0.5
+  conductivity:
+    callable: nonlinear
+    inputs_default:
+      alpha: 0.0
+      k0: 1.0
+  inputs_sampler:
+    callable: pytree
+    forcing:
+      mu_x: { callable: uniform, minval: 0.4, maxval: 0.6 }
+      A0: { callable: normal, mean: 0.5, std: 0.1 }
+    conductivity:
+      k0:
+        callable: darcy
+        shape: *s
+        bounds: *b

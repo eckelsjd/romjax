@@ -4,11 +4,10 @@ from typing import Any, Callable, Literal
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
-from pydantic import PositiveFloat, PositiveInt, model_validator, field_validator, Field
+from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator
 
 from romjax.pde import Coordinates
 from romjax.typing import DictModel
-
 
 __all__ = ["KLEConfig", "kle", "darcy"]
 
@@ -47,9 +46,9 @@ class KLEConfig(DictModel):
     variance: PositiveFloat = 1.0
     spectral_decay: PositiveFloat = 2.0
     mean: ArrayLike = 0.0
-    nsamples: PositiveInt = 1,
-    random_override: ArrayLike | None = None,
-    weight: Callable[[Coordinates], ArrayLike] | Literal["smooth"] | None = None,
+    nsamples: PositiveInt = 1
+    random_override: ArrayLike | None = None
+    weight: Callable[[Coordinates], ArrayLike] | Literal["smooth"] | None = None
     weight_opts: dict = Field(default_factory=dict)
 
     @field_validator("weight", mode="before")
@@ -229,7 +228,7 @@ def kle(key: Key, **config: KLEConfig) -> ArrayLike:
 
         coeff_shape = (cfg.nsamples, mx)
         coeffs = cfg.random_override if cfg.random_override is not None else jax.random.normal(key, coeff_shape)
-        coeffs = coeffs * sqrt_cov[None, :]
+        coeffs = coeffs * sqrt_cov[jnp.newaxis, :]
         samples = jnp.einsum("ik,bk->bi", phi_x, coeffs)
         coords = (x,)
     else:
@@ -258,7 +257,7 @@ def kle(key: Key, **config: KLEConfig) -> ArrayLike:
 
         coeff_shape = (cfg.nsamples, mx, my)
         coeffs = cfg.random_override if cfg.random_override is not None else jax.random.normal(key, coeff_shape)
-        coeffs = coeffs * sqrt_cov[None, :, :]
+        coeffs = coeffs * sqrt_cov[jnp.newaxis, :, :]
         samples = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
         coords = jnp.meshgrid(x, y, indexing="ij")
 

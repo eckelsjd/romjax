@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from inspect import Parameter, signature
 from pathlib import Path
-from typing import Annotated, Any, Iterator, Mapping, MutableMapping, Protocol, get_args, Callable, TypeVar
+from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Protocol, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
 import lineax as lx
@@ -21,7 +21,6 @@ from pydantic import (
 )
 from pydantic_core import core_schema
 
-
 __all__ = ['DictModel', 'ListModel', 'CallableModel', 'LxObject', 'OptxObject', 'IterativeSolver', 'AdjointMethod',
            'romjax_from_file', 'Routine', 'RoutineError', 'from_registry']
 
@@ -38,6 +37,19 @@ def romjax_from_file(value: str | Path | bytes | Any) -> Any:
 
 def from_registry(registry: dict[str, T], key: str | Any) -> T:
     """Try to load an object by key from a registry. Useful as a pydantic before validator."""
+    if isinstance(key, Mapping):
+        for selector in ("callable", "name"):
+            value = key.get(selector)
+            if isinstance(value, str) and value in registry:
+                target = registry[value]
+                opts = {k: v for k, v in key.items() if k != selector}
+                if isinstance(target, type):
+                    return target(**opts)
+                if opts:
+                    return {"callable": target, **opts}
+                return target
+        return key
+
     if not isinstance(key, str):
         return key
     
@@ -99,7 +111,16 @@ class CallableModel(BaseModel):
     def __call__(self, *args, **kwargs):
         opts = dict(self.opts)
         opts.update(kwargs)
-        return self.callable(*args, **opts)
+        callable_obj = self.callable
+        try:
+            first_param = next(iter(signature(callable_obj).parameters.values()))
+        except (TypeError, ValueError, StopIteration):
+            first_param = None
+
+        if isinstance(first_param, Parameter) and first_param.name == "self":
+            return callable_obj(self, *args, **opts)
+
+        return callable_obj(*args, **opts)
 
 
 class DictModel(BaseModel, MutableMapping):

@@ -10,6 +10,7 @@ from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
 from functools import partial as _partial
 from importlib import import_module as _import_module
+from inspect import getattr_static as _getattr_static
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
 from types import BuiltinFunctionType as _BuiltinFunctionType
@@ -23,6 +24,7 @@ from typing import Union as _Union
 
 import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
+from pydantic.fields import PydanticUndefined as _PydanticUndefined
 
 type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 
@@ -109,14 +111,34 @@ class YamlLoader(ConfigLoader):
             pass
 
         def _import_python_name(value: str) -> _Any:
-            module_name, _, attr_path = value.rpartition(".")
-            if not module_name or not attr_path:
-                raise ValueError(f"Invalid python/name tag: {value!r}")
-            module = _import_module(module_name)
-            obj: _Any = module
-            for attr in attr_path.split("."):
-                obj = getattr(obj, attr)
-            return obj
+            parts = value.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                module_name = ".".join(parts[:i])
+                attr_path = parts[i:]
+                try:
+                    module = _import_module(module_name)
+                except ModuleNotFoundError:
+                    continue
+
+                obj: _Any = module
+                for attr in attr_path:
+                    try:
+                        obj = getattr(obj, attr)
+                    except AttributeError:
+                        try:
+                            obj = _getattr_static(obj, attr)
+                        except AttributeError:
+                            fields = getattr(obj, "model_fields", None)
+                            if fields is None or attr not in fields:
+                                raise
+                            obj = fields[attr].default
+                            if obj is _PydanticUndefined:
+                                raise
+                        if isinstance(obj, staticmethod | classmethod):
+                            obj = obj.__func__
+                return obj
+
+            raise ValueError(f"Invalid python/name tag: {value!r}")
 
         def _construct_python_name_multi(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> _Any:
             value = tag_suffix or loader.construct_scalar(node)
