@@ -172,6 +172,7 @@ class InnerToOuterRoute(BaseModel):
 def identity_filter(x: PyTree, args: Any, **kwargs):
     return x
 
+# TODO: Clean up filter model and eqx_evaluate to use a callable validated model for each filter direction spec
 
 def eqx_evaluate(
     x: PyTree,

@@ -16,25 +16,24 @@ edges:
           atol: 5.0e-4
         max_steps: 250
         throw: true
-    forcing: constant
-    forcing_defaults: { const: -1.0 }
-    conductivity: nonlinear
-    conductivity_defaults: { k0: 1.0, alpha: 1.0 }
-    conductivity_opts: { amplitude: exp }
-    conductivity_sampler: parametric
-    conductivity_sampler_opts:
-      k0: 
-        distribution: !!python/name:romjax.random_field.kle
-        bounds: *bounds
-        shape: *shape
-        truncation: [8, 8]
-        correlation_lengths: [0.2, 0.2]
-        variance: 1
-    outputs_sampler: near_solution
-    outputs_sampler_opts:
+    forcing: !pd:romjax.poisson.ConstantForcing
+      inputs_default: { const: -1.0 }
+    conductivity: !pd:romjax.poisson.NonlinearConductivity
+      inputs_default: { k0: 1.0, alpha: 1.0 }
+      amplitude: exp
+    inputs_sampler: !romx:PyTreeSampler
+      conductivity:
+        k0:
+          callable: kle
+          bounds: *bounds
+          shape: *shape
+          truncation: [8, 8]
+          correlation_lengths: [0.2, 0.2]
+          variance: 1
+    outputs_sampler: !romx:NearSolutionSampler
       scale: [max_abs, 0.1]  # 10% relative
       phi:
-        distribution: !!python/name:romjax.random_field.kle
+        callable: kle
         bounds: *bounds
         shape: *shape
         truncation: [8, 8]

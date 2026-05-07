@@ -2,15 +2,49 @@
 from enum import IntEnum
 
 import jax.numpy as jnp
-from jaxtyping import ArrayLike
-from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator
+from jaxtyping import ArrayLike, PyTree
+from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator, field_serializer
 
-from romjax.typing import DictModel
+from romjax.typing import DictModel, CallableModel
+from romjax.tree import pytree_merge
 
-__all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid']
+__all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
+           'InitializeCallable', 'ForcingCallable']
 
 
 type Coordinates = tuple[ArrayLike, ...]
+
+
+class InitializeCallable(CallableModel):
+
+    def __call__(self, coords: Coordinates) -> ArrayLike:
+        return super().__call__(coords)
+    
+
+class ForcingCallable(CallableModel):
+
+    class Inputs(DictModel): pass
+    class Outputs(DictModel): pass
+
+    inputs_default: DictModel = Field(default_factory=dict)
+    outputs_default: DictModel = Field(default_factory=dict)
+
+    @field_validator("inputs_default", "outputs_default", mode="before")
+    @classmethod
+    def _apply_defaults(cls, value: None | DictModel, info) -> DictModel:
+        """Initialize inputs and outputs defaults with special Inputs and Outputs schemas."""
+        schema = cls.Inputs if info.field_name == "inputs_default" else cls.Outputs
+        return schema.model_validate(value)
+    
+    @field_serializer("inputs_default", "outputs_default")
+    def _dump_defaults(cls, value):
+        return value.model_dump()
+
+    def __call__(self, inputs: PyTree, outputs: PyTree) -> ArrayLike:
+        return super().__call__(
+            pytree_merge(self.inputs_default.model_dump(), inputs), 
+            pytree_merge(self.outputs_default.model_dump(), outputs)
+        )
 
 
 class BoundaryType(IntEnum):
