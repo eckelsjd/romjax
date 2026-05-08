@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from romjax.task_cli import (
     build_phase_prompt,
     clean_task,
     cli,
+    codex_rollout_files,
     collect_plan_prompt,
     create_task,
     current_git_branch,
@@ -24,10 +26,14 @@ from romjax.task_cli import (
     load_manifest,
     load_or_create_manifest,
     move_task_to_state,
+    parse_headless_codex_output,
     phase_entry,
+    phase_new_command,
     phase_paths,
     plan_task,
     review_task,
+    rollout_token_count,
+    run_phase_session,
     shared_venv_bin_dir,
     shared_venv_path,
     start_task,
@@ -100,8 +106,46 @@ def stub_phase_agent(
         Path(kwargs["output_path"]).write_text(body, encoding="utf-8")
         manifest = load_or_create_manifest(paths, kwargs["task_slug"])
         phase = phase_entry(manifest, phase_name)
+        extra_args = kwargs.get("extra_args") or []
         phase["status"] = "succeeded" if exit_code == 0 else "failed"
         phase["exit_code"] = exit_code
+        phase["codex_args"] = list(extra_args)
+        if "--model" in extra_args:
+            phase["model"] = extra_args[extra_args.index("--model") + 1]
+        elif "-m" in extra_args:
+            phase["model"] = extra_args[extra_args.index("-m") + 1]
+        else:
+            phase["model"] = next(
+                (arg.split("=", 1)[1] for arg in extra_args if arg.startswith("--model=")),
+                None,
+            )
+        phase["reasoning_effort"] = None
+        index = 0
+        while index < len(extra_args):
+            arg = extra_args[index]
+            config_arg: str | None = None
+            if arg in {"-c", "--config"}:
+                if index + 1 < len(extra_args):
+                    config_arg = extra_args[index + 1]
+                    index += 2
+                else:
+                    break
+            elif arg.startswith("--config="):
+                config_arg = arg.removeprefix("--config=")
+                index += 1
+            elif arg.startswith("-c") and arg != "-c":
+                config_arg = arg[2:]
+                index += 1
+            else:
+                index += 1
+                continue
+            if config_arg is None or not config_arg.startswith("model_reasoning_effort="):
+                continue
+            raw_value = config_arg.split("=", 1)[1]
+            try:
+                phase["reasoning_effort"] = tomllib.loads(f"value = {raw_value}")["value"]
+            except tomllib.TOMLDecodeError:
+                phase["reasoning_effort"] = raw_value
         write_manifest(paths, kwargs["task_slug"], manifest)
         return exit_code
 
@@ -159,6 +203,42 @@ def test_task_cli_support_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert f"any blockers to {output_path}" in interactive_prompt
     assert "Return a concise final summary as your last assistant message" in headless_prompt
 
+    interactive_argv, interactive_stdin = phase_new_command(
+        "implementation",
+        cwd=repo_root,
+        repo_root=repo_root,
+        prompt_text="do the work",
+        output_path=output_path,
+        headless=False,
+        extra_args=["--model", "gpt-5.5", "-c", "model_reasoning_effort=\"high\""],
+    )
+    assert interactive_stdin is False
+    assert interactive_argv[-5:-1] == [
+        "--model",
+        "gpt-5.5",
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
+    assert interactive_argv[-1] == "do the work"
+
+    headless_argv, headless_stdin = phase_new_command(
+        "planning",
+        cwd=repo_root,
+        repo_root=repo_root,
+        prompt_text="plan it",
+        output_path=output_path,
+        headless=True,
+        extra_args=["--model=gpt-5.4-mini", "-c", "model_reasoning_effort=\"medium\""],
+    )
+    assert headless_stdin is True
+    assert headless_argv[-4:] == [
+        "--model=gpt-5.4-mini",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "-",
+    ]
+    assert headless_argv[-1] == "-"
+
     (repo_root / "example.txt").write_text("hello\n", encoding="utf-8")
     assert "example.txt" in git_output(repo_root, ["status", "--short"])
 
@@ -175,6 +255,95 @@ def test_task_cli_support_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("romjax.task_cli.os.kill", lambda pid, sig: calls.append((pid, sig)))
     terminate_process(1234)
     assert calls == [(1234, signal.SIGTERM)]
+
+    thread_id, usage = parse_headless_codex_output(
+        '\n'.join(
+            [
+                '{"type":"thread.started","thread_id":"thread-123"}',
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3}}',
+            ]
+        )
+    )
+    assert thread_id == "thread-123"
+    assert usage == {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3}
+
+    codex_home = tmp_path / "codex-home"
+    rollout_path = codex_home / "sessions" / "2026" / "05" / "08" / "rollout-test.jsonl"
+    rollout_path.parent.mkdir(parents=True)
+    rollout_path.write_text(
+        '{"token_count":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"reasoning_output_tokens":2,"total_tokens":13}}}\n',
+        encoding="utf-8",
+    )
+    assert codex_rollout_files({"CODEX_HOME": str(codex_home)}) == [rollout_path]
+    assert rollout_token_count(rollout_path) == {
+        "total_token_usage": {
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "reasoning_output_tokens": 2,
+            "total_tokens": 13,
+        }
+    }
+
+
+def test_run_phase_session_records_usage_and_token_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = prepare_repo(init_repo(tmp_path))
+    paths = get_task_paths(repo_root)
+    task_path = create_task(paths, "feat-galerkin-rom")
+    load_or_create_manifest(paths, "feat-galerkin-rom")
+    info = phase_paths(paths, "feat-galerkin-rom", "planning")
+    info["prompt_path"].write_text("Plan the work.\n", encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    def fake_run(*args, **kwargs):
+        rollout_path = codex_home / "sessions" / "2026" / "05" / "08" / "rollout-thread-123.jsonl"
+        rollout_path.parent.mkdir(parents=True, exist_ok=True)
+        rollout_path.write_text(
+            '{"token_count":{"total_token_usage":{"input_tokens":11,"cached_input_tokens":5,"output_tokens":7,'
+            '"reasoning_output_tokens":3,"total_tokens":18}}}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            args=kwargs.get("args", args[0] if args else []),
+            returncode=0,
+            stdout=(
+                '{"type":"thread.started","thread_id":"thread-123"}\n'
+                '{"type":"turn.completed","usage":{"input_tokens":11,"cached_input_tokens":5,"output_tokens":7}}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("romjax.task_cli.subprocess.run", fake_run)
+
+    exit_code = run_phase_session(
+        paths=paths,
+        task_slug="feat-galerkin-rom",
+        phase_name="planning",
+        task_path=task_path,
+        prompt_path=info["prompt_path"],
+        output_path=info["output_path"],
+        log_path=info["log_path"],
+        headless=True,
+        extra_args=["-m", "gpt-5.4-mini", "-c", 'model_reasoning_effort="medium"'],
+    )
+
+    assert exit_code == 0
+    phase = load_manifest(paths, "feat-galerkin-rom")["phases"]["planning"]
+    assert phase["thread_id"] == "thread-123"
+    assert phase["usage"] == {"input_tokens": 11, "cached_input_tokens": 5, "output_tokens": 7}
+    assert phase["token_count"] == {
+        "total_token_usage": {
+            "input_tokens": 11,
+            "cached_input_tokens": 5,
+            "output_tokens": 7,
+            "reasoning_output_tokens": 3,
+            "total_tokens": 18,
+        }
+    }
+    assert phase["session_path"].endswith("rollout-thread-123.jsonl")
 
 
 def test_create_task_command(tmp_path: Path) -> None:
@@ -201,11 +370,19 @@ def test_plan_task_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         body="# feat-galerkin-rom\n\n## Summary\nImplement a Galerkin ROM feature.\n",
     )
 
-    task_path = plan_task(paths, "feat-galerkin-rom", user_prompt="Add a Galerkin ROM feature")
+    task_path = plan_task(
+        paths,
+        "feat-galerkin-rom",
+        user_prompt="Add a Galerkin ROM feature",
+        extra_args=["--model", "gpt-5.5", "-c", "model_reasoning_effort=\"high\""],
+    )
 
     assert task_path.exists()
     assert "Implement a Galerkin ROM feature." in task_path.read_text(encoding="utf-8")
-    assert load_manifest(paths, "feat-galerkin-rom")["phases"]["planning"]["status"] == "succeeded"
+    planning_phase = load_manifest(paths, "feat-galerkin-rom")["phases"]["planning"]
+    assert planning_phase["status"] == "succeeded"
+    assert planning_phase["model"] == "gpt-5.5"
+    assert planning_phase["reasoning_effort"] == "high"
     assert_task_state(paths, "feat-galerkin-rom", "open")
 
     create_task(paths, "fix-bug-1127")
@@ -227,12 +404,18 @@ def test_start_task_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     write_ready_task(paths, "feat-galerkin-rom")
     stub_phase_agent(monkeypatch, paths, phase_name="implementation", body="summary\n")
 
-    manifest = start_task(paths, "feat-galerkin-rom")
+    manifest = start_task(
+        paths,
+        "feat-galerkin-rom",
+        extra_args=["-m", "gpt-5.4", "-c", "model_reasoning_effort=\"low\""],
+    )
 
     assert Path(manifest["worktree_path"]).exists()
     assert_task_state(paths, "feat-galerkin-rom", "finished")
     stored = load_manifest(paths, "feat-galerkin-rom")
     assert stored["phases"]["implementation"]["status"] == "succeeded"
+    assert stored["phases"]["implementation"]["model"] == "gpt-5.4"
+    assert stored["phases"]["implementation"]["reasoning_effort"] == "low"
     info = phase_paths(paths, "feat-galerkin-rom", "implementation")
     assert info["prompt_path"].name == "feat-galerkin-rom-implementation-prompt.md"
     assert info["output_path"].name == "feat-galerkin-rom-implementation.md"
@@ -430,34 +613,42 @@ def test_cli_command_dispatch_and_listing(
 
     monkeypatch.setattr("romjax.task_cli.collect_plan_prompt", lambda: "Plan a new Galerkin ROM feature")
 
-    def fake_plan_task(_paths, task_slug: str, user_prompt: str | None = None, headless: bool = False):
+    def fake_plan_task(
+        _paths,
+        task_slug: str,
+        user_prompt: str | None = None,
+        headless: bool = False,
+        extra_args: list[str] | None = None,
+    ):
         assert task_slug == "feat-galerkin-rom"
         assert user_prompt == "Plan a new Galerkin ROM feature"
         assert headless is True
+        assert extra_args == ["--model", "gpt-5.5"]
         task_path = paths.open_dir / f"{task_slug}.md"
         task_path.parent.mkdir(parents=True, exist_ok=True)
         task_path.write_text("# feat-galerkin-rom\n", encoding="utf-8")
         return task_path
 
     monkeypatch.setattr("romjax.task_cli.plan_task", fake_plan_task)
-    assert cli(["plan", "feat-galerkin-rom", "--headless"], repo_root=repo_root) == 0
+    assert cli(["plan", "feat-galerkin-rom", "--headless", "--model", "gpt-5.5"], repo_root=repo_root) == 0
     assert "feat-galerkin-rom.md" in capsys.readouterr().out
 
     monkeypatch.setattr(
         "romjax.task_cli.start_task",
-        lambda _paths, task_slug, headless=False: {"task_slug": task_slug, "exit_code": 7},
+        lambda _paths, task_slug, headless=False, extra_args=None: {"task_slug": task_slug, "exit_code": 7},
     )
-    assert cli(["start", "feat-galerkin-rom", "--headless"], repo_root=repo_root) == 7
+    assert cli(["start", "feat-galerkin-rom", "--headless", "--model", "gpt-5.5"], repo_root=repo_root) == 7
 
-    def fake_review_task(_paths, task_slug: str, headless: bool = False):
+    def fake_review_task(_paths, task_slug: str, headless: bool = False, extra_args: list[str] | None = None):
         assert headless is False
+        assert extra_args == ["-c", 'model_reasoning_effort="medium"']
         review_path = paths.runs_dir / task_slug / f"{task_slug}-review.md"
         review_path.parent.mkdir(parents=True, exist_ok=True)
         review_path.write_text("# Review Summary: feat-galerkin-rom\n", encoding="utf-8")
         return review_path
 
     monkeypatch.setattr("romjax.task_cli.review_task", fake_review_task)
-    assert cli(["review", "feat-galerkin-rom"], repo_root=repo_root) == 0
+    assert cli(["review", "feat-galerkin-rom", "-c", 'model_reasoning_effort="medium"'], repo_root=repo_root) == 0
     assert "feat-galerkin-rom-review.md" in capsys.readouterr().out
 
     monkeypatch.setattr(

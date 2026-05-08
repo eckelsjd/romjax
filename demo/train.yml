@@ -1,5 +1,65 @@
-!romx:TrainConfig
+!romx:GraphTrain
 root: demo/training
-loss_fn:
-  graph: demo/poisson_graph.yml
-  
+graph: demo/poisson_graph.yml
+loss: !romx:GraphLoss            # a configurable default that acts as a Callable[[PyTree, Any], float] and aggregates over each individual dataset loss
+  - !pd:romjax.graph.GraphLossFunction      # Each item in the list is a CallableModel that acts over one dataset
+    dataset: poisson             # which sampleable graph edge the data is coming from (Can always assume data is {input, output, residual} following data_gen)
+    weight: 1.0                  # how to weight this term in the loss function
+    batch_reduce: mean           # how to reduce over a mini-batch, should support any UnaryOperator
+    callable: reconstruction     # what loss fn to use for a single sample (can be a supported str id)
+    path: [coordinate transform] # reconstruction loss only needs to know what path to take (all extra kwargs go to the callable)
+  - dataset: poisson             # Can have multiple dataset sources in the loss function
+    weight: 1.0
+    batch_reduce: rms
+    callable: reconstruction
+    path: [residual transform]   # Reconstruction error on residuals
+  - dataset: ~                   # Add an extra term that doesn't require data, i.e. regularization
+    weight: 0.1
+    callable: tikhonov
+    alpha: 0.001
+train_loader: !romx:GraphDataLoader  # Default graph loader will load from nested directories from gen_data (with a known input.h5, output.h5, residual.h5 format)
+  root: demo/dataset
+  poisson:                       # Species how to load training data for each sampleable graph edge
+    max_samples: ...             # Maximum total (input,output,residual) samples (defaults to all available)
+    max_input_samples: ...       # Maximum input directories (defaults to all)
+    max_outputs_per_input: ...   # Maximum output directories per input (defaults to all)
+    skip: !!python/name:...      # Optionally specify when to skip samples (e.g. certain seeds, or fail files detected, etc.)
+    batch_size: 16
+    shuffle_seed: 0              # Deterministic batch selection and shuffling
+  other_edge: ...
+test: !romx:GraphLoss            # Another loss function, but computed over validation data instead (and only on certain iterations) -- not used in training/gradients
+  - ...
+validation_loader: !romx:GraphDataLoader  # Another loader for validation data
+  root: demo/dataset
+  poisson: ...
+optimizer:                       # Can already fully specify an optax.GradientTransformation using the ThirdPartyType
+  name: optax.chain
+  args:
+    - name: scale_by_adam
+    - name: scale_by_schedule
+      args:
+        - name: exponential_decay
+          kwargs: { init_value: 0.01, transition_steps: 1000, decay_rate: 0.99 }
+    - name: optax.scale
+      args: [-1.0]
+init_params: !romx:GraphInitParams  # a configurable default that acts as a Callable[[Any], PyTree]
+  seed: 0                 # split the random key over edges, edges can use if they need
+  coordinate transform:   # Detect ThirdPartyType format for things like equinox modules (but have a few easily supported built-in like LinearProjection)
+    name: linear          # linear projection (should support automatically filling in full dimension)
+    kwargs: { latent: 20 }
+  galerkin rom:
+    param: 1.1    # generally support direct initialization of params (maybe extend PyTreeSampler to work with constants, i.e. dirac distributions)
+    other:
+      param: 2.2
+      random_param: { callable: uniform, min_val: 0, max_val: 1 }  # should generally support random initialization from a Distribution
+  residual transform: coordinate transform  # should support reusing parameters by reference to another edge (e.g. same coordinate and residual linear projection matrix)
+write_policy: reuse   # overwrite, or error if existing save files encountered, reuse could load params from file and overwrite init_params for example
+termination: 
+  max_steps: 200
+  loss_tol: ...
+  test_tol: ...
+  grad_tol: ...
+  max_runtime: ... # validate strings, datetime, floats, etc. into a timedelta (HH:MM:SS, or 10.3 s or 5 hrs or 1 day etc.)
+log: ...  # logging options
+plot: ... # plotting options
+save: ... # saving options

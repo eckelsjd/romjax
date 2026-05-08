@@ -9,10 +9,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 TASK_STATES = ("open", "running", "finished", "stopped", "review", "archive")
 PHASE_NAMES = ("planning", "implementation", "review")
@@ -20,6 +22,17 @@ PHASE_NAMES = ("planning", "implementation", "review")
 
 class TaskWorkflowError(RuntimeError):
     """Raised when the task workflow encounters an invalid local state."""
+
+
+@dataclass(slots=True)
+class PhaseRunResult:
+    """Structured result from running a Codex task phase."""
+
+    exit_code: int
+    thread_id: str | None = None
+    usage: dict[str, int] | None = None
+    token_count: dict[str, Any] | None = None
+    session_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -451,6 +464,74 @@ def phase_entry(manifest: dict[str, Any], phase_name: str) -> dict[str, Any]:
     return phases.setdefault(phase_name, {})
 
 
+def codex_option_value(extra_args: list[str], *names: str) -> str | None:
+    """Return the last explicit value passed for one of the given CLI flags."""
+    value: str | None = None
+    index = 0
+    while index < len(extra_args):
+        arg = extra_args[index]
+        matched_name = next((name for name in names if arg == name), None)
+        if matched_name is not None:
+            next_index = index + 1
+            if next_index < len(extra_args):
+                value = extra_args[next_index]
+                index = next_index + 1
+                continue
+            break
+        for name in names:
+            prefix = f"{name}="
+            if arg.startswith(prefix):
+                value = arg[len(prefix):]
+                break
+        index += 1
+    return value
+
+
+def codex_config_value(extra_args: list[str], key: str) -> Any:
+    """Return the last explicit value passed for a Codex ``-c/--config`` override."""
+    value: Any = None
+    index = 0
+    while index < len(extra_args):
+        arg = extra_args[index]
+        config_arg: str | None = None
+        if arg in {"-c", "--config"}:
+            next_index = index + 1
+            if next_index < len(extra_args):
+                config_arg = extra_args[next_index]
+                index = next_index + 1
+            else:
+                break
+        elif arg.startswith("-c") and arg not in {"-c", "--config"}:
+            config_arg = arg[2:]
+            index += 1
+        elif arg.startswith("--config="):
+            config_arg = arg.removeprefix("--config=")
+            index += 1
+        else:
+            index += 1
+            continue
+
+        if config_arg is None or "=" not in config_arg:
+            continue
+        config_key, raw_value = config_arg.split("=", 1)
+        if config_key != key:
+            continue
+        try:
+            value = tomllib.loads(f"value = {raw_value}")["value"]
+        except tomllib.TOMLDecodeError:
+            value = raw_value
+    return value
+
+
+def codex_phase_metadata(extra_args: list[str]) -> dict[str, Any]:
+    """Return manifest metadata for a Codex phase invocation."""
+    return {
+        "codex_args": list(extra_args),
+        "model": codex_option_value(extra_args, "--model", "-m") or codex_config_value(extra_args, "model"),
+        "reasoning_effort": codex_config_value(extra_args, "model_reasoning_effort"),
+    }
+
+
 def normalize_cwd(path_value: str | Path) -> Path:
     """Normalize a cwd/path value loaded from task metadata or manifests."""
     return Path(path_value).expanduser().resolve()
@@ -522,6 +603,101 @@ def write_phase_log(log_path: Path, lines: list[str]) -> None:
     with log_path.open("a", encoding="utf-8") as fh:
         for line in lines:
             fh.write(line.rstrip() + "\n")
+
+
+def codex_home_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Return the Codex home directory used for session storage."""
+    source = env if env is not None else os.environ
+    raw_path = source.get("CODEX_HOME")
+    if raw_path:
+        return Path(raw_path).expanduser().resolve()
+    return (Path.home() / ".codex").resolve()
+
+
+def codex_rollout_files(env: Mapping[str, str] | None = None) -> list[Path]:
+    """Return known Codex rollout JSONL files sorted by modification time."""
+    sessions_root = codex_home_dir(env) / "sessions"
+    if not sessions_root.exists():
+        return []
+    files = sorted(
+        sessions_root.glob("**/rollout-*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    return files
+
+
+def parse_json_line(raw_line: str) -> dict[str, Any] | None:
+    """Parse a JSONL line emitted by Codex, returning ``None`` on non-JSON lines."""
+    line = raw_line.strip()
+    if not line or not line.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def parse_headless_codex_output(output_text: str) -> tuple[str | None, dict[str, int] | None]:
+    """Extract thread id and usage details from ``codex exec --json`` output."""
+    thread_id: str | None = None
+    usage: dict[str, int] | None = None
+    for raw_line in output_text.splitlines():
+        event = parse_json_line(raw_line)
+        if event is None:
+            continue
+        if event.get("type") == "thread.started":
+            candidate = event.get("thread_id")
+            if isinstance(candidate, str):
+                thread_id = candidate
+        if event.get("type") != "turn.completed":
+            continue
+        candidate_usage = event.get("usage")
+        if not isinstance(candidate_usage, dict):
+            continue
+        normalized_usage = {
+            key: value
+            for key, value in candidate_usage.items()
+            if isinstance(key, str) and isinstance(value, int)
+        }
+        if normalized_usage:
+            usage = normalized_usage
+    return thread_id, usage
+
+
+def rollout_token_count(rollout_path: Path) -> dict[str, Any] | None:
+    """Extract the last ``token_count`` payload from a Codex rollout file."""
+    token_count: dict[str, Any] | None = None
+    try:
+        with rollout_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                event = parse_json_line(raw_line)
+                if event is None:
+                    continue
+                payload = event.get("token_count")
+                if isinstance(payload, dict):
+                    token_count = payload
+    except OSError:
+        return None
+    return token_count
+
+
+def select_rollout_file(
+    before_files: set[Path],
+    after_files: list[Path],
+    thread_id: str | None = None,
+) -> Path | None:
+    """Select the most relevant rollout file produced by the latest phase run."""
+    new_files = [path for path in after_files if path not in before_files]
+    candidates = new_files or after_files
+    if not candidates:
+        return None
+    if thread_id is None:
+        return candidates[-1]
+    for path in reversed(candidates):
+        if thread_id in path.read_text(encoding="utf-8", errors="ignore"):
+            return path
+    return candidates[-1]
 
 
 def phase_paths(paths: TaskPaths, task_slug: str, phase_name: str) -> dict[str, Path]:
@@ -605,10 +781,16 @@ def run_codex_interactive(
     cwd: Path,
     env: dict[str, str],
     log_path: Path,
-) -> int:
+    pid_callback: Callable[[int], None] | None = None,
+) -> PhaseRunResult:
     """Run Codex in interactive mode in the current terminal."""
+    before_files = set(codex_rollout_files(env))
     process = subprocess.Popen(argv, cwd=cwd, env=env)
+    if pid_callback is not None:
+        pid_callback(process.pid)
     exit_code = process.wait()
+    after_files = codex_rollout_files(env)
+    rollout_path = select_rollout_file(before_files, after_files)
     write_phase_log(
         log_path,
         [
@@ -616,7 +798,12 @@ def run_codex_interactive(
             f"[{utc_now()}] exit_code: {exit_code}",
         ],
     )
-    return exit_code
+    token_count = rollout_token_count(rollout_path) if rollout_path is not None else None
+    return PhaseRunResult(
+        exit_code=exit_code,
+        token_count=token_count,
+        session_path=str(rollout_path) if rollout_path is not None else None,
+    )
 
 
 def run_codex_headless(
@@ -626,8 +813,9 @@ def run_codex_headless(
     env: dict[str, str],
     prompt_path: Path | None,
     log_path: Path,
-) -> int:
+) -> PhaseRunResult:
     """Run Codex in non-interactive exec mode."""
+    before_files = set(codex_rollout_files(env))
     stdin_handle = prompt_path.open("r", encoding="utf-8") if prompt_path is not None else None
     try:
         process = subprocess.run(
@@ -643,7 +831,16 @@ def run_codex_headless(
         if stdin_handle is not None:
             stdin_handle.close()
     log_path.write_text(process.stdout + process.stderr, encoding="utf-8")
-    return process.returncode
+    thread_id, usage = parse_headless_codex_output(process.stdout)
+    rollout_path = select_rollout_file(before_files, codex_rollout_files(env), thread_id)
+    token_count = rollout_token_count(rollout_path) if rollout_path is not None else None
+    return PhaseRunResult(
+        exit_code=process.returncode,
+        thread_id=thread_id,
+        usage=usage,
+        token_count=token_count,
+        session_path=str(rollout_path) if rollout_path is not None else None,
+    )
 
 
 def phase_new_command(
@@ -654,8 +851,10 @@ def phase_new_command(
     prompt_text: str,
     output_path: Path,
     headless: bool,
+    extra_args: list[str] | None = None,
 ) -> tuple[list[str], bool]:
     """Build the argv for a new phase session and whether stdin should supply the prompt."""
+    forwarded_args = list(extra_args or [])
     if headless:
         if phase_name == "planning":
             argv = [
@@ -668,7 +867,6 @@ def phase_new_command(
                 str(repo_root),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
         elif phase_name == "review":
             argv = [
@@ -681,7 +879,6 @@ def phase_new_command(
                 str(cwd),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
         else:
             argv = [
@@ -697,8 +894,9 @@ def phase_new_command(
                 "never",
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
+        argv.extend(forwarded_args)
+        argv.append("-")
         return argv, True
 
     argv = ["codex", "--no-alt-screen", "-C", str(cwd)]
@@ -708,6 +906,7 @@ def phase_new_command(
         argv.extend(["-s", "read-only"])
     else:
         argv.extend(["--add-dir", str(repo_root)])
+    argv.extend(forwarded_args)
     argv.append(prompt_text)
     return argv, False
 
@@ -722,6 +921,7 @@ def run_phase_session(
     output_path: Path,
     log_path: Path,
     headless: bool,
+    extra_args: list[str] | None = None,
 ) -> int:
     """Run a task phase session."""
     manifest = load_or_create_manifest(paths, task_slug)
@@ -743,8 +943,10 @@ def run_phase_session(
         prompt_text=prompt_text,
         output_path=output_path,
         headless=headless,
+        extra_args=extra_args,
     )
     prompt_for_stdin = prompt_path if use_stdin else None
+    phase_metadata = codex_phase_metadata(list(extra_args or []))
 
     phase.update(
         {
@@ -754,12 +956,13 @@ def run_phase_session(
             "output_path": str(output_path),
             "log_path": str(log_path),
             "started_at": utc_now(),
+            **phase_metadata,
         }
     )
     write_manifest(paths, task_slug, manifest)
 
     if headless:
-        exit_code = run_codex_headless(
+        run_result = run_codex_headless(
             argv=argv,
             cwd=target_cwd,
             env=env,
@@ -767,25 +970,39 @@ def run_phase_session(
             log_path=log_path,
         )
     else:
-        process = subprocess.Popen(argv, cwd=target_cwd, env=env)
-        phase["pid"] = process.pid
-        write_manifest(paths, task_slug, manifest)
-        exit_code = process.wait()
+        def record_pid(pid: int) -> None:
+            phase["pid"] = pid
+            write_manifest(paths, task_slug, manifest)
+
+        run_result = run_codex_interactive(
+            argv=argv,
+            cwd=target_cwd,
+            env=env,
+            log_path=log_path,
+            pid_callback=record_pid,
+        )
         write_phase_log(
             log_path,
             [
                 f"[{utc_now()}] mode=interactive phase={phase_name}",
                 f"[{utc_now()}] cwd={target_cwd}",
-                f"[{utc_now()}] exit_code={exit_code}",
             ],
         )
 
-    phase["exit_code"] = exit_code
-    phase["status"] = "succeeded" if exit_code == 0 else "failed"
+    phase["exit_code"] = run_result.exit_code
+    phase["status"] = "succeeded" if run_result.exit_code == 0 else "failed"
     phase["completed_at"] = utc_now()
     phase.pop("pid", None)
+    if run_result.thread_id is not None:
+        phase["thread_id"] = run_result.thread_id
+    if run_result.usage is not None:
+        phase["usage"] = run_result.usage
+    if run_result.token_count is not None:
+        phase["token_count"] = run_result.token_count
+    if run_result.session_path is not None:
+        phase["session_path"] = run_result.session_path
     write_manifest(paths, task_slug, manifest)
-    return exit_code
+    return run_result.exit_code
 
 
 def git_output(worktree_path: Path, args: list[str]) -> str:
@@ -802,7 +1019,13 @@ def git_output(worktree_path: Path, args: list[str]) -> str:
     return process.stdout.strip()
 
 
-def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str | None = None, headless: bool = False) -> Path:
+def plan_task(
+    paths: TaskPaths,
+    task_slug: str,
+    user_prompt: str | None = None,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> Path:
     """Create or update an open task document using Codex planning guidance."""
     ensure_task_layout(paths)
     task_path = get_or_create_open_task(paths, task_slug)
@@ -831,6 +1054,7 @@ def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str | None = None, 
         output_path=info["output_path"],
         log_path=info["log_path"],
         headless=headless,
+        extra_args=extra_args,
     )
     if exit_code != 0:
         raise TaskWorkflowError(f"Planning command failed for '{task_slug}'. See {info['log_path']}.")
@@ -841,7 +1065,12 @@ def plan_task(paths: TaskPaths, task_slug: str, user_prompt: str | None = None, 
     return move_task_to_state(paths, task_slug, "open")
 
 
-def start_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> dict[str, Any]:
+def start_task(
+    paths: TaskPaths,
+    task_slug: str,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> dict[str, Any]:
     """Create a worktree if needed, then run the implementation agent."""
     ensure_task_layout(paths)
     info = ensure_phase_output_absent(paths, task_slug, "implementation", "implementation")
@@ -876,6 +1105,7 @@ def start_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> dict
         output_path=info["output_path"],
         log_path=info["log_path"],
         headless=headless,
+        extra_args=extra_args,
     )
     manifest = load_or_create_manifest(paths, task_slug)
     manifest["exit_code"] = exit_code
@@ -885,7 +1115,12 @@ def start_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> dict
     return manifest
 
 
-def review_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> Path:
+def review_task(
+    paths: TaskPaths,
+    task_slug: str,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> Path:
     """Summarize a task implementation using the git diff from its worktree."""
     ensure_task_layout(paths)
     state, task_path = find_task_document(paths, task_slug)
@@ -918,6 +1153,7 @@ def review_task(paths: TaskPaths, task_slug: str, headless: bool = False) -> Pat
         output_path=info["output_path"],
         log_path=info["log_path"],
         headless=headless,
+        extra_args=extra_args,
     )
     if exit_code != 0:
         raise TaskWorkflowError(f"Review command failed for '{task_slug}'. See {info['log_path']}.")
@@ -936,6 +1172,7 @@ def run_planning_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
+    extra_args: list[str] | None = None,
 ) -> int:
     """Run the planning agent."""
     return run_phase_session(
@@ -947,6 +1184,7 @@ def run_planning_agent(
         output_path=output_path,
         log_path=log_path,
         headless=headless,
+        extra_args=extra_args,
     )
 
 
@@ -958,6 +1196,7 @@ def run_implementation_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
+    extra_args: list[str] | None = None,
 ) -> int:
     """Run the implementation agent."""
     return run_phase_session(
@@ -969,6 +1208,7 @@ def run_implementation_agent(
         output_path=output_path,
         log_path=log_path,
         headless=headless,
+        extra_args=extra_args,
     )
 
 
@@ -980,6 +1220,7 @@ def run_review_agent(
     output_path: Path,
     log_path: Path,
     headless: bool = False,
+    extra_args: list[str] | None = None,
 ) -> int:
     """Run the review agent."""
     _, task_path = find_task_document(paths, task_slug)
@@ -992,6 +1233,7 @@ def run_review_agent(
         output_path=output_path,
         log_path=log_path,
         headless=headless,
+        extra_args=extra_args,
     )
 
 
@@ -1288,25 +1530,33 @@ def cli(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
     :return: process exit code
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, extra_args = parser.parse_known_args(argv)
     paths = get_task_paths(repo_root)
 
     try:
+        if extra_args and args.command not in {"plan", "start", "review"}:
+            parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
         if args.command == "create":
             task_path = create_task(paths, args.task_slug)
             print(task_path)
             return 0
         if args.command == "plan":
             user_prompt = collect_plan_prompt()
-            task_path = plan_task(paths, args.task_slug, user_prompt=user_prompt, headless=args.headless)
+            task_path = plan_task(
+                paths,
+                args.task_slug,
+                user_prompt=user_prompt,
+                headless=args.headless,
+                extra_args=extra_args,
+            )
             print(task_path)
             return 0
         if args.command == "review":
-            review_path = review_task(paths, args.task_slug, headless=args.headless)
+            review_path = review_task(paths, args.task_slug, headless=args.headless, extra_args=extra_args)
             print(review_path)
             return 0
         if args.command == "start":
-            manifest = start_task(paths, args.task_slug, headless=args.headless)
+            manifest = start_task(paths, args.task_slug, headless=args.headless, extra_args=extra_args)
             return int(manifest.get("exit_code", 0))
         if args.command == "stop":
             manifest = stop_task(paths, args.task_slug)
