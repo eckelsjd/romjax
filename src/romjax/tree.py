@@ -44,6 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
 from functools import lru_cache
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -61,6 +62,8 @@ __all__ = [
     "map_error",
     "pytree_iter",
     "to_pytree",
+    "get_subtree",
+    "set_subtree",
     "UnaryOperator",
     "ErrorOperator",
     "TreeErrorOperator",
@@ -73,6 +76,8 @@ type UnaryCallable = Callable[[ArrayLike], ArrayLike]
 type ErrorCallable = Callable[[ArrayLike, ArrayLike], ArrayLike]
 type TreeErrorCallable = Callable[[PyTree, PyTree], ArrayLike]
 type ErrorSpecKey = tuple[str, str | None]
+type PathToken = str | int
+type TreePath = tuple[PathToken, ...]
 
 _OPERATOR_CACHE_SIZE = 256
 
@@ -726,6 +731,51 @@ def pytree_size(tree: PyTree) -> int:
     """Get the leading dimension of the arrays in the pytree."""
     leaves, _ = jax.tree_util.tree_flatten(tree)
     return len(leaves[0])
+
+
+def get_subtree(tree: PyTree, path: TreePath) -> PyTree:
+    """Return subtree located at ``path``."""
+    node = tree
+    for token in path:
+        if isinstance(node, Mapping):
+            node = node[token]
+        elif isinstance(node, (list, tuple)):
+            node = node[token]
+        elif isinstance(token, int):
+            node = node[token]
+        else:
+            node = getattr(node, token)
+    return node
+
+
+def set_subtree(tree: PyTree | None, path: TreePath, value: PyTree) -> PyTree:
+    """Set one subtree in a nested dict/list/tuple tree and return the updated tree."""
+    if len(path) == 0:
+        return value
+
+    head, tail = path[0], path[1:]
+
+    if isinstance(head, str):
+        out = {} if tree is None else dict(tree)
+        out[head] = set_subtree(out.get(head), tail, value)
+        return out
+
+    if tree is None:
+        out_list: list[Any] = []
+    elif isinstance(tree, tuple):
+        out_list = list(tree)
+    elif isinstance(tree, list):
+        out_list = list(tree)
+    else:
+        raise TypeError(f"Cannot index non-sequence node with integer token {head!r}.")
+
+    while len(out_list) <= head:
+        out_list.append(None)
+    out_list[head] = set_subtree(out_list[head], tail, value)
+
+    if isinstance(tree, tuple):
+        return tuple(out_list)
+    return out_list
 
 
 at = pytree_at

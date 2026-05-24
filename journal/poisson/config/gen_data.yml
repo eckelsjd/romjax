@@ -1,9 +1,11 @@
 !romx:DataGeneration
-root: demo/dataset
-graph: demo/poisson_graph.yml
+routine_config: config/common.yml
+
+root: dataset
+graph: config/graph.yml
 train:
-  input_samples: 64
-  outputs_per_input: 4
+  input_samples: 500
+  outputs_per_input: 10
   input_seed: 0
   output_seed: 1
 validation:
@@ -12,4 +14,6 @@ validation:
   input_seed: 2
   output_seed: 3
 write_policy: reuse
-batch_size: 4
+batch_size: 32
+progress_bar:
+  theme: classic

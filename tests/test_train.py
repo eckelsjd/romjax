@@ -1,184 +1,697 @@
-import os
-import pickle
+from __future__ import annotations
+
 from pathlib import Path
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-from jaxtyping import PyTree
+import pytest
+from orbax.checkpoint import v1 as ocp
 
-from romjax.train import train
-from romjax.utils import get_logger
+from romjax import YamlLoader
+from romjax.graph import Edge, FunctionGraph, Node
+from romjax.model import Sampleable
+from romjax.nn import LinearProjection
+from romjax.rng import PyTreeSampler
+from romjax.routine import RoutineError
+from romjax.train import (
+    BatchDataLoader,
+    CheckpointerConfig,
+    DatasetConfig,
+    DiagnosticsConfig,
+    GraphDataLoader,
+    GraphLoss,
+    GraphTest,
+    TerminationConfig,
+    Train,
+)
+from romjax.tree import pytree_norm
+from romjax.utils import save_h5
 
 
-def test_pytree_train(tmp_path):
-    """Simple function approximation with optax adam and nested pytrees."""
-    true_params = {
-        "encoder": {
-            "A_x": jnp.array([[0.7, -0.2, 0.1, 0.4],
-                              [-0.3, 0.5, 0.6, -0.1]]),
-            "A_u": jnp.array([[0.2, -0.4, 0.3, 0.1],
-                              [0.6, 0.2, -0.5, 0.3],
-                              [-0.1, 0.7, 0.2, -0.6]]),
-            "b0": jnp.array([0.2, -0.1, 0.3, 0.05]),
-        },
-        "modulator": {
-            "w": jnp.array([0.9]),
-            "b": jnp.array([0.1]),
-        },
-        "heads": {
-            "y": {
-                "W": jnp.array([[0.5, -0.2],
-                                [0.1, 0.6],
-                                [-0.3, 0.4],
-                                [0.2, -0.5]])
-            },
-            "z": {
-                "W": jnp.array([[0.4],
-                                [-0.1],
-                                [0.2],
-                                [0.3]]),
-                "b": jnp.array([0.1]),
-            },
-        },
-        "scales": (
-            jnp.array([1.2]),
-            {"z": jnp.array([0.8])},
+def scalar_quadratic_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
+    del batch
+    return jnp.square(params["w"] - 1.0)
+
+
+def scalar_zero_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
+    del batch
+    return jnp.square(params["w"])
+
+
+def scalar_quadratic_test(params: dict[str, jax.Array]) -> jax.Array:
+    return jnp.abs(params["w"] - 1.0)
+
+
+def mlp_quadratic_loss(params: eqx.nn.MLP, batch: object) -> jax.Array:
+    del batch
+    x = jnp.array([1.0, -1.0])
+    y = params(x)
+    return jnp.sum(jnp.square(y - 0.5))
+
+
+def graph_batch_squared_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+    del graph
+    x = single_data["inputs"]["x"] if "inputs" in single_data else single_data["x"]
+    return jnp.square(params["toy"]["weight"] - x)
+
+
+def graph_batch_absolute_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+    del graph
+    x = single_data["inputs"]["x"] if "inputs" in single_data else single_data["x"]
+    return jnp.abs(params["toy"]["weight"] - x)
+
+
+def graph_reference_loss(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+    del graph
+    weight = params["toy"]["weight"]
+    alias = params["toy"]["alias"]
+    return jnp.square(weight - single_data["x"]) + jnp.square(alias - weight)
+
+
+class ToyLinearReconstructionEdge(Edge, Sampleable):
+    source: Node = Node(name="state", error_op="mse")
+    target: Node = Node(name="latent")
+    name: str = "toy"
+
+    def forward(self, payload: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        return {"x": payload["x"]}
+
+    def backward(self, payload: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        bias = payload.get("bias", 0.0)
+        return {"x": payload["weight"] * payload["x"] + bias}
+
+    def sample_inputs(self, key: jax.Array) -> dict[str, jax.Array]:
+        return {"x": jax.random.normal(key, ())}
+
+    def sample_outputs(
+        self,
+        key: jax.Array,
+        inputs: dict[str, jax.Array] | None = None,
+        solution: dict[str, jax.Array] | None = None,
+    ) -> dict[str, jax.Array]:
+        del key, solution
+        assert inputs is not None
+        return self.forward(inputs)
+
+
+class RepeatBatchLoader:
+    def __init__(self, batch: object):
+        self.batch = batch
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.batch
+
+
+def _history_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+    return arr[:, 0].astype(int), arr[:, 1]
+
+
+def _tree_allclose(lhs, rhs) -> bool:
+    return bool(
+        jax.tree.reduce(
+            lambda acc, leaf: acc and bool(np.all(np.asarray(leaf))),
+            jax.tree.map(lambda a, b: jnp.isclose(a, b), lhs, rhs),
+            True,
+        )
+    )
+
+
+def _write_graph_dataset(root: Path, dataset_name: str, *, n_inputs: int = 2, n_outputs: int = 2) -> None:
+    for input_idx in range(n_inputs):
+        input_dir = root / dataset_name / "seed_0" / f"sample_{input_idx}"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        save_h5({"x": np.asarray(10 * input_idx + 1)}, input_dir / "input.h5", mode="w")
+
+        for output_idx in range(n_outputs):
+            output_dir = input_dir / "seed_0" / f"sample_{output_idx}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_h5({"y": np.asarray(100 * input_idx + output_idx)}, output_dir / "output.h5", mode="w")
+            save_h5({"r": np.asarray(-100 * input_idx - output_idx)}, output_dir / "residual.h5", mode="w")
+
+
+@pytest.fixture
+def toy_graph() -> FunctionGraph:
+    return FunctionGraph(edges={"toy": ToyLinearReconstructionEdge()})
+
+
+def test_diagnostics(tmp_path: Path) -> None:
+    callback_calls: list[tuple[float, Path | None]] = []
+
+    def progress_callback(params, graph, root):
+        del graph
+        callback_calls.append((float(params["w"]), root))
+
+    root = tmp_path.resolve() / "diagnostics"
+    train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=scalar_quadratic_test,
+        termination=3,
+        diagnostics=DiagnosticsConfig(
+            log_interval=1,
+            plot_interval=1,
+            test_interval=1,
+            callback_interval=1,
+            progress_callback=progress_callback,
+            save_plot="history.pdf",
         ),
-    }
-    
-    def true_model(inputs: PyTree) -> PyTree:
-        # Nonlinear model with multiple inputs and outputs
-        x = inputs["x"]
-        u = inputs["u"]
-        meta = inputs["meta"]["scale"]
+        root=root,
+        checkpointer=CheckpointerConfig(save_decision_policy=1, preservation_policy=1, step_name_format="step"),
+    )
 
-        h = jnp.tanh(x @ true_params["encoder"]["A_x"] + u @ true_params["encoder"]["A_u"] + 
-                     true_params["encoder"]["b0"])
-        mod = meta * true_params["modulator"]["w"] + true_params["modulator"]["b"]
-        h2 = jnp.tanh(h * mod)
+    assert train.run() == 0
 
-        y = h2 @ true_params["heads"]["y"]["W"] + true_params["scales"][0]
-        z = jnp.tanh(h2 @ true_params["heads"]["z"]["W"] + 
-                     true_params["heads"]["z"]["b"]) * true_params["scales"][1]["z"]
-        energy = jnp.sum(h2**2, axis=1, keepdims=True)
+    loss_steps, loss_values = _history_csv(root / "loss.csv")
+    test_steps, test_values = _history_csv(root / "test.csv")
+    assert root.joinpath("history.pdf").exists()
+    assert loss_steps.tolist() == [0, 1, 2]
+    assert test_steps.tolist() == [0, 1, 2]
+    assert loss_values[0] > loss_values[-1]
+    assert test_values[0] > test_values[-1]
+    assert len(callback_calls) == 3
+    assert all(call_root == root for _, call_root in callback_calls)
 
-        return {
-            "y": y,
-            "aux": {
-                "z": z,
-                "energy": energy,
-            },
-        }
 
-    def approx_model(inputs: PyTree, params: PyTree) -> PyTree:
-        # Approximate model with nested pytree parameterization
-        x = inputs["x"]
-        u = inputs["u"]
-        meta = inputs["meta"]["scale"]
+def test_termination(tmp_path: Path) -> None:
+    loss_tol_root = tmp_path.resolve() / "loss_tol"
+    loss_tol_train = Train(
+        loss=scalar_zero_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.1),
+        termination=TerminationConfig(max_steps=5, loss_tol=1e-8),
+        root=loss_tol_root,
+    )
+    assert loss_tol_train.run() == 0
+    assert _history_csv(loss_tol_root / "loss.csv")[0].tolist() == [0]
 
-        h = jnp.tanh(x @ params["encoder"]["A_x"] + u @ params["encoder"]["A_u"] + params["encoder"]["b0"])
-        mod = meta * params["modulator"]["w"] + params["modulator"]["b"]
-        h2 = jnp.tanh(h * mod)
+    test_tol_root = tmp_path.resolve() / "test_tol"
+    test_tol_train = Train(
+        loss=scalar_zero_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.1),
+        test=scalar_quadratic_test,
+        termination=TerminationConfig(max_steps=5, test_tol=1.1),
+        diagnostics=DiagnosticsConfig(test_interval=1),
+        root=test_tol_root,
+    )
+    assert test_tol_train.run() == 0
+    assert _history_csv(test_tol_root / "test.csv")[0].tolist() == [0]
 
-        y = h2 @ params["heads"]["y"]["W"] + params["scales"][0]
-        z = jnp.tanh(h2 @ params["heads"]["z"]["W"] + params["heads"]["z"]["b"]) * params["scales"][1]["z"]
-        energy = jnp.sum(h2**2, axis=1, keepdims=True)
+    grad_tol_root = tmp_path.resolve() / "grad_tol"
+    grad_tol_train = Train(
+        loss=scalar_zero_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.1),
+        termination=TerminationConfig(max_steps=5, grad_tol=1e-8),
+        root=grad_tol_root,
+    )
+    assert grad_tol_train.run() == 0
+    assert _history_csv(grad_tol_root / "loss.csv")[0].tolist() == [0]
 
-        return {
-            "y": y,
-            "aux": {
-                "z": z,
-                "energy": energy,
-            },
-        }
+    runtime = TerminationConfig(max_steps=50, max_runtime="PT0.001S")
+    runtime_root = tmp_path.resolve() / "runtime_tol"
+    runtime_train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.1),
+        termination=runtime,
+        root=runtime_root,
+    )
+    assert runtime.max_runtime.total_seconds() == pytest.approx(0.001)
+    assert runtime_train.run() == 0
+    assert _history_csv(runtime_root / "loss.csv")[0].tolist() == [0]
 
-    key = jax.random.PRNGKey(0)
-    key_train, key_test = jax.random.split(key, 2)
-    n_train = 32
-    n_test = 16
 
-    def sample_inputs(key: jax.Array, n_samples: int) -> PyTree:
-        kx, ku, km = jax.random.split(key, 3)
-        x = jax.random.normal(kx, (n_samples, 2))
-        u = jax.random.normal(ku, (n_samples, 3))
-        scale = 0.6 + 0.4 * jax.random.uniform(km, (n_samples, 1))
-        return {
-            "x": x,
-            "u": u,
-            "meta": {
-                "scale": scale,
-            },
-        }
+def test_checkpointer_and_restart(tmp_path: Path) -> None:
+    checkpointer = CheckpointerConfig(
+        save_decision_policy=1,
+        preservation_policy=1,
+        step_name_format={"step_prefix": "train", "step_format_fixed_length": 3},
+    )
+    root = tmp_path.resolve() / "reuse"
 
-    train_inputs = sample_inputs(key_train, n_train)
-    test_inputs = sample_inputs(key_test, n_test)
-    train_data = {
-        "inputs": train_inputs,
-        "targets": true_model(train_inputs),
-    }
-    test_data = {
-        "inputs": test_inputs,
-        "targets": true_model(test_inputs),
-    }
+    first = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        termination=TerminationConfig(max_steps=2),
+        root=root,
+        checkpointer=checkpointer,
+    )
+    assert first.run() == 0
 
-    @jax.jit
-    def tree_mse(pred: PyTree, target: PyTree) -> jax.Array:
-        leaves_p = jax.tree_util.tree_leaves(pred)
-        leaves_t = jax.tree_util.tree_leaves(target)
-        losses = [jnp.mean((p - t) ** 2) for p, t in zip(leaves_p, leaves_t)]
-        return jnp.mean(jnp.stack(losses))
+    checkpoint_names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    assert checkpoint_names[:2] == ["train_000", "train_001"]
+    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+        assert ckptr.latest is not None
+        assert ckptr.latest.step == 1
 
-    def loss_fn(params: PyTree, *args) -> PyTree:
-        # MSE over training data using approx model
-        preds = approx_model(train_data["inputs"], params)
-        return tree_mse(preds, train_data["targets"])
+    resumed = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(5.0)},
+        optimizer=optax.sgd(0.2),
+        termination=TerminationConfig(max_steps=4),
+        root=root,
+        write_policy="reuse",
+        checkpointer=checkpointer,
+    )
+    assert resumed.run() == 0
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+        assert ckptr.latest is not None
+        assert ckptr.latest.step == 3
 
-    @jax.jit
-    def test_score(params: PyTree) -> PyTree:
-        # MSE over test data using approx model
-        preds = approx_model(test_data["inputs"], params)
-        return tree_mse(preds, test_data["targets"])
-    
-    logger = get_logger("Test train", log_file=Path(tmp_path) / 'opt.log', stdout=False)
-    options = {
-        "save": tmp_path,
-        "save_prefix": "test_",
-        "live_plot": False,
-        "save_interval": 10,
-        "log_interval": 10,
-        "plot_interval": 0,
-        "max_steps": 50,
-        "max_runtime_s": 10,
-        "test_fn": test_score,
-        "loss_tol": 1e-8,
-        "logger": logger
-    }
-    leaves, treedef = jax.tree_util.tree_flatten(true_params)
-    keys = jax.random.split(jax.random.key(123), len(leaves))
-    perturbed_leaves = [leaf + 0.08 * jax.random.normal(k, leaf.shape) for leaf, k in zip(leaves, keys)]
-    params0 = jax.tree_util.tree_unflatten(treedef, perturbed_leaves)
-    optimizer = optax.adam(0.2)
-    params_hat = train(loss_fn, params0, optimizer, **options)
-    
-    train_score = float(loss_fn(params_hat))
-    test_score_val = float(test_score(params_hat))
-    assert train_score < 6.0e-3
-    assert test_score_val < 1.6e-2
+    overwrite_root = tmp_path.resolve() / "overwrite"
+    overwrite_root.mkdir(parents=True, exist_ok=True)
+    overwrite_root.joinpath("sentinel.txt").write_text("remove-me")
+    overwrite = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        termination=TerminationConfig(max_steps=2),
+        root=overwrite_root,
+        write_policy="overwrite",
+        checkpointer=checkpointer,
+    )
+    assert not overwrite_root.joinpath("sentinel.txt").exists()
+    assert overwrite.run() == 0
 
-    log_file = Path(tmp_path) / "opt.log"
-    assert log_file.exists()
+    error_root = tmp_path.resolve() / "error"
+    error_root.mkdir(parents=True, exist_ok=True)
+    error_root.joinpath("sentinel.txt").write_text("keep-me")
+    with pytest.raises(RoutineError):
+        Train(
+            loss=scalar_quadratic_loss,
+            init_params={"w": jnp.array(0.0)},
+            optimizer=optax.sgd(0.2),
+            termination=TerminationConfig(max_steps=2),
+            root=error_root,
+            write_policy="error",
+            checkpointer=checkpointer,
+        )
 
-    history_file = Path(tmp_path) / "test_opt-history.csv"
-    assert history_file.exists()
 
-    steps = sorted([int(f.split("iter-")[1].split(".")[0]) for f in os.listdir(tmp_path) if f.endswith(".pkl")])
-    results_file = Path(tmp_path) / f"test_opt-iter-{steps[-1]}.pkl"
+def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
+    checkpointer = CheckpointerConfig(
+        save_decision_policy=1,
+        preservation_policy=1,
+        step_name_format={"step_prefix": "train", "step_format_fixed_length": 3},
+    )
+    root = tmp_path.resolve() / "adam_reuse"
 
-    with open(results_file, "rb") as fd:
-        saved = pickle.load(fd)
-    saved_params = saved["params"]
-    leaves_hat = jax.tree_util.tree_leaves(params_hat)
-    saved_leaves = jax.tree_util.tree_leaves(saved_params)
-    for a, b in zip(saved_leaves, leaves_hat):
-        assert jnp.allclose(a, b, atol=1e-6, rtol=1e-6)
+    first = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.adam(0.2),
+        termination=TerminationConfig(max_steps=2),
+        root=root,
+        checkpointer=checkpointer,
+    )
+    assert first.run() == 0
+
+    resumed = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(5.0)},
+        optimizer=optax.adam(0.2),
+        termination=TerminationConfig(max_steps=4),
+        root=root,
+        write_policy="reuse",
+        checkpointer=checkpointer,
+    )
+    assert resumed.run() == 0
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+
+    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+        assert ckptr.latest is not None
+        assert ckptr.latest.step == 3
+        loaded = ckptr.load_checkpointables(
+            abstract_checkpointables={
+                "params": {"w": jnp.array(0.0)},
+                "opt_state": optax.adam(0.2).init({"w": jnp.array(0.0)}),
+            }
+        )
+
+    assert hasattr(loaded["opt_state"][0], "mu")
+
+
+def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
+    checkpointer = CheckpointerConfig(
+        save_decision_policy=1,
+        preservation_policy=1,
+        step_name_format={"step_prefix": "train", "step_format_fixed_length": 3},
+    )
+    root = tmp_path.resolve() / "mlp_reuse"
+    init_params = eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(0))
+
+    first = Train(
+        loss=mlp_quadratic_loss,
+        init_params=init_params,
+        optimizer=optax.adam(0.1),
+        termination=TerminationConfig(max_steps=2),
+        root=root,
+        checkpointer=checkpointer,
+    )
+    assert first.run() == 0
+
+    resumed = Train(
+        loss=mlp_quadratic_loss,
+        init_params=eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(999)),
+        optimizer=optax.adam(0.1),
+        termination=TerminationConfig(max_steps=4),
+        root=root,
+        write_policy="reuse",
+        checkpointer=checkpointer,
+    )
+    assert resumed.run() == 0
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+
+    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+        assert ckptr.latest is not None
+        loaded = ckptr.load_checkpointables(
+            abstract_checkpointables={
+                "params": eqx.filter(init_params, eqx.is_array),
+                "opt_state": optax.adam(0.1).init(eqx.filter(init_params, eqx.is_array)),
+            }
+        )
+
+    assert isinstance(resumed.init_params, eqx.nn.MLP)
+    assert isinstance(loaded["params"], eqx.nn.MLP)
+    assert hasattr(loaded["opt_state"][0], "mu")
+
+
+def test_basic_batch_loader():
+    empty_loader = BatchDataLoader()
+    assert next(empty_loader) == ()
+
+    data = np.arange(5)
+    loader = BatchDataLoader(data=data, batch_size=2, shuffle_seed=0, max_epochs=1)
+    assert [batch.tolist() for batch in loader] == [[2, 4], [3, 0], [1]]
+
+    deterministic_a = BatchDataLoader(data=data, batch_size=2, shuffle_seed=7, max_epochs=2)
+    deterministic_b = BatchDataLoader(data=data, batch_size=2, shuffle_seed=7, max_epochs=2)
+    assert [batch.tolist() for batch in deterministic_a] == [batch.tolist() for batch in deterministic_b]
+
+    paired_data = ([1, 2, 3], [4, 5, 6])
+    paired_loader = BatchDataLoader(data=paired_data, batch_size=2, max_epochs=1)
+    assert list(paired_loader) == [([1, 2], [4, 5]), ([3], [6])]
+
+    with pytest.raises(ValueError, match="equal length"):
+        BatchDataLoader(data=([1, 2], [3]), batch_size=1)
+
+
+def test_train_convergence():
+    def rosenbrock_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
+        del batch
+        x, y = params["x"]
+        return jnp.square(1.0 - x) + 100.0 * jnp.square(y - jnp.square(x))
+
+    train = Train(
+        loss=rosenbrock_loss,
+        init_params={"x": jnp.array([-1.2, 1.0])},
+        optimizer=optax.adam(0.01),
+        termination=5_000,
+    )
+
+    params = train()
+    expected = {"x": jnp.array([1.0, 1.0])}
+    assert jnp.allclose(params["x"], expected["x"], atol=1e-3)
+    assert float(rosenbrock_loss(params, None)) == pytest.approx(0.0, abs=1e-6)
+
+
+
+def test_graph_init_params(toy_graph: FunctionGraph) -> None:
+    train = Train(
+        loss=GraphLoss(terms=["reconstruction"]),
+        init_params=PyTreeSampler(
+            template={
+                "toy": {
+                    "weight": {"callable": "normal", "mean": 0.0, "std": 0.1, "shape": ()},
+                    "bias": 0.25,
+                    "alias": "toy,weight",
+                    "module": {"name": "LinearProjection", "kwargs": {"latent": 1, "dof": 1}},
+                }
+            }
+        ),
+        optimizer=optax.sgd(0.1),
+        graph=toy_graph,
+        init_seed=7,
+    )
+
+    assert train.loss.graph is toy_graph
+    assert train.loss.terms[0].edge == "toy"
+    assert isinstance(train.init_params["toy"]["module"], LinearProjection)
+    assert jnp.shape(train.init_params["toy"]["weight"]) == ()
+    assert float(train.init_params["toy"]["bias"]) == pytest.approx(0.25)
+    assert train.init_params["toy"]["alias"] == "toy,weight"
+
+
+def test_graph_dataloader(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "graph_data"
+    _write_graph_dataset(root, "beta")
+    _write_graph_dataset(root, "alpha")
+
+    loader = GraphDataLoader(root=root)
+    assert [dataset.name for dataset in loader.datasets] == ["alpha", "beta"]
+
+    first_batch = next(loader)
+    assert set(first_batch) == {"alpha", "beta"}
+    assert first_batch["alpha"]["inputs"]["x"].shape == (4,)
+    assert first_batch["alpha"]["outputs"]["y"].shape == (4,)
+    assert first_batch["alpha"]["residuals"]["r"].shape == (4,)
+
+    skipped = GraphDataLoader(
+        root=root,
+        datasets=DatasetConfig(
+            batch_size=4,
+            skip_input=lambda path: path.name == "sample_0",
+            skip_output=lambda path: path.name == "sample_0",
+        ),
+    )
+    skipped_batch = next(skipped)
+    assert skipped.datasets[0].name == "alpha"
+    assert skipped_batch["alpha"]["inputs"]["x"].tolist() == [11]
+    assert skipped_batch["alpha"]["outputs"]["y"].tolist() == [101]
+
+    limited = GraphDataLoader(
+        root=root,
+        datasets=DatasetConfig(
+            batch_size=4,
+            max_samples=1,
+            max_input_samples=1,
+            max_outputs_per_input=1,
+        ),
+    )
+    limited_batch = next(limited)
+    assert limited_batch["alpha"]["inputs"]["x"].shape == (1,)
+    assert limited_batch["alpha"]["outputs"]["y"].shape == (1,)
+
+    iterator = iter(GraphDataLoader(root=root))
+    assert set(next(iterator)) == {"alpha", "beta"}
+    assert set(next(iterator)) == {"alpha", "beta"}
+
+    resumed_source = GraphDataLoader(root=root)
+    _ = next(resumed_source)
+    second_batch = next(resumed_source)
+
+    resumed = GraphDataLoader(root=root)
+    resumed.set_iterator(train_step=1)
+    assert _tree_allclose(second_batch, next(resumed))
+
+
+def test_graph_loss(toy_graph: FunctionGraph) -> None:
+    batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
+
+    squared = GraphLoss(terms=[{"function": graph_batch_squared_error, "edge": "toy"}], graph=toy_graph)
+    params = {"toy": {"weight": jnp.array(0.5)}}
+    assert squared(params, batch) == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
+
+    reference = GraphLoss(terms=[{"function": graph_reference_loss, "edge": "toy"}], graph=toy_graph)
+    ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
+    resolved_params = reference._resolve_references(ref_params)
+    assert reference(ref_params, batch) == pytest.approx(squared(params, batch))
+    assert eqx.filter_jit(reference)(ref_params, batch) == pytest.approx(squared(params, batch))
+    assert jax.jit(lambda data: reference(resolved_params, data))(batch) == pytest.approx(squared(params, batch))
+    grad = jax.grad(lambda weight: reference({"toy": {"weight": weight, "alias": weight}}, batch))(jnp.array(0.5))
+    assert jnp.isfinite(grad)
+    assert grad == pytest.approx(-3)
+    stacked_x = jnp.array([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])
+    vmapped = jax.vmap(lambda x: reference(resolved_params, {"toy": {"x": x}}))(stacked_x)
+    assert vmapped.shape == (2,)
+    assert np.all(np.isfinite(np.asarray(vmapped)))
+
+    weighted = GraphLoss(
+        terms=[
+            {"function": graph_batch_squared_error, "edge": "toy", "weight": 2.0},
+            {"function": graph_batch_absolute_error, "edge": "toy", "weight": 0.5},
+        ],
+        graph=toy_graph,
+    )
+    expected_weighted = (
+        2.0 * np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2)
+        + 0.5 * np.mean(np.abs(0.5 - np.array([1.0, 2.0, 3.0])))
+    )
+    assert weighted(params, batch) == pytest.approx(expected_weighted)
+
+    reconstructed = GraphLoss(
+        terms=[
+            {"callable": "reconstruction", "path": ["toy"]},
+            {"function": "tikhonov", "weight": 0.1, "batch_reduce": None},
+        ],
+        graph=toy_graph,
+    )
+    recon_params = {"toy": {"weight": jnp.array(0.5), "bias": jnp.array(0.2)}}
+    expected_reconstruction = np.mean((np.array([1.0, 2.0, 3.0]) - (0.5 * np.array([1.0, 2.0, 3.0]) + 0.2)) ** 2)
+    expected_regularization = 0.1 * float(pytree_norm(recon_params))
+    assert reconstructed(recon_params, batch) == pytest.approx(expected_reconstruction + expected_regularization)
+
+
+def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    data_root = tmp_path.resolve() / "graph_validation"
+    _write_graph_dataset(data_root, "toy", n_inputs=1, n_outputs=1)
+    dataloader = GraphDataLoader(
+        root=data_root,
+        datasets=DatasetConfig(name="toy", batch_size=1, max_epochs=2),
+    )
+    test = GraphTest(
+        terms=[{"function": graph_batch_squared_error, "edge": "toy"}],
+        graph=toy_graph,
+        dataloader=dataloader,
+        reduce="mean",
+    )
+
+    value = test({"toy": {"weight": jnp.array(0.0)}})
+    expected = np.mean([np.mean((0.0 - np.array([1])) ** 2), np.mean((0.0 - np.array([1])) ** 2)])
+    assert value == pytest.approx(expected)
+
+
+def test_load_train_from_yaml(tmp_path: Path) -> None:
+    data_root = tmp_path.resolve() / "yaml_data"
+    run_root = tmp_path.resolve() / "yaml_run"
+    _write_graph_dataset(data_root, "toyset", n_inputs=1, n_outputs=1)
+
+    yaml_text = f"""
+train: !romx:Train
+  graph: !romx:FunctionGraph
+    edges:
+      toy: !pd:tests.test_train.ToyLinearReconstructionEdge
+        source: state
+        target: latent
+        name: toy
+  loss: !romx:GraphLoss
+    terms:
+      - reconstruction
+      - function: !!python/name:tests.test_train.graph_batch_squared_error
+        weight: 0.5
+        edge: toy
+  test: !romx:GraphTest
+    terms:
+      - reconstruction
+    dataloader: !romx:GraphDataLoader
+      root: {data_root}
+      datasets:
+        batch_size: 1
+  dataloader: !romx:GraphDataLoader
+    root: {data_root}
+    datasets:
+      batch_size: 1
+  init_params: !romx:PyTreeSampler
+    template:
+      toy:
+        weight:
+          callable: normal
+          mean: 0.0
+          std: 0.1
+          shape: []
+        bias: 0.25
+        alias: toy,weight
+        module:
+          name: LinearProjection
+          kwargs:
+            latent: 1
+            dof: 1
+  optimizer:
+    name: sgd
+    args: [0.1]
+  root: {run_root}
+"""
+    train = YamlLoader.load(yaml_text)["train"]
+
+    assert isinstance(train, Train)
+    assert isinstance(train.loss, GraphLoss)
+    assert isinstance(train.test, GraphTest)
+    assert isinstance(train.dataloader, GraphDataLoader)
+    assert isinstance(train.init_params["toy"]["module"], LinearProjection)
+    assert train.root == run_root.resolve()
+    assert train.loss.graph is train.graph
+    assert train.test.graph is train.graph
+    assert train.loss.terms[0].edge == "toy"
+    assert train.test.terms[0].edge == "toy"
+    assert train.dataloader.datasets[0].name == "toyset"
+    assert train.test.dataloader.datasets[0].name == "toyset"
+    assert train.init_params["toy"]["alias"] == "toy,weight"
+
+
+def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    train_batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
+    validation_root = tmp_path.resolve() / "validation_graph_train"
+    _write_graph_dataset(validation_root, "toy", n_inputs=1, n_outputs=1)
+    validation_loader = GraphDataLoader(
+        root=validation_root,
+        datasets=DatasetConfig(name="toy", batch_size=1, max_epochs=2),
+    )
+    loss = GraphLoss(terms=[{"callable": "reconstruction", "path": "toy"}])
+
+    def validation_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+        del graph
+        x = single_data["inputs"]["x"] if "inputs" in single_data else single_data["x"]
+        return jnp.square(x - (params["toy"]["weight"] * x + params["toy"]["bias"]))
+
+    test = GraphTest(
+        terms=[{"function": validation_error}],
+        dataloader=validation_loader,
+    )
+
+    max_steps = 20
+    root = tmp_path.resolve() / "graph_train"
+    train = Train(
+        loss=loss,
+        init_params={"toy": {"weight": jnp.array(0.0), "bias": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.15),
+        test=test,
+        dataloader=RepeatBatchLoader(train_batch),
+        termination=TerminationConfig(max_steps=max_steps),
+        diagnostics=DiagnosticsConfig(test_interval=1),
+        root=root,
+        graph=toy_graph,
+    )
+
+    assert train.loss.graph is toy_graph
+    assert train.test.graph is toy_graph
+    assert train.run() == 0
+
+    loss_steps, loss_values = _history_csv(root / "loss.csv")
+    test_steps, test_values = _history_csv(root / "test.csv")
+    assert loss_steps.tolist() == list(range(max_steps))
+    assert test_steps.tolist() == list(range(max_steps))
+    assert loss_values[-1] < 0.1 * loss_values[0]
+    assert test_values[-1] < test_values[0]
+
+    with ocp.training.Checkpointer(root) as ckptr:
+        assert ckptr.latest is not None
+        assert ckptr.latest.step == max_steps - 1
+        params = ckptr.load_checkpointables(
+            abstract_checkpointables={
+                "params": {"toy": {"weight": jnp.array(0.0), "bias": jnp.array(0.0)}}
+            }
+        )["params"]
+    assert float(params["toy"]["weight"]) == pytest.approx(1.0, abs=0.2)
+    assert abs(float(params["toy"]["bias"])) < 0.2

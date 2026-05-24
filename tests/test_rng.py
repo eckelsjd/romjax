@@ -95,8 +95,9 @@ def test_pytree_sampler() -> None:
     assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
     assert np.isclose(float(sample["aux"][0]), float(expected_aux))
 
-    with pytest.raises(TypeError):
-        PyTreeSampler(template={"phi": 1.0})
+    passthrough_sampler = PyTreeSampler(template={"phi": 1.0})
+    passthrough_sample = passthrough_sampler.sample(key)
+    assert passthrough_sample["phi"] == 1.0
 
 
 def test_pytree_sampler_allows_inline_distribution_kwargs() -> None:
@@ -104,6 +105,20 @@ def test_pytree_sampler_allows_inline_distribution_kwargs() -> None:
     sample = sampler.sample(jax.random.key(0))
 
     assert np.asarray(sample["x"]).shape == ()
+
+
+def test_pytree_sampler_preserves_non_distribution_leaves() -> None:
+    sampler = PyTreeSampler(
+        template={
+            "phi": {"callable": "normal", "mean": 0.0, "std": 1.0, "shape": (2,)},
+            "meta": {"label": "keep-me", "step": 7},
+        }
+    )
+
+    sample = sampler.sample(jax.random.key(1))
+
+    assert sample["meta"] == {"label": "keep-me", "step": 7}
+    assert sample["phi"].shape == (2,)
 
 
 def test_near_solution_sampler_with_noise_wrapper() -> None:

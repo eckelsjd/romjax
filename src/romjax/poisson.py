@@ -1,13 +1,13 @@
 """Example 2D Poisson solver."""
 import functools
 from collections.abc import Mapping
-from typing import Annotated, Any, Callable, Literal, TypedDict
 from functools import partial
+from typing import Annotated, Any, Callable, Literal, TypedDict
 
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import BeforeValidator, ConfigDict, Field, PositiveInt, field_validator, AfterValidator
+from pydantic import AfterValidator, BeforeValidator, ConfigDict, Field, PositiveInt, field_validator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, Sampleable
@@ -20,10 +20,9 @@ from romjax.pde import (
     UniformGrid,
     homogeneous_boundary,
 )
-from romjax.rng import RomjaxSampler
+from romjax.rng import SamplerCallable
 from romjax.tree import to_pytree
-from romjax.typing import DictModel, from_registry, ThirdPartyType, require_type
-
+from romjax.typing import DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ["Poisson2D"]
 
@@ -237,8 +236,8 @@ class Poisson2D(ImplicitModel, Sampleable):
         default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2))
     )
 
-    inputs_sampler: RomjaxSampler | None = None
-    outputs_sampler: RomjaxSampler | None = None
+    inputs_sampler: SamplerCallable | None = None
+    outputs_sampler: SamplerCallable | None = None
     
     def _merge_coords(self, inputs: PoissonInputs) -> PoissonInputs:
         """Merge grid coords into incoming inputs."""

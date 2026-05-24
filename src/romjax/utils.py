@@ -1,7 +1,5 @@
 """Module for assorted processing utilities."""
-import logging
 import subprocess
-import sys
 import threading
 from os import PathLike
 from pathlib import Path
@@ -10,62 +8,10 @@ from typing import Any
 import h5py
 import jax.numpy as jnp
 import numpy as np
-from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
-__all__ = ['get_logger', 'get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'Logger']
-
-
-LOG_FORMATTER = logging.Formatter(u"%(asctime)s — [%(levelname)s] — %(name)-10s — %(message)s")
+__all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
 
 
-def get_logger(name: str, stdout: bool = True, log_file: str | Path = None,
-               level: int = logging.INFO) -> logging.Logger:
-    """Return a file/stdout logger with the given name.
-
-    :param name: the name of the logger to return
-    :param stdout: whether to add a stdout stream handler to the logger
-    :param log_file: add file logging to this file (optional)
-    :param level: the logging level to set
-    :returns: the logger
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    logger.handlers.clear()
-    if stdout:
-        std_handler = logging.StreamHandler(sys.stdout)
-        std_handler.setFormatter(LOG_FORMATTER)
-        logger.addHandler(std_handler)
-    if log_file is not None:
-        f_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-        f_handler.setLevel(level)
-        f_handler.setFormatter(LOG_FORMATTER)
-        logger.addHandler(f_handler)
-
-    return logger
-
-
-class Logger(BaseModel):
-    """Simple logging with pydantic validation."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
-
-    name: str
-    stdout: bool = True
-    file: Path | None = None
-    _logger: logging.Logger | None = PrivateAttr(default=None)
-
-    @model_validator(mode='after')
-    def _set_logger(self):
-        self._logger = get_logger(self.name, self.stdout, self.file)
-        return self
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate unknown attributes to the underlying ``logging.Logger``."""
-        logger = self.__pydantic_private__.get("_logger")
-        if logger is not None:
-            return getattr(logger, name)
-        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
-    
 
 def format_time_engineering(seconds: float):
     """Helper to format times in common engineering magnitudes."""
@@ -141,7 +87,7 @@ def get_gpu_memory() -> list[tuple[int, int]]:
     return usage
 
 
-def print_gpu_memory(logger: logging.Logger | None = None) -> None:
+def print_gpu_memory(logger: Any | None = None) -> None:
     """
     Print the current GPU memory usage and total memory in MiB.
 
@@ -257,5 +203,5 @@ def load_h5(data: dict[str, Any], filename: str | PathLike, mode: str = 'r', jax
         # Selectively load requested data (supports nested dict patterns)
         else:
             _recursively_fill(data, f)
-    
+
     return data

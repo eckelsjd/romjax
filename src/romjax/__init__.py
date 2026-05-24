@@ -16,6 +16,7 @@ from pathlib import Path as _Path
 from types import BuiltinFunctionType as _BuiltinFunctionType
 from types import FunctionType as _FunctionType
 from typing import IO as _IO
+from typing import TYPE_CHECKING
 from typing import Any as _Any
 from typing import Literal as _Literal
 from typing import Optional as _Optional
@@ -31,7 +32,6 @@ type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
     "tree": ("romjax.tree", None),
-    "routines": ("romjax.routines", None),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
@@ -51,17 +51,41 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "DictModel": ("romjax.typing", "DictModel"),
     "ListModel": ("romjax.typing", "ListModel"),
     "CallableModel": ("romjax.typing", "CallableModel"),
-    "Routine": ("romjax.typing", "Routine"),
     "ThirdPartyType": ("romjax.typing", "ThirdPartyType"),
+    "Routine": ("romjax.routine", "Routine"),
+    "RoutineConfig": ("romjax.routine", "RoutineConfig"),
+    "RoutineError": ("romjax.routine", "RoutineError"),
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
+    "Train": ("romjax.train", "Train"),
+    "GraphLoss": ("romjax.train", "GraphLoss"),
+    "GraphTest": ("romjax.train", "GraphTest"),
+    "GraphDataLoader": ("romjax.train", "GraphDataLoader"),
+    "BatchDataLoader": ("romjax.train", "BatchDataLoader")
 }
 
 __all__ = list(_LAZY_EXPORTS.keys())
 
+#ruff: noqa F401
+if TYPE_CHECKING:
+    from . import rng as random
+    from . import tree as tree
+    from .data_gen import DataGeneration
+    from .graph import CompositeEdge, FunctionGraph
+    from .model import ExplicitModel, FilterModel, ImplicitModel, Sampleable, eqx_evaluate
+    from .nn import LinearProjection
+    from .plotting import gridplot
+    from .poisson import Poisson2D
+    from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
+    from .routine import Routine, RoutineConfig, RoutineError
+    from .train import GraphDataLoader, GraphLoss, GraphTest, Train, BatchDataLoader
+    from .tree import get_error_operator, get_tree_operator, get_unary_operator
+    from .typing import CallableModel, DictModel, ListModel, ThirdPartyType
+    from .utils import load_h5, save_h5
 
 def __getattr__(name: str) -> _Any:
+    """Lazily load internal package symbols to avoid circular dependencies."""
     if name not in _LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attr_name = _LAZY_EXPORTS[name]

@@ -6,6 +6,7 @@ import lineax as lx
 import optax
 import optimistix as optx
 import pytest
+from orbax.checkpoint import v1 as ocp
 from pydantic import AfterValidator, BaseModel, TypeAdapter, ValidationError, model_validator
 
 from romjax import DictModel, YamlLoader
@@ -88,6 +89,26 @@ def test_third_party_type_accepts_partially_validated_nested_objects():
             "decay_rate": 0.99,
         },
     }
+
+
+def test_third_party_type_supports_custom_default_modules():
+    adapter = TypeAdapter(ThirdPartyType(default_modules=ocp.training.save_decision_policies.__name__))
+    policy = adapter.validate_python(
+        {
+            "name": "AnySavePolicy",
+            "args": [
+                [
+                    {"name": "FixedIntervalPolicy", "args": [3]},
+                    {"name": "SpecificStepsPolicy", "args": [[5]]},
+                ]
+            ],
+        }
+    )
+    dumped = adapter.dump_python(policy)
+
+    assert isinstance(policy, ocp.training.save_decision_policies.SaveDecisionPolicy)
+    assert dumped["name"] == "AnySavePolicy"
+    assert dumped["args"][0][0] == {"name": "FixedIntervalPolicy", "args": [3]}
 
 
 def test_gradient_transformation_type_rejects_wrong_object_type():

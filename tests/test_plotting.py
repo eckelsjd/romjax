@@ -1,8 +1,11 @@
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 
-from romjax.plotting import PlotOpts, PlotSpec, gridplot
+from romjax import plotting
+from romjax.plotting import AxisOptions, GridplotConfig, PlotSpec, gridplot
 
 
 def test_basic_gridplot(tmp_path):
@@ -14,18 +17,67 @@ def test_basic_gridplot(tmp_path):
     sin_spec = PlotSpec(
         kind='line',
         data=generate_sinusoid(),
-        opts=PlotOpts(xlabel="t", ylabel="y(t)", animate=True, ylim=(-1, 1)),
+        opts=AxisOptions(xlabel="t", ylabel="y(t)", animate=True, ylim=(-1, 1)),
         kwargs=dict(color="red", ls="--"),
         name="my_plot"
     )
 
-    fig, ax, ani = gridplot(
+    fig, _, _ = gridplot(
         sin_spec, 
         scheme='dark', 
-        plot_kwargs={"my_plot": {"lw": 3}},
+        local_plot_kwargs={"my_plot": {"lw": 3}},
         animate_opts={"writer": "pillow", "dpi": 100, "fps": 15, "blit": False},
         save=Path(tmp_path) / "sine.gif",
     )
-    print(tmp_path)
 
     assert (Path(tmp_path) / "sine.gif").exists()
+    plt.close(fig)
+
+
+def test_global_override(monkeypatch):
+    monkeypatch.setattr(
+        plotting,
+        "global_config",
+        GridplotConfig(
+            scheme="white",
+            subplot_size_in=(2.0, 3.0),
+            animate_opts={"blit": False, "fps": 10, "writer": "pillow"},
+            subplots_kwargs={"squeeze": False},
+        ),
+    )
+
+    plotting.set_global(
+        subplot_size_in=(4.0, 5.0),
+        global_axis_opts={"xlabel": "time"},
+        global_plot_kwargs={"lw": 5},
+    )
+
+    spec = PlotSpec(
+        kind="line",
+        data=(np.asarray([0.0, 1.0]), np.asarray([1.0, 2.0])),
+        opts=AxisOptions(ylabel="value"),
+        kwargs={"color": "red"},
+        name="series",
+    )
+
+    fig, axs = gridplot(
+        spec,
+        global_axis_opts={"title": "global title", "xscale": "linear"},
+        local_axis_opts={"series": {"ylabel": "local value", "title": "local title"}},
+        global_plot_kwargs={"marker": "o"},
+        local_plot_kwargs={"series": {"ls": "--"}},
+    )
+
+    ax = axs[0, 0]
+    line = ax.lines[0]
+
+    assert tuple(fig.get_size_inches()) == pytest.approx((4.0, 5.0))
+    assert ax.get_xlabel() == "time"
+    assert ax.get_ylabel() == "local value"
+    assert ax.get_title() == "local title"
+    assert line.get_color() == "red"
+    assert line.get_linewidth() == 5
+    assert line.get_marker() == "o"
+    assert line.get_linestyle() == "--"
+
+    plt.close(fig)

@@ -6,18 +6,19 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterable, Literal, Optional
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jaxtyping
 from jax.typing import ArrayLike
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import AfterValidator, BeforeValidator, Field, TypeAdapter, model_validator
 
 from romjax.random_field import darcy, kle
 from romjax.tree import UnaryOperator, get_unary_operator, pytree_merge
-from romjax.typing import CallableModel, from_registry
+from romjax.typing import CallableModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
-           'NearSolutionSampler', 'RomjaxSampler', 'gen_keys']
+           'NearSolutionSampler', 'gen_keys']
 
 
 type RelativeScale = tuple[UnaryOperator, float]
@@ -35,14 +36,51 @@ def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kw
     return jax.random.normal(key, **kwargs) * std + mean
 
 
+def dirac(key: jaxtyping.Key, value: ArrayLike = 0.0) -> ArrayLike:
+    """Just return a constant value as a dirac distribution."""
+    return jnp.asarray(value)
+
+
+def random_eqx_module(
+    key: jaxtyping.Key, 
+    name: str = None, 
+    args: tuple | list = (), 
+    kwargs: dict = None,
+    default_modules: str | Sequence[str] = "romjax.nn"
+) -> eqx.Module:
+    """
+    Construct a random eqx.Module object using the provided key and class constructor info. The class constructor
+    must take `key` as a kwarg in the init method. For compatibility with PyTreeSampler, the returned object should 
+    subclass eqx.Module.
+
+    See `ThirdPartyType` for details.
+    """
+    if name is None:
+        raise ValueError("Cannot construct third-party object with empty 'name'.")
+    if kwargs is None:
+        kwargs = {}
+    
+    type EquinoxModule = Annotated[
+        ThirdPartyType(default_modules=default_modules),
+        AfterValidator(functools.partial(require_type, eqx.Module)),
+    ]
+
+    kwargs["key"] = key
+    ta = TypeAdapter(EquinoxModule)
+
+    return ta.validate_python({"name": name, "args": args, "kwargs": kwargs})
+
+
 _distribution_registry = {
     "uniform": jax.random.uniform,
     "normal": normal,
     "darcy": darcy,
-    "kle": kle
+    "kle": kle,
+    "dirac": dirac,
+    "eqx_module": random_eqx_module
 }
 
-type DistributionCallable = Annotated[Callable[[jaxtyping.Key], ArrayLike], 
+type DistributionCallable = Annotated[Callable[[jaxtyping.Key], ArrayLike | eqx.Module], 
                                       BeforeValidator(functools.partial(from_registry, _distribution_registry))]
 """Take in a random key and extra options and produce an array of samples."""
 
@@ -51,24 +89,34 @@ class Distribution(CallableModel):
     """Simple class that provides validation for common distributions."""
 
     callable: DistributionCallable
+
+    @model_validator(mode="before")
+    @classmethod
+    def _dirac_distribution_from_number(cls, value):
+        if isinstance(value, float | int):
+            return {"callable": dirac, "value": value}
+        return value
     
     def sample(self, key: jaxtyping.Key):  # Just an alias
         return super().__call__(key)
 
 
 def validate_distribution_pytree(template: jaxtyping.PyTree) -> jaxtyping.PyTree:
-    """Validate every leaf in a pytree-like template as a :class:`Distribution`."""
-    if callable(template):
+    """Validate every leaf in a pytree-like template as a :class:`Distribution`. Leave anything else untouched."""
+    if callable(template) or isinstance(template, float | int):
         return Distribution.model_validate(template)
     if isinstance(template, Mapping):
         if "callable" in template:
             return Distribution(**template)
+        if "name" in template:
+            return Distribution(callable="eqx_module", **template)
         return {key: validate_distribution_pytree(value) for key, value in template.items()}
     if isinstance(template, tuple):
         return tuple(validate_distribution_pytree(value) for value in template)
     if isinstance(template, list):
         return [validate_distribution_pytree(value) for value in template]
-    raise TypeError("All leaves for pytree sampling must be Distribution-like mappings.")
+    
+    return template
 
 
 type DistributionPyTree = Annotated[jaxtyping.PyTree, BeforeValidator(validate_distribution_pytree)]
@@ -98,14 +146,22 @@ class PyTreeSampler(SamplerCallable):
         """
         Sample an arbitrary pytree template whose leaves are ``Distribution``-like specs.
 
+        Assumes third-party type samplers return eqx.Module, which will be treated as leaves.
+
         :param key: the JAX random key
         :param template: pytree whose leaves are Distribution instances or Distribution-like mappings
         :return: pytree with the same structure as ``template`` and sampled array leaves
         """
-        leaves, treedef = jax.tree.flatten(template, is_leaf=lambda value: isinstance(value, Distribution))
+        dist_tree, other_tree = eqx.partition(template, lambda leaf: isinstance(leaf, Distribution))
+        leaves, treedef = jax.tree.flatten(dist_tree, is_leaf=lambda leaf: isinstance(leaf, Distribution))
         subkeys = jax.random.split(key, len(leaves))
         samples = [dist.sample(subkey) for dist, subkey in zip(leaves, subkeys)]
-        return jax.tree.unflatten(treedef, samples)
+        ret = eqx.combine(
+            jax.tree.unflatten(treedef, samples), 
+            other_tree,
+            is_leaf = lambda val: eqx.is_array(val) | isinstance(val, eqx.Module)
+        )
+        return ret
 
     def sample(self, key: jaxtyping.Key):  # alias
         return self(key)
@@ -179,15 +235,6 @@ class NearSolutionSampler(PyTreeSampler):
     ) -> jaxtyping.PyTree:
         """Just a convenience alias."""
         return self(key, inputs=inputs, solution=solution)
-
-
-_sampler_registry = {
-    "pytree": PyTreeSampler,
-    "parametric": PyTreeSampler,
-    "near_solution": NearSolutionSampler
-}
-
-type RomjaxSampler = Annotated[SamplerCallable, BeforeValidator(functools.partial(from_registry, _sampler_registry))]
 
 
 def gen_keys(

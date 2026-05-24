@@ -10,11 +10,7 @@ from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from romjax.graph import Edge, Node
-from romjax.tree import pytree_merge
-
-type PathToken = str | int
-type TreePath = tuple[PathToken, ...]
-
+from romjax.tree import TreePath, get_subtree, pytree_merge, set_subtree
 
 __all__ = ['Sampleable', 'eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel']
 
@@ -532,57 +528,12 @@ def _coerce_path(value: Any) -> TreePath:
     return (value,)
 
 
-def _get_subtree(tree: PyTree, path: TreePath) -> PyTree:
-    """Return subtree located at ``path``."""
-    node = tree
-    for token in path:
-        if isinstance(node, Mapping):
-            node = node[token]
-        elif isinstance(node, (list, tuple)):
-            node = node[token]
-        elif isinstance(token, int):
-            node = node[token]
-        else:
-            node = getattr(node, token)
-    return node
-
-
-def _set_subtree(tree: PyTree | None, path: TreePath, value: PyTree) -> PyTree:
-    """Set one subtree in a nested dict/list/tuple tree and return the updated tree."""
-    if len(path) == 0:
-        return value
-
-    head, tail = path[0], path[1:]
-
-    if isinstance(head, str):
-        out = {} if tree is None else dict(tree)
-        out[head] = _set_subtree(out.get(head), tail, value)
-        return out
-
-    if tree is None:
-        out_list: list[Any] = []
-    elif isinstance(tree, tuple):
-        out_list = list(tree)
-    elif isinstance(tree, list):
-        out_list = list(tree)
-    else:
-        raise TypeError(f"Cannot index non-sequence node with integer token {head!r}.")
-
-    while len(out_list) <= head:
-        out_list.append(None)
-    out_list[head] = _set_subtree(out_list[head], tail, value)
-
-    if isinstance(tree, tuple):
-        return tuple(out_list)
-    return out_list
-
-
 def _assemble_inner_input(outer_payload: PyTree, routes: list[OuterToInnerRoute]) -> PyTree:
     """Construct one callable-facing inner tree from routed outer payload subtrees."""
     patch: PyTree | None = None
     for route in routes:
-        source_value = _get_subtree(outer_payload, route.outer)
-        patch = _set_subtree(patch, route.inner or (), source_value)
+        source_value = get_subtree(outer_payload, route.outer)
+        patch = set_subtree(patch, route.inner or (), source_value)
     return {} if patch is None else patch
 
 
@@ -590,8 +541,8 @@ def _assemble_outer_patch(inner_output: PyTree, routes: list[InnerToOuterRoute])
     """Construct one outer patch tree from routed inner callable output subtrees."""
     patch: PyTree | None = None
     for route in routes:
-        source_value = inner_output if len(route.inner) == 0 else _get_subtree(inner_output, route.inner)
-        patch = _set_subtree(patch, route.outer, source_value)
+        source_value = inner_output if len(route.inner) == 0 else get_subtree(inner_output, route.inner)
+        patch = set_subtree(patch, route.outer, source_value)
     return {} if patch is None else patch
 
 

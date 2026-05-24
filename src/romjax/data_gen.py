@@ -12,7 +12,6 @@ from jaxtyping import Key, PyTree
 from pydantic import (
     BaseModel,
     BeforeValidator,
-    ConfigDict,
     PositiveInt,
     ValidationInfo,
     ValidatorFunctionWrapHandler,
@@ -23,9 +22,10 @@ from pydantic import (
 from romjax.graph import FunctionGraph
 from romjax.model import Sampleable
 from romjax.rng import gen_keys
-from romjax.typing import Routine, RoutineError, romjax_from_file
-from romjax.utils import load_h5, save_h5
+from romjax.routine import Routine, RoutineError
 from romjax.tree import pytree_iter
+from romjax.typing import from_yaml
+from romjax.utils import load_h5, save_h5
 
 __all__ = ["DataGeneration"]
 
@@ -94,14 +94,13 @@ class DataGeneration(Routine):
     :ivar train: sampling configuration for each model (see `SampleConfig`) for training dataset
     :ivar validation: sampling configurations for validation dataset
     :ivar to_sample: the names of the models to sample. Each must implement the `Sampleable` protocol
+    :ivar batch_size: number of samples to generate at a time
     :ivar format: the data format to save samples. Only `h5` supported.
     :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
-
     root: Path 
-    graph: Annotated[FunctionGraph, BeforeValidator(romjax_from_file)]
+    graph: Annotated[FunctionGraph, BeforeValidator(from_yaml)]
     train: Sequence[SampleConfig]
     validation: Sequence[SampleConfig]
     to_sample: list[str] | None = None
