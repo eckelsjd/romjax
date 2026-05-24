@@ -171,7 +171,7 @@ class NearSolutionSampler(PyTreeSampler):
 
     scale: jaxtyping.PyTree[ArrayLike | RelativeScale] = 1.0
 
-    def _scale_noise(self, noise: jaxtyping.Pytree, solution: jaxtyping.Pytree) -> jaxtyping.Pytree:
+    def _scale_noise(self, noise: jaxtyping.PyTree, solution: jaxtyping.PyTree) -> jaxtyping.PyTree:
         """Scale noise using a reference solution."""
         def _is_relative_scale_spec(value: Any) -> bool:
             """Return True when ``value`` is a ``(reducer, factor)`` relative-scale specification."""
