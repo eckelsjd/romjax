@@ -1,11 +1,14 @@
 from pathlib import Path
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
 from romjax import plotting
 from romjax.plotting import AxisOptions, GridplotConfig, PlotSpec, gridplot
+
+matplotlib.use("Agg")
 
 
 def test_basic_gridplot(tmp_path):
