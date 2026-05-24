@@ -26,6 +26,7 @@ from romjax.task_cli import (
     load_manifest,
     load_or_create_manifest,
     move_task_to_state,
+    normalize_cwd,
     parse_headless_codex_output,
     phase_entry,
     phase_new_command,
@@ -532,7 +533,12 @@ def test_archive_task_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {archived_worktree_path.resolve()}" in worktree_list
+    listed_worktrees = [
+        normalize_cwd(raw_line.removeprefix("worktree ").strip())
+        for raw_line in worktree_list.splitlines()
+        if raw_line.startswith("worktree ")
+    ]
+    assert archived_worktree_path.resolve() in listed_worktrees
 
 
 def test_clean_task_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -591,7 +597,7 @@ def test_clean_task_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     archived_summary = clean_task(paths, "feat-archived-clean")
 
     assert archived_summary["removed_worktree"] is True
-    assert archived_summary["worktree_path"] == str(archived_worktree_path.resolve())
+    assert Path(archived_summary["worktree_path"]) == archived_worktree_path.resolve()
     assert not archived_worktree_path.exists()
     assert not (paths.runs_dir / "feat-archived-clean").exists()
 
