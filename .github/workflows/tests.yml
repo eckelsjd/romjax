@@ -15,7 +15,7 @@ jobs:
           version: "0.10.8"
           enable-cache: true
       - run: uv python install
-      - run: uv sync --all-groups --extra cpu
+      - run: uv sync --all-groups
       - run: uv run rr lint
 
   pr-tests:
@@ -35,6 +35,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv python install
       - name: Install dependencies
-        run: uv sync --all-groups --extra cpu
+        run: uv sync --all-groups
       - name: Run tests
         run: uv run rr test
