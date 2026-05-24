@@ -1,12 +1,23 @@
-"""ROM CLI for building reduced-order models with romjax."""
+"""
+ROM CLI for building reduced-order models with romjax.
+
+Supported global options (see `romjax.routine.RoutineConfig`):
+
+- root: copies the config file to this directory
+- logger: configures loguru logger globally
+- progress_bar: configures alive_bar globally
+- mplstyle: configures matplotlib globally (via rcParams or a style file)
+- gridplot: configures romjax gridplot global default options
+"""
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
 
 import romjax
-from romjax.typing import RoutineError
+from romjax.routine import RoutineError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required = True)
     
     gen = subparsers.add_parser("run", help="Run a romjax routine from yaml config file.")
-    gen.add_argument("config", help=f"Path to config file. Provided routines: {romjax.routines.__all__}")
+    gen.add_argument("config", help=f"Path to config file. Provided routines: {romjax.routine.available}")
 
     return parser
 
@@ -34,6 +45,7 @@ def cli(argv: list[str] | None = None) -> int:
             if not Path(args.config).exists():
                 raise RoutineError(f"Config file '{args.config}' not found")
             
+            sys.path.insert(0, os.getcwd())  # treat this as if it were launched with python directly
             routine = romjax.load(args.config)
 
             if not hasattr(routine, "run") or not callable(getattr(routine, "run")):

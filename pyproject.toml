@@ -19,6 +19,8 @@ dependencies = [
     "networkx>=3.6.1",
     "alive-progress>=3.3.0",
     "jax>=0.9.1",
+    "orbax-checkpoint>=0.11.39",
+    "loguru>=0.7.3",
 ]
 requires-python = ">=3.12"
 readme = "README.md"
@@ -78,6 +80,11 @@ ignore = ['E731']  # allow lambda definitions
 [tool.ruff]
 line-length = 120
 extend-exclude = ["*.ipynb"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:.*'asyncio.iscoroutinefunction' is deprecated.*:DeprecationWarning",
+]
 
 [tool.commitizen]
 version_scheme = "pep440"

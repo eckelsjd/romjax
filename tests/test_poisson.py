@@ -246,21 +246,13 @@ def test_poisson_sample_inputs() -> None:
 
 def test_poisson_outputs_sampler_validation_and_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
     model = get_small_poisson(
-        outputs_sampler={
-            "callable": "near_solution",
-            "phi": {
-                "callable": "normal",
-                "std": 0.1,
-                "shape": (6, 6),
-            },
-        }
+        outputs_sampler=NearSolutionSampler(
+            phi={"callable": "normal", "std": 0.1, "shape": (6, 6)}
+        )
     )
 
     assert isinstance(model.outputs_sampler, NearSolutionSampler)
     assert isinstance(model.outputs_sampler.template["phi"], Distribution)
-
-    with pytest.raises(TypeError):
-        get_small_poisson(outputs_sampler={"callable": "near_solution", "phi": 0.1})
 
     key = jax.random.key(7)
     solution = {"phi": jnp.ones(model.config.grid.shape)}

@@ -11,8 +11,8 @@ class LinearProjection(eqx.Module):
 
     def __init__(
         self,
-        n_latent: int | None = None,
-        n_full: int | None = None,
+        latent: int | None = None,
+        dof: int | None = None,
         key: Key | None = None,
         matrix: ArrayLike | None = None,
         scale: float = 0.25,
@@ -23,23 +23,23 @@ class LinearProjection(eqx.Module):
         This supports two equivalent styles:
 
         - explicit matrix: ``LinearProjection(matrix=...)``
-        - random init: ``LinearProjection(n_latent=..., n_full=..., key=...)``
+        - random init: ``LinearProjection(latent=..., dof=..., key=...)``
 
-        :param n_latent: latent dimension when using random initialization
-        :param n_full: full-space dimension when using random initialization
+        :param latent: latent dimension when using random initialization
+        :param dof: full-space dimension when using random initialization
         :param key: random key when using random initialization
-        :param matrix: explicit projection matrix with shape ``(n_latent, n_full)``
+        :param matrix: explicit projection matrix with shape ``(latent, dof)``
         :param scale: random init scaling factor
         """
         if matrix is not None:
             self.matrix = jnp.asarray(matrix)
             return
 
-        if key is None or n_latent is None or n_full is None:
+        if key is None or latent is None or dof is None:
             raise ValueError(
-                "LinearProjection requires either `matrix` or all of (`n_latent`, `n_full`, `key`)."
+                "LinearProjection requires either `matrix` or all of (`latent`, `dof`, `key`)."
             )
-        self.matrix = scale * jax.random.normal(key, (n_latent, n_full))
+        self.matrix = scale * jax.random.normal(key, (latent, dof))
 
     def reduce(self, x: ArrayLike) -> ArrayLike:
         """

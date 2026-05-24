@@ -8,20 +8,17 @@ solver: !romx:Poisson2D
       kwargs:
         rtol: 1.0e-2
         atol: 1.0e-6
-  forcing:
-    callable: gaussian
+  forcing: !pd:romjax.poisson.GaussianForcing
     inputs_default:
       mu_x: 0.5
       mu_y: 0.5
       sigma: 0.1
       A0: 0.5
-  conductivity:
-    callable: nonlinear
+  conductivity: !pd:romjax.poisson.NonlinearConductivity
     inputs_default:
       alpha: 0.0
       k0: 1.0
-  inputs_sampler:
-    callable: pytree
+  inputs_sampler: !romx:PyTreeSampler
     forcing:
       mu_x: { callable: uniform, minval: 0.4, maxval: 0.6 }
       A0: { callable: normal, mean: 0.5, std: 0.1 }

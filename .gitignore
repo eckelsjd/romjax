@@ -1,6 +1,8 @@
 data/
 darcy-opt/
 scripts/darcy-opt/
+*.mp4
+*.gif
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -157,8 +157,7 @@ def test_poisson_registered_callable_inline_load_and_dump() -> None:
 def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     yaml_text = (
         "solver: !romx:romjax.poisson.Poisson2D\n"
-        "  outputs_sampler:\n"
-        "    callable: near_solution\n"
+        "  outputs_sampler: !romx:NearSolutionSampler\n"
         "    phi:\n"
         "      callable: normal\n"
         "      std: 0.1\n"

@@ -360,7 +360,7 @@ def test_linear_projection() -> None:
         ],
     )
 
-    projection = LinearProjection(n_latent=n_latent, n_full=n_full, key=k_init)
+    projection = LinearProjection(latent=n_latent, dof=n_full, key=k_init)
     opt = optax.adam(1e-1)
     opt_state = opt.init(eqx.filter(projection, eqx.is_array))
 
@@ -439,7 +439,7 @@ def test_filter_model_in_graph() -> None:
     )
     graph = FunctionGraph(edges={"filter": filter_edge})
 
-    module = LinearProjection(n_latent=n_latent, n_full=n_full, key=k_init)
+    module = LinearProjection(latent=n_latent, dof=n_full, key=k_init)
     opt = optax.adam(1e-1)
     opt_state = opt.init(eqx.filter(module, eqx.is_array))
 
@@ -549,7 +549,7 @@ def test_filter_model_runtime_input_normalization_and_errors() -> None:
             {"forward": {"input_routes": [{"outer": ["full", "x"], "inner": []}], "output_routes": [["latent", "z2"]]}},
         ],
     )
-    module = LinearProjection(n_latent=2, n_full=3, key=jax.random.PRNGKey(0))
+    module = LinearProjection(latent=2, dof=3, key=jax.random.PRNGKey(0))
     data = jnp.ones((4, 3))
 
     encoded = shared_model.forward({"full": {"x": data}, "call_args": module})

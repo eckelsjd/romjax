@@ -1,0 +1,42 @@
+!romx:Train
+routine_config: demo/diagnostics.yml
+
+loss: !romx:GraphLoss
+  - { callable: reconstruction, path: [coordinate transform] }
+  - { function: tikhonov, weight: 0.01, batch_reduce: null }
+init_params: !romx:PyTreeSampler
+  coordinate transform:
+    call_args:
+      name: LinearProjection
+      kwargs: { n_latent: 20, dof: 1024 }
+  residual transform: coordinate transform
+optimizer:
+  name: optax.chain
+  args:
+    - { name: clip_by_global_norm, args: [1.0] }
+    - scale_by_adam
+    - name: scale_by_schedule
+      args:
+        - name: exponential_decay
+          kwargs: { init_value: 0.01, transition_steps: 1000, decay_rate: 0.99 }
+    - { name: optax.scale, args: [-1.0] }
+
+dataloader: !romx:GraphDataLoader demo/dataset/train
+test: !romx.GraphTest
+  dataloader: demo/dataset/validation
+  terms:
+    - { callable: reconstruction, path: [coordinate transform] }
+termination: 
+  max_steps: 200
+  max_runtime: 300
+diagnostics:
+  log_interval: 1
+  plot_interval: 1
+  live_plot: true
+  save_plot: {}
+  train_plot: {}
+  validation_plot: {}
+
+root: demo/training
+write_policy: reuse
+graph: demo/poisson_graph.yml

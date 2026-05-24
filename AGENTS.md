@@ -25,7 +25,6 @@ Since our primary goal is comparison to state-of-the-art and publication, there 
 Use YAML-friendly configuration for public, file-loaded objects. Prefer `romjax.typing.DictModel` for user-facing config schemas and preserve the `YAML -> Pydantic model -> runtime object` workflow. YAML configs may reference callables with `!!python/name` and classes with `!romx:module.path`.
 
 * Use modern Python typing (prefer `dict` over `Dict`, `type1 | type2` over `Union[type1, type2]`, `type MyType = ...`, etc.)
-* Avoid `Any` unless unavoidable
 * Annotate all public APIs
 * Prefer "wider" interfaces where possible, for example `Sequence[int]` instead of `list[int]`
 * Use Pydantic for user-facing config models
@@ -56,7 +55,8 @@ The public API provided by `romjax` is generally structured as the following:
 - `graph.py` - defines `FunctionGraph`, the main graph-based ROM interface.
 - `model.py` - defines core `Edge` implementations such as `ImplicitModel` and `FilterModel`.
 - `poisson.py` - provides `Poisson2D`, the main PDE example and configuration reference.
-- `optim.py` - provides training utilities built around `jax.grad` and `optax`.
+- `train.py` - provides training utilities built around `jax.grad` and `optax`.
+- `data_gen.py` - provides data generation utilities
 - `plotting.py` - provides plotting helpers for ROM results.
 
 Other modules provide various utilities for solving PDEs, handling random numbers, custom types, and other various package utilities.
@@ -66,7 +66,7 @@ Other modules provide various utilities for solving PDEs, handling random number
 The general development workflow is:
 
 ```
-uv sync --all-groups --extra cpu    # install only needed once, use cu13 if gpu is available
+uv sync --all-groups                # install only needed once, use --extra cu13 if gpu is available
 uv run rr lint                      # runs ruff check on src and tests directories
 uv run rr test                      # runs pytest on tests directory with coverage
 ```

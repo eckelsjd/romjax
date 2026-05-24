@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import sys
 from copy import deepcopy
 from importlib import import_module
 from inspect import Parameter, signature
 from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType
-from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, TypeVar, get_args
+from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Sequence, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
 import lineax as lx
@@ -24,13 +24,14 @@ from pydantic import (
     model_validator,
 )
 
-__all__ = ['DictModel', 'ListModel', 'CallableModel', 'Routine', 'RoutineError', 'ThirdPartyType',
-           'romjax_from_file', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'ThirdPartyType', 'WriteStream',
+           'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
 
 
 _SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
 _SPEC_ID_REGISTRY: dict[int, tuple[type, dict[str, Any]]] = {}
 _THIRD_PARTY_MODULES = (lx, optx, optax)
+type _DefaultModules = str | ModuleType | Sequence[str | ModuleType] | None
 
 T = TypeVar("T")
 
@@ -41,8 +42,14 @@ def require_type(required_type: type, value: Any):
     return value
 
 
-def romjax_from_file(value: str | Path | bytes | Any) -> Any:
-    """Try to load a romjax object from config file. Useful as a pydantic validator."""
+def require_attr(required_attr: str, value: Any):
+    if not hasattr(value, required_attr):
+        raise ValueError(f"Expected attribute '{required_attr}'")
+    return value
+
+
+def from_yaml(value: str | Path | bytes | Any) -> Any:
+    """Try to load from yaml. Useful as a pydantic validator."""
     if isinstance(value, str | Path | bytes):
         import romjax
         return romjax.load(value)
@@ -74,21 +81,6 @@ def from_registry(registry: dict[str, T], key: str | Any) -> T:
         return registry[key]()
     
     return registry[key]
-
-
-class Routine(BaseModel, ABC):
-    """Base class mixin that provides the `run()` method."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
-
-    @abstractmethod
-    def run(self) -> int:
-        raise NotImplementedError
-
-
-class RoutineError(RuntimeError):
-    """Raised when routines encounter invalid local state."""
-    pass
     
 
 class CallableModel(BaseModel):
@@ -342,7 +334,20 @@ def _is_importable_object(value: Any) -> bool:
     return resolved is value
 
 
-def _resolve_name(name: str, *, default_module: str | None = None) -> Any:
+def _normalize_default_modules(default_modules: _DefaultModules = None) -> tuple[ModuleType, ...]:
+    """Normalize default module hints used when resolving short third-party names."""
+    if default_modules is None:
+        return ()
+    if isinstance(default_modules, str | ModuleType):
+        default_modules = (default_modules,)
+
+    modules: list[ModuleType] = []
+    for module in default_modules:
+        modules.append(import_module(module) if isinstance(module, str) else module)
+    return tuple(modules)
+
+
+def _resolve_name(name: str, *, default_modules: _DefaultModules = None) -> Any:
     """Resolve an import path, optionally using a parent module as context."""
     if "." in name:
         module_name, _, attr_path = name.rpartition(".")
@@ -352,8 +357,7 @@ def _resolve_name(name: str, *, default_module: str | None = None) -> Any:
             resolved = getattr(resolved, attr)
         return resolved
 
-    if default_module is not None:
-        module = import_module(default_module)
+    for module in _normalize_default_modules(default_modules):
         if hasattr(module, name):
             return getattr(module, name)
 
@@ -370,20 +374,20 @@ def _resolve_name(name: str, *, default_module: str | None = None) -> Any:
     raise ValueError(f"Could not resolve third-party name {name!r}.")
 
 
-def _try_normalize_spec_string(value: str, *, default_module: str | None = None) -> dict[str, Any] | None:
+def _try_normalize_spec_string(value: str, *, default_modules: _DefaultModules = None) -> dict[str, Any] | None:
     try:
-        _resolve_name(value, default_module=default_module)
+        _resolve_name(value, default_modules=default_modules)
     except Exception:
         return None
 
     return {"name": value}
 
 
-def _normalize_value(value: Any, *, default_module: str | None = None) -> Any:
+def _normalize_value(value: Any, *, default_modules: _DefaultModules = None) -> Any:
     """Normalize nested values, converting nested specs and cached objects recursively."""
     if _is_primitive(value):
         if isinstance(value, str):
-            spec = _try_normalize_spec_string(value, default_module=default_module)
+            spec = _try_normalize_spec_string(value, default_modules=default_modules)
             if spec is not None:
                 return spec
         return value
@@ -394,14 +398,14 @@ def _normalize_value(value: Any, *, default_module: str | None = None) -> Any:
 
     if isinstance(value, Mapping):
         if "name" in value:
-            return _normalize_spec_data(value, default_module=default_module)
-        return {str(key): _normalize_value(val, default_module=default_module) for key, val in value.items()}
+            return _normalize_spec_data(value, default_modules=default_modules)
+        return {str(key): _normalize_value(val, default_modules=default_modules) for key, val in value.items()}
 
     if isinstance(value, list):
-        return [_normalize_value(item, default_module=default_module) for item in value]
+        return [_normalize_value(item, default_modules=default_modules) for item in value]
 
     if isinstance(value, tuple):
-        return tuple(_normalize_value(item, default_module=default_module) for item in value)
+        return tuple(_normalize_value(item, default_modules=default_modules) for item in value)
 
     if _is_importable_object(value):
         return {"name": _qualname(value), "args": [], "kwargs": {}}
@@ -409,10 +413,10 @@ def _normalize_value(value: Any, *, default_module: str | None = None) -> Any:
     return value
 
 
-def _normalize_spec_data(data: str | Mapping[str, Any], *, default_module: str | None = None) -> dict[str, Any]:
+def _normalize_spec_data(data: str | Mapping[str, Any], *, default_modules: _DefaultModules = None) -> dict[str, Any]:
     """Normalize shorthand or mapping specs into a canonical recursive form."""
     if isinstance(data, str):
-        spec = _try_normalize_spec_string(data, default_module=default_module)
+        spec = _try_normalize_spec_string(data, default_modules=default_modules)
         if spec is None:
             raise ValueError(f"Could not resolve third-party shorthand {data!r}.")
         return spec
@@ -423,28 +427,28 @@ def _normalize_spec_data(data: str | Mapping[str, Any], *, default_module: str |
     if "name" not in data:
         raise ValueError("Third-party spec mappings must include a 'name' field.")
 
-    target = _resolve_name(str(data["name"]), default_module=default_module)
+    target = _resolve_name(str(data["name"]), default_modules=default_modules)
     nested_default_module = getattr(target, "__module__", None)
 
     spec: dict[str, Any] = {"name": str(data["name"])}
     if "args" in data:
-        spec["args"] = [_normalize_value(arg, default_module=nested_default_module) for arg in data.get("args", ())]
+        spec["args"] = [_normalize_value(arg, default_modules=nested_default_module) for arg in data.get("args", ())]
     if "kwargs" in data:
         spec["kwargs"] = {
-            str(key): _normalize_value(val, default_module=nested_default_module)
+            str(key): _normalize_value(val, default_modules=nested_default_module)
             for key, val in data.get("kwargs", {}).items()
         }
     return spec
 
 
-def _construct_value(value: Any, *, default_module: str | None = None) -> Any:
+def _construct_value(value: Any, *, default_modules: _DefaultModules = None) -> Any:
     """Recursively construct nested spec values."""
     if _is_primitive(value):
         if isinstance(value, str):
-            spec = _try_normalize_spec_string(value, default_module=default_module)
+            spec = _try_normalize_spec_string(value, default_modules=default_modules)
             if spec is None:
                 return value
-            return _construct_spec(spec)
+            return _construct_spec(spec, default_modules=default_modules)
         return value
 
     spec = _get_spec(value)
@@ -453,25 +457,28 @@ def _construct_value(value: Any, *, default_module: str | None = None) -> Any:
 
     if isinstance(value, Mapping):
         if "name" in value:
-            return _construct_spec(_normalize_spec_data(value, default_module=default_module))
-        return {str(key): _construct_value(val, default_module=default_module) for key, val in value.items()}
+            return _construct_spec(
+                _normalize_spec_data(value, default_modules=default_modules),
+                default_modules=default_modules,
+            )
+        return {str(key): _construct_value(val, default_modules=default_modules) for key, val in value.items()}
 
     if isinstance(value, list):
-        return [_construct_value(item, default_module=default_module) for item in value]
+        return [_construct_value(item, default_modules=default_modules) for item in value]
 
     if isinstance(value, tuple):
-        return tuple(_construct_value(item, default_module=default_module) for item in value)
+        return tuple(_construct_value(item, default_modules=default_modules) for item in value)
 
     return value
 
 
-def _construct_spec(spec: dict[str, Any]) -> Any:
+def _construct_spec(spec: dict[str, Any], *, default_modules: _DefaultModules = None) -> Any:
     """Construct an object from a normalized spec and cache its serialized form."""
-    target = _resolve_name(spec["name"])
+    target = _resolve_name(spec["name"], default_modules=default_modules)
     target_module = getattr(target, "__module__", None)
-    args = [_construct_value(arg, default_module=target_module) for arg in spec.get("args", ())]
+    args = [_construct_value(arg, default_modules=target_module) for arg in spec.get("args", ())]
     kwargs = {
-        key: _construct_value(val, default_module=target_module)
+        key: _construct_value(val, default_modules=target_module)
         for key, val in spec.get("kwargs", {}).items()
     }
     value = target(*args, **kwargs)
@@ -479,14 +486,14 @@ def _construct_spec(spec: dict[str, Any]) -> Any:
     return value
 
 
-def from_module_spec(value: Any):
+def from_module_spec(value: Any, *, default_modules: _DefaultModules = None):
     """Recursively convert a module spec into a third-party object."""
     if isinstance(value, str | Mapping):
         try:
-            spec = _normalize_spec_data(value)
+            spec = _normalize_spec_data(value, default_modules=default_modules)
         except Exception:
             return value
-        return _construct_spec(spec)
+        return _construct_spec(spec, default_modules=default_modules)
     return value
 
 
@@ -541,4 +548,42 @@ def _infer_spec(value: Any) -> dict[str, Any]:
     return {"name": _public_qualname(type(value)), "kwargs": kwargs}
 
 
-type ThirdPartyType = Annotated[Any, BeforeValidator(from_module_spec), PlainSerializer(to_module_spec)]
+class _ThirdPartyType:
+    """Pydantic-compatible third-party object spec annotation factory."""
+
+    def __call__(self, *, default_modules: _DefaultModules = None):
+        return Annotated[
+            Any,
+            BeforeValidator(lambda value: from_module_spec(value, default_modules=default_modules)),
+            PlainSerializer(to_module_spec),
+        ]
+
+    def __or__(self, other: Any) -> Any:
+        return self() | other
+
+    def __ror__(self, other: Any) -> Any:
+        return other | self()
+
+    def __get_pydantic_core_schema__(self, source: Any, handler: Any) -> Any:
+        del source
+        return handler.generate_schema(self())
+
+
+ThirdPartyType = _ThirdPartyType()
+
+
+def _resolve_stream_or_path(value):
+    if value in ("stdout", "sys.stdout", sys.stdout):
+        return sys.stdout
+    if value in ("stderr", "sys.stderr", sys.stderr):
+        return sys.stderr
+    if isinstance(value, str):
+        return Path(value)  # treat all plain strings as files
+    return value
+
+
+type WriteStream = Annotated[
+    ThirdPartyType(),
+    BeforeValidator(_resolve_stream_or_path),
+    # AfterValidator(partial(require_attr, "write"))
+]

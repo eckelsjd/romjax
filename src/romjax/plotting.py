@@ -1,47 +1,37 @@
 """Plotting utilities.
 
+Update global configuration for gridplot with `romjax.plotting.set_global(**opts)`.
+
 Includes:
   - gridplot - Plot simulation data (1d or 2d) in a grid (with animation utilities)
-  - PlotOpts - Extra options for plotting (see gridplot)
-  - PlotSpec - Spec for a single subplot (see gridplot)
-  - SupportedPlots - plt plots supported by gridplot
+  - set_global - default global options for gridplot
+  - PlotSpec - spec for a single subplot (see gridplot)
+  - AxisOptions - extra axis options
+  - AnimateOptions - extra animate options
+  - GridplotConfig - config object for gridplot
   - get_scheme - Get a plotting color scheme
 """
 import copy
 import math
-from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Generator, Iterable, Literal, Optional
+from typing import Annotated, Any, Callable, Generator, Iterable, Literal, Mapping, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+from alive_progress import alive_bar
+from loguru import logger
 from matplotlib.animation import FuncAnimation
 from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.cm import ScalarMappable
 from matplotlib.colorbar import Colorbar
 from matplotlib.figure import Figure
+from pydantic import Field, SkipValidation
 
-__all__ = ['gridplot', 'PlotOpts', 'PlotSpec', 'SupportedPlots', 'get_scheme']
+from romjax.typing import DictModel
 
-
-def _default_progress(i, n):
-    """For printing animation save progress."""
-    if n is not None:
-        if np.mod(i, int(0.1 * n)) == 0 or i == 0 or i == n - 1:
-            print(f'Saving frame {i+1}/{n}...')
-    else:
-        if np.mod(i+1, 20) == 0 or i == 0:
-            print(f'Saving frame {i+1}...')
-
-
-ANIMATE_DEFAULT = {
-    'blit': False, 
-    'fps': 10,
-    'dpi': 200,
-    'writer': 'ffmpeg',
-    'progress_callback': _default_progress
-}
+__all__ = ['gridplot', 'set_global', 'PlotSpec', 'AxisOptions', 'AnimateOptions', 'GridplotConfig', 'get_scheme']
 
 
 def get_scheme(scheme: Literal['white', 'dark']):
@@ -60,13 +50,47 @@ def get_scheme(scheme: Literal['white', 'dark']):
     return text_color, bg_color
 
 
-type SupportedPlots = Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
 type PlotName = str  # just a short, memorable key name
 
 
-@dataclass
-class PlotOpts:
-    """A few particular options common to all types of plots.
+class AnimateOptions(DictModel):
+    """A few particular animate options. All extra options will be passed to FuncAnimation.save.
+    
+    :ivar blit: blitting for FuncAnimation
+    :ivar num_frames: estimate of total number of frames for the progress bar
+    :ivar log_interval: how often to log while saving animation (by default will not log)
+    :ivar fps: frames per second
+    :ivar progress_callback: callable override for custom progress while saving animation
+    """
+    blit: bool | None = None
+    num_frames: int | None = None
+    log_interval: int | None = None
+    fps: int | None = None
+    progress_callback: Callable[[int ,int], None] | Literal["log", "bar"] | None = None
+
+    def get_save_kwargs(self):
+        """Return kwargs that can be passed directly to FuncAnimation.save."""
+        d = copy.deepcopy(self.model_extra)
+        d["fps"] = self.fps
+
+        if self.progress_callback == "log":
+            interval = self.log_interval or 10
+            num_frames = self.num_frames
+            def save_progress(i, n):
+                n = n or num_frames
+                if i % interval == 0:
+                    logger.info(f"Frame {i}/{n-1}" if n is not None else f"Frame {i}")
+            d["progress_callback"] = save_progress
+        elif self.progress_callback == "bar":
+            d["progress_callback"] = lambda bar, i, n: bar()
+        else:
+            d["progress_callback"] = self.progress_callback
+        
+        return d
+
+
+class AxisOptions(DictModel):
+    """A few particular axis options common to all types of plots.
     
     :ivar xlabel: the x-axis label
     :ivar ylabel: the y-axis label
@@ -80,10 +104,11 @@ class PlotOpts:
     :ivar leg_label: label for legend (legend only shown if all artists on an axis have a label)
     :ivar ax_visible: whether to show axes, ticks, and spines (default True)
     :ivar animate: whether to animate data for this plot (default False)
+    :ivar grid: options for showing axis grid
     """
-    xlabel: str = ""
-    ylabel: str = ""
-    title: str = ""
+    xlabel: str | None = None
+    ylabel: str | None = None
+    title: str | None = None
     xscale: str | None = None
     yscale: str | None = None
     xlim: tuple[float, float] | None = None
@@ -91,12 +116,12 @@ class PlotOpts:
     clim: tuple[float, float] | Literal['auto'] | None = None
     cbar_label: str | None = None
     leg_label: str | None = None
-    ax_visible: bool = True
-    animate: bool = False
+    ax_visible: bool | None = None
+    animate: bool | None = None
+    grid: dict | bool | None = None
 
 
-@dataclass
-class PlotSpec:
+class PlotSpec(DictModel):
     """Specs for a matplotlib plot.
 
     !!! Example "Animation"
@@ -118,10 +143,10 @@ class PlotSpec:
     :ivar kwargs: extra kwargs passed directly to the matplotlib plotting routine (e.g. plot, contour, etc.)
     :ivar name: optional short name for specifying local option overrides
     """
-    kind: SupportedPlots
-    data: Any | Iterable[Any]
-    opts: PlotOpts = field(default_factory=lambda: PlotOpts())
-    kwargs: dict = field(default_factory=dict)
+    kind: Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
+    data: Annotated[Any | Iterable[Any], SkipValidation] = Field(exclude=True)
+    opts: AxisOptions = Field(default_factory=AxisOptions)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
     name: PlotName | None = None
 
 
@@ -129,86 +154,135 @@ type PlotSpecs = PlotSpec | tuple[PlotSpec, ...]  # multiple on same graph
 type DataFrame = list[list[tuple[Any, ...]]]
 
 
-def _fill_plot_specs_grid(plots, local_opts, global_opts, local_kwargs, global_kwargs, shape):
-    """Fill a 2d grid of plot specs, merging global and local options with the default.
-       The order of precedence is: local > global > default.
-       opts are specialized plot options. kwargs are everything else that go into plt functions.
+class GridplotConfig(DictModel):
+    """Configuration options for `gridplot`.
+    
+    :ivar scheme: the color scheme (dark or white)
+    :ivar subplot_size_in: the size of each subplot in inches (W, H)
+    :ivar shape: the shape of the subplot grid. If None, the shape will be inferred
+    :ivar title: for animations, an iterable to update the figure title (such as showing the time step)
+    :ivar save: name of file to save (use .gif or .mp4 for animations, use .pdf, .png, or similar for static)
+    :ivar adjust: catch-all func for applying changes before saving/animating. Call as adjust(fig, axs, artists, cbars)
+    :ivar animate_opts: options for animating/saving movie. Defaults to 10 fps, 200 dpi, and blit=False with ffmpeg
+    :ivar legend_kwargs: extra options for legends (same used for all subplots if applicable)
+    :ivar local_axis_opts: local overrides for plot options. Specify as plot.name->{ override_opts }. See `AxisOptions`.
+    :ivar local_plot_kwargs: local ovverides for plot kwargs. Specify as plot.name->{ override_kwargs }. See `PlotSpec`.
+    :ivar global_axis_opts: global overrides applied to all subplot options. See `AxisOptions`.
+    :ivar global_plot_kwargs: global overrides applied to all subplot kwargs. See `PlotSpec`.
+    :ivar subplots_kwargs: all extra arguments are passed to plt.subplots
     """
-    def fill_spec(spec: dict | PlotSpec):
-        """For a single plot spec"""
-        # Get default opts and kwargs
-        spec = copy.copy(spec) if isinstance(spec, PlotSpec) else PlotSpec(**spec)
-        opts = spec.opts
-        if isinstance(opts, PlotOpts):
-            opts = copy.deepcopy(asdict(opts))
-        kwargs = copy.deepcopy(spec.kwargs)
+    scheme: Literal['white', 'dark'] | None = None
+    subplot_size_in: tuple[float, float] | None = None
+    shape: tuple[int, int] | None = None
+    title: Iterable[str] | None = None
+    save: str | Path | None = None
+    adjust: Callable[[Figure, Axes, Iterable[Artist], list[list[Colorbar]]], None] | None = None
+    animate_opts: AnimateOptions = Field(default_factory=AnimateOptions)
+    legend_kwargs: dict = Field(default_factory=dict)
+    local_axis_opts: dict[PlotName, AxisOptions] = Field(default_factory=dict)
+    local_plot_kwargs: dict[PlotName, dict[str, Any]] = Field(default_factory=dict)
+    global_axis_opts: AxisOptions = Field(default_factory=AxisOptions)
+    global_plot_kwargs: dict = Field(default_factory=dict)
+    subplots_kwargs: dict = Field(default_factory=dict)
 
-        # Overwrite with global
-        d = global_opts
-        if isinstance(d, PlotOpts):
-            d = asdict(d)
-        opts.update(d)
-        kwargs.update(global_kwargs)
+    def fill_plot_grid(self, plots: PlotSpecs | list[PlotSpecs] | list[list[PlotSpecs]]) -> list[list[PlotSpecs]]:
+        """
+        Fill a 2d grid of plot specs, merging global and local options with the default.
+        The order of precedence is: local > global > default.
+        """
+        def fill_spec(spec: PlotSpec):
+            """Validate a single plot spec."""
+            # Default
+            spec = PlotSpec.model_validate(spec)
 
-        # Overwrite with local
-        if spec.name is not None:
-            d = local_opts.get(spec.name, {})
-            if isinstance(d, PlotOpts):
-                d = asdict(d)
-            opts.update(d)
-            kwargs.update(local_kwargs.get(spec.name, {}))
+            # Global
+            opts = self.merge(spec.opts, self.global_axis_opts)
+            kwargs = self.merge(spec.kwargs, self.global_plot_kwargs)
 
-        spec.opts = PlotOpts(**opts)
-        spec.kwargs = kwargs
-        return spec
+            # Local
+            if spec.name is not None:
+                if spec.name in self.local_axis_opts:
+                    opts = self.merge(opts, self.local_axis_opts[spec.name])
+                if spec.name in self.local_plot_kwargs:
+                    kwargs = self.merge(kwargs, self.local_plot_kwargs[spec.name])
 
-    def fill_specs(specs: dict | PlotSpec | tuple):
-        """Handle multiple specs per plot"""
-        if isinstance(specs, tuple):
-            return tuple(fill_spec(spec) for spec in specs)
-        else:
-            return (fill_spec(specs),)
-    
-    # 1 subplot
-    if isinstance(plots, dict | PlotSpec | tuple):
-        return [[fill_specs(plots)]]
-    
-    # 2d grid
-    if all(isinstance(row, list) for row in plots):
-        return [[fill_specs(spec) for spec in row] for row in plots]
-    
-    # Convert 1d sequence to 2d
-    if shape is None:
-        n = len(plots)
-        c = int(math.ceil(math.sqrt(n)))
-        r = int(math.ceil(n / c))
-        shape = (r, c)
+            spec.opts = opts
+            spec.kwargs = kwargs
+            return spec
 
-    grid = []
-    nrows, ncols = shape
-    for i in range(nrows):
-        row = [fill_specs(spec) for spec in plots[i*ncols:(i+1)*ncols]]
-        row += [None] * (ncols - len(row))  # pad
-        grid.append(row)
+        def fill_specs(specs: PlotSpec | tuple):
+            """Handle multiple specs per plot."""
+            if isinstance(specs, tuple):
+                return tuple(fill_spec(spec) for spec in specs)
+            else:
+                return (fill_spec(specs),)
+        
+        # 1 subplot
+        if isinstance(plots, dict | PlotSpec | tuple):
+            return [[fill_specs(plots)]]
+        
+        # 2d grid
+        if all(isinstance(row, list) for row in plots):
+            return [[fill_specs(spec) for spec in row] for row in plots]
+        
+        # Convert 1d sequence to 2d
+        if self.shape is None:
+            n = len(plots)
+            c = int(math.ceil(math.sqrt(n)))
+            r = int(math.ceil(n / c))
+            self.shape = (r, c)
 
-    return grid
+        grid = []
+        nrows, ncols = self.shape
+        for i in range(nrows):
+            row = [fill_specs(spec) for spec in plots[i*ncols:(i+1)*ncols]]
+            row += [None for _ in  range(ncols - len(row))]  # pad
+            grid.append(row)
+
+        return grid
+
+    @staticmethod
+    def merge(base: Mapping, override: Mapping, in_place: bool = False) -> Mapping:
+        """Recursively merge two mappings into a new one.
+
+        Values in ``override`` only replace corresponding values in ``base``
+        when the override value is not ``None``. Nested mappings are merged
+        recursively with the same rule.
+        """
+        merged = base if in_place else copy.deepcopy(base)
+
+        for key, value in override.items():
+            if value is None:
+                continue
+
+            if isinstance(value, Mapping):
+                base_value = merged.get(key)
+                if isinstance(base_value, Mapping):
+                    merged[key] = GridplotConfig.merge(base_value, value)
+                else:
+                    merged[key] = copy.deepcopy(value)
+            else:
+                merged[key] = copy.deepcopy(value)
+
+        return merged
+
+
+global_config = GridplotConfig(
+    scheme="white", 
+    subplot_size_in=(3, 2.5), 
+    animate_opts=dict(blit=False, progress_callback="bar", fps=10, dpi=200, writer="ffmpeg"),
+    subplots_kwargs=dict(squeeze=False, layout="constrained")
+)
+
+
+def set_global(**settings):
+    """Update global default gridplot settings."""
+    GridplotConfig.merge(global_config, settings, in_place=True)
 
 
 def gridplot(
     plots: PlotSpecs | list[PlotSpecs] | list[list[PlotSpecs]],
-    scheme: Literal['white', 'dark'] = 'white',
-    subplot_size_in: tuple[float, float] = (3, 2.5),
-    shape: tuple[int, int] | None = None,
-    title: Iterable[str] | None = None,
-    save: str | Path | None = None,
-    adjust: Callable[[Figure, Axes, Iterable[Artist], list[list[Colorbar]]], None] | None = None,
-    animate_opts: dict | None = None,
-    legend_opts: dict | None = None,
-    plot_opts: dict[PlotName, PlotOpts] | None = None,
-    plot_kwargs: dict[PlotName, dict[str, Any]] | None = None,
-    global_plot_opts: PlotOpts | None = None,
-    global_plot_kwargs: dict[str, Any] | None = None,
-    **subplot_kwargs
+    **cfg: GridplotConfig
 ) -> tuple[Figure, Axes, Optional[FuncAnimation]]:
     """Generate a grid of plt subplots with easy formatting and animation.
     
@@ -233,46 +307,22 @@ def gridplot(
         fig, axs = gridplot([(sin_spec, cos_spec), contour_spec]) -> (1,2) animated subplot with sin/cos on first axis
         ```
     
+    See `GridplotConfig` for additional keyword options.
+    
     :param plots: grid of PlotSpecs with plot data and style options. If a single PlotSpec, then a (1,1) figure will
                   be generated. If a 1D list of PlotSpecs, then the grid will be shaped to the nearest square. If a 
                   2D list of PlotSpecs, then will use this grid directly. Use tuples of PlotSpecs to specify multiple
                   plots per axis. See `PlotSpec` for details on specifying plot data, styles, and supported plot types.
-    :param scheme: the color scheme (dark or white)
-    :param subplot_size_in: the size of each subplot in inches (W, H)
-    :param shape: the shape of the subplot grid. If None, the shape will be inferred
-    :param title: for animations, an iterable to update the figure title (such as showing the time step)
-    :param save: name of file to save (use .gif or .mp4 for animations, use .pdf, .png, or similar for static)
-    :param adjust: catch-all func for applying changes before saving/animating. Call as adjust(fig, axs, artists, cbars)
-    :param animate_opts: options for animating/saving movie. Defaults to 10 fps, 200 dpi, and blit=False with ffmpeg
-    :param legend_opts: extra options for legends (same used for all subplots if applicable)
-    :param plot_opts: local overrides for plot options. Specify as plot.name -> { override_opts }. See `PlotOpts`.
-    :param plot_kwargs: local ovverides for plot kwargs. Specify as plot.name -> { override_kwargs }. See `PlotSpec`.
-    :param global_plot_opts: global overrides applied to all subplot options. See `PlotOpts`.
-    :param global_plot_kwargs: global overrides applied to all subplot kwargs. See `PlotSpec`.
-    :param **subplot_kwargs: all extra arguments are passed to plt.subplots
     :return: the Figure and Axes objects, optionally the FuncAnimation object if plot is animated
     """
-    if plot_opts is None:
-        plot_opts = {}
-    if plot_kwargs is None:
-        plot_kwargs = {}
-    if animate_opts is None:
-        animate_opts = {}
-    if legend_opts is None:
-        legend_opts = {}
-    if global_plot_opts is None:
-        global_plot_opts = {}
-    if global_plot_kwargs is None:
-        global_plot_kwargs = {}
-
-    plots = _fill_plot_specs_grid(plots, plot_opts, global_plot_opts, plot_kwargs, global_plot_kwargs, shape)
+    cfg = GridplotConfig.merge(global_config, GridplotConfig(**cfg))  # allows maintaining a top-level global config
+    plots = cfg.fill_plot_grid(plots)
     shape = (len(plots), len(plots[0]))
-    a_opts = copy.deepcopy(ANIMATE_DEFAULT)
-    a_opts.update(animate_opts)
-    text_color, bg_color = get_scheme(scheme)
+    text_color, bg_color = get_scheme(cfg.scheme)
+    if "figsize" not in cfg.subplots_kwargs:
+        cfg.subplots_kwargs["figsize"] = (cfg.subplot_size_in[0]*shape[1], cfg.subplot_size_in[1]*shape[0])
     
-    fig, axs = plt.subplots(*shape, squeeze=False, layout='constrained',
-                            figsize=(subplot_size_in[0]*shape[1], subplot_size_in[1]*shape[0]), **subplot_kwargs)
+    fig, axs = plt.subplots(*shape, **cfg.subplots_kwargs)
     fig.patch.set_facecolor(bg_color)
 
     def _iter_plot_specs():
@@ -319,7 +369,7 @@ def gridplot(
                 cb.outline.set_edgecolor(text_color)
                 cbars[i][j] = cb
 
-            xlabel, ylabel, xscale, yscale, xlim, ylim, title = None, None, None, None, None, None, None
+            xlabel, ylabel, xscale, yscale, xlim, ylim, title, grid = None, None, None, None, None, None, None, None
             for s in plots[i][j]:
                 if xlabel is None or xlabel == "":
                     xlabel = s.opts.xlabel
@@ -335,7 +385,9 @@ def gridplot(
                     ylim = s.opts.ylim
                 if title is None or title == "":
                     title = s.opts.title
-            ax_visible = any(s.opts.ax_visible for s in plots[i][j])
+                if grid is None or not grid:
+                    grid = s.opts.grid
+            ax_visible = any(s.opts.ax_visible or s.opts.ax_visible is None for s in plots[i][j])
             animate = animate or any(s.opts.animate for s in plots[i][j])
             legends[i][j] = all(s.opts.leg_label is not None for s in plots[i][j])
 
@@ -353,6 +405,8 @@ def gridplot(
                 ax.set_ylabel(ylabel, color=text_color)
             if ax_visible and title is not None:
                 ax.set_title(title, color=text_color)
+            if ax_visible and grid:
+                ax.grid(**grid) if isinstance(grid, Mapping) else ax.grid()
             if xscale is not None:
                 ax.set_xscale(xscale)
             if yscale is not None:
@@ -427,7 +481,7 @@ def gridplot(
 
             if legends[i][j]:
                 leg = dict(facecolor=bg_color, edgecolor=text_color, labelcolor=text_color, fancybox=True)
-                leg.update(legend_opts)
+                leg.update(cfg.legend_kwargs)
                 ax.legend(**leg)
 
         return artists
@@ -437,8 +491,8 @@ def gridplot(
     fig.suptitle("")
     fig.canvas.draw()
 
-    if adjust is not None:
-        adjust(fig, axs, all_artists, cbars)
+    if cfg.adjust is not None:
+        cfg.adjust(fig, axs, all_artists, cbars)
     
     def _update(frame_and_title: tuple[DataFrame, str | None]):
         """Update the plot with new data."""
@@ -634,7 +688,7 @@ def gridplot(
     def _frames() -> Generator[tuple[DataFrame, str | None], None, None]:
         """Return the next data from all plot specs (if available), and a title str."""
         iterable_data = _get_iterable_data()
-        iterable_title = iter(title) if title is not None else None
+        iterable_title = iter(cfg.title) if cfg.title is not None else None
         
         while True:
             frame = [[list() for _ in range(shape[1])] for _ in range(shape[0])]
@@ -651,7 +705,7 @@ def gridplot(
                 break
             
             title_str = None
-            if title is not None:
+            if cfg.title is not None:
                 try:
                     title_str = next(iterable_title)
                 except StopIteration:
@@ -664,21 +718,30 @@ def gridplot(
             ax.set_position(ax.get_position().frozen())
             ax.set_in_layout(False)
 
-        ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists_og, repeat=False, 
-                            cache_frame_data=False, blit=a_opts['blit'], interval=int(1000/a_opts['fps']))
+        a_opts = cfg.animate_opts
+        blit = a_opts['blit'] or False
+        interval = int(1000/fps) if (fps := a_opts['fps']) is not None else 200
 
-        if save is not None:
-            print(f"Saving animation to '{save}'")
-            del a_opts['blit']
-            ani.save(Path(save), **a_opts)
+        ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists_og, repeat=False, 
+                            cache_frame_data=False, blit=blit, interval=interval)
+
+        if cfg.save is not None:
+            logger.info(f"Saving animation to '{cfg.save}'")
+            save_kwargs = a_opts.get_save_kwargs()
+
+            if a_opts.progress_callback == "bar":
+                with alive_bar(a_opts["num_frames"]) as bar:
+                    save_kwargs["progress_callback"] = partial(save_kwargs["progress_callback"], bar)
+                    ani.save(Path(cfg.save), **save_kwargs)
+            else:
+                ani.save(Path(cfg.save), **save_kwargs)
 
         return fig, axs, ani
     
     # Static figure
     else:
         _update(next(_frames()))
-        if save is not None:
-            fig.savefig(Path(save), bbox_inches='tight')
+        if cfg.save is not None:
+            fig.savefig(Path(cfg.save), bbox_inches='tight')
     
-        return fig, axs
-    
+        return fig, axs 

@@ -1,0 +1,19 @@
+!pd:demo.CustomRoutine
+routine_config: diagnostics.yml
+logger: [ file2.log, sys.stdout ]
+gridplot:
+  global_plot_kwargs: {lw: 1, c: cyan}
+  animate_opts:
+    fps: 20
+init_params: !romx:PyTreeSampler
+  coordinate transform:
+    call_args:
+      name: LinearProjection
+      kwargs: { latent: 2, dof: 5 }
+  residual transform: coordinate transform
+  poisson:
+    inputs:
+      conductivity:
+        k0: { callable: uniform, minval: -1, maxval: 1 }
+      forcing:
+        alpha: 1.0

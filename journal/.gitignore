@@ -1,0 +1,11 @@
+*.pdf
+*.png
+*.h5
+*.txt
+*.tex
+*.svg
+*.mp4
+*.gif
+*.log
+
+dataset/

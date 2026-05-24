@@ -58,8 +58,21 @@ class Node(BaseModel, Hashable):
         return self.__str__()
 
     def error(self, value: PyTree, value_hat: PyTree) -> jax.Array:
-        """Compute the pytree error at this node."""
-        return self.error_op(value, value_hat)
+        """
+        Compute the pytree error at this node. Only consider entries present in `value_hat`
+        (i.e. ignore extra entries in `value`).
+        """
+        def _select_matching(tree: PyTree, template: PyTree) -> PyTree:
+            if isinstance(template, Mapping):
+                return {key: _select_matching(tree[key], template[key]) for key in template}
+            if isinstance(template, tuple):
+                return tuple(_select_matching(tree[idx], template[idx]) for idx in range(len(template)))
+            if isinstance(template, list):
+                return [_select_matching(tree[idx], template[idx]) for idx in range(len(template))]
+            return tree
+
+        value_filter = _select_matching(value, value_hat)
+        return self.error_op(value_filter, value_hat)
 
 
 class Edge(BaseModel, Hashable, ABC):
@@ -340,6 +353,8 @@ class FunctionGraph(BaseModel):
         """Normalize a path-like input to a concrete edge list."""
         if path is None:
             raise ValueError("Path may not be None.")
+        if isinstance(path, str):
+            return [path]
         return list(path)
 
     def _resolve_start_node(self, path: list[str | Edge], start: Node | str | None) -> Node:
