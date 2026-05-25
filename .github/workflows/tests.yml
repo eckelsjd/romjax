@@ -9,7 +9,7 @@ jobs:
     name: Lint check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.10.8"
@@ -27,7 +27,7 @@ jobs:
         python-version: ['3.12', '3.13']
         os: [ ubuntu-latest, windows-latest ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.10.8"
