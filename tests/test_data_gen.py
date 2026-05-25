@@ -4,10 +4,10 @@ import pytest
 
 from romjax.data_gen import DataGeneration
 from romjax.graph import FunctionGraph
-from romjax.model import Edge, Sampleable
+from romjax.model import Edge, ImplicitSampleable
 
 
-class _ToySampleableEdge(Edge, Sampleable):
+class _ToySampleableEdge(Edge, ImplicitSampleable):
     shift: float = 1.0
 
     def forward(self, x):

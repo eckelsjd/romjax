@@ -86,7 +86,7 @@ def test_poisson_model_load_and_dump() -> None:
     solver = data["solver"]
     assert isinstance(solver, Poisson2D)
     assert isinstance(solver.forcing, GaussianForcing)
-    assert solver.config.grid.shape == (8, 8)
+    assert solver.grid.shape == (8, 8)
     assert solver.forcing.inputs_default["A0"] == 0.5
 
     dumped = YamlLoader.dump(data)
@@ -102,10 +102,9 @@ def test_custom_model_load_and_dump() -> None:
         "    callable: !!python/name:tests.test_loader.example_forcing\n"
         "    inputs_default:\n"
         "      value: 4\n"
-        "  config:\n"
-        "    grid:\n"
-        "      shape: [2, 4]\n"
-        "      bounds: [[0, 1], [0, 1]]\n"
+        "  grid:\n"
+        "    shape: [2, 4]\n"
+        "    bounds: [[0, 1], [0, 1]]\n"
     )
     data_colon = YamlLoader.load(yaml_text_colon)
     assert isinstance(data_colon["solver"], Poisson2D)
@@ -119,10 +118,9 @@ def test_custom_model_load_and_dump() -> None:
         "    callable: !!python/name tests.test_loader.example_forcing\n"
         "    inputs_default:\n"
         "      value: 2\n"
-        "  config:\n"
-        "    grid:\n"
-        "      shape: [2, 4]\n"
-        "      bounds: [[0, 1], [0, 1]]\n"
+        "  grid:\n"
+        "    shape: [2, 4]\n"
+        "    bounds: [[0, 1], [0, 1]]\n"
     )
     data_space = YamlLoader.load(yaml_text_space)
     assert isinstance(data_space["solver"], Poisson2D)
@@ -139,10 +137,9 @@ def test_poisson_registered_callable_inline_load_and_dump() -> None:
         "    inputs_default:\n"
         "      A0: 0.75\n"
         "      sigma: 0.2\n"
-        "  config:\n"
-        "    grid:\n"
-        "      shape: [2, 4]\n"
-        "      bounds: [[0, 1], [0, 1]]\n"
+        "  grid:\n"
+        "    shape: [2, 4]\n"
+        "    bounds: [[0, 1], [0, 1]]\n"
     )
     data = YamlLoader.load(yaml_text)
     solver = data["solver"]
@@ -162,10 +159,9 @@ def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
         "      callable: normal\n"
         "      std: 0.1\n"
         "      shape: [4, 4]\n"
-        "  config:\n"
-        "    grid:\n"
-        "      shape: [4, 4]\n"
-        "      bounds: [[0, 1], [0, 1]]\n"
+        "  grid:\n"
+        "    shape: [4, 4]\n"
+        "    bounds: [[0, 1], [0, 1]]\n"
     )
     data = YamlLoader.load(yaml_text)
     solver = data["solver"]

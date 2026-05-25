@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 
 from romjax import YamlLoader
-from romjax.pde import UniformGrid, homogeneous_boundary
+from romjax.pde import IterativeSolver, UniformGrid, homogeneous_boundary
 from romjax.plotting import gridplot
-from romjax.poisson import GaussianForcing, NonlinearConductivity, Poisson2D, PoissonConfig
+from romjax.poisson import GaussianForcing, NonlinearConductivity, Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 from romjax.typing import DictModel
 
@@ -61,7 +61,7 @@ def test_nonlinear_conductivity_jit_vmap_and_grad() -> None:
 
 def test_poisson_coercion() -> None:
     model = Poisson2D(
-        config={"grid": {"shape": (2, 4), "bounds": [[0, 1], [1, 2]]}},
+        grid={"shape": (2, 4), "bounds": [[0, 1], [1, 2]]},
         forcing={"callable": "gaussian", "inputs_default": {"A0": 0.0}},
         conductivity={"callable": "nonlinear", "inputs_default": {"alpha": 0.25}},
         boundary={
@@ -72,8 +72,8 @@ def test_poisson_coercion() -> None:
         },
     )
 
-    assert isinstance(model.config, PoissonConfig)
-    assert np.allclose(model.config.grid.spacing, (0.5, 0.25))
+    assert isinstance(model.solver, IterativeSolver)
+    assert np.allclose(model.grid.spacing, (0.5, 0.25))
     assert isinstance(model.forcing, GaussianForcing)
     assert isinstance(model.conductivity, NonlinearConductivity)
     assert isinstance(model.forcing.inputs_default, DictModel)
@@ -85,8 +85,8 @@ def test_poisson_coercion() -> None:
 
 def test_poisson_evaluate_and_autodiff() -> None:
     model = Poisson2D(
-        config={
-            "grid": {"shape": (8, 8), "bounds": ((0, 1), (0, 1))},
+        grid={"shape": (8, 8), "bounds": ((0, 1), (0, 1))},
+        solver={
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1.0, "atol": 1e-4}},
             "max_steps": 6,
             "throw": False,
@@ -94,11 +94,11 @@ def test_poisson_evaluate_and_autodiff() -> None:
         forcing="gaussian",
     )
 
-    grid = model.config.grid
+    grid = model.grid
     x, y = grid.coords
 
     phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
-    manufactured = Poisson2D(config=model.config, forcing="sinusoid")
+    manufactured = Poisson2D(grid=model.grid, solver=model.solver, forcing="sinusoid")
     inputs_exact = {
         "conductivity": {"k0": 1.0, "alpha": 0.0},
         "boundary": homogeneous_boundary(ndim=2),
@@ -136,19 +136,19 @@ def test_poisson_evaluate_and_autodiff() -> None:
 
 def get_laplace_solver() -> Poisson2D:
     return Poisson2D(
-        config={
-            "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(12, 12)),
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(12, 12)),
+        solver={
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1, "atol": 1e-4}},
             "max_steps": 10,
-            "initial_guess": lambda coords: jnp.ones_like(coords[0]),
-        }
+        },
+        initial_guess=lambda coords: jnp.ones_like(coords[0]),
     )
 
 
 def get_small_poisson(**kwargs) -> Poisson2D:
     return Poisson2D(
-        config={
-            "grid": UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(6, 6)),
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(6, 6)),
+        solver={
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1.0, "atol": 1e-4}},
             "max_steps": 5,
             "throw": False,
@@ -182,17 +182,17 @@ def test_poisson_manufactured_solve(show_plot: bool = False) -> None:
     shape = (12, 12)
     dx_error = (1 / shape[0]) ** 2
     mms = Poisson2D(
-        config={
-            "grid": {"shape": shape, "bounds": ((0, 1), (0, 1))},
-            "max_steps": 15,
+        grid={"shape": shape, "bounds": ((0, 1), (0, 1))},
+        solver={
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1e2, "atol": dx_error * 1.5}},
-            "initial_guess": lambda coords: jnp.ones_like(coords[0]),
+            "max_steps": 15,
             "throw": False,
         },
+        initial_guess=lambda coords: jnp.ones_like(coords[0]),
         forcing="sinusoid",
     )
 
-    x, y = mms.config.grid.coords
+    x, y = mms.grid.coords
     phi = mms.solve()["phi"]
     phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
     error = jnp.abs(phi - phi_exact)
@@ -255,14 +255,14 @@ def test_poisson_outputs_sampler_validation_and_sampling(monkeypatch: pytest.Mon
     assert isinstance(model.outputs_sampler.template["phi"], Distribution)
 
     key = jax.random.key(7)
-    solution = {"phi": jnp.ones(model.config.grid.shape)}
+    solution = {"phi": jnp.ones(model.grid.shape)}
     sample_a = model.sample_outputs(key, solution=solution)
     sample_b = model.sample_outputs(key, solution=solution)
-    assert sample_a["phi"].shape == model.config.grid.shape
+    assert sample_a["phi"].shape == model.grid.shape
     assert jnp.allclose(sample_a["phi"], sample_b["phi"])
 
     calls = {"count": 0}
-    solved = {"phi": 2.0 * jnp.ones(model.config.grid.shape)}
+    solved = {"phi": 2.0 * jnp.ones(model.grid.shape)}
 
     def solve_spy(self, inputs=None, residuals=None, return_sol=False):
         del inputs, residuals, return_sol
@@ -271,14 +271,14 @@ def test_poisson_outputs_sampler_validation_and_sampling(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(Poisson2D, "solve", solve_spy)
 
-    provided = {"phi": jnp.ones(model.config.grid.shape)}
+    provided = {"phi": jnp.ones(model.grid.shape)}
     sample_with_solution = model.sample_outputs(jax.random.key(0), solution=provided)
     assert calls["count"] == 0
     assert not jnp.allclose(sample_with_solution["phi"], solved["phi"])
 
     sample_without_solution = model.sample_outputs(jax.random.key(0))
     assert calls["count"] == 1
-    assert sample_without_solution["phi"].shape == model.config.grid.shape
+    assert sample_without_solution["phi"].shape == model.grid.shape
     assert jnp.isfinite(sample_without_solution["phi"]).all()
 
 
@@ -293,7 +293,7 @@ def test_poisson_sample_outputs_custom_callable_support() -> None:
 
     model = get_small_poisson(outputs_sampler={"callable": custom_sampler, "bias": 0.25})
     inputs = {"forcing": {"const": 1.5}}
-    solution = {"phi": jnp.zeros(model.config.grid.shape)}
+    solution = {"phi": jnp.zeros(model.grid.shape)}
 
     sample = model.sample_outputs(jax.random.key(9), inputs=inputs, solution=solution)
 

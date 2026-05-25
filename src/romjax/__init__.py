@@ -37,9 +37,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
     "FilterModel": ("romjax.model", "FilterModel"),
     "ImplicitModel": ("romjax.model", "ImplicitModel"),
-    "Sampleable": ("romjax.model", "Sampleable"),
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
+    "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "gridplot": ("romjax.plotting", "gridplot"),
     "Poisson2D": ("romjax.poisson", "Poisson2D"),
     "gen_keys": ("romjax.rng", "gen_keys"),
@@ -73,8 +73,9 @@ if TYPE_CHECKING:
     from . import tree as tree
     from .data_gen import DataGeneration
     from .graph import CompositeEdge, FunctionGraph
-    from .model import ExplicitModel, FilterModel, ImplicitModel, Sampleable, eqx_evaluate
+    from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
+    from .pde import ImplicitIterativeGalerkin
     from .plotting import gridplot
     from .poisson import Poisson2D
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
