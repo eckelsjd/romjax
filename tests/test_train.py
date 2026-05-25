@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import equinox as eqx
@@ -141,6 +142,7 @@ def toy_graph() -> FunctionGraph:
     return FunctionGraph(edges={"toy": ToyLinearReconstructionEdge()})
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_diagnostics(tmp_path: Path) -> None:
     callback_calls: list[tuple[float, Path | None]] = []
 
@@ -181,6 +183,7 @@ def test_diagnostics(tmp_path: Path) -> None:
     assert all(call_root == root for _, call_root in callback_calls)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_termination(tmp_path: Path) -> None:
     loss_tol_root = tmp_path.resolve() / "loss_tol"
     loss_tol_train = Train(
@@ -231,6 +234,7 @@ def test_termination(tmp_path: Path) -> None:
     assert _history_csv(runtime_root / "loss.csv")[0].tolist() == [0]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_and_restart(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -300,6 +304,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -343,6 +348,7 @@ def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
     assert hasattr(loaded["opt_state"][0], "mu")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -640,6 +646,7 @@ train: !romx:Train
     assert train.init_params["toy"]["alias"] == "toy,weight"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     train_batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
     validation_root = tmp_path.resolve() / "validation_graph_train"
