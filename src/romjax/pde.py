@@ -1,24 +1,57 @@
 """Utilites for PDE-based solvers."""
 from enum import IntEnum
+from functools import partial
+from typing import Annotated, Any, Callable
 
 import jax.numpy as jnp
-from jaxtyping import ArrayLike, PyTree
-from pydantic import Field, PositiveFloat, PositiveInt, field_serializer, field_validator, model_validator
+import optimistix as optx
+from jaxtyping import ArrayLike, Key, PyTree
+from pydantic import (
+    AfterValidator,
+    BeforeValidator,
+    Field,
+    PositiveFloat,
+    PositiveInt,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
+from romjax.graph import CompositeEdge
+from romjax.model import SourceSampleable
+from romjax.rng import SamplerCallable
 from romjax.tree import pytree_merge
-from romjax.typing import CallableModel, DictModel
+from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, from_yaml, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
-           'InitializeCallable', 'ForcingCallable']
+           'InitializeCallable', 'ForcingCallable', 'IterativeSolver', 'RegisteredInitialize', 'ConstantInitialize',
+           'ImplicitIterativeGalerkin']
 
 
-type Coordinates = tuple[ArrayLike, ...]
+type Coordinates = tuple[ArrayLike, ...] | ArrayLike
 
 
 class InitializeCallable(CallableModel):
 
     def __call__(self, coords: Coordinates) -> ArrayLike:
         return super().__call__(coords)
+
+
+class ConstantInitialize(InitializeCallable):
+    const: ArrayLike = 0.0
+
+    def callable(self, coords: Coordinates) -> ArrayLike:
+        return self.const * jnp.ones_like(coords[0] if isinstance(coords, tuple) else coords)
+    
+
+_initialize_registry = {
+    "constant": ConstantInitialize
+}
+
+type RegisteredInitialize = Annotated[
+    InitializeCallable, 
+    BeforeValidator(partial(from_registry, _initialize_registry))
+]
     
 
 class ForcingCallable(CallableModel):
@@ -217,3 +250,100 @@ class UniformGrid(DictModel):
                     raise ValueError("Specified spacings are not consistent with provided coords")
             
         return self
+
+
+type AbstractIterativeSolver = Annotated[
+    ThirdPartyType, 
+    AfterValidator(partial(require_type, optx.AbstractIterativeSolver))
+]
+type AbstractAdjoint = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractAdjoint))]
+
+
+class IterativeSolver(DictModel):
+    """Configuration for optimistix iterative solvers. Only root find supported.
+    
+    :ivar solver: Optimistix nonlinear root finding solver (name+kwargs or instance), default is Newton
+    :ivar options: runtime options for the nonlinear solver
+    :ivar max_steps: maximum number of solver steps
+    :ivar adjoint: Optimistix adjoint method
+    :ivar throw: whether to throw failures as errors (default True)
+    """
+    solver: AbstractIterativeSolver = Field(
+        default_factory=lambda: dict(name='optimistix.Newton', kwargs={'rtol': 1e-2, 'atol': 1e-4}), 
+        validate_default=True
+    )
+    options: dict[str, Any] = Field(default_factory=dict)
+    max_steps: PositiveInt = 100
+    adjoint: AbstractAdjoint = Field(
+        default_factory=lambda: dict(name='optimistix.ImplicitAdjoint'), 
+        validate_default=True
+    )
+    throw: bool = False
+
+    def root_find(
+        self,
+        fn: Callable[[ArrayLike, Any], ArrayLike], 
+        y0: ArrayLike,
+        args: Any | None = None,
+        return_sol: bool = False
+    ) -> ArrayLike | optx.Solution:
+        """Small wrapper around optimistix root find.
+
+        See Optimistix docs for `root_find()` method.
+        
+        :param fn: the objective function to find the root of, callable as `fn(y_k, Any) -> y_(k+1)`
+        :param y0: the initial guess
+        :param args: extra arguments for the objective function
+        :param return_sol: whether to return the solution object or just the result (default)
+        :return: the solution object or the result
+        """
+        solution = optx.root_find(
+            fn,
+            solver=self.solver,
+            y0=y0,
+            args=args,
+            options=self.options,
+            max_steps=self.max_steps,
+            adjoint=self.adjoint,
+            throw=self.throw
+        )
+        return solution if return_sol else solution.value
+
+
+class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
+    """Galerkin ROM that solves any `ImplicitModel` via an iterative solver in latent space."""
+
+    solver: IterativeSolver = Field(default_factory=IterativeSolver)
+    initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
+    source_sampler: Annotated[SamplerCallable | None, BeforeValidator(from_yaml)] = None
+
+    # Override default composite edge behavior by solving in latent space directly
+    def backward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+        """Solve in latent space (with optional aux data)."""
+        y0 = jnp.asarray(self.initial_guess(x["residuals"]))
+
+        def residual_fn(z: ArrayLike, args: PyTree, aux=None) -> ArrayLike:
+            """Root find residual function, with `z` as the latent coordinates."""
+            payload = {"outputs": z}
+            if (inputs := args.get("inputs", None)) is not None:
+                payload["inputs"] = inputs
+
+            result, aux = self.forward_aux(payload, aux=aux)
+
+            return result["residuals"] - args["residuals"]
+        
+        solution = self.solver.root_find(lambda z, args: residual_fn(z, args, aux=aux), y0, x, return_sol=False)
+
+        ret = {"outputs": solution}
+
+        # Pass inputs through
+        if (inputs := x.get("inputs", None)) is not None:
+            ret["inputs"] = inputs
+
+        return ret, aux
+
+    def sample_source(self, key: Key) -> PyTree:
+        if self.source_sampler is not None:
+            return self.source_sampler(key)
+        return {}
+    

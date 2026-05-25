@@ -31,6 +31,12 @@ class SamplerCallable(CallableModel):
         return super().__call__(key, **kwargs)
 
 
+def uniform(key: jaxtyping.Key, shape=(), dtype=None, minval=0.0, maxval=1.0, *, out_sharding=None):
+    """Small wrapper of jax.random.uniform to convert list bounds into arrays."""
+    return jax.random.uniform(key, shape=shape, dtype=dtype, minval=jnp.asarray(minval), maxval=jnp.asarray(maxval),
+                              out_sharding=out_sharding)
+
+
 def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs) -> ArrayLike:
     """Small wrapper of jax.random.normal to support mean/std args."""
     return jax.random.normal(key, **kwargs) * std + mean
@@ -72,7 +78,7 @@ def random_eqx_module(
 
 
 _distribution_registry = {
-    "uniform": jax.random.uniform,
+    "uniform": uniform,
     "normal": normal,
     "darcy": darcy,
     "kle": kle,

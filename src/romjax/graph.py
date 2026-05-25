@@ -14,6 +14,9 @@ type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra
 type EdgePyTree = Mapping[Edge, PyTree]               # Maps edge names to more general pytree data
 
 
+__all__ = ['FunctionGraph', 'Node', 'Edge', 'CompositeEdge']
+    
+
 class Node(BaseModel, Hashable):
     """
     A Node in a FunctionGraph represents a vector space. This is essentially just a string identifier and
@@ -236,11 +239,13 @@ class CompositeEdge(Edge):
 
     def forward(self, x: PyTree) -> PyTree:
         """Evaluate the configured path from ``source`` to ``target``."""
-        return self._run_path(x, start=self.source)
+        ret, aux = self.forward_aux(x, aux=None)
+        return ret
 
     def backward(self, x: PyTree) -> PyTree:
         """Evaluate the configured path from ``target`` back to ``source``."""
-        return self._run_path(x, path=list(reversed(self.path)), start=self.target)
+        ret, aux = self.backward_aux(x, aux=None)
+        return ret
 
     def forward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
         """

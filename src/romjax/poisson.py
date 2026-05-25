@@ -1,28 +1,29 @@
 """Example 2D Poisson solver."""
 import functools
 from collections.abc import Mapping
-from functools import partial
-from typing import Annotated, Any, Callable, Literal, TypedDict
+from typing import Annotated, Callable, Literal, TypedDict
 
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import AfterValidator, BeforeValidator, ConfigDict, Field, PositiveInt, field_validator
+from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 
 from romjax.graph import Node
-from romjax.model import ImplicitModel, Sampleable
+from romjax.model import ImplicitModel, ImplicitSampleable
 from romjax.pde import (
     BoundarySpec,
     BoundaryType,
+    ConstantInitialize,
     Coordinates,
     ForcingCallable,
-    InitializeCallable,
+    IterativeSolver,
+    RegisteredInitialize,
     UniformGrid,
     homogeneous_boundary,
 )
 from romjax.rng import SamplerCallable
 from romjax.tree import to_pytree
-from romjax.typing import DictModel, ThirdPartyType, from_registry, require_type
+from romjax.typing import DictModel, from_registry
 
 __all__ = ["Poisson2D"]
 
@@ -154,13 +155,6 @@ class IdentityInputs(ForcingCallable):
     def callable(self, inputs, outputs):
         """Simple boundary that uses boundary input params directly (just pass them through)."""
         return inputs
-
-
-class ConstantInitialize(InitializeCallable):
-    const: ArrayLike = 0.0
-
-    def callable(self, coords: Coordinates) -> ArrayLike:
-        return self.const * jnp.ones_like(coords[0])
     
 
 _forcing_registry = {
@@ -170,58 +164,18 @@ _forcing_registry = {
     "constant": ConstantForcing,
     "identity": IdentityInputs
 }
-_initialize_registry = {
-    "constant": ConstantInitialize
-}
+
 
 type PoissonForcing = Annotated[ForcingCallable, BeforeValidator(functools.partial(from_registry, _forcing_registry))]
-type PoissonInitialize = Annotated[InitializeCallable, 
-                                   BeforeValidator(functools.partial(from_registry, _initialize_registry))]
-type IterativeSolver = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractIterativeSolver))]
-type AdjointMethod = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractAdjoint))]
 
 
-class PoissonConfig(DictModel):
-    """Numerical configs for solving the Poisson PDE on a 2D grid.
-
-    See Optimistix docs for `root_find()` method.
-    
-    :ivar grid: the uniform 2D Cartesian grid
-    :ivar solver: Optimistix nonlinear root finding solver (name+opts or instance), default is Newton
-    :ivar initial_guess: callable that takes coords and generates an initial guess on the grid
-    :ivar options: runtime options for the nonlinear solver
-    :ivar max_steps: maximum number of solver steps
-    :ivar adjoint: Optimistix adjoint method
-    :ivar throw: whether to throw failures as errors (default True)
-    """
-    grid: UniformGrid
-    solver: IterativeSolver = Field(
-        default_factory=lambda: dict(name='optimistix.Newton', kwargs={'rtol': 1e-2, 'atol': 1e-4}), 
-        validate_default=True
-    )
-    initial_guess: PoissonInitialize = Field(default_factory=ConstantInitialize)
-    options: dict[str, Any] = Field(default_factory=dict)
-    max_steps: PositiveInt = 100
-    adjoint: AdjointMethod = Field(
-        default_factory=lambda: dict(name='optimistix.ImplicitAdjoint'), 
-        validate_default=True
-    )
-    throw: bool = True
-
-    @field_validator("grid", mode="after")
-    @classmethod
-    def _check_2d_grid(cls, value: UniformGrid) -> UniformGrid:
-        if len(value.shape) != 2:
-            raise ValueError("Only 2D grid supported for Poisson")
-        
-        return value
-
-
-class Poisson2D(ImplicitModel, Sampleable):
+class Poisson2D(ImplicitModel, ImplicitSampleable):
     model_config = ConfigDict(extra='forbid')
 
-    # Required (and static once set)
-    config: PoissonConfig
+    grid: UniformGrid  # Required
+
+    solver: IterativeSolver = Field(default_factory=IterativeSolver)
+    initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
 
     # To satisfy criteria for being a graph edge
     source: Node = Node(name="poisson_in")
@@ -238,13 +192,21 @@ class Poisson2D(ImplicitModel, Sampleable):
 
     inputs_sampler: SamplerCallable | None = None
     outputs_sampler: SamplerCallable | None = None
+
+    @field_validator("grid", mode="after")
+    @classmethod
+    def _check_2d_grid(cls, value: UniformGrid) -> UniformGrid:
+        if len(value.shape) != 2:
+            raise ValueError("Only 2D grid supported for Poisson")
+        
+        return value
     
     def _merge_coords(self, inputs: PoissonInputs) -> PoissonInputs:
         """Merge grid coords into incoming inputs."""
         inputs = to_pytree(inputs)
         for name in ("forcing", "conductivity", "boundary"):
             inputs.setdefault(name, {})
-        coords = {'coords': self.config['grid']['coords']}
+        coords = {'coords': self.grid['coords']}
         for k in inputs:
             inputs[k].update(coords)
         
@@ -253,7 +215,7 @@ class Poisson2D(ImplicitModel, Sampleable):
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
         phi = jnp.asarray(outputs[self.field_name])
-        dx, dy = self.config['grid']['spacing']
+        dx, dy = self.grid['spacing']
         forcing = jnp.asarray(self.forcing(inputs['forcing'], outputs))
         conductivity = jnp.broadcast_to(self.conductivity(inputs['conductivity'], outputs), phi.shape)
         xbds, ybds = self.boundary(inputs['boundary'], outputs)['boundary']
@@ -342,25 +304,17 @@ class Poisson2D(ImplicitModel, Sampleable):
         if self.residual_name in residuals:
             target = jnp.asarray(residuals[self.residual_name])
         else:
-            target = jnp.zeros_like(self.config.grid.coords[0])
+            target = jnp.zeros_like(self.grid.coords[0])
         args = {'inputs': self._merge_coords(inputs), 'target': target}
 
         def residual_fn(phi: ArrayLike, args: PyTree) -> ArrayLike:
             residual = self._compute_residual(args['inputs'], {self.field_name: phi})
             return residual[self.residual_name] - args['target']
         
-        solution = optx.root_find(
-            residual_fn,
-            solver=self.config.solver,
-            y0=jnp.asarray(self.config.initial_guess(self.config.grid.coords)),
-            args=args,
-            options=self.config.options,
-            max_steps=self.config.max_steps,
-            adjoint=self.config.adjoint,
-            throw=self.config.throw,
-        )
+        y0 = jnp.asarray(self.initial_guess(self.grid.coords))
+        solution = self.solver.root_find(residual_fn, y0, args, return_sol=return_sol)
 
-        ret = solution if return_sol else {self.field_name: solution.value} 
+        ret = solution if return_sol else {self.field_name: solution} 
         return ret
     
     def sample_inputs(self, key: Key) -> PoissonInputs:
@@ -393,3 +347,4 @@ class Poisson2D(ImplicitModel, Sampleable):
         if isinstance(sample, Mapping):
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}
+    
