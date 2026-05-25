@@ -1,0 +1,2 @@
+!romx.PyTreeSampler
+outputs: { callable: uniform, shape=(...), minval: [...], maxval: [...] }

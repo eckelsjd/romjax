@@ -12,11 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from romjax.graph import Edge, Node
 from romjax.tree import TreePath, get_subtree, pytree_merge, set_subtree
 
-__all__ = ['Sampleable', 'eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel']
+__all__ = ['eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel',
+           'ImplicitSampleable', 'SourceSampleable']
 
 
-class Sampleable(ABC):
-    """Mixin for models that can sample input/output spaces."""
+class ImplicitSampleable(ABC):
+    """Mixin for implicit models that can sample input/output spaces."""
 
     @abstractmethod
     def sample_inputs(self, key: Key) -> PyTree:
@@ -37,7 +38,16 @@ class Sampleable(ABC):
         :return: sampled outputs
         """
         raise NotImplementedError
+    
 
+class SourceSampleable(ABC):
+    """Mixin for models that sample arbitrary source nodes."""
+
+    @abstractmethod
+    def sample_source(self, key: Key) -> PyTree:
+        """Sample a single pytree for the source node."""
+        raise NotImplementedError
+    
 
 class ImplicitModel(Edge, ABC):
     """
