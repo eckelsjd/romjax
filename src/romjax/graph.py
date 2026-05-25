@@ -124,7 +124,7 @@ class Edge(BaseModel, Hashable, ABC):
         return self.name
 
     def __repr__(self) -> str:
-        return f"{self.name}: {self.source}->{self.target}"
+        return f"{self.source}->{self.target}"
 
     def __call__(
         self,
@@ -247,7 +247,13 @@ class CompositeEdge(Edge):
         ret, aux = self.backward_aux(x, aux=None)
         return ret
 
-    def forward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+    def forward_aux(
+        self, 
+        x: PyTree, 
+        aux: PyTree | None = None, 
+        edge_payload_patches: EdgePatch | None = None, 
+        composite_stack: tuple[str, ...] = ()
+    ) -> tuple[PyTree, PyTree | None]:
         """
         Evaluate the forward composite path and return the graph-managed auxiliary cache.
 
@@ -255,9 +261,16 @@ class CompositeEdge(Edge):
         :param aux: optional precomputed graph aux cache
         :return: ``(payload, aux_cache)``
         """
-        return self._run_path(x, start=self.source, aux=aux, return_aux=True)
+        return self._run_path(x, start=self.source, aux=aux, return_aux=True, 
+                              edge_payload_patches=edge_payload_patches, composite_stack=composite_stack)
 
-    def backward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+    def backward_aux(
+        self, 
+        x: PyTree, 
+        aux: PyTree | None = None,
+        edge_payload_patches: EdgePatch | None = None, 
+        composite_stack: tuple[str, ...] = ()
+        ) -> tuple[PyTree, PyTree | None]:
         """
         Evaluate the backward composite path and return the graph-managed auxiliary cache.
 
@@ -265,7 +278,8 @@ class CompositeEdge(Edge):
         :param aux: optional precomputed graph aux cache
         :return: ``(payload, aux_cache)``
         """
-        return self._run_path(x, path=list(reversed(self.path)), start=self.target, aux=aux, return_aux=True)
+        return self._run_path(x, path=list(reversed(self.path)), start=self.target, aux=aux, return_aux=True,
+                              edge_payload_patches=edge_payload_patches, composite_stack=composite_stack)
 
 
 # Equivalent to the alias NodeList = ListModel[Node], but now others can use this by importing it
@@ -471,36 +485,25 @@ class FunctionGraph(BaseModel):
                     )
                 payload_in = pytree_merge(payload_in, edge_payload_patch)
 
-            edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
-            if direction == "forward":
-                if isinstance(edge, CompositeEdge):
-                    payload, aux_cache = edge._run_path(
-                        payload_in,
-                        start=edge.source,
-                        aux=aux_cache,
-                        edge_payload_patches=edge_payload_patches,
-                        return_aux=True,
-                        composite_stack=composite_stack,
-                    )
-                else:
-                    payload, edge_aux_out = edge.forward_aux(payload_in, edge_aux_in)
+            composite = isinstance(edge, CompositeEdge)
+            if composite:
+                edge_aux_in = aux_cache
+                extra_kwargs = {"edge_payload_patches": edge_payload_patches, "composite_stack": composite_stack}
             else:
-                if isinstance(edge, CompositeEdge):
-                    payload, aux_cache = edge._run_path(
-                        payload_in,
-                        path=list(reversed(edge.path)),
-                        start=edge.target,
-                        aux=aux_cache,
-                        edge_payload_patches=edge_payload_patches,
-                        return_aux=True,
-                        composite_stack=composite_stack,
-                    )
-                else:
-                    payload, edge_aux_out = edge.backward_aux(payload_in, edge_aux_in)
+                edge_aux_in = aux_cache.get(edge.name, {}).get(direction)
+                extra_kwargs = {}
 
-            if not isinstance(edge, CompositeEdge) and edge_aux_out is not None:
-                edge_cache = aux_cache.setdefault(edge.name, {})
-                edge_cache[produced_key] = edge_aux_out
+            if direction == "forward":
+                payload, edge_aux_out = edge.forward_aux(payload_in, edge_aux_in, **extra_kwargs)
+            else:
+                payload, edge_aux_out = edge.backward_aux(payload_in, edge_aux_in, **extra_kwargs)
+
+            if composite:
+                aux_cache = edge_aux_out
+            else:
+                if edge_aux_out is not None:
+                    edge_cache = aux_cache.setdefault(edge.name, {})
+                    edge_cache[produced_key] = edge_aux_out
 
             curr_node = next_node
 

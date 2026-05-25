@@ -35,7 +35,7 @@ from pydantic import (
 )
 
 from romjax.graph import FunctionGraph
-from romjax.model import Sampleable
+from romjax.model import ImplicitSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree
@@ -602,7 +602,7 @@ class GraphLoss(BaseModel):
         """Grab the first sampleable edge as the default edge, i.e. typically there is only one."""
         _default_edge = None
         for edge_name, edge in graph.edges.items():
-            if isinstance(edge, Sampleable):
+            if isinstance(edge, ImplicitSampleable):
                 _default_edge = edge_name
             break
 

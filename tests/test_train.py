@@ -13,7 +13,7 @@ from orbax.checkpoint import v1 as ocp
 
 from romjax import YamlLoader
 from romjax.graph import Edge, FunctionGraph, Node
-from romjax.model import Sampleable
+from romjax.model import ImplicitSampleable
 from romjax.nn import LinearProjection
 from romjax.rng import PyTreeSampler
 from romjax.routine import RoutineError
@@ -72,7 +72,7 @@ def graph_reference_loss(params: dict, single_data: dict, graph: FunctionGraph) 
     return jnp.square(weight - single_data["x"]) + jnp.square(alias - weight)
 
 
-class ToyLinearReconstructionEdge(Edge, Sampleable):
+class ToyLinearReconstructionEdge(Edge, ImplicitSampleable):
     source: Node = Node(name="state", error_op="mse")
     target: Node = Node(name="latent")
     name: str = "toy"

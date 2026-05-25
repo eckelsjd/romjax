@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from romjax.graph import CompositeEdge
+from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import SourceSampleable
 from romjax.rng import SamplerCallable
 from romjax.tree import pytree_merge
@@ -318,21 +318,31 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     source_sampler: Annotated[SamplerCallable | None, BeforeValidator(from_yaml)] = None
 
     # Override default composite edge behavior by solving in latent space directly
-    def backward_aux(self, x: PyTree, aux: PyTree | None = None) -> tuple[PyTree, PyTree | None]:
+    def backward_aux(
+        self, 
+        x: PyTree, 
+        aux: PyTree | None = None,
+        edge_payload_patches: EdgePatch | None = None, 
+        composite_stack: tuple[str, ...] = ()
+    ) -> tuple[PyTree, PyTree | None]:
         """Solve in latent space (with optional aux data)."""
-        y0 = jnp.asarray(self.initial_guess(x["residuals"]))
-
-        def residual_fn(z: ArrayLike, args: PyTree, aux=None) -> ArrayLike:
+        
+        def residual_fn(z: ArrayLike, args: PyTree, aux, edge_payload_patches, composite_stack) -> ArrayLike:
             """Root find residual function, with `z` as the latent coordinates."""
             payload = {"outputs": z}
             if (inputs := args.get("inputs", None)) is not None:
                 payload["inputs"] = inputs
 
-            result, aux = self.forward_aux(payload, aux=aux)
+            result, aux = self.forward_aux(payload, aux, edge_payload_patches, composite_stack)
 
             return result["residuals"] - args["residuals"]
         
-        solution = self.solver.root_find(lambda z, args: residual_fn(z, args, aux=aux), y0, x, return_sol=False)
+        solution = self.solver.root_find(
+            lambda z, args: residual_fn(z, args, aux, edge_payload_patches, composite_stack), 
+            jnp.asarray(self.initial_guess(x["residuals"])), 
+            x, 
+            return_sol=False
+        )
 
         ret = {"outputs": solution}
 
@@ -345,5 +355,4 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     def sample_source(self, key: Key) -> PyTree:
         if self.source_sampler is not None:
             return self.source_sampler(key)
-        return {}
-    
+        return {}  

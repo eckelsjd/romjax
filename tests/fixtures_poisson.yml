@@ -1,8 +1,8 @@
 solver: !romx:Poisson2D
-  config:
-    grid:
-      shape: &s [8, 8]
-      bounds: &b [[0, 1], [0, 1]]
+  grid:
+    shape: &s [8, 8]
+    bounds: &b [[0, 1], [0, 1]]
+  solver:
     solver:
       name: optimistix.Newton
       kwargs:

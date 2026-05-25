@@ -1,7 +1,9 @@
 import jax.numpy as jnp
 import pytest
 
-from romjax.pde import BoundaryType, UniformGrid, homogeneous_boundary
+from romjax.graph import Edge, FunctionGraph, Node
+from romjax.model import ImplicitModel
+from romjax.pde import BoundaryType, ImplicitIterativeGalerkin, UniformGrid, homogeneous_boundary
 from romjax.tree import pytree_merge
 
 
@@ -70,4 +72,99 @@ def test_uniform_grid():
     # 6) Make sure we don't serialize big coords array
     d = grid.model_dump()
     assert 'coords' not in d
+
+
+def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
+
+    class TinyNonlinearImplicit(ImplicitModel):
+        source: Node = Node(name="implicit_source")
+        target: Node = Node(name="implicit_target")
+        field_name: str = "u"
+        residual_name: str = "r"
+
+        def evaluate(self, inputs, outputs):
+            u = jnp.asarray(outputs[self.field_name])
+            b = jnp.asarray(inputs["b"])
+            return {self.residual_name: u**2 - b}
+
+        def solve(self, inputs, residuals):
+            b = jnp.asarray(inputs["b"])
+            r = jnp.asarray(residuals[self.residual_name])
+            return {self.field_name: jnp.sqrt(b + r)}
+
+    class SourceMapEdge(Edge):
+        source: Node = Node(name="galerkin_source")
+        target: Node = Node(name="implicit_source")
+        scale: float = 2.0
+        shift: float = 1.0
+
+        def forward(self, x):
+            z = jnp.asarray(x["outputs"])
+            return {"inputs": x["inputs"], "outputs": {"u": self.scale * z + self.shift}}
+
+        def backward(self, x):
+            u = jnp.asarray(x["outputs"]["u"])
+            return {"inputs": x["inputs"], "outputs": (u - self.shift) / self.scale}
+
+    class TargetMapEdge(Edge):
+        source: Node = Node(name="implicit_target")
+        target: Node = Node(name="galerkin_target")
+        scale: float = 3.0
+        shift: float = -0.5
+
+        def forward(self, x):
+            r = jnp.asarray(x["residuals"]["r"])
+            return {"inputs": x["inputs"], "residuals": self.scale * r + self.shift}
+
+        def backward(self, x):
+            eta = jnp.asarray(x["residuals"])
+            return {"inputs": x["inputs"], "residuals": {"r": (eta - self.shift) / self.scale}}
+
+    graph = FunctionGraph(
+        edges={
+            "src_map": SourceMapEdge(),
+            "implicit": TinyNonlinearImplicit(),
+            "tgt_map": TargetMapEdge(),
+            "galerkin": ImplicitIterativeGalerkin(
+                source="galerkin_source",
+                target="galerkin_target",
+                path=["src_map", "implicit", "tgt_map"],
+                initial_guess=lambda arr: 0.1 * jnp.ones_like(arr),
+            ),
+        }
+    )
+
+    inputs = {"b": jnp.array([1.0, 1.5])}
+    z_true = jnp.array([0.2, 0.4])
+
+    target_payload = graph.push_path(
+        {"inputs": inputs, "outputs": z_true},
+        path=["src_map", "implicit", "tgt_map"],
+        start="galerkin_source",
+    )
+    eta_target = target_payload["residuals"]
+
+    z_galerkin = graph.push_path(
+        {"inputs": inputs, "residuals": eta_target},
+        path=["galerkin"],
+        start="galerkin_target",
+    )["outputs"]
+
+    implicit_residuals = graph.push_path(
+        {"inputs": inputs, "residuals": eta_target},
+        path=["tgt_map"],
+        start="galerkin_target",
+    )["residuals"]
+    implicit_outputs = graph.push_path(
+        {"inputs": inputs, "residuals": implicit_residuals},
+        path=["implicit"],
+        start="implicit_target",
+    )["outputs"]
+    z_direct = graph.push_path(
+        {"inputs": inputs, "outputs": implicit_outputs},
+        path=["src_map"],
+        start="implicit_source",
+    )["outputs"]
+
+    assert jnp.allclose(z_galerkin, z_direct, atol=1e-6, rtol=1e-6)
     

@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from romjax.graph import FunctionGraph
-from romjax.model import Sampleable
+from romjax.model import ImplicitSampleable
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
 from romjax.tree import pytree_iter
@@ -93,7 +93,7 @@ class DataGeneration(Routine):
                  May point to a yaml file with the FunctionGraph spec implemented at the top-level
     :ivar train: sampling configuration for each model (see `SampleConfig`) for training dataset
     :ivar validation: sampling configurations for validation dataset
-    :ivar to_sample: the names of the models to sample. Each must implement the `Sampleable` protocol
+    :ivar to_sample: the names of the models to sample. Each must implement the `ImplicitSampleable` protocol
     :ivar batch_size: number of samples to generate at a time
     :ivar format: the data format to save samples. Only `h5` supported.
     :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
@@ -142,7 +142,7 @@ class DataGeneration(Routine):
         if value is None:
             value = []
             for edge_name, edge in info.data['graph'].edges.items():
-                if isinstance(edge, Sampleable):
+                if isinstance(edge, ImplicitSampleable):
                     value.append(edge_name)
         
         if not isinstance(value, list):

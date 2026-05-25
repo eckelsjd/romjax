@@ -6,10 +6,12 @@ import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
 from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_validator
 
-from romjax.pde import Coordinates
 from romjax.typing import DictModel
 
 __all__ = ["KLEConfig", "kle", "darcy"]
+
+
+type Coordinates = tuple[ArrayLike, ...] | ArrayLike
 
 
 class KLEConfig(DictModel):
