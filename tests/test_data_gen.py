@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from romjax.data_gen import DataGeneration
+from romjax.data_gen import DataGeneration, DatasetConfig
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable
 
@@ -47,16 +47,41 @@ def _get_graph():
 def test_generate_data(tmp_path, batch_size):
     config = DataGeneration(
         root=tmp_path,
+        datasets={
+            "train": {
+                "low": {
+                    "input_samples": 2,
+                    "outputs_per_input": 1,
+                    "input_seed": 3,
+                    "output_seed": 5,
+                    "batch_size": batch_size,
+                },
+                "high": {
+                    "input_samples": 2,
+                    "outputs_per_input": 1,
+                    "input_seed": 3,
+                    "output_seed": 5,
+                    "batch_size": batch_size,
+                },
+            },
+            "validation": {
+                "low": {
+                    "input_samples": 1,
+                    "outputs_per_input": 1,
+                    "input_seed": 7,
+                    "output_seed": 11,
+                    "batch_size": batch_size,
+                },
+                "high": {
+                    "input_samples": 1,
+                    "outputs_per_input": 1,
+                    "input_seed": 7,
+                    "output_seed": 11,
+                    "batch_size": batch_size,
+                },
+            },
+        },
         graph=_get_graph(),
-        train=[
-            {"input_samples": 2, "outputs_per_input": 1, "input_seed": 3, "output_seed": 5},
-            {"input_samples": 2, "outputs_per_input": 1, "input_seed": 3, "output_seed": 5},
-        ],
-        validation=[
-            {"input_samples": 1, "outputs_per_input": 1, "input_seed": 7, "output_seed": 11},
-            {"input_samples": 1, "outputs_per_input": 1, "input_seed": 7, "output_seed": 11},
-        ],
-        batch_size=batch_size,
     )
     config.run()
 
@@ -74,3 +99,29 @@ def test_generate_data(tmp_path, batch_size):
                 output_dir = sample_dir / "seed_5" if dataset_name == "train" else sample_dir / "seed_11"
                 assert (output_dir / "sample_0" / "output.h5").exists()
                 assert (output_dir / "sample_0" / "residual.h5").exists()
+
+
+class _CustomDataset(DatasetConfig):
+    marker: str
+    last_call: tuple[str, str, str] | None = None
+
+    def generate(self, path, format=None, write_policy=None):
+        file_path = path / f"{self.marker}.txt"
+        path.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(self.marker)
+        self.last_call = (str(path), str(format), str(write_policy))
+
+
+def test_custom_dataset_config_leaf(tmp_path):
+    custom = _CustomDataset(marker="ok")
+    config = DataGeneration(
+        root=tmp_path,
+        datasets={"custom": custom},
+        format="h5",
+        write_policy="overwrite",
+    )
+
+    config.run()
+
+    assert (tmp_path / "custom" / "ok.txt").exists()
+    assert custom.last_call == (str(tmp_path / "custom"), "h5", "overwrite")
