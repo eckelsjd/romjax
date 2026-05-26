@@ -1,19 +1,18 @@
 !romx:DataGeneration
 routine_config: config/common.yml
-
 root: dataset
-graph: config/graph.yml
-train:
-  input_samples: 500
-  outputs_per_input: 10
-  input_seed: 0
-  output_seed: 1
-validation:
-  input_samples: 32
-  outputs_per_input: 2
-  input_seed: 2
-  output_seed: 3
 write_policy: reuse
-batch_size: 32
-progress_bar:
-  theme: classic
+graph: config/graph.yml
+datasets:
+  train:
+    poisson:
+      input_samples: 250
+      outputs_per_input: 10
+      input_seed: 0
+      output_seed: 1
+  validation:
+    poisson:
+      input_samples: 25
+      outputs_per_input: 10
+      input_seed: 2
+      output_seed: 3

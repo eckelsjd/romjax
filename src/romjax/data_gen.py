@@ -1,33 +1,24 @@
 """Data generation routine."""
 import inspect
-import os
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Annotated, Callable, Literal, Sequence
+from typing import Annotated, Callable, Literal, Mapping, get_args
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from alive_progress import alive_bar
 from jaxtyping import Key, PyTree
-from pydantic import (
-    BaseModel,
-    BeforeValidator,
-    PositiveInt,
-    ValidationInfo,
-    ValidatorFunctionWrapHandler,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PositiveInt, model_validator
 
 from romjax.graph import FunctionGraph
-from romjax.model import ImplicitSampleable
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
-from romjax.tree import pytree_iter
+from romjax.tree import pytree_iter, pytree_path_iter
 from romjax.typing import from_yaml
 from romjax.utils import load_h5, save_h5
 
-__all__ = ["DataGeneration"]
+__all__ = ["DataGeneration", "DatasetConfig"]
 
 
 def _get_kwargs(fn: Callable) -> set[str]:
@@ -68,153 +59,155 @@ def _build_batched_sample_outputs(model):
     return eqx.filter_jit(_sample_outputs)
 
 
-class SampleConfig(BaseModel):
+def _required_fields(model_cls: type[BaseModel]) -> set[str]:
+    inherited = set()
+
+    # for base in model_cls.__mro__[1:]:
+    #     if issubclass(base, BaseModel):
+    #         inherited.update(getattr(base, "model_fields", {}))
+
+    return {
+        name
+        for name, field in model_cls.model_fields.items()
+        if name not in inherited and field.is_required()
+    }
+
+
+type SUPPORTED_FORMATS = Literal["h5"]
+type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
+
+
+class DatasetConfig(BaseModel, ABC):
+    """Abstract class for generating datasets."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    format: SUPPORTED_FORMATS | None = None
+    write_policy: SUPPORTED_POLICIES | None = None
+
+    def _validate_format_and_policy(self, format, write_policy):
+        """Make sure we have format and policy at runtime."""
+        format = self.format or format
+        write_policy = self.write_policy or write_policy
+
+        if format is None:
+            raise ValueError(f"Must specify a write format. Supported: {get_args(SUPPORTED_FORMATS)}")
+        if write_policy is None:
+            raise ValueError(f"Must specify a write policy. Supported: {get_args(SUPPORTED_POLICIES)}")
+        
+        return format, write_policy
+
+    @abstractmethod
+    def generate(
+        self, 
+        path: Path, 
+        format: SUPPORTED_FORMATS | None = None,
+        write_policy: SUPPORTED_POLICIES | None = None
+    ) -> None:
+        """Generate data at the provided path using the specified format and write_policy."""
+        raise NotImplementedError
+
+
+class GraphDataset(DatasetConfig):
+    """Datasets that use a FunctionGraph for sample generation."""
+
+    graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+
+
+class ImplicitModelDataset(GraphDataset):
     """
-    Sampling configuration for a nested input/output sampling strategy.
+    Sampling configuration for a nested input/output strategy for implicit models in a FunctionGraph.
 
     :ivar input_samples: number of input samples
     :ivar outputs_per_input: number of output samples for each input sample
     :ivar input_seed: random seed for inputs
     :ivar output_seed: random seed for outputs
+    :ivar batch_size: number of samples to generate at a time
+    :ivar name_depth: depth in the path for displaying current dataset name (default: 2)
     """
 
     input_samples: int
     outputs_per_input: int
     input_seed: int
     output_seed: int
-
-
-class DataGeneration(Routine):
-    """
-    Data generation routine for a FunctionGraph.
-    
-    :ivar root: root directory for saving data
-    :ivar graph: the FunctionGraph object specifying all models and connections. 
-                 May point to a yaml file with the FunctionGraph spec implemented at the top-level
-    :ivar train: sampling configuration for each model (see `SampleConfig`) for training dataset
-    :ivar validation: sampling configurations for validation dataset
-    :ivar to_sample: the names of the models to sample. Each must implement the `ImplicitSampleable` protocol
-    :ivar batch_size: number of samples to generate at a time
-    :ivar format: the data format to save samples. Only `h5` supported.
-    :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
-    """
-
-    root: Path 
-    graph: Annotated[FunctionGraph, BeforeValidator(from_yaml)]
-    train: Sequence[SampleConfig]
-    validation: Sequence[SampleConfig]
-    to_sample: list[str] | None = None
     batch_size: PositiveInt = 1
-    format: Literal["h5"] = "h5"
-    write_policy: Literal["reuse", "overwrite", "error"] = "reuse"
+    name_depth: int = 2
 
-    def run(self) -> int:
-        if self.batch_size > 1:
-            return self._generate_data_batch()
-        else:
-            return self._generate_data_serial()
+    def _generate_serial(self, path, format, write_policy):
+        """Generate data in serial for an ImplicitModel."""
+        path = Path(path)
+        bar_text = "/".join(path.parts[-self.name_depth:])
+        edge_name = path.name
 
-    @field_validator("root", mode="after")
-    @classmethod
-    def _make_root(cls, value: Path):
-        if not value.exists():
-            os.makedirs(value, exist_ok=True)
-        os.makedirs(value / "train", exist_ok=True)
-        os.makedirs(value / "validation", exist_ok=True)
-        return value
+        if edge_name not in self.graph.edges:
+            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
+        
+        model = self.graph.edges[edge_name]
+
+        with alive_bar(self.input_samples) as bar:
+            bar.text(bar_text)
+
+            if write_policy == "error" and path.exists():
+                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+
+            path.mkdir(parents=True, exist_ok=True)
+
+            sample_inputs = eqx.filter_jit(model.sample_inputs)
+            solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") else None
+            evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") else None
+
+            sample_output_kwargs = _get_kwargs(model.sample_outputs)
+            if all(arg in sample_output_kwargs for arg in ["inputs", "solution"]):
+                sample_outputs = eqx.filter_jit(
+                    lambda key, one_input, one_solution: model.sample_outputs(
+                        key, inputs=one_input, solution=one_solution
+                    )
+                )
+            elif "solution" in sample_output_kwargs:
+                sample_outputs = eqx.filter_jit(
+                    lambda key, _, one_solution: model.sample_outputs(key, solution=one_solution)
+                )
+            else:
+                sample_outputs = eqx.filter_jit(lambda key, *_: model.sample_outputs(key))
+
+            for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
+                input_path = input_dir / "input.h5"
+                solution_path = input_dir / "solution.h5"
+
+                if write_policy == "reuse" and input_path.exists():
+                    if format != "h5":
+                        raise RoutineError(f"Save format '{format}' not recognized")
+                    one_input = load_h5({}, input_path, jax=True)
+                    one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
+                else:
+                    one_input = sample_inputs(input_key)
+                    one_solution = solve(one_input) if solve is not None else None
+
+                    if format == "h5":
+                        save_h5(one_input, input_path, mode="w")
+                        if one_solution is not None:
+                            save_h5(one_solution, solution_path, mode="w")
+                    else:
+                        raise RoutineError(f"Save format '{format}' not recognized")
+
+                skip = "existing" if write_policy == "reuse" else None
+                for output_key, output_dir in gen_keys(
+                    self.outputs_per_input, self.output_seed, path=input_dir, skip=skip
+                ):
+                    one_output = sample_outputs(output_key, one_input, one_solution)
+                    one_residual = evaluate(one_input, one_output) if evaluate is not None else None
+
+                    if format == "h5":
+                        save_h5(one_output, output_dir / "output.h5", mode="w")
+                        if one_residual is not None:
+                            save_h5(one_residual, output_dir / "residual.h5", mode="w")
+                    else:
+                        raise RoutineError(f"Save format '{format}' not recognized")
+
+                bar()
     
-    @field_validator("train", "validation", mode="before")
-    @classmethod
-    def _allow_single_config(cls, value: SampleConfig | Sequence[SampleConfig]) -> Sequence[SampleConfig]:
-        if not isinstance(value, Sequence):
-            return [value]
-        return value
-    
-    @field_validator("to_sample", mode="wrap")
-    @classmethod
-    def _validate_sampleable(
-        cls, 
-        value: str | list[str] | None, 
-        handler: ValidatorFunctionWrapHandler, 
-        info: ValidationInfo
-    ) -> list[str]:
-        """If none, default to all sampleables in the graph."""
-        if value is None:
-            value = []
-            for edge_name, edge in info.data['graph'].edges.items():
-                if isinstance(edge, ImplicitSampleable):
-                    value.append(edge_name)
-        
-        if not isinstance(value, list):
-            value = [value]
-        
-        value = handler(value)
-
-        # Check for the Sampleable required methods
-        for name in value:
-            if name not in info.data['graph'].edges:
-                raise ValueError(f"Model name '{name}' not an edge in the graph, so it cannot be sampled.")
-            edge = info.data['graph'].edges[name]
-            if not hasattr(edge, 'sample_inputs') or not hasattr(edge, 'sample_outputs'):
-                raise ValueError(f"Graph edge object {edge} does not have the required 'sample_inputs' and "
-                                 f"'sample_outputs' methods, so it cannot be sampled.")
-        return value
-    
-    @model_validator(mode="after")
-    def _validate_sequences(self):
-        """Make sure train, validation configs match the length of sampleables (will broadcast len=1)."""
-        num_sample = len(self.to_sample)
-
-        if num_sample == 0:
-            raise ValueError("Must specify at least one model to sample.")
-
-        if num_sample > 1:
-            if len(self.train) == 1:
-                for i in range(1, num_sample):
-                    new_config = self.train[0].copy()
-                    new_config.seed += i
-                    self.train.append(new_config)
-            
-            if len(self.validation) == 1:
-                for i in range(1, num_sample):
-                    new_config = self.validation[0].copy()
-                    new_config.seed += i
-                    self.validation.append(new_config)
-        
-        if len(self.train) != num_sample:
-            raise ValueError(f"Number of training configs: {len(self.train)}. Expected {num_sample}")
-        if len(self.validation) != num_sample:
-            raise ValueError(f"Number of validation configs: {len(self.validation)}. Expected {num_sample}")
-        
-        return self
-
-    def _get_dataset_totals(self):
-        """Sum over just input samples for all sampleable models."""
-        total_train_samples = 0
-        total_validation_samples = 0
-        for edge_idx, edge_name in enumerate(self.to_sample):
-            total_train_samples += self.train[edge_idx].input_samples
-            total_validation_samples += self.validation[edge_idx].input_samples
-        
-        return {"train": total_train_samples, "validation": total_validation_samples}
-
-    def _generate_data_batch(self):
-        """
-        Generate training and validation data for a FunctionGraph using batches and vmap.
-        
-        Compatible with Edges stored in a FunctionGraph that implement the Sampleable protocol.
-        A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the 
-        result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
-        Generally, output samples are conditioned on input samples, and so several output samples may be requested 
-        for a single input sample.
-
-        Of particular interest are ImplictModels, which implement the `solve` and `evaluate` methods. If an Edge
-        implements these methods, a solution will be generated and saved alongside each input, and a residual will be
-        computed and saved alongside each output.
-
-        Only the `h5` storage format is supported for all samples, so make sure your samples adhere to a simple nested
-        dict structure with array leaves.
-        """
+    def _generate_batch(self, path, format, write_policy):
+        """Generate data for an ImplicitModel using batches and vmap."""
 
         def _save_outputs(
             sample_outputs: Callable,
@@ -233,12 +226,12 @@ class DataGeneration(Routine):
             for one_output, output_path in zip(pytree_iter(outputs), output_paths):
                 one_residual = next(residual_iter) if residual_iter is not None else None
 
-                if self.format == "h5":
+                if format == "h5":
                     save_h5(one_output, output_path / "output.h5", mode="w")
                     if one_residual is not None:
                         save_h5(one_residual, output_path / "residual.h5", mode="w")
                 else:
-                    raise RoutineError(f"Save format '{self.format}' not recognized")
+                    raise RoutineError(f"Save format '{format}' not recognized")
 
         def _process_input_batch(
             input_batch: list[tuple[Key, Path]],
@@ -246,7 +239,6 @@ class DataGeneration(Routine):
             solve: Callable | None,
             sample_outputs: Callable,
             evaluate: Callable | None,
-            sample_config: object,
             bar: Callable,
         ) -> None:
             if not input_batch:
@@ -257,7 +249,7 @@ class DataGeneration(Routine):
             solutions_by_index: dict[int, object] = {}
 
             missing_indices = range(len(input_batch))
-            if self.write_policy == "reuse":
+            if write_policy == "reuse":
                 missing_indices = [
                     i for i, (_, input_path) in enumerate(input_batch) if not (input_path / "input.h5").exists()
                 ]
@@ -281,25 +273,25 @@ class DataGeneration(Routine):
                     one_input = inputs_by_index[i]
                     one_solution = solutions_by_index.get(i)
 
-                    if self.format == "h5":
+                    if format == "h5":
                         save_h5(one_input, input_path / "input.h5", mode="w")
                         if one_solution is not None:
                             save_h5(one_solution, input_path / "solution.h5", mode="w")
                     else:
-                        raise RoutineError(f"Save format '{self.format}' not recognized")
+                        raise RoutineError(f"Save format '{format}' not recognized")
 
                 else:
-                    if self.format != "h5":
-                        raise RoutineError(f"Save format '{self.format}' not recognized")
+                    if format != "h5":
+                        raise RoutineError(f"Save format '{format}' not recognized")
                     one_input = load_h5({}, input_path / "input.h5", jax=True)
                     solution_path = input_path / "solution.h5"
                     one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
 
                 output_batch: list[tuple[Key, Path]] = []
-                skip = 'existing' if self.write_policy == 'reuse' else None
+                skip = 'existing' if write_policy == 'reuse' else None
 
                 for output_key, output_dir in gen_keys(
-                    sample_config.outputs_per_input, sample_config.output_seed, path=input_path, skip=skip
+                    self.outputs_per_input, self.output_seed, path=input_path, skip=skip
                 ):
                     if len(output_batch) < self.batch_size:
                         output_batch.append((output_key, output_dir))
@@ -317,123 +309,135 @@ class DataGeneration(Routine):
                 bar()
 
             input_batch.clear()
+        
+        path = Path(path)
+        bar_text = "/".join(path.parts[-self.name_depth:])
+        edge_name = path.name
 
-        dataset_totals = self._get_dataset_totals()
+        if edge_name not in self.graph.edges:
+            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
+        
+        model = self.graph.edges[edge_name]
 
-        for dataset_name in ["train", "validation"]:
-            with alive_bar(dataset_totals[dataset_name], title=f"{dataset_name} data", title_length=15) as bar:
-                for edge_idx, edge_name in enumerate(self.to_sample):
-                    sample_config = getattr(self, dataset_name)[edge_idx]
-                    bar.text(f"current model={edge_name}")
+        with alive_bar(self.input_samples) as bar:
+            bar.text(bar_text)
 
-                    working_dir = self.root / dataset_name / edge_name
+            if write_policy == 'error' and path.exists():
+                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
-                    if self.write_policy == 'error' and working_dir.exists():
-                        raise RoutineError(f"Dataset already exists at {working_dir} and policy='error'")
+            path.mkdir(parents=True, exist_ok=True)
 
-                    working_dir.mkdir(parents=True, exist_ok=True)
+            sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
+            solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
+            sample_outputs = _build_batched_sample_outputs(model)
+            evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
+                        if hasattr(model, "evaluate") else None)
 
-                    model = self.graph.edges[edge_name]
-                    sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
-                    solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
-                    sample_outputs = _build_batched_sample_outputs(model)
-                    evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
-                                if hasattr(model, "evaluate") else None)
+            input_batch: list[tuple[Key, Path]] = []
 
-                    input_batch: list[tuple[Key, Path]] = []
+            for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
+                if len(input_batch) < self.batch_size:
+                    input_batch.append((input_key, input_dir))
+                    continue
 
-                    for input_key, input_dir in gen_keys(
-                        sample_config.input_samples, sample_config.input_seed, path=working_dir
-                    ):
-                        if len(input_batch) < self.batch_size:
-                            input_batch.append((input_key, input_dir))
-                            continue
+                _process_input_batch(input_batch, sample_inputs, solve, sample_outputs, evaluate, bar)
+                input_batch.append((input_key, input_dir))
 
-                        _process_input_batch(
-                            input_batch, sample_inputs, solve, sample_outputs, evaluate, sample_config, bar
-                        )
-                        input_batch.append((input_key, input_dir))
+            _process_input_batch(input_batch, sample_inputs, solve, sample_outputs, evaluate, bar)
 
-                    _process_input_batch(
-                        input_batch, sample_inputs, solve, sample_outputs, evaluate, sample_config, bar
-                    )
-        return 0
-    
-    def _generate_data_serial(self):
+    def generate(self, path, format=None, write_policy=None):
         """
-        Generate training and validation data for a FunctionGraph, in serial. See `generate_data_batch`.
+        Generate data for an ImplicitModel. Assumes graph edge name is the last name in the `path`.
+        
+        A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the 
+        result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
+        Generally, output samples are conditioned on input samples, and so several output samples may be requested 
+        for a single input sample.
+
+        If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
+        and a residual will be computed and saved alongside each output.
         """
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
 
-        dataset_totals = self._get_dataset_totals()
+        if self.graph is None:
+            raise ValueError("Must specify a graph to generate data.")
+        
+        if self.batch_size > 1:
+            self._generate_batch(path, format, write_policy)
+        else:
+            self._generate_serial(path, format, write_policy)
 
-        for dataset_name in ["train", "validation"]:
-            with alive_bar(dataset_totals[dataset_name], title=f"{dataset_name} data", title_length=15) as bar:
-                for edge_idx, edge_name in enumerate(self.to_sample):
-                    sample_config = getattr(self, dataset_name)[edge_idx]
-                    bar.text(f"current model={edge_name}")
 
-                    working_dir = self.root / dataset_name / edge_name
+class SourceDataset(GraphDataset):
+    """
+    Sampling configuration for a plain source node in a FunctionGraph.
+    """
 
-                    if self.write_policy == "error" and working_dir.exists():
-                        raise RoutineError(f"Dataset already exists at {working_dir} and policy='error'")
+    samples: int
+    seed: int
 
-                    working_dir.mkdir(parents=True, exist_ok=True)
+    def generate(self, path, format=None, write_policy=None):
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
 
-                    model = self.graph.edges[edge_name]
-                    sample_inputs = eqx.filter_jit(model.sample_inputs)
-                    solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") else None
-                    evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") else None
+        if self.graph is None:
+            raise ValueError("Must specify a graph to generate data.")
+        
+        pass
 
-                    sample_output_kwargs = _get_kwargs(model.sample_outputs)
-                    if all(arg in sample_output_kwargs for arg in ["inputs", "solution"]):
-                        sample_outputs = eqx.filter_jit(
-                            lambda key, one_input, one_solution: model.sample_outputs(
-                                key, inputs=one_input, solution=one_solution
-                            )
-                        )
-                    elif "solution" in sample_output_kwargs:
-                        sample_outputs = eqx.filter_jit(
-                            lambda key, _, one_solution: model.sample_outputs(key, solution=one_solution)
-                        )
-                    else:
-                        sample_outputs = eqx.filter_jit(lambda key, *_: model.sample_outputs(key))
 
-                    for input_key, input_dir in gen_keys(
-                        sample_config.input_samples, sample_config.input_seed, path=working_dir
-                    ):
-                        input_path = input_dir / "input.h5"
-                        solution_path = input_dir / "solution.h5"
-
-                        if self.write_policy == "reuse" and input_path.exists():
-                            if self.format != "h5":
-                                raise RoutineError(f"Save format '{self.format}' not recognized")
-                            one_input = load_h5({}, input_path, jax=True)
-                            one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
-                        else:
-                            one_input = sample_inputs(input_key)
-                            one_solution = solve(one_input) if solve is not None else None
-
-                            if self.format == "h5":
-                                save_h5(one_input, input_path, mode="w")
-                                if one_solution is not None:
-                                    save_h5(one_solution, solution_path, mode="w")
-                            else:
-                                raise RoutineError(f"Save format '{self.format}' not recognized")
-
-                        skip = "existing" if self.write_policy == "reuse" else None
-                        for output_key, output_dir in gen_keys(
-                            sample_config.outputs_per_input, sample_config.output_seed, path=input_dir, skip=skip
-                        ):
-                            one_output = sample_outputs(output_key, one_input, one_solution)
-                            one_residual = evaluate(one_input, one_output) if evaluate is not None else None
-
-                            if self.format == "h5":
-                                save_h5(one_output, output_dir / "output.h5", mode="w")
-                                if one_residual is not None:
-                                    save_h5(one_residual, output_dir / "residual.h5", mode="w")
-                            else:
-                                raise RoutineError(f"Save format '{self.format}' not recognized")
-
-                        bar()
-        return 0
+def validate_dataset_pytree(template: PyTree) -> PyTree:
+    """Validate every leaf in a pytree-like template as a :class:`DatasetConfig`. Leave anything else untouched."""
+    if isinstance(template, Mapping):
+        if all(field in template for field in _required_fields(ImplicitModelDataset)):
+            return ImplicitModelDataset(**template)
+        if all(field in template for field in _required_fields(SourceDataset)):
+            return SourceDataset(**template)
+        return {key: validate_dataset_pytree(value) for key, value in template.items()}
+    if isinstance(template, tuple):
+        return tuple(validate_dataset_pytree(value) for value in template)
+    if isinstance(template, list):
+        return [validate_dataset_pytree(value) for value in template]
     
+    return template
+
+
+type DatasetPyTree = Annotated[PyTree, BeforeValidator(validate_dataset_pytree)]
+
+
+class DataGeneration(Routine):
+    """
+    File-based data generation routine.
+
+    :ivar root: root directory for saving data
+    :ivar datasets: pytree template for datasets to generate under root
+    :ivar format: the data format to save samples. Only `h5` supported.
+    :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
+    :ivar graph: graph object or YAML path (optional, for graph-related datasets)
+    """
+
+    root: Path
+    datasets: DatasetPyTree
+
+    format: SUPPORTED_FORMATS = "h5"
+    write_policy: SUPPORTED_POLICIES = "reuse"
+
+    graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+
+    @model_validator(mode="after")
+    def _bind_graph(self):
+        # Pass graph object to graph datasets
+        if self.graph is not None:
+            leaves, _ = jax.tree.flatten(self.datasets, is_leaf=lambda leaf: isinstance(leaf, DatasetConfig))
+            for ds in leaves:
+                if hasattr(ds, "graph"):
+                    if ds.graph is None:
+                        ds.graph = self.graph
+        
+        return self
+    
+    def run(self) -> int:
+        """Generate all datasets."""
+        for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, DatasetConfig)):
+            dataset.generate(self.root / "/".join(path), format=self.format, write_policy=self.write_policy)
+        
+        return 0
