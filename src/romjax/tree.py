@@ -115,6 +115,7 @@ _tree_error_aliases: dict[str, dict[str, str | ErrorSpecKey]] = {
     "rmse": {"reduce_op": "sqrt-mean", "leaf_op": "square"},
     "relative": {"reduce_op": "norm", "norm": "norm"},
     "mean-relative": {"reduce_op": "mean", "leaf_op": ("norm", "norm")},
+    "mean-norm": {"reduce_op": "mean", "leaf_op": "norm"}
 }
 
 

@@ -408,6 +408,7 @@ def test_filter_model_in_graph() -> None:
     filter_edge = FilterModel(
         source="full",
         target="latent",
+        name="filter",
         filters=[
             {
                 "forward": {
@@ -437,7 +438,7 @@ def test_filter_model_in_graph() -> None:
             }
         ],
     )
-    graph = FunctionGraph(edges={"filter": filter_edge})
+    graph = FunctionGraph(edges=[filter_edge])
 
     module = LinearProjection(latent=n_latent, dof=n_full, key=k_init)
     opt = optax.adam(1e-1)
@@ -446,9 +447,10 @@ def test_filter_model_in_graph() -> None:
     @eqx.filter_jit
     def loss_fn(curr_module: LinearProjection) -> jax.Array:
         decoded = graph.push_path(
-            {"full": {"field1": field1, "field2": field2}, "call_args": curr_module},
+            {"full": {"field1": field1, "field2": field2}},
             path=["filter", "filter"],
             start="full",
+            edge_payload_patches={"filter": {"call_args": curr_module}}
         )
         field1_mse = jnp.mean((decoded["full"]["field1"] - field1) ** 2)
         field2_mse = jnp.mean((decoded["full"]["field2"] - field2) ** 2)
@@ -477,7 +479,7 @@ def test_filter_model_in_graph() -> None:
         start="full",
         return_aux=True,
     )
-    assert aux_cache["full->latent"]["backward"]["cached_states"][0]["template"]["field1"].shape == field1.shape
+    assert aux_cache["filter"]["backward"]["cached_states"][0]["template"]["field1"].shape == field1.shape
     decoded = graph.push_path(
         {"latent": {"z1": encoded["latent"]["z1"], "z2": encoded["latent"]["z2"]}, "call_args": module},
         path=["filter"],

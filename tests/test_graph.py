@@ -57,7 +57,7 @@ def test_node_list():
 def test_node_error_operator_on_graph_node() -> None:
     graph = FunctionGraph(
         nodes={
-            "state": {"name": "state", "error_op": "relative"},
+            "state": {"name": "state", "error_op": "relative", "ignore": [["ignore"]]},
         }
     )
     node = graph.nodes["state"]
@@ -68,6 +68,63 @@ def test_node_error_operator_on_graph_node() -> None:
 
     assert node.error_op.reduce_op.op_str == "norm"
     assert jnp.allclose(error, jnp.array(1.0))
+
+
+def test_node_error_ignore():
+    """Make sure node error works for non-overlapping and ignored subtrees."""
+    node = Node(name="state", error_op="mae", ignore=[("keep", "ignore")])
+
+    value = {
+        "keep": {
+            "x": jnp.array(3.0),
+            "ignore": {"y": jnp.array(100.0)},
+            "left_only": jnp.array(9.0),
+        },
+        "shared": jnp.array(1.0),
+        "only_in_value": jnp.array(5.0),
+        "seq": [jnp.array(10.0), jnp.array(20.0), jnp.array(30.0)],
+    }
+    value_hat = {
+        "keep": {
+            "x": jnp.array(1.0),
+            "ignore": {"y": jnp.array(-100.0)},
+            "right_only": jnp.array(4.0),
+        },
+        "shared": jnp.array(4.0),
+        "only_in_hat": jnp.array(8.0),
+        "seq": [jnp.array(13.0), jnp.array(21.0)],
+        "other": {"z": jnp.array(0.0)},
+    }
+
+    error = node.error(value, value_hat)
+
+    # Shared, non-ignored leaves are: keep.x (2), shared (3), seq[0] (3), seq[1] (1).
+    assert jnp.allclose(error, jnp.array(2.25))
+    
+    def error_with_keep_x(x):
+        current = {
+            "keep": {
+                "x": x,
+                "ignore": {"y": jnp.array(100.0)},
+                "left_only": jnp.array(9.0),
+            },
+            "shared": jnp.array(1.0),
+            "only_in_value": jnp.array(5.0),
+            "seq": [jnp.array(10.0), jnp.array(20.0), jnp.array(30.0)],
+        }
+        return node.error(current, value_hat)
+
+    x0 = jnp.array(3.0)
+    jit_error = jax.jit(error_with_keep_x)(x0)
+    grad_error = jax.grad(error_with_keep_x)(x0)
+    x_batch = jnp.array([1.0, 2.0, 3.0])
+    vmap_error = jax.vmap(error_with_keep_x)(x_batch)
+
+    expected = (jnp.abs(x0 - 1.0) + 7.0) / 4.0
+    expected_vmap = (jnp.abs(x_batch - 1.0) + 7.0) / 4.0
+    assert jnp.allclose(jit_error, expected)
+    assert jnp.allclose(grad_error, jnp.array(0.25))
+    assert jnp.allclose(vmap_error, expected_vmap)
 
 
 def test_edge_list():

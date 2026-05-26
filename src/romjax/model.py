@@ -400,7 +400,7 @@ class FilterModel(Edge):
             runtime_args = outer_payload.pop(self._CALL_ARGS_KEY)
 
         if runtime_args is None:
-            return outer_payload, None, [None] * len(self.filters)
+            return outer_payload, [None] * len(self.filters)
 
         if (
             isinstance(runtime_args, Mapping)
@@ -411,7 +411,6 @@ class FilterModel(Edge):
             if self._SHARED_CALL_ARGS_KEY in runtime_args:
                 return (
                     outer_payload,
-                    runtime_args,
                     [runtime_args[self._SHARED_CALL_ARGS_KEY]] * len(self.filters),
                 )
             runtime_args = runtime_args.get(self._PER_SPEC_CALL_ARGS_KEY)
@@ -419,7 +418,7 @@ class FilterModel(Edge):
                 raise ValueError("call_args['per_spec'] must be a list or tuple aligned with the filter specs.")
 
         if len(self.filters) == 1:
-            return outer_payload, runtime_args, [runtime_args]
+            return outer_payload, [runtime_args]
 
         if isinstance(runtime_args, (list, tuple)):
             args = list(runtime_args)
@@ -427,9 +426,9 @@ class FilterModel(Edge):
                 raise ValueError(
                     f"Received {len(args)} per-spec runtime inputs but model has {len(self.filters)} filter specs."
                 )
-            return outer_payload, runtime_args, args
+            return outer_payload, args
 
-        return outer_payload, runtime_args, [runtime_args] * len(self.filters)
+        return outer_payload, [runtime_args] * len(self.filters)
 
     def _extract_cached_states(self, aux: Any) -> list[Any]:
         """Normalize graph-transported cached call state into one entry per spec."""
@@ -460,7 +459,7 @@ class FilterModel(Edge):
         aux: Any = None,
         return_aux: bool = False,
     ) -> tuple[PyTree, list[Any] | None]:
-        outer_payload, runtime_payload, runtime_inputs = self._split_outer_payload_and_runtime_inputs(x)
+        outer_payload, runtime_inputs = self._split_outer_payload_and_runtime_inputs(x)
         cached_states = self._extract_cached_states(aux)
         assembled_outer: PyTree | None = None
         produced_cached_states: list[Any] | None = [] if return_aux else None
@@ -486,9 +485,6 @@ class FilterModel(Edge):
                 produced_cached_states.append(cached_state_out)
 
         output = outer_payload if assembled_outer is None else assembled_outer
-        if runtime_payload is not None and isinstance(output, Mapping):
-            output = dict(output)
-            output[self._CALL_ARGS_KEY] = runtime_payload
         return output, produced_cached_states
 
     def forward(self, x: PyTree) -> PyTree:

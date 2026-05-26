@@ -1,14 +1,18 @@
 !romx:FunctionGraph
-nodes: [hf_coord, lf_coord, lf_res, hf_res]
+nodes: 
+  - { name: hf_coord, ignore: [ [inputs] ], error_op: mean-norm }
+  - { name: hf_res,   ignore: [ [inputs] ], error_op: mean-norm }
+  - { name: lf_coord, ignore: [ [inputs] ], error_op: mean-norm }
+  - { name: lf_res,   ignore: [ [inputs] ], error_op: mean-norm }
 edges:
   - !romx:Poisson2D
     source: hf_coord
     target: hf_res
     name: poisson
-    config:
-      grid:
-        shape: &shape [32, 32]
-        bounds: &bounds [[0, 1], [0, 1]]
+    grid:
+      shape: &shape [32, 32]
+      bounds: &bounds [[0, 1], [0, 1]]
+    solver: &solver
       solver:
         name: optimistix.Newton
         kwargs:
@@ -75,8 +79,10 @@ edges:
           opts: { gather: flat, scatter: flat, method: reconstruct }
       - forward:  { input_routes: [ [inputs] ] }
         backward: { input_routes: [ [inputs] ] }
-  - !romx:CompositeEdge
+  - !romx:ImplicitIterativeGalerkin
     source: lf_coord
     target: lf_res
     name: galerkin rom
     path: [coordinate transform, poisson, residual transform]
+    solver: *solver
+    # source_sampler: galerkin_sampler.yml
