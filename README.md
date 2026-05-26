@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-%23FE5196?logo=conventionalcommits&logoColor=white)](https://conventionalcommits.org)
-![Code Coverage](https://img.shields.io/badge/coverage-14%25-red?logo=codecov)
+![Code Coverage](https://img.shields.io/badge/coverage-27%25-red?logo=codecov)
 
 Reduced-order modeling in jax.
 
@@ -22,7 +22,6 @@ Right now, we have the basic `FunctionGraph` API up and running with the `Poisso
 
 - Testing dataloading and optimization of simple linear projection on some Poisson data.
 - Implementing a Galerkin projection ROM ImplicitModel.
-- Configuring a full Poisson<->Galerkin graph from yaml.
 - Implementing various graph-theoretic objective functions (state reconstruction, solution error, etc.)
 - Automate running multiple cases with different configurations (maybe scaling up hardware too)
 - Automate hyperparameter optimization

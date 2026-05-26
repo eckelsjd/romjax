@@ -1,16 +1,12 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
-- [ ] Galerkin ROM needs to have its own solver config
-- [ ] Need to fix computing errors over unwanted subtrees like inputs
 - [ ] Normalization for eqx transforms
 - [ ] Latent space sampling (routine to save galerkin_sampler.yml from SVD bounds)
-- [ ] Filtermodel passing params through
 
 ## Needs testing
 - [ ] Reconstruction matching SVD
 - [ ] Training on param references
-- [ ] Galerkin ROM
 
 ## Blind spots
 - [ ] Including solution data in mini-batches (with residual=0)

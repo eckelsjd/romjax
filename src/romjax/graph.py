@@ -7,7 +7,7 @@ import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from romjax.tree import TreeErrorOperator, get_tree_operator, pytree_merge
+from romjax.tree import TreeErrorOperator, TreePath, get_tree_operator, pytree_merge
 from romjax.typing import ListModel
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
@@ -28,6 +28,7 @@ class Node(BaseModel, Hashable):
     """
     name: str
     error_op: TreeErrorOperator = Field(default_factory=lambda: get_tree_operator("mean-relative"))
+    ignore: list[TreePath] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -62,20 +63,55 @@ class Node(BaseModel, Hashable):
 
     def error(self, value: PyTree, value_hat: PyTree) -> jax.Array:
         """
-        Compute the pytree error at this node. Only consider entries present in `value_hat`
-        (i.e. ignore extra entries in `value`).
+        Compute the pytree error at this node. Only consider shared paths, and optionally ignore paths via `self.ignore`
         """
-        def _select_matching(tree: PyTree, template: PyTree) -> PyTree:
-            if isinstance(template, Mapping):
-                return {key: _select_matching(tree[key], template[key]) for key in template}
-            if isinstance(template, tuple):
-                return tuple(_select_matching(tree[idx], template[idx]) for idx in range(len(template)))
-            if isinstance(template, list):
-                return [_select_matching(tree[idx], template[idx]) for idx in range(len(template))]
-            return tree
+        ignore_set = set(self.ignore)
+        skip = object()
 
-        value_filter = _select_matching(value, value_hat)
-        return self.error_op(value_filter, value_hat)
+        def _is_ignored(path: TreePath) -> bool:
+            return any(path[:idx] in ignore_set for idx in range(1, len(path) + 1))
+
+        def _select_shared(a: PyTree, b: PyTree, path: TreePath = ()) -> tuple[PyTree, PyTree] | object:
+            if _is_ignored(path):
+                return skip
+
+            if isinstance(a, Mapping) and isinstance(b, Mapping):
+                out_a: dict[Any, PyTree] = {}
+                out_b: dict[Any, PyTree] = {}
+                for key in b:
+                    if key not in a:
+                        continue
+                    child = _select_shared(a[key], b[key], (*path, key))
+                    if child is skip:
+                        continue
+                    child_a, child_b = child
+                    out_a[key] = child_a
+                    out_b[key] = child_b
+                return out_a, out_b
+
+            if isinstance(a, tuple) and isinstance(b, tuple):
+                shared: list[tuple[PyTree, PyTree]] = []
+                for idx in range(min(len(a), len(b))):
+                    child = _select_shared(a[idx], b[idx], (*path, idx))
+                    if child is not skip:
+                        shared.append(child)
+                return tuple(x for x, _ in shared), tuple(y for _, y in shared)
+
+            if isinstance(a, list) and isinstance(b, list):
+                shared: list[tuple[PyTree, PyTree]] = []
+                for idx in range(min(len(a), len(b))):
+                    child = _select_shared(a[idx], b[idx], (*path, idx))
+                    if child is not skip:
+                        shared.append(child)
+                return [x for x, _ in shared], [y for _, y in shared]
+
+            return a, b
+
+        filtered = _select_shared(value, value_hat)
+        if filtered is skip:
+            return jax.numpy.asarray(0.0)
+        value_filter, value_hat_filter = filtered
+        return self.error_op(value_filter, value_hat_filter)
 
 
 class Edge(BaseModel, Hashable, ABC):
