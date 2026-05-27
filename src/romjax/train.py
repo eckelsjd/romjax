@@ -34,15 +34,15 @@ from pydantic import (
     model_validator,
 )
 
+from romjax.data_gen import DataLoader
 from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type
-from romjax.utils import load_h5
 
-__all__ = ["Train", "GraphLoss", "GraphTest", "GraphDataLoader", "BatchDataLoader"]
+__all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
 
 
 def _prettify_timedelta(delta: float) -> str:
@@ -60,7 +60,7 @@ def _prettify_timedelta(delta: float) -> str:
     return f"{delta:.3f} s"
 
 
-class BatchDataLoader[T: Any](BaseModel, Iterator):
+class BatchLoader[T: Any](BaseModel, Iterator):
     """
     Helper for basic mini-batch data loading.
 
@@ -68,7 +68,7 @@ class BatchDataLoader[T: Any](BaseModel, Iterator):
         ```python
         data = list(range(10))
         
-        for batch in BatchDataLoader(data=data, batch_size=2):
+        for batch in BatchLoader(data=data, batch_size=2):
             print(batch)  # [0, 1],  [2, 3],  [4, 5], ...
         ```
 
@@ -199,289 +199,6 @@ class BatchDataLoader[T: Any](BaseModel, Iterator):
         return next(self._iterator)
     
     def __iter__(self):
-        self.set_iterator()
-        return self
-
-
-class DatasetConfig(BaseModel):
-    """
-    File-based load configuration for datasets created by :class:`romjax.data_gen.DataGeneration`.
-    
-    :param batch_size: number of output samples per yielded mini-batch
-    :param shuffle_seed: seed for shuffling mini-batch data
-    :param name: the dataset name (if None, will search the dataset root dir by default)
-    :param max_samples: maximum loaded output samples  (defaults to all)
-    :param max_input_samples: maximum loaded input samples  (defaults to all)
-    :param max_outputs_per_input: maximum loaded output samples below each input sample  (defaults to all)
-    :param max_epochs: maximum times to iterate through all available data (defaults to infinite loop)
-    :param skip_input: decide whether to skip a particular input sample when loading
-    :param skip_output: decide whether to skip a particular output sample when loading
-    """
-
-    batch_size: PositiveInt = 16
-    shuffle_seed: int = 0
-    name: str | None = None
-    max_samples: PositiveInt | None = None
-    max_input_samples: PositiveInt | None = None
-    max_outputs_per_input: PositiveInt | None = None
-    max_epochs: PositiveInt | None = None
-    skip_input: Callable[[Path], bool] | None = None
-    skip_output: Callable[[Path], bool] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_plain_dataset_name(cls, value):
-        if isinstance(value, str):
-            return {"name": value}
-        return value
-
-
-class GraphDataLoader(BaseModel):
-    """
-    File-backed mini-batch loader for datasets created by :class:`romjax.data_gen.DataGeneration` for a FunctionGraph.
-
-    The yielded batch payload is a mapping keyed by sampled dataset names:
-    ``{dataset_name: {"inputs": batch, "outputs": batch, "residuals": batch}}``.
-
-    :param root: root directory for loading datasets, expected structure is `root/dataset_name`
-    :param datasets: configs for loading independent datasets under root
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
-
-    root: Path
-    datasets: Sequence[DatasetConfig] = Field(default_factory=list)
-    _iterator: Iterator[dict[str, PyTree]] | None = PrivateAttr(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_root(cls, value):
-        """Validate a loader with all default options from just a plain root directory."""
-        if isinstance(value, str | Path):
-            return {"root": value}
-        return value
-    
-    @field_validator("datasets", mode="before")
-    @classmethod
-    def _allow_single_dataset(cls, value):
-        if isinstance(value, str) or not isinstance(value, Sequence):
-            return [value]
-        return value
-    
-    @model_validator(mode="after")
-    def _validate_datasets(self):
-        """Use all available datasets if not specified. Try to infer dataset names and raise an error if we cannot."""
-        dataset_dirs = sorted(d for d in self.root.iterdir() if d.is_dir() and not d.name.startswith("."))
-
-        if len(self.datasets) == 0:
-            self.datasets = [DatasetConfig(name=d.name) for d in dataset_dirs]
-        else:
-            for ds_idx, ds_cfg in enumerate(self.datasets):
-                if not ds_cfg.name and ds_idx > len(dataset_dirs)-1:
-                    raise ValueError(f"Can't infer dataset name at index {ds_idx}. Please provide explicitly.")
-                if not ds_cfg.name:
-                    ds_cfg.name = dataset_dirs[ds_idx].name
-        
-        return self
-
-    @staticmethod
-    def walk_sample_directories(
-        root: Path, 
-        skip_input: Callable[[Path], bool] | None = None, 
-        skip_output: Callable[[Path], bool] | None = None
-    ) -> Generator[tuple[Path, Path], None, None]:
-        """Walk a nested input/output directory structure generated by `gen_keys` via `DataGeneration`."""
-        if skip_input is None:
-            skip_input = lambda p: False
-        if skip_output is None:
-            skip_output = lambda p: False
-
-        for input_seed_dir in sorted(root.iterdir()):
-            if not input_seed_dir.is_dir() or not input_seed_dir.name.startswith("seed_"):
-                continue
-
-            for input_sample_dir in sorted(input_seed_dir.iterdir()):
-                if (not input_sample_dir.is_dir() or 
-                    not input_sample_dir.name.startswith("sample_") or
-                    skip_input(input_sample_dir)):
-                    continue
-
-                for output_seed_dir in sorted(input_sample_dir.iterdir()):
-                    if not output_seed_dir.is_dir() or not output_seed_dir.name.startswith("seed_"):
-                        continue
-
-                    for output_sample_dir in sorted(output_seed_dir.iterdir()):
-                        if (not output_sample_dir.is_dir() or
-                            not output_sample_dir.name.startswith("sample_") or
-                            skip_output(output_sample_dir)):
-                            continue
-
-                        yield input_sample_dir, output_sample_dir
-
-    @staticmethod
-    def _select_dataset_batch(
-        paths: Sequence[tuple[Path, Path]],
-        indices: jax.Array,
-        cursor: int,
-        config: DatasetConfig,
-    ) -> tuple[list[tuple[Path, Path]], int]:
-        """Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end."""
-        batch_paths: list[tuple[Path, Path]] = []
-        unique_inputs: set[Path] = set()
-        outputs_per_input: dict[Path, int] = {}
-        limit = min(cursor + config.batch_size, len(paths))
-
-        while cursor < limit:
-            input_path, output_path = paths[int(indices[cursor])]
-            cursor += 1
-
-            next_total = len(batch_paths) + 1
-            next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
-            next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
-
-            if config.max_samples is not None and next_total > config.max_samples:
-                continue
-            if config.max_input_samples is not None and next_input_total > config.max_input_samples:
-                continue
-            if config.max_outputs_per_input is not None and next_outputs_per_input > config.max_outputs_per_input:
-                continue
-
-            batch_paths.append((input_path, output_path))
-            unique_inputs.add(input_path)
-            outputs_per_input[input_path] = next_outputs_per_input
-
-        return batch_paths, cursor
-    
-    @staticmethod
-    def _stack_batch(items: Sequence[PyTree]) -> PyTree:
-        """Stack matching sample pytrees along a leading batch axis."""
-        return jax.tree.map(lambda *xs: jnp.stack(xs), *items)
-
-    def _iter_datasets(self, train_step: int = 0):
-        """
-        Walk over all available datasets at once, using available configurations to limit sample sizes.
-        Yields a mapping of dataset names to PyTree batches of data.
-        
-        :param train_step: initialize from this training step (default: 0)
-        """
-        ds_config = {}
-        ds_paths = {}
-        ds_totals = {}
-
-        for ds_cfg in self.datasets:
-            ds_name = ds_cfg.name
-
-            ds_paths[ds_name] = list(
-                self.walk_sample_directories(
-                    self.root / ds_name, skip_input=ds_cfg.skip_input, skip_output=ds_cfg.skip_output
-                )
-            )
-            if len(ds_paths[ds_name]) == 0:
-                raise ValueError(f"No samples found for dataset '{ds_name}' in {self.root / ds_name}")
-
-            ds_totals[ds_name] = len(ds_paths[ds_name])  # Total available data for each dataset
-            ds_config[ds_name] = ds_cfg
-
-        # Advance dataset epoch and cursor indices based on current training step
-        # Epoch - number of iterations through an entire dataset
-        # Cursor - starting index within a dataset for the next mini-batch
-        
-        ds_epochs = {name: 0 for name in ds_config}
-        ds_cursors = {name: 0 for name in ds_config}
-        ds_active = {name: True for name in ds_config}
-
-        def _shuffle_indices(name: str, epoch: int) -> np.ndarray:
-            """Build a deterministic per-epoch permutation without invoking JAX random ops."""
-            seed = np.random.SeedSequence([ds_config[name].shuffle_seed, epoch])
-            return np.random.default_rng(seed).permutation(ds_totals[name])
-
-        ds_indices = {name: _shuffle_indices(name, ds_epochs[name]) for name in ds_config}
-
-        def _advance_dataset(name: str) -> None:
-            """Advance one dataset by a single batch and update its termination state."""
-            if not ds_active[name]:
-                return
-
-            _, next_cursor = self._select_dataset_batch(
-                ds_paths[name],
-                ds_indices[name],
-                ds_cursors[name],
-                ds_config[name],
-            )
-            if next_cursor >= ds_totals[name]:
-                ds_epochs[name] += 1
-                if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
-                    ds_active[name] = False
-                    ds_cursors[name] = ds_totals[name]
-                    return
-
-                ds_cursors[name] = 0
-                ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
-            else:
-                ds_cursors[name] = next_cursor
-
-        for _ in range(train_step):
-            for name in ds_config:
-                _advance_dataset(name)
-
-            if not any(ds_active.values()):
-                return
-
-        while True:
-            active_names = [name for name in ds_paths if ds_active[name]]
-            if len(active_names) == 0:
-                return
-
-            ds_batch = {}
-
-            for name in active_names:
-                batch_paths, next_cursor = self._select_dataset_batch(
-                    ds_paths[name], ds_indices[name], ds_cursors[name], ds_config[name]
-                )
-                loaded: dict[str, list[PyTree]] = {"inputs": [], "outputs": [], "residuals": []}
-
-                for input_path, output_path in batch_paths:
-                    loaded["inputs"].append(load_h5({}, input_path / "input.h5", jax=True))
-
-                    output_file = output_path / "output.h5"
-                    if output_file.exists():
-                        loaded["outputs"].append(load_h5({}, output_file, jax=True))
-
-                    residual_file = output_path / "residual.h5"
-                    if residual_file.exists():
-                        loaded["residuals"].append(load_h5({}, residual_file, jax=True))
-
-                ds_batch[name] = {
-                    key: self._stack_batch(value)
-                    for key, value in loaded.items()
-                    if len(value) > 0
-                }
-
-                if next_cursor >= ds_totals[name]:
-                    ds_epochs[name] += 1
-                    if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
-                        ds_active[name] = False
-                        ds_cursors[name] = ds_totals[name]
-                    else:
-                        ds_cursors[name] = 0
-                        ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
-                else:
-                    ds_cursors[name] = next_cursor
-
-            yield ds_batch
-    
-    def set_iterator(self, train_step: int = 0):
-        """Set the iterator based on the current train step."""
-        self._iterator = self._iter_datasets(train_step)
-
-    def __next__(self):
-        """Continue existing iterator if possible, otherwise start from beginning."""
-        if self._iterator is None:
-            self.set_iterator()
-        return next(self._iterator)
-    
-    def __iter__(self):
-        """Restart iteration from 0."""
         self.set_iterator()
         return self
 
@@ -677,7 +394,7 @@ class GraphTest(GraphLoss):
     Just compute a graph loss function over a set of validation data.
     """
 
-    dataloader: GraphDataLoader
+    dataloader: DataLoader
     reduce: UnaryOperator | None = "mean"
     
     @field_validator("reduce", mode="before")
@@ -886,7 +603,7 @@ class Train(Routine):
 
     # Optional
     test: Callable[[PyTree], float] | None = None
-    dataloader: Iterator[Any] = Field(default_factory=BatchDataLoader)  # empty loading by default
+    dataloader: Iterator[Any] = Field(default_factory=BatchLoader)  # empty loading by default
     termination: TerminationConfig = Field(default_factory=TerminationConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
 

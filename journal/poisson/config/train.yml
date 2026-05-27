@@ -21,7 +21,7 @@ optimizer:
           kwargs: { init_value: 0.01, transition_steps: 1000, decay_rate: 0.99 }
     - { name: optax.scale, args: [-1.0] }
 
-dataloader: !romx:GraphDataLoader demo/dataset/train
+dataloader: !romx:DataLoader demo/dataset/train
 test: !romx.GraphTest
   dataloader: demo/dataset/validation
   terms:

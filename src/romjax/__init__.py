@@ -58,11 +58,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
+    "DataLoader": ("romjax.data_gen", "DataLoader"),
     "Train": ("romjax.train", "Train"),
     "GraphLoss": ("romjax.train", "GraphLoss"),
     "GraphTest": ("romjax.train", "GraphTest"),
-    "GraphDataLoader": ("romjax.train", "GraphDataLoader"),
-    "BatchDataLoader": ("romjax.train", "BatchDataLoader")
+    "BatchLoader": ("romjax.train", "BatchLoader"),
 }
 
 __all__ = list(_LAZY_EXPORTS.keys())
@@ -71,7 +71,7 @@ __all__ = list(_LAZY_EXPORTS.keys())
 if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
-    from .data_gen import DataGeneration
+    from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
@@ -80,7 +80,12 @@ if TYPE_CHECKING:
     from .poisson import Poisson2D
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import Routine, RoutineConfig, RoutineError
-    from .train import GraphDataLoader, GraphLoss, GraphTest, Train, BatchDataLoader
+    from .train import (
+        BatchLoader,
+        GraphLoss,
+        GraphTest,
+        Train,
+    )
     from .tree import get_error_operator, get_tree_operator, get_unary_operator
     from .typing import CallableModel, DictModel, ListModel, ThirdPartyType
     from .utils import load_h5, save_h5
