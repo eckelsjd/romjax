@@ -241,6 +241,7 @@ class GenImplicitModel(GenGraph):
             for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
                 input_path = input_dir / "input.h5"
                 solution_path = input_dir / "solution.h5"
+                solution_residual_path = input_dir / "solution_residual.h5"
 
                 if write_policy == "reuse" and input_path.exists():
                     if format != "h5":
@@ -250,11 +251,18 @@ class GenImplicitModel(GenGraph):
                 else:
                     one_input = sample_inputs(input_key)
                     one_solution = solve(one_input) if solve is not None else None
+                    one_solution_residual = (
+                        evaluate(one_input, one_solution)
+                        if evaluate is not None and one_solution is not None
+                        else None
+                    )
 
                     if format == "h5":
                         save_h5(one_input, input_path, mode="w")
                         if one_solution is not None:
                             save_h5(one_solution, solution_path, mode="w")
+                        if one_solution_residual is not None:
+                            save_h5(one_solution_residual, solution_residual_path, mode="w")
                     else:
                         raise RoutineError(f"Save format '{format}' not recognized")
 
@@ -305,6 +313,7 @@ class GenImplicitModel(GenGraph):
             input_batch: list[tuple[Key, Path]],
             sample_inputs: Callable,
             solve: Callable | None,
+            evaluate_solution: Callable | None,
             sample_outputs: Callable,
             evaluate: Callable | None,
             bar: Callable,
@@ -315,6 +324,7 @@ class GenImplicitModel(GenGraph):
             # Only sample/solve missing inputs for policy=reuse
             inputs_by_index: dict[int, object] = {}
             solutions_by_index: dict[int, object] = {}
+            solution_residuals_by_index: dict[int, object] = {}
 
             missing_indices = range(len(input_batch))
             if write_policy == "reuse":
@@ -326,25 +336,45 @@ class GenImplicitModel(GenGraph):
                 missing_keys = tuple(input_batch[i][0] for i in missing_indices)
                 generated_inputs = sample_inputs(pytree_stack(missing_keys))
                 generated_solutions = solve(generated_inputs) if solve is not None else None
+                generated_solution_residuals = (
+                    evaluate_solution(generated_inputs, generated_solutions)
+                    if evaluate_solution is not None and generated_solutions is not None
+                    else None
+                )
                 generated_inputs = jax.device_get(generated_inputs)
                 generated_solutions = jax.device_get(generated_solutions) if generated_solutions is not None else None
+                generated_solution_residuals = (
+                    jax.device_get(generated_solution_residuals)
+                    if generated_solution_residuals is not None
+                    else None
+                )
                 input_samples = list(pytree_iter(generated_inputs))
                 solution_samples = list(pytree_iter(generated_solutions)) if generated_solutions is not None else None
+                solution_residual_samples = (
+                    list(pytree_iter(generated_solution_residuals))
+                    if generated_solution_residuals is not None
+                    else None
+                )
 
                 for batch_index, input_index in enumerate(missing_indices):
                     inputs_by_index[input_index] = input_samples[batch_index]
                     if solution_samples is not None:
                         solutions_by_index[input_index] = solution_samples[batch_index]
+                    if solution_residual_samples is not None:
+                        solution_residuals_by_index[input_index] = solution_residual_samples[batch_index]
 
             for i, (_, input_path) in enumerate(input_batch):
                 if i in inputs_by_index:
                     one_input = inputs_by_index[i]
                     one_solution = solutions_by_index.get(i)
+                    one_solution_residual = solution_residuals_by_index.get(i)
 
                     if format == "h5":
                         save_h5(one_input, input_path / "input.h5", mode="w")
                         if one_solution is not None:
                             save_h5(one_solution, input_path / "solution.h5", mode="w")
+                        if one_solution_residual is not None:
+                            save_h5(one_solution_residual, input_path / "solution_residual.h5", mode="w")
                     else:
                         raise RoutineError(f"Save format '{format}' not recognized")
 
@@ -392,6 +422,7 @@ class GenImplicitModel(GenGraph):
             sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
             solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
             sample_outputs = _build_batched_sample_outputs(model)
+            evaluate_solution = eqx.filter_jit(eqx.filter_vmap(model.evaluate)) if hasattr(model, "evaluate") else None
             evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
                         if hasattr(model, "evaluate") else None)
 
@@ -402,16 +433,24 @@ class GenImplicitModel(GenGraph):
                     input_batch.append((input_key, input_dir))
                     continue
 
-                _process_input_batch(input_batch, sample_inputs, solve, sample_outputs, evaluate, bar)
+                _process_input_batch(
+                    input_batch,
+                    sample_inputs,
+                    solve,
+                    evaluate_solution,
+                    sample_outputs,
+                    evaluate,
+                    bar,
+                )
                 input_batch.append((input_key, input_dir))
 
-            _process_input_batch(input_batch, sample_inputs, solve, sample_outputs, evaluate, bar)
+            _process_input_batch(input_batch, sample_inputs, solve, evaluate_solution, sample_outputs, evaluate, bar)
 
 
-type ImplicitPathPair = tuple[Path, Path]  # (input path, output path)
+type ImplicitSampleRef = tuple[Path, Path, Literal["output", "solution"]]
 
 
-class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
+class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     """
     File-based load configuration for implicit-model datasets corresponding to `GenImplicitModel`.
 
@@ -420,6 +459,8 @@ class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
     :param max_outputs_per_input: maximum loaded output samples below each input sample  (defaults to all)
     :param skip_input: decide whether to skip a particular input sample when loading
     :param skip_output: decide whether to skip a particular output sample when loading
+    :param load_solution: whether to include ``solution.h5`` and ``solution_residual.h5`` as an extra
+        sample for each input (defaults to ``True``)
     """
 
     max_samples: PositiveInt | None = None
@@ -427,13 +468,15 @@ class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
     max_outputs_per_input: PositiveInt | None = None
     skip_input: Callable[[Path], bool] | None = None
     skip_output: Callable[[Path], bool] | None = None
+    load_solution: bool = True
 
     @staticmethod
     def walk_sample_directories(
         root: Path,
         skip_input: Callable[[Path], bool] | None = None,
         skip_output: Callable[[Path], bool] | None = None,
-    ) -> Generator[ImplicitPathPair, None, None]:
+        load_solution: bool = True,
+    ) -> Generator[ImplicitSampleRef, None, None]:
         """Walk a nested input/output directory structure generated by `gen_keys` via `DataGeneration`."""
         if skip_input is None:
             skip_input = lambda p: False
@@ -450,6 +493,9 @@ class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
                     skip_input(input_sample_dir)):
                     continue
 
+                if load_solution and (input_sample_dir / "solution.h5").exists():
+                    yield input_sample_dir, input_sample_dir, "solution"
+
                 for output_seed_dir in sorted(input_sample_dir.iterdir()):
                     if not output_seed_dir.is_dir() or not output_seed_dir.name.startswith("seed_"):
                         continue
@@ -460,26 +506,34 @@ class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
                             skip_output(output_sample_dir)):
                             continue
 
-                        yield input_sample_dir, output_sample_dir
+                        yield input_sample_dir, output_sample_dir, "output"
 
-    def discover_sample_refs(self, root: Path) -> list[ImplicitPathPair]:
+    def discover_sample_refs(self, root: Path) -> list[ImplicitSampleRef]:
         """Discover nested implicit-model input/output sample paths."""
-        return list(self.walk_sample_directories(root, skip_input=self.skip_input, skip_output=self.skip_output))
+        return list(
+            self.walk_sample_directories(
+                root,
+                skip_input=self.skip_input,
+                skip_output=self.skip_output,
+                load_solution=self.load_solution,
+            )
+        )
 
     def select_batch(
         self,
-        refs: Sequence[ImplicitPathPair],
+        refs: Sequence[ImplicitSampleRef],
         indices: jax.Array,
         cursor: int,
-    ) -> tuple[list[ImplicitPathPair], int]:
+    ) -> tuple[list[ImplicitSampleRef], int]:
         """Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end."""
-        batch_refs: list[ImplicitPathPair] = []
+        batch_refs: list[ImplicitSampleRef] = []
         unique_inputs: set[Path] = set()
         outputs_per_input: dict[Path, int] = {}
         limit = min(cursor + self.batch_size, len(refs))
 
         while cursor < limit:
-            input_path, output_path = refs[int(indices[cursor])]
+            sample_ref = refs[int(indices[cursor])]
+            input_path, _, _ = sample_ref
             cursor += 1
 
             next_total = len(batch_refs) + 1
@@ -493,24 +547,25 @@ class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
             if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
                 continue
 
-            batch_refs.append((input_path, output_path))
+            batch_refs.append(sample_ref)
             unique_inputs.add(input_path)
             outputs_per_input[input_path] = next_outputs_per_input
 
         return batch_refs, cursor
 
-    def load_batch(self, refs: Sequence[ImplicitPathPair]) -> dict[str, PyTree]:
+    def load_batch(self, refs: Sequence[ImplicitSampleRef]) -> dict[str, PyTree]:
         """Load stacked implicit-model mini-batches."""
         loaded: dict[str, list[PyTree]] = {"inputs": [], "outputs": [], "residuals": []}
 
-        for input_path, output_path in refs:
+        for input_path, output_path, sample_kind in refs:
             loaded["inputs"].append(load_h5({}, input_path / "input.h5", jax=True))
 
-            output_file = output_path / "output.h5"
+            output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
             if output_file.exists():
                 loaded["outputs"].append(load_h5({}, output_file, jax=True))
 
-            residual_file = output_path / "residual.h5"
+            residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
+            residual_file = output_path / residual_name
             if residual_file.exists():
                 loaded["residuals"].append(load_h5({}, residual_file, jax=True))
 

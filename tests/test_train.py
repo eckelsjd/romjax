@@ -129,6 +129,7 @@ def _write_graph_dataset(root: Path, dataset_name: str, *, n_inputs: int = 2, n_
         input_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"x": np.asarray(10 * input_idx + 1)}, input_dir / "input.h5", mode="w")
         save_h5({"y": np.asarray(10 * input_idx + 2)}, input_dir / "solution.h5", mode="w")
+        save_h5({"r": np.asarray(-(10 * input_idx + 2))}, input_dir / "solution_residual.h5", mode="w")
 
         for output_idx in range(n_outputs):
             output_dir = input_dir / "seed_0" / f"sample_{output_idx}"
@@ -482,9 +483,9 @@ def test_data_loader(tmp_path: Path) -> None:
 
     first_batch = next(loader)
     assert set(first_batch) == {"alpha", "beta"}
-    assert first_batch["alpha"]["inputs"]["x"].shape == (4,)
-    assert first_batch["alpha"]["outputs"]["y"].shape == (4,)
-    assert first_batch["alpha"]["residuals"]["r"].shape == (4,)
+    assert first_batch["alpha"]["inputs"]["x"].shape == (6,)
+    assert first_batch["alpha"]["outputs"]["y"].shape == (6,)
+    assert first_batch["alpha"]["residuals"]["r"].shape == (6,)
 
     skipped = DataLoader(
         root=root,
@@ -494,6 +495,7 @@ def test_data_loader(tmp_path: Path) -> None:
                 "batch_size": 4,
                 "skip_input": lambda path: path.name == "sample_0",
                 "skip_output": lambda path: path.name == "sample_0",
+                "load_solution": False,
                 "max_epochs": 1,
             }
         },
@@ -511,6 +513,7 @@ def test_data_loader(tmp_path: Path) -> None:
                 "max_samples": 1,
                 "max_input_samples": 1,
                 "max_outputs_per_input": 1,
+                "load_solution": False,
                 "max_epochs": 1,
             }
         },
