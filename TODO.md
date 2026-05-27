@@ -9,7 +9,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Training on param references
 
 ## Blind spots
-- [ ] Including solution data in mini-batches (with residual=0)
 - [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 

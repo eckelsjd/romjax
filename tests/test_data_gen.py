@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from romjax.data_gen import DataGeneration, DataLoader, GenDataConfig, GenSource, LoadSource
+from romjax.data_gen import DataGeneration, DataLoader, GenDataConfig, GenSource, LoadImplicitModel, LoadSource
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.utils import save_h5
@@ -115,6 +115,7 @@ def test_generate_data(tmp_path, batch_size):
                 sample_dir = seed_dir / f"sample_{sample_idx}"
                 assert (sample_dir / "input.h5").exists()
                 assert (sample_dir / "solution.h5").exists()
+                assert (sample_dir / "solution_residual.h5").exists()
                 output_dir = sample_dir / "seed_5" if dataset_name == "train" else sample_dir / "seed_11"
                 assert (output_dir / "sample_0" / "output.h5").exists()
                 assert (output_dir / "sample_0" / "residual.h5").exists()
@@ -171,6 +172,7 @@ def test_data_loader_supports_nested_dataset_pytree(tmp_path):
 
         save_h5({"x": jnp.asarray([value], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
         save_h5({"y": jnp.asarray([value + 1.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
+        save_h5({"r": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
         output_dir = input_dir / "seed_1" / "sample_0"
         output_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"y": jnp.asarray([value + 2.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
@@ -179,8 +181,10 @@ def test_data_loader_supports_nested_dataset_pytree(tmp_path):
     loader = DataLoader(
         root=nested_root,
         datasets={
-            "train": {"alpha": {"kind": "implicit", "batch_size": 1, "max_epochs": 1}},
-            "validation": {"beta": {"kind": "implicit", "batch_size": 1, "max_epochs": 1}},
+            "train": {"alpha": {"kind": "implicit", "batch_size": 1, "max_epochs": 1, "load_solution": False}},
+            "validation": {
+                "beta": {"kind": "implicit", "batch_size": 1, "max_epochs": 1, "load_solution": False}
+            },
         },
     )
 
@@ -238,3 +242,40 @@ def test_data_loader_mixed_generated_implicit_and_source_datasets(tmp_path):
     assert batch["toy"]["residuals"]["residual"].shape == (3, 1)
     assert batch["source"]["state"]["x"].shape == (2,)
     assert batch["source"]["state"]["meta"].shape == (2, 1)
+
+
+def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
+    input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
+    save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
+    save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
+
+    output_dir = input_dir / "seed_0" / "sample_0"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
+    save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
+
+    refs = LoadImplicitModel(batch_size=4).discover_sample_refs(tmp_path / "toy")
+    assert [sample_kind for _, _, sample_kind in refs] == ["solution", "output"]
+
+    batch = LoadImplicitModel(batch_size=4).load_batch(refs)
+    assert batch["inputs"]["x"].shape == (2, 1)
+    assert batch["outputs"]["y"][:, 0].tolist() == [2.0, 3.0]
+    assert batch["residuals"]["r"][:, 0].tolist() == [-1.0, 0.5]
+
+
+def test_load_implicit_model_can_disable_solution_sample_loading(tmp_path):
+    input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
+    save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
+    save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
+
+    output_dir = input_dir / "seed_0" / "sample_0"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
+    save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
+
+    refs = LoadImplicitModel(batch_size=4, load_solution=False).discover_sample_refs(tmp_path / "toy")
+    assert [sample_kind for _, _, sample_kind in refs] == ["output"]
