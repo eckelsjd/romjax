@@ -44,7 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
 from functools import lru_cache
-from typing import Any
+from typing import Any, Sequence
 
 import equinox as eqx
 import jax
@@ -60,6 +60,7 @@ __all__ = [
     "reduce",
     "mean",
     "map_error",
+    "stack",
     "pytree_iter",
     "pytree_path_iter",
     "to_pytree",
@@ -800,6 +801,11 @@ def set_subtree(tree: PyTree | None, path: TreePath, value: PyTree) -> PyTree:
     return out_list
 
 
+def pytree_stack(items: Sequence[PyTree]) -> PyTree:
+    """Stack matching sample pytrees along a leading batch axis."""
+    return jax.tree.map(lambda *xs: jnp.stack(xs), *items)
+
+
 at = pytree_at
 merge = pytree_merge
 size = pytree_size
@@ -807,3 +813,4 @@ norm = pytree_norm
 reduce = pytree_reduce
 mean = pytree_mean
 map_error = pytree_map_error
+stack = pytree_stack

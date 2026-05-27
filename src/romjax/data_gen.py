@@ -1,24 +1,24 @@
-"""Data generation routine."""
+"""Data generation routine and data loading."""
 import inspect
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Annotated, Callable, Literal, Mapping, get_args
+from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
+import numpy as np
 from alive_progress import alive_bar
 from jaxtyping import Key, PyTree
-from pydantic import BaseModel, BeforeValidator, ConfigDict, PositiveInt, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PositiveInt, PrivateAttr, model_validator
 
-from romjax.graph import FunctionGraph
+from romjax.graph import Edge, FunctionGraph
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
-from romjax.tree import pytree_iter, pytree_path_iter
+from romjax.tree import pytree_iter, pytree_path_iter, pytree_stack
 from romjax.typing import from_yaml
-from romjax.utils import load_h5, save_h5
+from romjax.utils import load_h5, required_fields, save_h5
 
-__all__ = ["DataGeneration", "DatasetConfig"]
+__all__ = ["DataGeneration", "DataLoader", "GenDataConfig", "LoadDataConfig"]
 
 
 def _get_kwargs(fn: Callable) -> set[str]:
@@ -31,11 +31,6 @@ def _get_kwargs(fn: Callable) -> set[str]:
             inspect.Parameter.KEYWORD_ONLY,
         )
     }
-
-
-def _stack_batch(items: tuple[object, ...]) -> object:
-    """Stack matching pytree items into a single batched pytree."""
-    return jax.tree.map(lambda *xs: jnp.stack(xs), *items)
 
 
 def _build_batched_sample_outputs(model):
@@ -59,25 +54,11 @@ def _build_batched_sample_outputs(model):
     return eqx.filter_jit(_sample_outputs)
 
 
-def _required_fields(model_cls: type[BaseModel]) -> set[str]:
-    inherited = set()
-
-    # for base in model_cls.__mro__[1:]:
-    #     if issubclass(base, BaseModel):
-    #         inherited.update(getattr(base, "model_fields", {}))
-
-    return {
-        name
-        for name, field in model_cls.model_fields.items()
-        if name not in inherited and field.is_required()
-    }
-
-
 type SUPPORTED_FORMATS = Literal["h5"]
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 
 
-class DatasetConfig(BaseModel, ABC):
+class GenDataConfig(BaseModel, ABC):
     """Abstract class for generating datasets."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -108,44 +89,131 @@ class DatasetConfig(BaseModel, ABC):
         raise NotImplementedError
 
 
-class GraphDataset(DatasetConfig):
-    """Datasets that use a FunctionGraph for sample generation."""
+class GenGraph(GenDataConfig, ABC):
+    """
+    Datasets that use a FunctionGraph for sample generation.
+
+    Concrete classes must specify how to generate both in serial and in batch.
+    
+    :ivar graph: the FunctionGraph or Yaml path
+    :ivar name_depth: depth in the path for displaying current dataset name (default: 2)
+    :ivar batch_size: batch size
+    :ivar _required_methods: names of the sampling methods that corresponding graph edges must implement.
+    """
 
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+    name_depth: int = 2
+    batch_size: PositiveInt = 1
+    _required_methods: list[str] = PrivateAttr(default_factory=list)
+
+    @abstractmethod
+    def generate_serial(self, path, format, write_policy):
+        """Generate data in serial (batch=1)."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def generate_batch(self, path, format, write_policy):
+        """Genereate data in batches (batch>1)."""
+        raise NotImplementedError
+
+    def bar_text(self, path: Path):
+        return "/".join(path.parts[-self.name_depth:])
+    
+    def _edge_from_path(self, path: Path) -> Edge:
+        edge_name = path.name
+
+        if edge_name not in self.graph.edges:
+            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
+        
+        return self.graph.edges[edge_name]
+
+    def _validate_required_methods(self, path: Path):
+        """Make sure all required methods are implemented."""
+        edge = self._edge_from_path(Path(path))
+
+        for meth in self._required_methods:
+            if not hasattr(edge, meth):
+                raise ValueError(f"Graph edge '{edge}' must implement '{meth}' method.")
+
+    def generate(self, path, format=None, write_policy=None):
+        """
+        Generate data for a FunctionGraph. Assumes graph edge name is the last name in the `path`.
+        """
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
+
+        if self.graph is None:
+            raise ValueError("Must specify a graph to generate data.")
+        
+        self._validate_required_methods(path)
+        
+        if self.batch_size > 1:
+            self.generate_batch(path, format, write_policy)
+        else:
+            self.generate_serial(path, format, write_policy)
 
 
-class ImplicitModelDataset(GraphDataset):
+class LoadDataConfig[T: Any](BaseModel, ABC):
+    """
+    Abstract class for batch-loading datasets.
+
+    :param batch_size: number of output samples per yielded mini-batch
+    :param shuffle_seed: seed for shuffling mini-batch data
+    :param max_epochs: maximum times to iterate through all available data (defaults to infinite loop)
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    batch_size: PositiveInt = 16
+    shuffle_seed: int = 0
+    max_epochs: PositiveInt | None = None
+
+    @abstractmethod
+    def discover_sample_refs(self, root: Path) -> list[T]:
+        """Discover sample references below one dataset root."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def select_batch(self, refs: Sequence[T], indices: jax.Array, cursor: int) -> tuple[list[T], int]:
+        """Select one mini-batch from shuffled dataset references."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_batch(self, refs: Sequence[T]) -> dict[str, PyTree]:
+        """Load and stack a selected batch of dataset references."""
+        raise NotImplementedError
+
+
+class GenImplicitModel(GenGraph):
     """
     Sampling configuration for a nested input/output strategy for implicit models in a FunctionGraph.
+
+    A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the 
+    result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
+    Generally, output samples are conditioned on input samples, and so several output samples may be requested 
+    for a single input sample.
+
+    If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
+    and a residual will be computed and saved alongside each output.
 
     :ivar input_samples: number of input samples
     :ivar outputs_per_input: number of output samples for each input sample
     :ivar input_seed: random seed for inputs
     :ivar output_seed: random seed for outputs
-    :ivar batch_size: number of samples to generate at a time
-    :ivar name_depth: depth in the path for displaying current dataset name (default: 2)
     """
 
     input_samples: int
     outputs_per_input: int
     input_seed: int
     output_seed: int
-    batch_size: PositiveInt = 1
-    name_depth: int = 2
+    _required_methods: list[str] = PrivateAttr(default=["sample_inputs"])
 
-    def _generate_serial(self, path, format, write_policy):
+    def generate_serial(self, path, format, write_policy):
         """Generate data in serial for an ImplicitModel."""
         path = Path(path)
-        bar_text = "/".join(path.parts[-self.name_depth:])
-        edge_name = path.name
-
-        if edge_name not in self.graph.edges:
-            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
-        
-        model = self.graph.edges[edge_name]
+        model = self._edge_from_path(path)
 
         with alive_bar(self.input_samples) as bar:
-            bar.text(bar_text)
+            bar.text(self.bar_text(path))
 
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
@@ -206,7 +274,7 @@ class ImplicitModelDataset(GraphDataset):
 
                 bar()
     
-    def _generate_batch(self, path, format, write_policy):
+    def generate_batch(self, path, format, write_policy):
         """Generate data for an ImplicitModel using batches and vmap."""
 
         def _save_outputs(
@@ -217,7 +285,7 @@ class ImplicitModelDataset(GraphDataset):
             output_paths: tuple[Path, ...],
             evaluate: Callable | None,
         ) -> None:
-            outputs = sample_outputs(_stack_batch(output_keys), one_input, one_solution)
+            outputs = sample_outputs(pytree_stack(output_keys), one_input, one_solution)
             residuals = evaluate(one_input, outputs) if evaluate is not None else None
             outputs = jax.device_get(outputs)
             residuals = jax.device_get(residuals) if residuals is not None else None
@@ -256,7 +324,7 @@ class ImplicitModelDataset(GraphDataset):
 
             if missing_indices:
                 missing_keys = tuple(input_batch[i][0] for i in missing_indices)
-                generated_inputs = sample_inputs(_stack_batch(missing_keys))
+                generated_inputs = sample_inputs(pytree_stack(missing_keys))
                 generated_solutions = solve(generated_inputs) if solve is not None else None
                 generated_inputs = jax.device_get(generated_inputs)
                 generated_solutions = jax.device_get(generated_solutions) if generated_solutions is not None else None
@@ -311,16 +379,10 @@ class ImplicitModelDataset(GraphDataset):
             input_batch.clear()
         
         path = Path(path)
-        bar_text = "/".join(path.parts[-self.name_depth:])
-        edge_name = path.name
-
-        if edge_name not in self.graph.edges:
-            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
-        
-        model = self.graph.edges[edge_name]
+        model = self._edge_from_path(path)
 
         with alive_bar(self.input_samples) as bar:
-            bar.text(bar_text)
+            bar.text(self.bar_text(path))
 
             if write_policy == 'error' and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
@@ -345,63 +407,348 @@ class ImplicitModelDataset(GraphDataset):
 
             _process_input_batch(input_batch, sample_inputs, solve, sample_outputs, evaluate, bar)
 
-    def generate(self, path, format=None, write_policy=None):
-        """
-        Generate data for an ImplicitModel. Assumes graph edge name is the last name in the `path`.
-        
-        A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the 
-        result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
-        Generally, output samples are conditioned on input samples, and so several output samples may be requested 
-        for a single input sample.
 
-        If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
-        and a residual will be computed and saved alongside each output.
-        """
-        format, write_policy = self._validate_format_and_policy(format, write_policy)
-
-        if self.graph is None:
-            raise ValueError("Must specify a graph to generate data.")
-        
-        if self.batch_size > 1:
-            self._generate_batch(path, format, write_policy)
-        else:
-            self._generate_serial(path, format, write_policy)
+type ImplicitPathPair = tuple[Path, Path]  # (input path, output path)
 
 
-class SourceDataset(GraphDataset):
+class LoadImplicitModel(LoadDataConfig[ImplicitPathPair]):
+    """
+    File-based load configuration for implicit-model datasets corresponding to `GenImplicitModel`.
+
+    :param max_samples: maximum loaded output samples  (defaults to all)
+    :param max_input_samples: maximum loaded input samples  (defaults to all)
+    :param max_outputs_per_input: maximum loaded output samples below each input sample  (defaults to all)
+    :param skip_input: decide whether to skip a particular input sample when loading
+    :param skip_output: decide whether to skip a particular output sample when loading
+    """
+
+    max_samples: PositiveInt | None = None
+    max_input_samples: PositiveInt | None = None
+    max_outputs_per_input: PositiveInt | None = None
+    skip_input: Callable[[Path], bool] | None = None
+    skip_output: Callable[[Path], bool] | None = None
+
+    @staticmethod
+    def walk_sample_directories(
+        root: Path,
+        skip_input: Callable[[Path], bool] | None = None,
+        skip_output: Callable[[Path], bool] | None = None,
+    ) -> Generator[ImplicitPathPair, None, None]:
+        """Walk a nested input/output directory structure generated by `gen_keys` via `DataGeneration`."""
+        if skip_input is None:
+            skip_input = lambda p: False
+        if skip_output is None:
+            skip_output = lambda p: False
+
+        for input_seed_dir in sorted(root.iterdir()):
+            if not input_seed_dir.is_dir() or not input_seed_dir.name.startswith("seed_"):
+                continue
+
+            for input_sample_dir in sorted(input_seed_dir.iterdir()):
+                if (not input_sample_dir.is_dir() or
+                    not input_sample_dir.name.startswith("sample_") or
+                    skip_input(input_sample_dir)):
+                    continue
+
+                for output_seed_dir in sorted(input_sample_dir.iterdir()):
+                    if not output_seed_dir.is_dir() or not output_seed_dir.name.startswith("seed_"):
+                        continue
+
+                    for output_sample_dir in sorted(output_seed_dir.iterdir()):
+                        if (not output_sample_dir.is_dir() or
+                            not output_sample_dir.name.startswith("sample_") or
+                            skip_output(output_sample_dir)):
+                            continue
+
+                        yield input_sample_dir, output_sample_dir
+
+    def discover_sample_refs(self, root: Path) -> list[ImplicitPathPair]:
+        """Discover nested implicit-model input/output sample paths."""
+        return list(self.walk_sample_directories(root, skip_input=self.skip_input, skip_output=self.skip_output))
+
+    def select_batch(
+        self,
+        refs: Sequence[ImplicitPathPair],
+        indices: jax.Array,
+        cursor: int,
+    ) -> tuple[list[ImplicitPathPair], int]:
+        """Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end."""
+        batch_refs: list[ImplicitPathPair] = []
+        unique_inputs: set[Path] = set()
+        outputs_per_input: dict[Path, int] = {}
+        limit = min(cursor + self.batch_size, len(refs))
+
+        while cursor < limit:
+            input_path, output_path = refs[int(indices[cursor])]
+            cursor += 1
+
+            next_total = len(batch_refs) + 1
+            next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
+            next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
+
+            if self.max_samples is not None and next_total > self.max_samples:
+                continue
+            if self.max_input_samples is not None and next_input_total > self.max_input_samples:
+                continue
+            if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
+                continue
+
+            batch_refs.append((input_path, output_path))
+            unique_inputs.add(input_path)
+            outputs_per_input[input_path] = next_outputs_per_input
+
+        return batch_refs, cursor
+
+    def load_batch(self, refs: Sequence[ImplicitPathPair]) -> dict[str, PyTree]:
+        """Load stacked implicit-model mini-batches."""
+        loaded: dict[str, list[PyTree]] = {"inputs": [], "outputs": [], "residuals": []}
+
+        for input_path, output_path in refs:
+            loaded["inputs"].append(load_h5({}, input_path / "input.h5", jax=True))
+
+            output_file = output_path / "output.h5"
+            if output_file.exists():
+                loaded["outputs"].append(load_h5({}, output_file, jax=True))
+
+            residual_file = output_path / "residual.h5"
+            if residual_file.exists():
+                loaded["residuals"].append(load_h5({}, residual_file, jax=True))
+
+        return {
+            key: pytree_stack(value)
+            for key, value in loaded.items()
+            if len(value) > 0
+        }
+
+
+class GenSource(GenGraph):
     """
     Sampling configuration for a plain source node in a FunctionGraph.
     """
 
     samples: int
     seed: int
+    _required_methods: list[str] = PrivateAttr(default=["sample_source"])
 
-    def generate(self, path, format=None, write_policy=None):
-        format, write_policy = self._validate_format_and_policy(format, write_policy)
+    def generate_serial(self, path, format, write_policy):
+        """Generate source node data in serial."""
+        path = Path(path)
+        model = self._edge_from_path(path)
 
-        if self.graph is None:
-            raise ValueError("Must specify a graph to generate data.")
+        with alive_bar(self.samples) as bar:
+            bar.text(self.bar_text(path))
+
+            if write_policy == "error" and path.exists():
+                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+
+            path.mkdir(parents=True, exist_ok=True)
+
+            sample_source = eqx.filter_jit(model.sample_source)
+            skip = (
+                lambda p: (Path(p) / "source.h5").exists()
+                if write_policy == "reuse"
+                else False
+            )
+
+            for input_key, input_dir in gen_keys(self.samples, self.seed, path=path):
+                if skip(input_dir):
+                    bar()
+                    continue
+
+                if format == "h5":
+                    save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
+                else:
+                    raise RoutineError(f"Save format '{format}' not recognized.")
+                
+                bar()
+    
+    def generate_batch(self, path, format, write_policy):
+        """Generate source node data in batches using vmap."""
         
-        pass
+        def _process_batch(batch, sample_source):
+            if not batch:
+                return
+            
+            input_keys, input_paths = zip(*batch)
+            inputs = jax.device_get(sample_source(pytree_stack(input_keys)))
+
+            for one_input, one_path in zip(pytree_iter(inputs), input_paths):
+                if format == "h5":
+                    save_h5(one_input, one_path / "source.h5", mode="w")
+                else:
+                    raise RoutineError(f"Save format '{format}' not recognized.")
+            
+        path = Path(path)
+        model = self._edge_from_path(path)
+
+        with alive_bar(self.samples) as bar:
+            bar.text(self.bar_text(path))
+
+            if write_policy == "error" and path.exists():
+                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+
+            path.mkdir(parents=True, exist_ok=True)
+
+            sample_source = eqx.filter_jit(eqx.filter_vmap(model.sample_source))
+            skip = (
+                lambda p: (Path(p) / "source.h5").exists()
+                if write_policy == "reuse"
+                else False
+            )
+
+            batch: list[tuple[Key, Path]] = []
+
+            for input_key, input_dir in gen_keys(self.samples, self.seed, path=path):
+                if skip(input_dir):
+                    bar()
+                    continue
+
+                if len(batch) < self.batch_size:
+                    batch.append((input_key, input_dir))
+                    continue
+
+                _process_batch(batch, sample_source)
+                batch.clear()
+                batch.append((input_key, input_dir))
+                bar()
+            
+            _process_batch(batch, sample_source)
 
 
-def validate_dataset_pytree(template: PyTree) -> PyTree:
-    """Validate every leaf in a pytree-like template as a :class:`DatasetConfig`. Leave anything else untouched."""
+class LoadSource(LoadDataConfig[Path]):
+    """
+    File-based load configuration for source-node datasets corresponding to `GenSource`.
+
+    :param max_samples: maximum loaded source samples per yielded mini-batch (defaults to all)
+    :param skip_sample: decide whether to skip a particular source sample when loading
+    """
+
+    max_samples: PositiveInt | None = None
+    skip_sample: Callable[[Path], bool] | None = None
+
+    @staticmethod
+    def walk_sample_directories(
+        root: Path,
+        skip_sample: Callable[[Path], bool] | None = None,
+    ) -> Generator[Path, None, None]:
+        """
+        Walk a seed/sample directory structure generated by `gen_keys` via `GenSource`.
+
+        :param root: Root directory containing seed/sample subdirectories.
+        :param skip_sample: Optional predicate for skipping sample directories.
+        :return: Generator yielding discovered sample directories.
+        """
+        if skip_sample is None:
+            skip_sample = lambda p: False
+
+        for seed_dir in sorted(root.iterdir()):
+            if not seed_dir.is_dir() or not seed_dir.name.startswith("seed_"):
+                continue
+
+            for sample_dir in sorted(seed_dir.iterdir()):
+                if (not sample_dir.is_dir() or
+                    not sample_dir.name.startswith("sample_") or
+                    skip_sample(sample_dir)):
+                    continue
+
+                yield sample_dir
+
+    def discover_sample_refs(self, root: Path) -> list[Path]:
+        """
+        Discover source sample paths.
+
+        :param root: Dataset root directory.
+        :return: List of sample directories containing source data.
+        """
+        return list(self.walk_sample_directories(root, skip_sample=self.skip_sample))
+
+    def select_batch(
+        self,
+        refs: Sequence[Path],
+        indices: jax.Array,
+        cursor: int,
+    ) -> tuple[list[Path], int]:
+        """
+        Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end.
+
+        :param refs: Available source sample directories.
+        :param indices: Shuffled dataset indices for the current epoch.
+        :param cursor: Current position in ``indices``.
+        :return: The selected sample directories and updated cursor.
+        """
+        batch_refs: list[Path] = []
+        limit = min(cursor + self.batch_size, len(refs))
+
+        while cursor < limit:
+            sample_path = refs[int(indices[cursor])]
+            cursor += 1
+
+            if self.max_samples is not None and len(batch_refs) + 1 > self.max_samples:
+                continue
+
+            batch_refs.append(sample_path)
+
+        return batch_refs, cursor
+
+    def load_batch(self, refs: Sequence[Path]) -> dict[str, PyTree]:
+        """
+        Load stacked source mini-batches.
+
+        :param refs: Sample directories to load.
+        :return: Mapping containing the stacked ``source`` batch.
+        """
+        return pytree_stack([load_h5({}, ref / "source.h5", jax=True) for ref in refs])
+
+
+def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
+    """Validate every leaf in a pytree-like template as a :class:`GenDataConfig`. Leave anything else untouched."""
     if isinstance(template, Mapping):
-        if all(field in template for field in _required_fields(ImplicitModelDataset)):
-            return ImplicitModelDataset(**template)
-        if all(field in template for field in _required_fields(SourceDataset)):
-            return SourceDataset(**template)
-        return {key: validate_dataset_pytree(value) for key, value in template.items()}
+        if all(field in template for field in required_fields(GenImplicitModel)):
+            return GenImplicitModel(**template)
+        if all(field in template for field in required_fields(GenSource)):
+            return GenSource(**template)
+        return {key: _validate_gendata_pytree(value) for key, value in template.items()}
     if isinstance(template, tuple):
-        return tuple(validate_dataset_pytree(value) for value in template)
+        return tuple(_validate_gendata_pytree(value) for value in template)
     if isinstance(template, list):
-        return [validate_dataset_pytree(value) for value in template]
+        return [_validate_gendata_pytree(value) for value in template]
     
     return template
 
 
-type DatasetPyTree = Annotated[PyTree, BeforeValidator(validate_dataset_pytree)]
+def _validate_loaddata_pytree(template: PyTree) -> PyTree[LoadDataConfig]:
+    """Validate every leaf in a pytree-like template as a :class:`LoadDataConfig`. Leave anything else untouched."""
+    if isinstance(template, Mapping):
+        if len(template) == 0:
+            return {}
+
+        implicit_fields = set(LoadImplicitModel.model_fields)
+        source_fields = set(LoadSource.model_fields)
+        template_fields = set(template)
+
+        if (kind := template.pop("kind", None)) is not None:
+            if kind == "implicit":
+                return LoadImplicitModel(**template)
+            elif kind == "source":
+                return LoadSource(**template)
+            else:
+                raise ValueError(f"Load config '{kind}' not recognized. Supported: ['implicit', 'source']")
+
+        if template_fields <= implicit_fields:
+            return LoadImplicitModel(**template)
+        if template_fields <= source_fields:
+            return LoadSource(**template)
+        return {key: _validate_loaddata_pytree(value) for key, value in template.items()}
+    if isinstance(template, tuple):
+        return tuple(_validate_loaddata_pytree(value) for value in template)
+    if isinstance(template, list):
+        return [_validate_loaddata_pytree(value) for value in template]
+    
+    return template
+
+
+type GenDataPyTree = Annotated[PyTree, BeforeValidator(_validate_gendata_pytree)]
+type LoadDataPyTree = Annotated[PyTree, BeforeValidator(_validate_loaddata_pytree)]
 
 
 class DataGeneration(Routine):
@@ -416,7 +763,7 @@ class DataGeneration(Routine):
     """
 
     root: Path
-    datasets: DatasetPyTree
+    datasets: GenDataPyTree
 
     format: SUPPORTED_FORMATS = "h5"
     write_policy: SUPPORTED_POLICIES = "reuse"
@@ -427,7 +774,7 @@ class DataGeneration(Routine):
     def _bind_graph(self):
         # Pass graph object to graph datasets
         if self.graph is not None:
-            leaves, _ = jax.tree.flatten(self.datasets, is_leaf=lambda leaf: isinstance(leaf, DatasetConfig))
+            leaves, _ = jax.tree.flatten(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig))
             for ds in leaves:
                 if hasattr(ds, "graph"):
                     if ds.graph is None:
@@ -437,7 +784,174 @@ class DataGeneration(Routine):
     
     def run(self) -> int:
         """Generate all datasets."""
-        for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, DatasetConfig)):
+        for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
             dataset.generate(self.root / "/".join(path), format=self.format, write_policy=self.write_policy)
         
         return 0
+
+
+class DataLoader(BaseModel):
+    """
+    File-backed mini-batch loader for datasets created by :class:`romjax.data_gen.DataGeneration`.
+
+    The yielded batch payload is a mapping keyed by sampled dataset names, e.g. for implicit models:
+    ``{dataset_name: {"inputs": batch, "outputs": batch, "residuals": batch}}``.
+
+    If `datasets` is a PyTree, then data will be loaded from the corresponding path under `root`. The name of the last
+    directory in the path will be used as the `dataset_name` in the returned batch.
+
+    :param root: root directory for loading datasets
+    :param datasets: configs for loading independent datasets under root, defaults to all top-level directories
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    root: Path
+    datasets: LoadDataPyTree = Field(default_factory=dict)
+
+    _iterator: Iterator[dict[str, PyTree]] | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_root(cls, value):
+        """Validate a loader with all default options from just a plain root directory."""
+        if isinstance(value, str | Path):
+            return {"root": value}
+        return value
+
+    @model_validator(mode="after")
+    def _infer_datasets(self):
+        """Try to infer datasets from top-level directories. Can only infer ImplicitModel and Source."""
+        if len(self.datasets) == 0:
+            dataset_dirs = sorted(d for d in self.root.iterdir() if d.is_dir() and not d.name.startswith("."))
+
+            def _infer_dataset_dir(ds_dir: Path) -> LoadDataConfig | None:
+                """If nested seed/sample, then ImplicitModel. If flat seed/sample, then Source. Can't tell otherwise."""
+                seed_dirs = [d for d in ds_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+                if len(seed_dirs) > 0 and all("seed_" in d.name for d in seed_dirs):
+                    # Just check the first seed directory
+                    sample_dirs = [d for d in seed_dirs[0].iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+                    if len(sample_dirs) > 0 and all("sample_" in d.name for d in sample_dirs):
+                        if all((s / "input.h5").exists() and (s / "solution.h5").exists() for s in sample_dirs):
+                            return LoadImplicitModel()
+                        if all((s / "source.h5").exists() for s in sample_dirs):
+                            return LoadSource()
+                
+                return None
+
+            datasets = {}
+            for ds_dir in dataset_dirs:
+                if (load_cfg := _infer_dataset_dir(ds_dir)) is not None:
+                    datasets[ds_dir.name] = load_cfg
+            
+            if datasets:
+                self.datasets = datasets
+        
+        return self
+
+    def _iter_datasets(self, train_step: int = 0):
+        """
+        Walk over all available datasets at once, using available configurations to limit sample sizes.
+        Yields a mapping of dataset names to PyTree batches of data.
+        
+        :param train_step: initialize from this training step (default: 0)
+        """
+        ds_config = {}
+        ds_paths = {}
+        ds_totals = {}
+
+        for path, ds_cfg in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+            ds_root = self.root / "/".join(path)
+            ds_name = ds_root.name
+
+            ds_paths[ds_name] = ds_cfg.discover_sample_refs(ds_root)
+            if len(ds_paths[ds_name]) == 0:
+                raise ValueError(f"No samples found for dataset '{ds_name}' in {ds_root}")
+
+            ds_totals[ds_name] = len(ds_paths[ds_name])  # Total available data for each dataset
+            ds_config[ds_name] = ds_cfg
+
+        # Advance dataset epoch and cursor indices based on current training step
+        # Epoch - number of iterations through an entire dataset
+        # Cursor - starting index within a dataset for the next mini-batch
+        
+        ds_epochs = {name: 0 for name in ds_config}
+        ds_cursors = {name: 0 for name in ds_config}
+        ds_active = {name: True for name in ds_config}
+
+        def _shuffle_indices(name: str, epoch: int) -> np.ndarray:
+            """Build a deterministic per-epoch permutation without invoking JAX random ops."""
+            seed = np.random.SeedSequence([ds_config[name].shuffle_seed, epoch])
+            return np.random.default_rng(seed).permutation(ds_totals[name])
+
+        ds_indices = {name: _shuffle_indices(name, ds_epochs[name]) for name in ds_config}
+
+        def _advance_dataset(name: str) -> None:
+            """Advance one dataset by a single batch and update its termination state."""
+            if not ds_active[name]:
+                return
+
+            _, next_cursor = ds_config[name].select_batch(ds_paths[name], ds_indices[name], ds_cursors[name])
+            if next_cursor >= ds_totals[name]:
+                ds_epochs[name] += 1
+                if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
+                    ds_active[name] = False
+                    ds_cursors[name] = ds_totals[name]
+                    return
+
+                ds_cursors[name] = 0
+                ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
+            else:
+                ds_cursors[name] = next_cursor
+
+        for _ in range(train_step):
+            for name in ds_config:
+                _advance_dataset(name)
+
+            if not any(ds_active.values()):
+                return
+
+        while True:
+            active_names = [name for name in ds_paths if ds_active[name]]
+            if len(active_names) == 0:
+                return
+
+            ds_batch = {}
+
+            for name in active_names:
+                batch_paths, next_cursor = ds_config[name].select_batch(
+                    ds_paths[name],
+                    ds_indices[name],
+                    ds_cursors[name],
+                )
+                ds_batch[name] = ds_config[name].load_batch(batch_paths)
+
+                if next_cursor >= ds_totals[name]:
+                    ds_epochs[name] += 1
+                    if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
+                        ds_active[name] = False
+                        ds_cursors[name] = ds_totals[name]
+                    else:
+                        ds_cursors[name] = 0
+                        ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
+                else:
+                    ds_cursors[name] = next_cursor
+
+            yield ds_batch
+    
+    def set_iterator(self, train_step: int = 0):
+        """Set the iterator based on the current train step."""
+        self._iterator = self._iter_datasets(train_step)
+
+    def __next__(self):
+        """Continue existing iterator if possible, otherwise start from beginning."""
+        if self._iterator is None:
+            self.set_iterator()
+        return next(self._iterator)
+    
+    def __iter__(self):
+        """Restart iteration from 0."""
+        self.set_iterator()
+        return self

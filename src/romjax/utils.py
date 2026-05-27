@@ -8,9 +8,26 @@ from typing import Any
 import h5py
 import jax.numpy as jnp
 import numpy as np
+from pydantic import BaseModel
 
-__all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5']
+__all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'required_fields']
 
+
+def required_fields(model_cls: type[BaseModel], inherited: bool = True) -> set[str]:
+    """Get the required fields of a pydantic model."""
+    ignore = set()
+
+    # Ignore inherited fields
+    if not inherited:
+        for base in model_cls.__mro__[1:]:
+            if issubclass(base, BaseModel):
+                ignore.update(getattr(base, "model_fields", {}))
+
+    return {
+        name
+        for name, field in model_cls.model_fields.items()
+        if name not in ignore and field.is_required()
+    }
 
 
 def format_time_engineering(seconds: float):
