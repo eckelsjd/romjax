@@ -2,7 +2,7 @@
 from enum import IntEnum
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 import jax.numpy as jnp
 import optimistix as optx
@@ -314,27 +314,61 @@ class IterativeSolver(DictModel):
 
 
 def _default_latent_sampler(
-    latent_size: int,
-    latent_bounds: tuple[ArrayLike, ArrayLike],
-    *,
+    compression: Compression, 
+    *, 
     path: TreePath = ("outputs",),
+    distribution: Literal["uniform", "normal"] = "normal",
 ) -> SamplerCallable:
-    """Build a uniform latent sampler under the requested pytree path."""
-    minval, maxval = latent_bounds
-    sampler = {
-        "callable": "uniform",
-        "shape": [latent_size],
-        "minval": jnp.asarray(minval).tolist(),
-        "maxval": jnp.asarray(maxval).tolist(),
-    }
-    template = set_subtree(None, path, sampler)
-    return PyTreeSampler(**template)
+    """Build a uniform or normal latent sampler under the requested pytree path."""
+    if distribution == "uniform":
+        minval, maxval = compression.latent_bounds()
+        if minval is None or maxval is None:
+            raise ValueError("Uniform latent sampling requires compression latent bounds.")
+        latent_size = compression.latent_size()
+        sampler = {
+            "callable": "uniform",
+            "shape": [latent_size],
+            "minval": jnp.asarray(minval).tolist(),
+            "maxval": jnp.asarray(maxval).tolist(),
+        }
+        template = set_subtree(None, path, sampler)
+        return PyTreeSampler(**template)
+    
+    elif distribution == "normal":
+        latent_normal = compression.latent_normal()
+        if latent_normal is not None:
+            mean, std = latent_normal
+            latent_size = compression.latent_size()
+            sampler = {
+                "callable": "normal",
+                "shape": [latent_size],
+                "mean": jnp.asarray(mean).tolist(),
+                "std": jnp.asarray(std).tolist(),
+            }
+            template = set_subtree(None, path, sampler)
+            return PyTreeSampler(**template)
+
+        minval, maxval = compression.latent_bounds()
+        if minval is None or maxval is None:
+            raise ValueError("Latent sampling requires either latent normal statistics or bounds.")
+        latent_size = compression.latent_size()
+        sampler = {
+            "callable": "uniform",
+            "shape": [latent_size],
+            "minval": jnp.asarray(minval).tolist(),
+            "maxval": jnp.asarray(maxval).tolist(),
+        }
+        template = set_subtree(None, path, sampler)
+        return PyTreeSampler(**template)
+    
+    else:
+        raise ValueError(f"Latent sampler distribution '{distribution}' not recognized.")
 
 
 class LatentSamplerFactory(CallableModel):
     """Factory for building a source sampler from latent size and latent bounds."""
 
-    callable: Callable[[int, tuple[ArrayLike, ArrayLike]], SamplerCallable] = _default_latent_sampler
+    callable: Callable[[Compression], SamplerCallable] = _default_latent_sampler
 
 
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
@@ -343,7 +377,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
     initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
     source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
-    compression: Compression | Path | str | None = None
+    compression: Path | str | Compression | None = None
     _resolved_source_sampler: SamplerCallable | None = PrivateAttr(default=None)
     _resolved_compression: Compression | None = PrivateAttr(default=None)
 
@@ -386,13 +420,8 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         if compression is None:
             return None
 
-        latent_size = compression.latent_size()
-        bounds = compression.latent_bounds()
-        if bounds is None:
-            return None
-
         if isinstance(sampler, LatentSamplerFactory):
-            sampler = sampler(latent_size, bounds)
+            sampler = sampler(compression)
             object.__setattr__(self, "_resolved_source_sampler", sampler)
             return sampler
 

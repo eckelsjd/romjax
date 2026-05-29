@@ -2,6 +2,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import pytest
+from pydantic import TypeAdapter
 
 from romjax.compression import SVD, Compression
 
@@ -43,6 +44,13 @@ def test_compression_registry_and_round_trip(tmp_path: Path) -> None:
     assert reloaded.rank == 1
     assert reloaded.template is not None
     assert reloaded.latent_size() == 1
+
+
+def test_compression_type_adapter_accepts_registry_dict() -> None:
+    compression = TypeAdapter(Compression).validate_python({"energy_tol": 0.99})
+
+    assert isinstance(compression, SVD)
+    assert compression.energy_tol == 0.99
 
 
 def test_svd_requires_rank_or_energy_tol() -> None:

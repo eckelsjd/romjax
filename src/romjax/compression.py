@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
 from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
+from pydantic_core import core_schema
 
 __all__ = ["Compression"]
 
@@ -19,25 +20,44 @@ class Compression(BaseModel, ABC):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
-    @model_validator(mode="before")
     @classmethod
     def _from_registry(cls, value):
-        if cls is Compression and isinstance(value, str | Mapping):
-            if isinstance(value, str):
-                name = value
-                opts = {}
-            else:
-                name = value.pop("kind", "svd")
-                opts = value
+        if isinstance(value, Compression):
+            return value
 
-            if name is None:
-                raise ValueError("Must specify compression 'kind'")
-            if name == "svd":
-                return SVD(**opts)
-            else:
-                raise ValueError(f"Compression '{name}' not recognized.")
+        if isinstance(value, str):
+            name = value
+            opts: dict[str, Any] = {}
+        elif isinstance(value, Mapping):
+            opts = dict(value)
+            name = opts.pop("kind", "svd")
+        else:
+            raise TypeError(
+                "Compression config must be a string, mapping, or Compression instance; "
+                f"got {type(value).__name__}."
+            )
 
-        return value
+        if name is None:
+            raise ValueError("Must specify compression 'kind'")
+        if name == "svd":
+            return SVD(**opts)
+        raise ValueError(f"Compression '{name}' not recognized.")
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any) -> Any:
+        """Accept compression configs as either an instance or a registry-backed mapping."""
+        if cls.__name__ != "Compression":
+            return handler(source_type)
+
+        def _validate(value: Any) -> "Compression":
+            if isinstance(value, Compression):
+                return value
+            return cls._from_registry(value)
+
+        return core_schema.no_info_plain_validator_function(
+            _validate,
+            json_schema_input_schema=core_schema.any_schema(),
+        )
 
     @abstractmethod
     def compress(self, sample: PyTree) -> PyTree:
@@ -57,6 +77,11 @@ class Compression(BaseModel, ABC):
     @abstractmethod
     def latent_bounds(self) -> tuple[jax.Array, jax.Array] | None:
         """Return latent-space min/max bounds if available."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def latent_normal(self) -> tuple[jax.Array, jax.Array] | None:
+        """Return latent-space mean/std if available."""
         raise NotImplementedError
 
     @abstractmethod
@@ -150,6 +175,8 @@ class SVD(Compression):
     singular_values: np.ndarray | None = None
     minval: np.ndarray | None = None
     maxval: np.ndarray | None = None
+    latent_mean: np.ndarray | None = None
+    latent_std: np.ndarray | None = None
     template: PyTree | None = None
 
     @model_validator(mode="after")
@@ -198,6 +225,8 @@ class SVD(Compression):
         latent = centered @ basis.T
         minval = jnp.min(latent, axis=0)
         maxval = jnp.max(latent, axis=0)
+        latent_mean = jnp.mean(latent, axis=0)
+        latent_std = jnp.std(latent, axis=0)
 
         return type(self)(
             energy_tol=self.energy_tol,
@@ -208,6 +237,8 @@ class SVD(Compression):
             singular_values=np.asarray(singular_values),
             minval=np.asarray(minval),
             maxval=np.asarray(maxval),
+            latent_mean=np.asarray(latent_mean),
+            latent_std=np.asarray(latent_std),
             template=samples[0],
         )
 
@@ -253,3 +284,7 @@ class SVD(Compression):
             return None
         return jnp.asarray(self.minval), jnp.asarray(self.maxval)
     
+    def latent_normal(self) -> tuple[jax.Array, jax.Array] | None:
+        if self.latent_mean is None or self.latent_std is None:
+            return None
+        return jnp.asarray(self.latent_mean), jnp.asarray(self.latent_std)

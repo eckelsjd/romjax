@@ -14,17 +14,17 @@ datasets:
       batch_size: 1
     compression:
       loader: !romx:DataLoader
-        root: data
+        root: data/train
         datasets:
-          train:
-            poisson: { kind: implicit, max_samples: 1000 }
+          poisson: { kind: implicit, max_samples: 500 }
       gather_paths: [poisson, outputs]
-      compression: { energy_tol: 0.999 }
+      compression: { energy_tol: 0.95 }
       filename: poisson_pod.npz
+      write_policy: overwrite
     galerkin:
       samples: 200
       seed: 2
-      batch_size: 1
+      batch_size: 32
   validation:
     poisson:
       input_samples: 25

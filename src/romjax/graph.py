@@ -1,13 +1,13 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Hashable, Literal, Sequence, Annotated
+from typing import Annotated, Any, Hashable, Literal, Sequence
 
 import jax
 import networkx as nx
 from jaxtyping import PyTree
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from romjax.tree import TreeErrorOperator, TreePath, get_tree_operator, pytree_merge, coerce_tree_paths
+from romjax.tree import TreeErrorOperator, TreePath, coerce_tree_paths, get_tree_operator, pytree_merge
 from romjax.typing import ListModel
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
