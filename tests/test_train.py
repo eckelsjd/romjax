@@ -468,7 +468,7 @@ def test_graph_init_params(toy_graph: FunctionGraph) -> None:
     )
 
     assert train.loss.graph is toy_graph
-    assert train.loss.terms[0].edge == "toy"
+    assert train.loss.terms[0].dataset == "toy"
     assert isinstance(train.init_params["toy"]["module"], LinearProjection)
     assert jnp.shape(train.init_params["toy"]["weight"]) == ()
     assert float(train.init_params["toy"]["bias"]) == pytest.approx(0.25)
@@ -561,11 +561,11 @@ def test_data_loader_config_types(tmp_path: Path) -> None:
 def test_graph_loss(toy_graph: FunctionGraph) -> None:
     batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
 
-    squared = GraphLoss(terms=[{"function": graph_batch_squared_error, "edge": "toy"}], graph=toy_graph)
+    squared = GraphLoss(terms=[{"function": graph_batch_squared_error, "dataset": "toy"}], graph=toy_graph)
     params = {"toy": {"weight": jnp.array(0.5)}}
     assert squared(params, batch) == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
 
-    reference = GraphLoss(terms=[{"function": graph_reference_loss, "edge": "toy"}], graph=toy_graph)
+    reference = GraphLoss(terms=[{"function": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
     ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
     resolved_params = reference._resolve_references(ref_params)
     assert reference(ref_params, batch) == pytest.approx(squared(params, batch))
@@ -581,8 +581,8 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
 
     weighted = GraphLoss(
         terms=[
-            {"function": graph_batch_squared_error, "edge": "toy", "weight": 2.0},
-            {"function": graph_batch_absolute_error, "edge": "toy", "weight": 0.5},
+            {"function": graph_batch_squared_error, "dataset": "toy", "weight": 2.0},
+            {"function": graph_batch_absolute_error, "dataset": "toy", "weight": 0.5},
         ],
         graph=toy_graph,
     )
@@ -613,7 +613,7 @@ def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         datasets={"toy": {"kind": "implicit", "batch_size": 1, "max_epochs": 2}},
     )
     test = GraphTest(
-        terms=[{"function": graph_batch_squared_error, "edge": "toy"}],
+        terms=[{"function": graph_batch_squared_error, "dataset": "toy"}],
         graph=toy_graph,
         dataloader=dataloader,
         reduce="mean",
@@ -642,7 +642,7 @@ train: !romx:Train
       - reconstruction
       - function: !!python/name:tests.test_train.graph_batch_squared_error
         weight: 0.5
-        edge: toy
+        dataset: toy
   test: !romx:GraphTest
     terms:
       - reconstruction
@@ -689,8 +689,8 @@ train: !romx:Train
     assert train.root == run_root.resolve()
     assert train.loss.graph is train.graph
     assert train.test.graph is train.graph
-    assert train.loss.terms[0].edge == "toy"
-    assert train.test.terms[0].edge == "toy"
+    assert train.loss.terms[0].dataset == "toy"
+    assert train.test.terms[0].dataset == "toy"
     assert train.init_params["toy"]["alias"] == "toy,weight"
 
 

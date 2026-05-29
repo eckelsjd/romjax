@@ -1,6 +1,6 @@
 !romx:DataGeneration
 routine_config: config/common.yml
-root: dataset
+root: data
 write_policy: reuse
 graph: config/graph.yml
 
@@ -11,21 +11,24 @@ datasets:
       outputs_per_input: 10
       input_seed: 0
       output_seed: 1
+      batch_size: 1
     compression:
       loader: !romx:DataLoader
-        root: dataset
+        root: data
         datasets:
           train:
             poisson: { kind: implicit, max_samples: 1000 }
       gather_paths: [poisson, outputs]
       compression: { energy_tol: 0.999 }
-      filename: galerkin_compression.npz
+      filename: poisson_pod.npz
     galerkin:
       samples: 200
       seed: 2
+      batch_size: 1
   validation:
     poisson:
       input_samples: 25
       outputs_per_input: 10
       input_seed: 3
       output_seed: 4
+      batch_size: 1

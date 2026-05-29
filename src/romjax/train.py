@@ -36,7 +36,7 @@ from pydantic import (
 
 from romjax.data_gen import DataLoader
 from romjax.graph import FunctionGraph
-from romjax.model import ImplicitSampleable
+from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree
@@ -267,7 +267,7 @@ class GraphLossTerm(BaseModel):
     One weighted term in a :class:`GraphLoss`. Aggregates a loss function over batch data.
 
     :param function: function to apply to a single sample of data
-    :param edge: which edge to read data from
+    :param dataset: which dataset name to read data from
     :param weight: scalar term weight
     :param batch_reduce: reduce the loss over batch data; skip batch reduce if none
     """
@@ -275,7 +275,7 @@ class GraphLossTerm(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
     function: GraphLossFunction
-    edge: str | None = None
+    dataset: str | None = None
     weight: float = 1.0
     batch_reduce: UnaryOperator | None = "mean"
 
@@ -300,7 +300,7 @@ class GraphLossTerm(BaseModel):
         graph: FunctionGraph
     ) -> jax.Array:
         if self.batch_reduce is not None:
-            term_batch = batch_data[self.edge] if self.edge is not None else batch_data
+            term_batch = batch_data[self.dataset] if self.dataset is not None else batch_data
 
             def body(carry, single_data):
                 return carry, self.function(params, single_data, graph)
@@ -335,25 +335,23 @@ class GraphLoss(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _bind_default_edges(self):
+    def _bind_default_datasets(self):
         if self.graph is not None:
-            self.terms = self._set_default_edge(self.terms, self.graph)
+            self._set_default_datasets()
         return self
     
-    @staticmethod
-    def _set_default_edge(terms, graph):
-        """Grab the first sampleable edge as the default edge, i.e. typically there is only one."""
-        _default_edge = None
-        for edge_name, edge in graph.edges.items():
-            if isinstance(edge, ImplicitSampleable):
-                _default_edge = edge_name
-            break
+    def _set_default_datasets(self):
+        """Grab the first sampleable edge as the default dataset, i.e. typically there is only one."""
+        if self.graph is not None:
+            _default_edge = None
+            for edge_name, edge in self.graph.edges.items():
+                if isinstance(edge, ImplicitSampleable | SourceSampleable):
+                    _default_edge = edge_name
+                break
 
-        for term in terms:
-            if term.edge is None:
-                term.edge = _default_edge
-        
-        return terms
+            for term in self.terms:
+                if term.dataset is None:
+                    term.dataset = _default_edge
     
     @staticmethod
     def _resolve_references(params: PyTree, reference_type: type = str):
@@ -657,7 +655,7 @@ class Train(Routine):
                         ele.graph = self.graph
                 
                         if isinstance(ele, GraphLoss):
-                            GraphLoss._set_default_edge(ele.terms, ele.graph)
+                            ele._set_default_datasets()
 
             self.init_params = _resolve_graph_refs(self.init_params, self.graph)
 

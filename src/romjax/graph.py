@@ -1,13 +1,13 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Hashable, Literal
+from typing import Any, Hashable, Literal, Sequence, Annotated
 
 import jax
 import networkx as nx
 from jaxtyping import PyTree
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, BeforeValidator
 
-from romjax.tree import TreeErrorOperator, TreePath, get_tree_operator, pytree_merge
+from romjax.tree import TreeErrorOperator, TreePath, get_tree_operator, pytree_merge, coerce_tree_paths
 from romjax.typing import ListModel
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
@@ -28,7 +28,7 @@ class Node(BaseModel, Hashable):
     """
     name: str
     error_op: TreeErrorOperator = Field(default_factory=lambda: get_tree_operator("mean-relative"))
-    ignore: list[TreePath] = Field(default_factory=list)
+    ignore: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

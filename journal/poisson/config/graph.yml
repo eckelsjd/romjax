@@ -1,9 +1,9 @@
 !romx:FunctionGraph
 nodes: 
-  - { name: hf_coord, ignore: [ [inputs] ], error_op: norm }
-  - { name: hf_res,   ignore: [ [inputs] ], error_op: norm }
-  - { name: lf_coord, ignore: [ [inputs] ], error_op: norm }
-  - { name: lf_res,   ignore: [ [inputs] ], error_op: norm }
+  - { name: hf_coord, ignore: inputs, error_op: norm }
+  - { name: hf_res,   ignore: inputs, error_op: norm }
+  - { name: lf_coord, ignore: inputs, error_op: norm }
+  - { name: lf_res,   ignore: inputs, error_op: norm }
 edges:
   - !romx:Poisson2D
     source: hf_coord
@@ -85,4 +85,4 @@ edges:
     name: galerkin
     path: [coordinate transform, poisson, residual transform]
     solver: *solver
-    compression: dataset/train/compression/galerkin_compression.npz
+    compression: data/train/compression/poisson_pod.npz
