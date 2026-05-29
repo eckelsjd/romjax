@@ -1,13 +1,13 @@
 !romx:Train
 routine_config: config/common.yml
-root: training
+root: train
 write_policy: reuse
 graph: config/graph.yml
 init_seed: 0
 
 loss: !romx:GraphLoss
   - { callable: reconstruction, path: [coordinate transform] }
-  - { function: tikhonov, weight: 0.01, batch_reduce: null }
+  # - { function: tikhonov, weight: 0.01, batch_reduce: null }
 init_params: !romx:PyTreeSampler
   coordinate transform:
     call_args:
@@ -16,26 +16,31 @@ init_params: !romx:PyTreeSampler
         latent: !romx:GraphRef [edges, galerkin, latent_dim]
         dof: 1024
   residual transform: coordinate transform
-optimizer:
-  name: optax.chain
-  args:
-    - { name: clip_by_global_norm, args: [1.0] }
-    - scale_by_adam
-    - name: scale_by_schedule
-      args:
-        - name: exponential_decay
-          kwargs: { init_value: 0.01, transition_steps: 1000, decay_rate: 0.99 }
-    - { name: optax.scale, args: [-1.0] }
+optimizer: { name: adam, args: [ 0.1 ] }
 
-dataloader: !romx:DataLoader dataset/train
+dataloader: !romx:DataLoader 
+  root: data/train
+  datasets:
+    poisson: { batch_size: 32, shuffle_seed: 0 }
+    # galerkin: { batch_size: 32, shuffle_seed: 1 }
 test: !romx.GraphTest
-  dataloader: dataset/validation
+  dataloader: !romx:DataLoader
+    root: data/validation
+    datasets:
+      poisson: { batch_size: 32, shuffle_seed: 0 }
   terms:
     - { callable: reconstruction, path: [coordinate transform] }
+
 termination: 
   max_steps: 200
   max_runtime: 300
 diagnostics:
-  log_interval: 1
-  plot_interval: 1
+  log_interval: 5
+  plot_interval: 5
+  test_interval: 20
   live_plot: true
+checkpointer:
+  save_decision_policy: { name: FixedIntervalPolicy, args: [1] }
+  preservation_policy: 
+    name: AnyPreservationPolicy
+    args: [ [{ name: LatestN, args: [10] }, {name: EveryNSteps, args: [5] }] ]
