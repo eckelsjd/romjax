@@ -84,6 +84,32 @@ type TreePath = tuple[PathToken, ...]
 _OPERATOR_CACHE_SIZE = 256
 
 
+def coerce_tree_path(value: Any) -> TreePath:
+    """Coerce a single tree path."""
+    if isinstance(value, tuple):
+        return tuple(int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token for token in value)
+    if isinstance(value, list):
+        return tuple(int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token for token in value)
+    if isinstance(value, str):
+        return (value,)
+    return value
+
+
+def coerce_tree_paths(value: Any) -> list[TreePath]:
+    """Coerce multiple tree paths."""
+    if value is None:
+        return []
+    if isinstance(value, str | int):
+        return [(value,)]
+    if isinstance(value, list | tuple):
+        if len(value) == 0:
+            return []
+        if all(isinstance(token, str | int) for token in value):
+            return [tuple(coerce_tree_path(value))]
+        return [tuple(coerce_tree_path(path)) for path in value]
+    return value
+
+
 def _noop(x: PyTree) -> PyTree:
     return x
 

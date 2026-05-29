@@ -1,6 +1,7 @@
 """Utilites for PDE-based solvers."""
 from enum import IntEnum
 from functools import partial
+from pathlib import Path
 from typing import Annotated, Any, Callable
 
 import jax.numpy as jnp
@@ -12,20 +13,22 @@ from pydantic import (
     Field,
     PositiveFloat,
     PositiveInt,
+    PrivateAttr,
     field_serializer,
     field_validator,
     model_validator,
 )
 
+from romjax.compression import Compression
 from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import SourceSampleable
-from romjax.rng import SamplerCallable
-from romjax.tree import pytree_merge
-from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, from_yaml, require_type
+from romjax.rng import PyTreeSampler, SamplerCallable
+from romjax.tree import TreePath, pytree_merge, set_subtree
+from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'InitializeCallable', 'ForcingCallable', 'IterativeSolver', 'RegisteredInitialize', 'ConstantInitialize',
-           'ImplicitIterativeGalerkin']
+           'LatentSamplerFactory', 'ImplicitIterativeGalerkin']
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
@@ -52,7 +55,7 @@ type RegisteredInitialize = Annotated[
     InitializeCallable, 
     BeforeValidator(partial(from_registry, _initialize_registry))
 ]
-    
+
 
 class ForcingCallable(CallableModel):
 
@@ -310,12 +313,90 @@ class IterativeSolver(DictModel):
         return solution if return_sol else solution.value
 
 
+def _default_latent_sampler(
+    latent_size: int,
+    latent_bounds: tuple[ArrayLike, ArrayLike],
+    *,
+    path: TreePath = ("outputs",),
+) -> SamplerCallable:
+    """Build a uniform latent sampler under the requested pytree path."""
+    minval, maxval = latent_bounds
+    sampler = {
+        "callable": "uniform",
+        "shape": [latent_size],
+        "minval": jnp.asarray(minval).tolist(),
+        "maxval": jnp.asarray(maxval).tolist(),
+    }
+    template = set_subtree(None, path, sampler)
+    return PyTreeSampler(**template)
+
+
+class LatentSamplerFactory(CallableModel):
+    """Factory for building a source sampler from latent size and latent bounds."""
+
+    callable: Callable[[int, tuple[ArrayLike, ArrayLike]], SamplerCallable] = _default_latent_sampler
+
+
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     """Galerkin ROM that solves any `ImplicitModel` via an iterative solver in latent space."""
 
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
     initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
-    source_sampler: Annotated[SamplerCallable | None, BeforeValidator(from_yaml)] = None
+    source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
+    compression: Compression | Path | str | None = None
+    _resolved_source_sampler: SamplerCallable | None = PrivateAttr(default=None)
+    _resolved_compression: Compression | None = PrivateAttr(default=None)
+
+    def resolve_compression(self) -> Compression | None:
+        """Resolve the compression artifact from a preloaded object or a file path."""
+        if self._resolved_compression is not None:
+            return self._resolved_compression
+        
+        artifact = self.compression
+        if isinstance(artifact, Compression):
+            object.__setattr__(self, "_resolved_compression", artifact)
+            return artifact
+        
+        if isinstance(artifact, (str, Path)):
+            artifact_path = Path(artifact)
+            if artifact_path.exists():
+                compression = Compression.load(artifact_path)
+                object.__setattr__(self, "_resolved_compression", compression)
+                return compression
+            
+        return None
+
+    def resolve_latent_dim(self) -> int | None:
+        """Resolve the latent dimension from the compression artifact."""
+        compression = self.resolve_compression()
+        latent_dim = None if compression is None else compression.latent_size()
+        return None if latent_dim is None else int(latent_dim)
+
+    def resolve_source_sampler(self) -> SamplerCallable | None:
+        """Resolve the source sampler from explicit configuration or a compression artifact."""
+        if self._resolved_source_sampler is not None:
+            return self._resolved_source_sampler
+
+        sampler = self.source_sampler
+        if isinstance(sampler, SamplerCallable):
+            object.__setattr__(self, "_resolved_source_sampler", sampler)
+            return sampler
+
+        compression = self.resolve_compression()
+        if compression is None:
+            return None
+
+        latent_size = compression.latent_size()
+        bounds = compression.latent_bounds()
+        if bounds is None:
+            return None
+
+        if isinstance(sampler, LatentSamplerFactory):
+            sampler = sampler(latent_size, bounds)
+            object.__setattr__(self, "_resolved_source_sampler", sampler)
+            return sampler
+
+        return None
 
     # Override default composite edge behavior by solving in latent space directly
     def backward_aux(
@@ -353,6 +434,9 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         return ret, aux
 
     def sample_source(self, key: Key) -> PyTree:
-        if self.source_sampler is not None:
-            return self.source_sampler(key)
+        sampler = self.resolve_source_sampler()
+        if sampler is not None:
+            if hasattr(sampler, "sample"):
+                return sampler.sample(key)
+            return sampler(key)
         return {}  

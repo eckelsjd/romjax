@@ -40,7 +40,7 @@ from romjax.model import ImplicitSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree
-from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type
+from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
 
@@ -58,6 +58,32 @@ def _prettify_timedelta(delta: float) -> str:
     if minutes > 0:
         return f"{minutes:02d}:{seconds:02d}"
     return f"{delta:.3f} s"
+
+
+def _resolve_graph_refs(value: Any, graph: FunctionGraph | None) -> Any:
+    """Resolve graph-field references inside nested config trees. For use with init_params."""
+    if graph is None:
+        return value
+    if isinstance(value, GraphRef):
+        return value.resolve(graph)
+    if isinstance(value, BaseModel):
+        for field_name in type(value).model_fields:
+            if hasattr(value, field_name):
+                resolved = _resolve_graph_refs(getattr(value, field_name), graph)
+                if resolved is not getattr(value, field_name):
+                    object.__setattr__(value, field_name, resolved)
+        for extra_name, extra_value in (value.model_extra or {}).items():
+            resolved = _resolve_graph_refs(extra_value, graph)
+            if resolved is not extra_value:
+                setattr(value, extra_name, resolved)
+        return value
+    if isinstance(value, Mapping):
+        return {key: _resolve_graph_refs(item, graph) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_graph_refs(item, graph) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_graph_refs(item, graph) for item in value)
+    return value
 
 
 class BatchLoader[T: Any](BaseModel, Iterator):
@@ -623,9 +649,6 @@ class Train(Routine):
             self.root = self.root.resolve()
 
         # If init params implements a 'sample' function, then initialize the parameter pytree.
-        if (sample_fn := getattr(self.init_params, "sample", None)) is not None and callable(sample_fn):
-            self.init_params = self.init_params.sample(jax.random.key(self.init_seed))
-
         # Pass graph object to loss, test, and dataloader if requested
         if self.graph is not None:
             for attr in ["loss", "test", "dataloader"]:
@@ -635,6 +658,12 @@ class Train(Routine):
                 
                         if isinstance(ele, GraphLoss):
                             GraphLoss._set_default_edge(ele.terms, ele.graph)
+
+            self.init_params = _resolve_graph_refs(self.init_params, self.graph)
+
+        sample_fn = getattr(self.init_params, "sample", None)
+        if callable(sample_fn):
+            self.init_params = sample_fn(jax.random.key(self.init_seed))
         
         # Start dataloader from current training step if applicable
         if self.root is not None and hasattr(self.dataloader, "set_iterator"):

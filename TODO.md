@@ -2,7 +2,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
 - [ ] Normalization for eqx transforms
-- [ ] Latent space sampling (routine to save galerkin_sampler.yml from SVD bounds)
 
 ## Needs testing
 - [ ] Reconstruction matching SVD
@@ -19,7 +18,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Other data save formats outside of H5
 
 ## Ergonomics
-- [ ] Auto-fill linear projection full dof size
 - [ ] !include pydantic tag for loading from another .yml file
 
 ## Serialization

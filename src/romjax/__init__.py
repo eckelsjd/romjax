@@ -32,6 +32,7 @@ type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
     "tree": ("romjax.tree", None),
+    "Compression": ("romjax.compression", "Compression"),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
@@ -45,6 +46,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "gen_keys": ("romjax.rng", "gen_keys"),
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
+    "GraphRef": ("romjax.typing", "GraphRef"),
     "get_unary_operator": ("romjax.tree", "get_unary_operator"),
     "get_error_operator": ("romjax.tree", "get_error_operator"),
     "get_tree_operator": ("romjax.tree", "get_tree_operator"),
@@ -71,6 +73,7 @@ __all__ = list(_LAZY_EXPORTS.keys())
 if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
+    from .compression import Compression
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
@@ -87,7 +90,7 @@ if TYPE_CHECKING:
         Train,
     )
     from .tree import get_error_operator, get_tree_operator, get_unary_operator
-    from .typing import CallableModel, DictModel, ListModel, ThirdPartyType
+    from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType
     from .utils import load_h5, save_h5
 
 def __getattr__(name: str) -> _Any:

@@ -1,16 +1,16 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from inspect import Signature, signature
-from typing import Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key, PyTree
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from romjax.graph import Edge, Node
-from romjax.tree import TreePath, get_subtree, pytree_merge, set_subtree
+from romjax.tree import TreePath, coerce_tree_path, get_subtree, pytree_merge, set_subtree
 
 __all__ = ['eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel',
            'ImplicitSampleable', 'SourceSampleable']
@@ -146,7 +146,7 @@ class OuterToInnerRoute(BaseModel):
     def _coerce_paths(cls, value: Any) -> TreePath | None:
         if value is None:
             return None
-        return _coerce_path(value)
+        return coerce_tree_path(value)
 
 
 class InnerToOuterRoute(BaseModel):
@@ -159,8 +159,8 @@ class InnerToOuterRoute(BaseModel):
     :param inner: source path in the inner callable output tree
     """
 
-    outer: TreePath
-    inner: TreePath = ()
+    outer: Annotated[TreePath, BeforeValidator(coerce_tree_path)]
+    inner: Annotated[TreePath, BeforeValidator(coerce_tree_path)] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -168,11 +168,6 @@ class InnerToOuterRoute(BaseModel):
         if isinstance(value, tuple | list):
             return {"outer": value}
         return value
-
-    @field_validator("outer", "inner", mode="before")
-    @classmethod
-    def _coerce_paths(cls, value: Any) -> TreePath:
-        return _coerce_path(value)
 
 
 def identity_filter(x: PyTree, args: Any, **kwargs):
@@ -521,17 +516,6 @@ class FilterModel(Edge):
             return_aux=True,
         )
         return output, self._package_cached_states(produced_aux)
-
-
-def _coerce_path(value: Any) -> TreePath:
-    """Coerce a path-like object into a tuple path."""
-    if value is None:
-        return ()
-    if isinstance(value, tuple):
-        return value
-    if isinstance(value, list):
-        return tuple(value)
-    return (value,)
 
 
 def _assemble_inner_input(outer_payload: PyTree, routes: list[OuterToInnerRoute]) -> PyTree:

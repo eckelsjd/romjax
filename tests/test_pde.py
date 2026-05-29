@@ -1,6 +1,11 @@
+from pathlib import Path
+
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
+from romjax.compression import SVD
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
 from romjax.pde import BoundaryType, ImplicitIterativeGalerkin, UniformGrid, homogeneous_boundary
@@ -167,4 +172,32 @@ def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
     )["outputs"]
 
     assert jnp.allclose(z_galerkin, z_direct, atol=1e-6, rtol=1e-6)
+
+
+def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "dataset" / "train" / "galerkin_compression.npz"
+    compression = SVD(
+        energy_tol=0.9,
+        center=False,
+        rank=2,
+        mean=np.asarray([0.0, 0.0]),
+        basis=np.asarray([[1.0, 0.0], [0.0, 1.0]]),
+        singular_values=np.asarray([2.0, 1.0]),
+        minval=np.asarray([-1.0, -2.0]),
+        maxval=np.asarray([1.0, 2.0]),
+    )
+    compression.dump(artifact_path)
+    edge = ImplicitIterativeGalerkin(
+        source="a",
+        target="b",
+        name="galerkin",
+        path=["ab"],
+        compression=artifact_path,
+    )
+
+    assert edge.resolve_latent_dim() == 2
+    sample = edge.sample_source(jax.random.key(0))
+    assert sample["outputs"].shape == (2,)
+    assert jnp.all(sample["outputs"] >= jnp.asarray([-1.0, -2.0]))
+    assert jnp.all(sample["outputs"] <= jnp.asarray([1.0, 2.0]))
     
