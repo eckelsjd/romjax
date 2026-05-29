@@ -2,6 +2,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
 - [ ] Normalization for eqx transforms
+- [ ] Sample latent coeff from normal
 
 ## Needs testing
 - [ ] Reconstruction matching SVD

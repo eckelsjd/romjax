@@ -39,7 +39,7 @@ def uniform(key: jaxtyping.Key, shape=(), dtype=None, minval=0.0, maxval=1.0, *,
 
 def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs) -> ArrayLike:
     """Small wrapper of jax.random.normal to support mean/std args."""
-    return jax.random.normal(key, **kwargs) * std + mean
+    return jax.random.normal(key, **kwargs) * jnp.asarray(std) + jnp.asarray(mean)
 
 
 def dirac(key: jaxtyping.Key, value: ArrayLike = 0.0) -> ArrayLike:

@@ -11,6 +11,7 @@ import jax
 import numpy as np
 from alive_progress import alive_bar
 from jaxtyping import Key, PyTree
+from loguru import logger
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -196,10 +197,9 @@ class LoadDataConfig[T: Any](BaseModel, ABC):
         """Discover sample references below one dataset root."""
         raise NotImplementedError
 
-    @abstractmethod
-    def select_batch(self, refs: Sequence[T], indices: jax.Array, cursor: int) -> tuple[list[T], int]:
-        """Select one mini-batch from shuffled dataset references."""
-        raise NotImplementedError
+    def select_epoch_refs(self, refs: Sequence[T], indices: jax.Array) -> list[T]:
+        """Select the full epoch reference order from a shuffled dataset index order."""
+        return [refs[int(index)] for index in indices]
 
     @abstractmethod
     def load_batch(self, refs: Sequence[T]) -> dict[str, PyTree]:
@@ -478,7 +478,7 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     """
     File-based load configuration for implicit-model datasets corresponding to `GenImplicitModel`.
 
-    :param max_samples: maximum loaded output samples  (defaults to all)
+    :param max_samples: maximum loaded samples per epoch (defaults to all)
     :param max_input_samples: maximum loaded input samples  (defaults to all)
     :param max_outputs_per_input: maximum loaded output samples below each input sample  (defaults to all)
     :param skip_input: decide whether to skip a particular input sample when loading
@@ -543,39 +543,32 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
             )
         )
 
-    def select_batch(
-        self,
-        refs: Sequence[ImplicitSampleRef],
-        indices: jax.Array,
-        cursor: int,
-    ) -> tuple[list[ImplicitSampleRef], int]:
-        """Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end."""
-        batch_refs: list[ImplicitSampleRef] = []
+    def select_epoch_refs(self, refs: Sequence[ImplicitSampleRef], indices: jax.Array) -> list[ImplicitSampleRef]:
+        """Select a global shuffled subset of implicit samples subject to epoch-level caps."""
+        selected_refs: list[ImplicitSampleRef] = []
         unique_inputs: set[Path] = set()
         outputs_per_input: dict[Path, int] = {}
-        limit = min(cursor + self.batch_size, len(refs))
 
-        while cursor < limit:
-            sample_ref = refs[int(indices[cursor])]
+        for index in indices:
+            sample_ref = refs[int(index)]
             input_path, _, _ = sample_ref
-            cursor += 1
 
-            next_total = len(batch_refs) + 1
+            next_total = len(selected_refs) + 1
             next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
             next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
 
             if self.max_samples is not None and next_total > self.max_samples:
-                continue
+                break
             if self.max_input_samples is not None and next_input_total > self.max_input_samples:
                 continue
             if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
                 continue
 
-            batch_refs.append(sample_ref)
+            selected_refs.append(sample_ref)
             unique_inputs.add(input_path)
             outputs_per_input[input_path] = next_outputs_per_input
 
-        return batch_refs, cursor
+        return selected_refs
 
     def load_batch(self, refs: Sequence[ImplicitSampleRef]) -> dict[str, PyTree]:
         """Load stacked implicit-model mini-batches."""
@@ -622,7 +615,7 @@ class GenSource(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            sample_source = eqx.filter_jit(model.sample_source)
+            sample_source = model.sample_source
             skip = (
                 lambda p: (Path(p) / "source.h5").exists()
                 if write_policy == "reuse"
@@ -668,7 +661,7 @@ class GenSource(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            sample_source = eqx.filter_jit(eqx.filter_vmap(model.sample_source))
+            sample_source = eqx.filter_vmap(model.sample_source)
             skip = (
                 lambda p: (Path(p) / "source.h5").exists()
                 if write_policy == "reuse"
@@ -698,7 +691,7 @@ class LoadSource(LoadDataConfig[Path]):
     """
     File-based load configuration for source-node datasets corresponding to `GenSource`.
 
-    :param max_samples: maximum loaded source samples per yielded mini-batch (defaults to all)
+    :param max_samples: maximum loaded samples per epoch (defaults to all)
     :param skip_sample: decide whether to skip a particular source sample when loading
     """
 
@@ -741,33 +734,12 @@ class LoadSource(LoadDataConfig[Path]):
         """
         return list(self.walk_sample_directories(root, skip_sample=self.skip_sample))
 
-    def select_batch(
-        self,
-        refs: Sequence[Path],
-        indices: jax.Array,
-        cursor: int,
-    ) -> tuple[list[Path], int]:
-        """
-        Select one dataset batch from a shuffled epoch, allowing a partial batch at epoch end.
-
-        :param refs: Available source sample directories.
-        :param indices: Shuffled dataset indices for the current epoch.
-        :param cursor: Current position in ``indices``.
-        :return: The selected sample directories and updated cursor.
-        """
-        batch_refs: list[Path] = []
-        limit = min(cursor + self.batch_size, len(refs))
-
-        while cursor < limit:
-            sample_path = refs[int(indices[cursor])]
-            cursor += 1
-
-            if self.max_samples is not None and len(batch_refs) + 1 > self.max_samples:
-                continue
-
-            batch_refs.append(sample_path)
-
-        return batch_refs, cursor
+    def select_epoch_refs(self, refs: Sequence[Path], indices: jax.Array) -> list[Path]:
+        """Select a global shuffled subset of source samples subject to epoch-level caps."""
+        selected_refs = [refs[int(index)] for index in indices]
+        if self.max_samples is not None:
+            return selected_refs[: self.max_samples]
+        return selected_refs
 
     def load_batch(self, refs: Sequence[Path]) -> dict[str, PyTree]:
         """
@@ -796,11 +768,10 @@ class GenLatent(GenDataConfig):
         return value
 
     @model_validator(mode="after")
-    def _set_max_epochs_and_batch(self):
-        """Only load data once, and only need serial load."""
+    def _set_max_epochs(self):
+        """Only load data once"""
         for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
             ds_cfg.max_epochs = 1
-            ds_cfg.batch_size = 1
         return self
 
     def _selected_paths(self) -> list[TreePath]:
@@ -856,7 +827,9 @@ class GenLatent(GenDataConfig):
             return
 
         samples = list(self._iter_samples())
+        logger.info("Fitting compression...")
         compression = self.compression.fit(samples)
+        logger.info(f"Compression finished. Latent space: {compression.latent_size()}")
         compression.dump(artifact_path)
 
 
@@ -1022,6 +995,7 @@ class DataLoader(BaseModel):
         """
         ds_config = {}
         ds_paths = {}
+        ds_selected_refs = {}
         ds_totals = {}
 
         for path, ds_cfg in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
@@ -1032,7 +1006,14 @@ class DataLoader(BaseModel):
             if len(ds_paths[ds_name]) == 0:
                 raise ValueError(f"No samples found for dataset '{ds_name}' in {ds_root}")
 
-            ds_totals[ds_name] = len(ds_paths[ds_name])  # Total available data for each dataset
+            initial_indices = np.random.default_rng(np.random.SeedSequence([ds_cfg.shuffle_seed, 0])).permutation(
+                len(ds_paths[ds_name])
+            )
+            ds_selected_refs[ds_name] = ds_cfg.select_epoch_refs(ds_paths[ds_name], initial_indices)
+            if len(ds_selected_refs[ds_name]) == 0:
+                raise ValueError(f"No samples selected for dataset '{ds_name}' in {ds_root}")
+
+            ds_totals[ds_name] = len(ds_selected_refs[ds_name])
             ds_config[ds_name] = ds_cfg
 
         # Advance dataset epoch and cursor indices based on current training step
@@ -1050,23 +1031,25 @@ class DataLoader(BaseModel):
 
         ds_indices = {name: _shuffle_indices(name, ds_epochs[name]) for name in ds_config}
 
+        def _refresh_epoch(name: str) -> None:
+            """Advance a dataset to the next epoch and reshuffle the selected sample pool."""
+            ds_epochs[name] += 1
+            if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
+                ds_active[name] = False
+                ds_cursors[name] = len(ds_selected_refs[name])
+                return
+
+            ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
+            ds_cursors[name] = 0
+
         def _advance_dataset(name: str) -> None:
             """Advance one dataset by a single batch and update its termination state."""
             if not ds_active[name]:
                 return
 
-            _, next_cursor = ds_config[name].select_batch(ds_paths[name], ds_indices[name], ds_cursors[name])
-            if next_cursor >= ds_totals[name]:
-                ds_epochs[name] += 1
-                if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
-                    ds_active[name] = False
-                    ds_cursors[name] = ds_totals[name]
-                    return
-
-                ds_cursors[name] = 0
-                ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
-            else:
-                ds_cursors[name] = next_cursor
+            ds_cursors[name] += ds_config[name].batch_size
+            if ds_cursors[name] >= len(ds_selected_refs[name]):
+                _refresh_epoch(name)
 
         for _ in range(train_step):
             for name in ds_config:
@@ -1083,23 +1066,16 @@ class DataLoader(BaseModel):
             ds_batch = {}
 
             for name in active_names:
-                batch_paths, next_cursor = ds_config[name].select_batch(
-                    ds_paths[name],
-                    ds_indices[name],
-                    ds_cursors[name],
-                )
+                epoch_refs = ds_selected_refs[name]
+                batch_size = ds_config[name].batch_size
+                batch_paths = [
+                    epoch_refs[int(index)] for index in ds_indices[name][ds_cursors[name]:ds_cursors[name] + batch_size]
+                ]
                 ds_batch[name] = ds_config[name].load_batch(batch_paths)
+                ds_cursors[name] += len(batch_paths)
 
-                if next_cursor >= ds_totals[name]:
-                    ds_epochs[name] += 1
-                    if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
-                        ds_active[name] = False
-                        ds_cursors[name] = ds_totals[name]
-                    else:
-                        ds_cursors[name] = 0
-                        ds_indices[name] = _shuffle_indices(name, ds_epochs[name])
-                else:
-                    ds_cursors[name] = next_cursor
+                if ds_cursors[name] >= len(epoch_refs):
+                    _refresh_epoch(name)
 
             yield ds_batch
     

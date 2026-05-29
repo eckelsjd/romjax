@@ -56,21 +56,28 @@ def _get_graph():
     return graph
 
 
-def _write_poisson_dataset(root: Path, dataset_name: str = "train/poisson") -> None:
+def _write_poisson_dataset(
+    root: Path,
+    dataset_name: str = "train/poisson",
+    sample_count: int = 2,
+    outputs_per_input: int = 1,
+) -> None:
     samples = (
         (np.asarray([10.0, 0.0], dtype=np.float32), np.asarray([-1.0, 0.0], dtype=np.float32)),
         (np.asarray([0.0, 1.0], dtype=np.float32), np.asarray([0.0, -1.0], dtype=np.float32)),
     )
-    for sample_idx, (phi, residual) in enumerate(samples):
+    for sample_idx in range(sample_count):
+        phi, residual = samples[sample_idx % len(samples)]
         input_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
-        output_dir = input_dir / "seed_0" / "sample_0"
         input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"x": np.asarray(sample_idx, dtype=np.float32)}, input_dir / "input.h5", mode="w")
         save_h5({"phi": phi}, input_dir / "solution.h5", mode="w")
         save_h5({"phi_residual": residual}, input_dir / "solution_residual.h5", mode="w")
-        save_h5({"phi": phi}, output_dir / "output.h5", mode="w")
-        save_h5({"phi_residual": residual}, output_dir / "residual.h5", mode="w")
+        for output_idx in range(outputs_per_input):
+            output_dir = input_dir / "seed_0" / f"sample_{output_idx}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_h5({"phi": phi + output_idx}, output_dir / "output.h5", mode="w")
+            save_h5({"phi_residual": residual}, output_dir / "residual.h5", mode="w")
 
 
 class _ToySourceEdge(Edge, SourceSampleable):
@@ -110,6 +117,24 @@ class _DummyCompression(Compression):
 
     def latent_bounds(self):
         return jnp.asarray([0.0], dtype=jnp.float32), jnp.asarray([1.0], dtype=jnp.float32)
+    
+    def latent_normal(self):
+        pass
+
+
+class _TrackingLoadSource(LoadSource):
+    select_calls: int = 0
+
+    def select_epoch_refs(self, refs, indices):
+        self.select_calls += 1
+        return super().select_epoch_refs(refs, indices)
+
+
+def _write_source_dataset(root: Path, dataset_name: str = "train/source", sample_count: int = 6) -> None:
+    for sample_idx in range(sample_count):
+        sample_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        save_h5({"state": {"x": np.asarray([sample_idx], dtype=np.float32)}}, sample_dir / "source.h5", mode="w")
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -241,6 +266,76 @@ def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None
     assert compression.rank == 1
     assert compression.scale == 2.0
     assert compression.template is not None
+
+
+def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:
+    _write_poisson_dataset(tmp_path, sample_count=5)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "poisson": {
+                    "kind": "implicit",
+                    "batch_size": 2,
+                    "max_samples": 3,
+                    "max_epochs": 1,
+                    "load_solution": False,
+                }
+            }
+        },
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 2
+    assert sum(batch["poisson"]["inputs"]["x"].shape[0] for batch in batches) == 3
+    assert sum(batch["poisson"]["outputs"]["phi"].shape[0] for batch in batches) == 3
+    assert len(np.unique(np.asarray(jnp.concatenate([batch["poisson"]["inputs"]["x"] 
+                                                     for batch in batches]).reshape(-1)))) == 3
+
+
+def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Path) -> None:
+    _write_poisson_dataset(tmp_path, sample_count=4, outputs_per_input=3)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "poisson": {
+                    "kind": "implicit",
+                    "batch_size": 2,
+                    "max_samples": 5,
+                    "max_input_samples": 2,
+                    "max_outputs_per_input": 2,
+                    "load_solution": False,
+                    "shuffle_seed": 0,
+                    "max_epochs": 1,
+                }
+            }
+        },
+    )
+
+    batches = list(loader)
+    inputs = jnp.concatenate([batch["poisson"]["inputs"]["x"] for batch in batches]).reshape(-1)
+
+    assert sum(batch["poisson"]["outputs"]["phi"].shape[0] for batch in batches) == 4
+    assert len(np.unique(np.asarray(inputs))) == 2
+    assert all(count <= 2 for count in np.unique(np.asarray(inputs), return_counts=True)[1])
+
+
+def test_loader_selects_epoch_pool_once_per_dataset(tmp_path: Path) -> None:
+    _write_source_dataset(tmp_path, sample_count=6)
+    source_cfg = _TrackingLoadSource(
+        batch_size=2,
+        max_samples=3,
+        max_epochs=2,
+        shuffle_seed=0,
+    )
+    loader = DataLoader(root=tmp_path, datasets={"train": {"source": source_cfg}})
+
+    batches = list(loader)
+
+    assert source_cfg.select_calls == 1
+    assert sum(batch["source"]["state"]["x"].shape[0] for batch in batches) == 6
 
 
 def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -> None:
