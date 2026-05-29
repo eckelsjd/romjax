@@ -1,5 +1,9 @@
 !romx:Train
-routine_config: demo/diagnostics.yml
+routine_config: config/common.yml
+root: training
+write_policy: reuse
+graph: config/graph.yml
+init_seed: 0
 
 loss: !romx:GraphLoss
   - { callable: reconstruction, path: [coordinate transform] }
@@ -8,7 +12,9 @@ init_params: !romx:PyTreeSampler
   coordinate transform:
     call_args:
       name: LinearProjection
-      kwargs: { n_latent: 20, dof: 1024 }
+      kwargs:
+        latent: !romx:GraphRef [edges, galerkin, latent_dim]
+        dof: 1024
   residual transform: coordinate transform
 optimizer:
   name: optax.chain
@@ -21,9 +27,9 @@ optimizer:
           kwargs: { init_value: 0.01, transition_steps: 1000, decay_rate: 0.99 }
     - { name: optax.scale, args: [-1.0] }
 
-dataloader: !romx:DataLoader demo/dataset/train
+dataloader: !romx:DataLoader dataset/train
 test: !romx.GraphTest
-  dataloader: demo/dataset/validation
+  dataloader: dataset/validation
   terms:
     - { callable: reconstruction, path: [coordinate transform] }
 termination: 
@@ -33,10 +39,3 @@ diagnostics:
   log_interval: 1
   plot_interval: 1
   live_plot: true
-  save_plot: {}
-  train_plot: {}
-  validation_plot: {}
-
-root: demo/training
-write_policy: reuse
-graph: demo/poisson_graph.yml

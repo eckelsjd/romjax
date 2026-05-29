@@ -3,6 +3,8 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
 
+__all__ = ["LinearProjection"]
+
 
 class LinearProjection(eqx.Module):
     """Linear projection module with tied transpose reconstruction."""

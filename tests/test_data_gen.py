@@ -1,8 +1,20 @@
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from romjax.data_gen import DataGeneration, DataLoader, GenDataConfig, GenSource, LoadImplicitModel, LoadSource
+from romjax.compression import SVD, Compression
+from romjax.data_gen import (
+    DataGeneration,
+    DataLoader,
+    GenDataConfig,
+    GenLatent,
+    GenSource,
+    LoadImplicitModel,
+    LoadSource,
+)
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.utils import save_h5
@@ -44,6 +56,23 @@ def _get_graph():
     return graph
 
 
+def _write_poisson_dataset(root: Path, dataset_name: str = "train/poisson") -> None:
+    samples = (
+        (np.asarray([10.0, 0.0], dtype=np.float32), np.asarray([-1.0, 0.0], dtype=np.float32)),
+        (np.asarray([0.0, 1.0], dtype=np.float32), np.asarray([0.0, -1.0], dtype=np.float32)),
+    )
+    for sample_idx, (phi, residual) in enumerate(samples):
+        input_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
+        output_dir = input_dir / "seed_0" / "sample_0"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_h5({"x": np.asarray(sample_idx, dtype=np.float32)}, input_dir / "input.h5", mode="w")
+        save_h5({"phi": phi}, input_dir / "solution.h5", mode="w")
+        save_h5({"phi_residual": residual}, input_dir / "solution_residual.h5", mode="w")
+        save_h5({"phi": phi}, output_dir / "output.h5", mode="w")
+        save_h5({"phi_residual": residual}, output_dir / "residual.h5", mode="w")
+
+
 class _ToySourceEdge(Edge, SourceSampleable):
     bias: float = 0.0
 
@@ -60,6 +89,27 @@ class _ToySourceEdge(Edge, SourceSampleable):
                 "meta": jnp.asarray([self.bias], dtype=jnp.float32),
             }
         }
+
+
+class _DummyCompression(Compression):
+    scale: float = 1.0
+    rank: int = 1
+    template: dict | None = None
+
+    def fit(self, samples):
+        return type(self)(scale=self.scale, rank=self.rank, template=samples[0] if samples else None)
+
+    def compress(self, sample):
+        return jnp.asarray([self.scale], dtype=jnp.float32)
+
+    def reconstruct(self, latent):
+        return self.template if self.template is not None else latent
+
+    def latent_size(self):
+        return int(self.rank)
+
+    def latent_bounds(self):
+        return jnp.asarray([0.0], dtype=jnp.float32), jnp.asarray([1.0], dtype=jnp.float32)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -161,6 +211,88 @@ def test_source_data_config_types(tmp_path):
 
     assert isinstance(generation.datasets["source"], GenSource)
     assert isinstance(loader.datasets["source"], LoadSource)
+
+
+def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None:
+    _write_poisson_dataset(tmp_path)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "poisson": {
+                    "kind": "implicit",
+                    "batch_size": 1,
+                    "load_solution": False,
+                }
+            }
+        },
+    )
+    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
+    generator = GenLatent(
+        loader=loader,
+        gather_paths=[("poisson", "outputs", "phi")],
+        compression=_DummyCompression(scale=2.0, rank=1),
+        filename="galerkin_compression.npz",
+    )
+
+    generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
+    compression = Compression.load(artifact_path)
+    assert isinstance(compression, _DummyCompression)
+    assert compression.rank == 1
+    assert compression.scale == 2.0
+    assert compression.template is not None
+
+
+def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -> None:
+    _write_poisson_dataset(tmp_path)
+    for sample_idx in range(2):
+        output_dir = (
+            tmp_path
+            / "train"
+            / "poisson"
+            / "seed_0"
+            / f"sample_{sample_idx}"
+            / "seed_0"
+            / "sample_0"
+        )
+        save_h5(
+            {
+                "phi": np.asarray([sample_idx, sample_idx + 1], dtype=np.float32),
+                "psi": np.asarray([2.0, 3.0], dtype=np.float32),
+            },
+            output_dir / "output.h5",
+                mode="w",
+            )
+
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "poisson": {
+                    "kind": "implicit",
+                    "batch_size": 1,
+                    "load_solution": False,
+                }
+            }
+        },
+    )
+    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
+    generator = GenLatent(
+        loader=loader,
+        gather_paths=[("poisson", "outputs", "phi"), ("poisson", "outputs", "psi")],
+        compression=SVD(rank=1, center=False),
+        filename="galerkin_compression.npz",
+    )
+
+    generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
+    compression = Compression.load(artifact_path)
+    assert isinstance(compression, SVD)
+    assert compression.rank == 1
+    assert compression.latent_size() == 1
+    assert compression.template is not None
+    reconstructed = compression.reconstruct(compression.compress(compression.template))
+    assert reconstructed["poisson"]["outputs"]["phi"].shape == (2,)
+    assert reconstructed["poisson"]["outputs"]["psi"].shape == (2,)
 
 
 def test_data_loader_supports_nested_dataset_pytree(tmp_path):

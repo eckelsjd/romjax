@@ -1,4 +1,6 @@
 """Data generation routine and data loading."""
+from __future__ import annotations
+
 import inspect
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -9,16 +11,38 @@ import jax
 import numpy as np
 from alive_progress import alive_bar
 from jaxtyping import Key, PyTree
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PositiveInt, PrivateAttr, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    PrivateAttr,
+    model_validator,
+)
 
+from romjax.compression import SVD, Compression
 from romjax.graph import Edge, FunctionGraph
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
-from romjax.tree import pytree_iter, pytree_path_iter, pytree_stack
+from romjax.tree import (
+    TreePath,
+    coerce_tree_paths,
+    get_subtree,
+    pytree_iter,
+    pytree_path_iter,
+    pytree_stack,
+    set_subtree,
+)
 from romjax.typing import from_yaml
 from romjax.utils import load_h5, required_fields, save_h5
 
-__all__ = ["DataGeneration", "DataLoader", "GenDataConfig", "LoadDataConfig"]
+__all__ = [
+    "DataGeneration",
+    "DataLoader",
+    "GenDataConfig",
+    "LoadDataConfig",
+]
 
 
 def _get_kwargs(fn: Callable) -> set[str]:
@@ -755,9 +779,92 @@ class LoadSource(LoadDataConfig[Path]):
         return pytree_stack([load_h5({}, ref / "source.h5", jax=True) for ref in refs])
 
 
+class GenLatent(GenDataConfig):
+    """Fit a latent-space compressor and emit the compression artifact."""
+
+    loader: DataLoader
+    filename: str | Path = "compression.npz"
+    gather_paths: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
+    gather_template: Any | None = None
+    compression: Compression = Field(default_factory=lambda: SVD(energy_tol=0.999))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_loader(cls, value):
+        if isinstance(value, str | Path | DataLoader):
+            return {"loader": value}
+        return value
+
+    @model_validator(mode="after")
+    def _set_max_epochs_and_batch(self):
+        """Only load data once, and only need serial load."""
+        for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+            ds_cfg.max_epochs = 1
+            ds_cfg.batch_size = 1
+        return self
+
+    def _selected_paths(self) -> list[TreePath]:
+        paths = list(self.gather_paths)
+        if self.gather_template is not None:
+            def _collect(template: PyTree, prefix: TreePath = ()) -> list[TreePath]:
+                if isinstance(template, Mapping):
+                    paths: list[TreePath] = []
+                    for key, value in template.items():
+                        paths.extend(_collect(value, prefix + (key,)))
+                    return paths
+                if isinstance(template, tuple):
+                    paths: list[TreePath] = []
+                    for index, value in enumerate(template):
+                        paths.extend(_collect(value, prefix + (index,)))
+                    return paths
+                if isinstance(template, list):
+                    paths: list[TreePath] = []
+                    for index, value in enumerate(template):
+                        paths.extend(_collect(value, prefix + (index,)))
+                    return paths
+                if template is None or template is False:
+                    return []
+                return [prefix]
+
+            paths.extend(_collect(self.gather_template))
+        return paths
+
+    def _merge_selected_sample(self, sample: PyTree) -> PyTree:
+        selected_paths = self._selected_paths()
+        if not selected_paths:
+            return sample
+
+        merged: PyTree | None = None
+        for path in selected_paths:
+            merged = set_subtree(merged, path, get_subtree(sample, path))
+        return merged if merged is not None else sample
+
+    def _iter_samples(self) -> Generator[PyTree, None, None]:
+        for batch in self.loader:
+            for dataset_name, loaded in batch.items():
+                for sample in pytree_iter(loaded):
+                    yield self._merge_selected_sample({dataset_name: sample})
+
+    def generate(self, path, format=None, write_policy=None):
+        """Fit latent coordinates from loaded data and emit the compression artifact."""
+        _, write_policy = self._validate_format_and_policy(format, write_policy)
+        artifact_path = Path(path) / self.filename
+
+        if write_policy == "error" and artifact_path.exists():
+            raise RoutineError(f"Latent compression artifact already exists at {artifact_path} and policy='error'")
+        if write_policy == "reuse" and artifact_path.exists():
+            return
+
+        samples = list(self._iter_samples())
+        compression = self.compression.fit(samples)
+        compression.dump(artifact_path)
+
+
 def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
     """Validate every leaf in a pytree-like template as a :class:`GenDataConfig`. Leave anything else untouched."""
     if isinstance(template, Mapping):
+        if all(field in template for field in required_fields(GenLatent)):
+            return GenLatent(**template)
         if all(field in template for field in required_fields(GenImplicitModel)):
             return GenImplicitModel(**template)
         if all(field in template for field in required_fields(GenSource)):

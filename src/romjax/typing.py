@@ -20,11 +20,12 @@ from pydantic import (
     PrivateAttr,
     SerializationInfo,
     TypeAdapter,
+    field_validator,
     model_serializer,
     model_validator,
 )
 
-__all__ = ['DictModel', 'ListModel', 'CallableModel', 'ThirdPartyType', 'WriteStream',
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'GraphRef', 'ThirdPartyType', 'WriteStream', 'GraphRef',
            'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
 
 
@@ -46,6 +47,50 @@ def require_attr(required_attr: str, value: Any):
     if not hasattr(value, required_attr):
         raise ValueError(f"Expected attribute '{required_attr}'")
     return value
+
+
+class GraphRef(BaseModel):
+    """Reference a value inside a graph or graph-backed config tree by path."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    path: tuple[str | int, ...]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_path(cls, value):
+        if isinstance(value, list | tuple):
+            return {"path": value}
+        return value
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _coerce_path(cls, value):
+        if isinstance(value, list | tuple):
+            return tuple(
+                int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token
+                for token in value
+            )
+        return value
+
+    def resolve(self, graph: Any) -> Any:
+        """Resolve this reference against a graph-like object."""
+        from romjax.tree import get_subtree
+
+        value = get_subtree(graph, self.path)
+        if len(self.path) == 0:
+            return value
+
+        if value is None:
+            parent = get_subtree(graph, self.path[:-1])
+            field_name = str(self.path[-1])
+            resolver = getattr(parent, f"resolve_{field_name}", None)
+            if callable(resolver):
+                resolved = resolver()
+                if resolved is not None:
+                    return resolved
+
+        return value
 
 
 def from_yaml(value: str | Path | bytes | Any) -> Any:

@@ -12,10 +12,12 @@ import pytest
 from orbax.checkpoint import v1 as ocp
 
 from romjax import YamlLoader
+from romjax.compression import SVD
 from romjax.data_gen import DataLoader, LoadImplicitModel, LoadSource
-from romjax.graph import Edge, FunctionGraph, Node
+from romjax.graph import Edge, FunctionGraph, IdentityEdge, Node
 from romjax.model import ImplicitSampleable
 from romjax.nn import LinearProjection
+from romjax.pde import ImplicitIterativeGalerkin
 from romjax.rng import PyTreeSampler
 from romjax.routine import RoutineError
 from romjax.train import (
@@ -28,6 +30,7 @@ from romjax.train import (
     Train,
 )
 from romjax.tree import pytree_norm
+from romjax.typing import GraphRef
 from romjax.utils import save_h5
 
 
@@ -689,6 +692,58 @@ train: !romx:Train
     assert train.loss.terms[0].edge == "toy"
     assert train.test.terms[0].edge == "toy"
     assert train.init_params["toy"]["alias"] == "toy,weight"
+
+
+def test_train_initialization_resolves_graph_latent_dim_from_source_sampler(tmp_path: Path) -> None:
+    compression = SVD(
+        energy_tol=0.9,
+        center=False,
+        rank=3,
+        mean=np.asarray([0.0, 0.0, 0.0, 0.0]),
+        basis=np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ]
+        ),
+        singular_values=np.asarray([3.0, 2.0, 1.0]),
+        minval=np.asarray([-1.0, -1.0, -1.0]),
+        maxval=np.asarray([1.0, 1.0, 1.0]),
+    )
+
+    graph = FunctionGraph(
+        edges={
+            "ab": IdentityEdge(source="a", target="b", name="ab"),
+            "bc": IdentityEdge(source="b", target="c", name="bc"),
+            "galerkin": ImplicitIterativeGalerkin(
+                source="a",
+                target="c",
+                name="galerkin",
+                path=["ab", "bc"],
+                compression=compression,
+            ),
+        }
+    )
+    train = Train(
+        loss=scalar_zero_loss,
+        init_params=PyTreeSampler(
+            toy={
+                "module": {
+                    "name": "LinearProjection",
+                    "kwargs": {
+                        "latent": GraphRef(path=("edges", "galerkin", "compression", "rank")),
+                        "dof": 4,
+                    },
+                }
+            }
+        ),
+        optimizer=optax.sgd(0.1),
+        graph=graph,
+    )
+
+    assert train.init_params["toy"]["module"].matrix.shape == (3, 4)
+    assert train.graph.edges["galerkin"].resolve_latent_dim() == 3
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
