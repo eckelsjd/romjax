@@ -8,7 +8,7 @@ import pytest
 from romjax.compression import SVD
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
-from romjax.pde import BoundaryType, ImplicitIterativeGalerkin, UniformGrid, homogeneous_boundary
+from romjax.pde import BoundaryType, ImplicitIterativeGalerkin, LatentSamplerFactory, UniformGrid, homogeneous_boundary
 from romjax.tree import pytree_merge
 
 
@@ -193,9 +193,11 @@ def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Pat
         name="galerkin",
         path=["ab"],
         compression=artifact_path,
+        source_sampler=LatentSamplerFactory(distribution="uniform"),
     )
 
     assert edge.resolve_latent_dim() == 2
+    edge.resolve_source_sampler()
     sample = edge.sample_source(jax.random.key(0))
     assert sample["outputs"].shape == (2,)
     assert jnp.all(sample["outputs"] >= jnp.asarray([-1.0, -2.0]))

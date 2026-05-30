@@ -300,6 +300,9 @@ class GraphLossTerm(BaseModel):
         graph: FunctionGraph
     ) -> jax.Array:
         if self.batch_reduce is not None:
+            if self.dataset is not None and self.dataset not in batch_data:
+                return jnp.asarray(0.0)  # if a dataset runs out during iteration
+            
             term_batch = batch_data[self.dataset] if self.dataset is not None else batch_data
 
             def body(carry, single_data):

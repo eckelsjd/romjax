@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import jax
@@ -262,10 +263,16 @@ def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None
 
     generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
     compression = Compression.load(artifact_path)
+    manifest = json.loads((artifact_path.with_suffix(".manifest.json")).read_text())
     assert isinstance(compression, _DummyCompression)
     assert compression.rank == 1
     assert compression.scale == 2.0
     assert compression.template is not None
+    assert manifest == {
+        "latent_size": 1,
+        "latent_bounds": [[0.0], [1.0]],
+        "latent_normal": None,
+    }
 
 
 def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:

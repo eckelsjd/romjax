@@ -320,49 +320,38 @@ def _default_latent_sampler(
     distribution: Literal["uniform", "normal"] = "normal",
 ) -> SamplerCallable:
     """Build a uniform or normal latent sampler under the requested pytree path."""
+    minval, maxval = compression.latent_bounds()
+    latent_normal = compression.latent_normal()
+    latent_size = compression.latent_size()
+
     if distribution == "uniform":
-        minval, maxval = compression.latent_bounds()
         if minval is None or maxval is None:
             raise ValueError("Uniform latent sampling requires compression latent bounds.")
-        latent_size = compression.latent_size()
+
         sampler = {
             "callable": "uniform",
             "shape": [latent_size],
             "minval": jnp.asarray(minval).tolist(),
             "maxval": jnp.asarray(maxval).tolist(),
-        }
-        template = set_subtree(None, path, sampler)
-        return PyTreeSampler(**template)
+        }     
     
     elif distribution == "normal":
-        latent_normal = compression.latent_normal()
-        if latent_normal is not None:
-            mean, std = latent_normal
-            latent_size = compression.latent_size()
-            sampler = {
-                "callable": "normal",
-                "shape": [latent_size],
-                "mean": jnp.asarray(mean).tolist(),
-                "std": jnp.asarray(std).tolist(),
-            }
-            template = set_subtree(None, path, sampler)
-            return PyTreeSampler(**template)
-
-        minval, maxval = compression.latent_bounds()
-        if minval is None or maxval is None:
-            raise ValueError("Latent sampling requires either latent normal statistics or bounds.")
-        latent_size = compression.latent_size()
+        if latent_normal is None:
+            raise ValueError("Normal latent sampling requires compression (mean, std)")
+        
+        mean, std = latent_normal
         sampler = {
-            "callable": "uniform",
+            "callable": "normal",
             "shape": [latent_size],
-            "minval": jnp.asarray(minval).tolist(),
-            "maxval": jnp.asarray(maxval).tolist(),
+            "mean": jnp.asarray(mean).tolist(),
+            "std": jnp.asarray(std).tolist(),
         }
-        template = set_subtree(None, path, sampler)
-        return PyTreeSampler(**template)
     
     else:
         raise ValueError(f"Latent sampler distribution '{distribution}' not recognized.")
+    
+    template = set_subtree(None, path, sampler)
+    return PyTreeSampler(**template)
 
 
 class LatentSamplerFactory(CallableModel):
@@ -420,7 +409,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         if compression is None:
             return None
 
-        if isinstance(sampler, LatentSamplerFactory):
+        if sampler is not None:
             sampler = sampler(compression)
             object.__setattr__(self, "_resolved_source_sampler", sampler)
             return sampler
@@ -463,9 +452,10 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         return ret, aux
 
     def sample_source(self, key: Key) -> PyTree:
-        sampler = self.resolve_source_sampler()
+        sampler = self._resolved_source_sampler
         if sampler is not None:
             if hasattr(sampler, "sample"):
                 return sampler.sample(key)
             return sampler(key)
-        return {}  
+        else:
+            raise ValueError("Source sampler has not been resolved yet.")

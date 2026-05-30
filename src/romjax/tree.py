@@ -750,24 +750,34 @@ def pytree_iter(tree: PyTree) -> Generator[PyTree, None, None]:
         yield jax.tree_util.tree_unflatten(treedef, [leaf[i] for leaf in leaves])
 
 
-def pytree_path_iter(tree: PyTree, is_leaf: Callable[[Any], bool] = eqx.is_array) -> Generator[Any, None, None]:
-    """Yield tuples of (path, leaf) for all leaves in the tree."""
-    leaves_with_path, _ = jax.tree_util.tree_flatten_with_path(tree, is_leaf=is_leaf)
+def pytree_path_iter(
+    tree: PyTree,
+    is_leaf: Callable[[Any], bool] = eqx.is_array,
+) -> Generator[tuple[TreePath, PyTree], None, None]:
+    """Yield tuples of ``(path, leaf)`` for all leaves in the tree.
 
-    for key_path, leaf in leaves_with_path:
-        path: list[PathToken] = []
-        for key in key_path:
-            if isinstance(key, jax.tree_util.DictKey):
-                path.append(key.key)
-            elif isinstance(key, jax.tree_util.SequenceKey):
-                path.append(key.idx)
-            elif isinstance(key, jax.tree_util.GetAttrKey):
-                path.append(key.name)
-            elif isinstance(key, jax.tree_util.FlattenedIndexKey):
-                path.append(key.key)
-            else:
-                raise TypeError(f"Unsupported pytree key type: {type(key)!r}")
-        yield tuple(path), leaf
+    This walks standard ``dict``/``list``/``tuple`` containers directly so the
+    yielded order matches Python's native container order.
+    """
+
+    def _iter(node: PyTree, path: list[PathToken]) -> Generator[tuple[TreePath, PyTree], None, None]:
+        if is_leaf(node) or not isinstance(node, (Mapping, list, tuple)):
+            yield tuple(path), node
+            return
+
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                path.append(key)
+                yield from _iter(value, path)
+                path.pop()
+            return
+
+        for index, value in enumerate(node):
+            path.append(index)
+            yield from _iter(value, path)
+            path.pop()
+
+    yield from _iter(tree, [])
 
 
 def pytree_at(tree: PyTree, index: int) -> PyTree:

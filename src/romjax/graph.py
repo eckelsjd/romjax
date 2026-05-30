@@ -321,7 +321,9 @@ class CompositeEdge(Edge):
 # Equivalent to the alias NodeList = ListModel[Node], but now others can use this by importing it
 class NodeList(ListModel[Node]):
     """A list of graph nodes."""
-    pass
+    
+    def __repr__(self):
+        return f"[{', '.join([node.name for node in self.values()])}]"
 
 
 class EdgeList(ListModel[Edge]):
@@ -329,6 +331,9 @@ class EdgeList(ListModel[Edge]):
 
     Untyped edge inputs (e.g., dicts or strings) are parsed as :class:`IdentityEdge` by default.
     """
+
+    def __repr__(self):
+        return f"[{', '.join([repr(edge) for edge in self.values()])}]"
 
     def __setitem__(self, key: str | int, value: Any) -> None:
         if not isinstance(value, Edge):
@@ -341,6 +346,9 @@ class FunctionGraph(BaseModel):
 
     nodes: NodeList = Field(default_factory=NodeList)
     edges: EdgeList = Field(default_factory=EdgeList)
+
+    def __repr__(self):
+        return f"FunctionGraph{repr(self.edges)}"
 
     @model_validator(mode='after')
     def _add_extra_nodes_from_edges(self):
