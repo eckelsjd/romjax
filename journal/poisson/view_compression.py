@@ -6,6 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -18,16 +19,16 @@ import jax.numpy as jnp
 
 from romjax import YamlLoader
 from romjax.compression import SVD
-from romjax.data_gen import GenLatent
+from romjax.data_gen import DataLoader, GenLatent, LoadSource
 from romjax.plotting import AxisOptions, PlotSpec, gridplot
-from romjax.tree import norm as pytree_norm
+from romjax.tree import norm as pytree_norm, pytree_iter
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 STYLE_PATH = REPO_ROOT / "src" / "romjax" / "stix.mplstyle"
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config" / "gen_data.yml"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "figures" / "latent"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "figures" / "compression"
 
 
 def _use_style() -> None:
@@ -36,23 +37,53 @@ def _use_style() -> None:
         plt.style.use(STYLE_PATH)
 
 
-def _load_generator(config_path: Path) -> GenLatent:
-    """Load the latent-generation config from YAML."""
+def _load_generation_config(config_path: Path) -> Any:
+    """Load the generation config from YAML."""
     os.chdir(SCRIPT_DIR)
-    config = YamlLoader.load(config_path)
+    return YamlLoader.load(config_path)
+
+
+def _load_generator(config: Any) -> GenLatent:
+    """Extract the latent-generation config from a loaded generation config."""
     generator = config.datasets["train"]["compression"]
     if not isinstance(generator, GenLatent):
         raise TypeError("Expected the train/compression config to resolve to GenLatent.")
     return generator
 
 
-def _sample_latents(compression: SVD, samples: list[dict]) -> np.ndarray:
+def _sample_latents(compression: SVD, samples: list[dict[str, Any]]) -> np.ndarray:
     """Project all samples into latent space and return a dense array."""
     latent = [np.asarray(compression.compress(sample), dtype=np.float64).reshape(-1) for sample in samples]
     return np.stack(latent, axis=0)
 
 
-def _relative_reconstruction_errors(compression: SVD, samples: list[dict]) -> np.ndarray:
+def _flatten_sample(sample: dict[str, Any]) -> np.ndarray:
+    """Flatten a loaded source sample into a 1D latent vector."""
+    leaves = [np.ravel(np.asarray(leaf, dtype=np.float64)) for leaf in jax.tree.leaves(sample)]
+    if not leaves:
+        return np.asarray([], dtype=np.float64)
+    return np.concatenate(leaves, axis=0)
+
+
+def _load_source_latents(root: Path) -> np.ndarray:
+    """Load and flatten all train/galerkin samples using the built-in DataLoader."""
+    loader = DataLoader(
+        root=root,
+        datasets={"train": {"galerkin": LoadSource(batch_size=64, max_epochs=1)}},
+    )
+
+    source_latents: list[np.ndarray] = []
+    for batch in loader:
+        for sample in pytree_iter(batch["galerkin"]):
+            source_latents.append(_flatten_sample(sample))
+
+    if len(source_latents) == 0:
+        raise ValueError(f"No Galerkin samples found under {root / 'train' / 'galerkin'}.")
+
+    return np.stack(source_latents, axis=0)
+
+
+def _relative_reconstruction_errors(compression: SVD, samples: list[dict[str, Any]]) -> np.ndarray:
     """Compute relative reconstruction error for each sample."""
     errors: list[float] = []
     for sample in samples:
@@ -65,12 +96,12 @@ def _relative_reconstruction_errors(compression: SVD, samples: list[dict]) -> np
     return np.asarray(errors, dtype=np.float64)
 
 
-def _field_array(sample: dict) -> np.ndarray:
+def _field_array(sample: dict[str, Any]) -> np.ndarray:
     """Extract the Poisson field from one latent sample."""
     return np.asarray(sample["poisson"]["outputs"]["phi"], dtype=np.float64)
 
 
-def _plot_field_comparison(samples: list[dict], compression: SVD, output_dir: Path) -> None:
+def _plot_field_comparison(samples: list[dict[str, Any]], compression: SVD, output_dir: Path) -> None:
     """Plot original, reconstructed, and absolute error fields for four samples."""
     n_rows = min(4, len(samples))
     if n_rows == 0:
@@ -122,6 +153,55 @@ def _plot_field_comparison(samples: list[dict], compression: SVD, output_dir: Pa
     plt.close(fig)
 
 
+def _plot_random_source_reconstructions(
+    source_latent_matrix: np.ndarray,
+    compression: SVD,
+    output_dir: Path,
+) -> None:
+    """Plot a 3x3 grid of randomly reconstructed fields from source samples."""
+    if source_latent_matrix.size == 0:
+        raise ValueError("Source latent matrix is empty.")
+
+    rng = np.random.default_rng(0)
+    n_samples = source_latent_matrix.shape[0]
+    sample_indices = rng.choice(n_samples, size=9, replace=n_samples < 9)
+
+    reconstructed_fields = [
+        _field_array(compression.reconstruct(source_latent_matrix[int(sample_idx)]))
+        for sample_idx in sample_indices
+    ]
+
+    x = np.linspace(0.0, 1.0, reconstructed_fields[0].shape[0])
+    y = np.linspace(0.0, 1.0, reconstructed_fields[0].shape[1])
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+
+    field_vmin = float(np.min([field.min() for field in reconstructed_fields]))
+    field_vmax = float(np.max([field.max() for field in reconstructed_fields]))
+
+    rows: list[list[PlotSpec]] = []
+    for row_idx in range(3):
+        row: list[PlotSpec] = []
+        for col_idx in range(3):
+            field_idx = row_idx * 3 + col_idx
+            row.append(
+                PlotSpec(
+                    kind="pcolor",
+                    data=(xx, yy, reconstructed_fields[field_idx]),
+                    opts=AxisOptions(
+                        ax_visible=False,
+                        grid=False,
+                        title=f"Reconstruction {field_idx + 1}",
+                    ),
+                    kwargs={"cmap": "viridis", "vmin": field_vmin, "vmax": field_vmax},
+                )
+            )
+        rows.append(row)
+
+    fig, _axs = gridplot(rows, scheme="dark", subplot_size_in=(3.2, 2.8), subplots_kwargs={"squeeze": False})
+    fig.savefig(output_dir / "source_reconstructed_fields.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_singular_spectrum(compression: SVD, output_dir: Path) -> None:
     """Plot the singular value spectrum and cumulative energy."""
     singular_values = np.asarray(compression.singular_values, dtype=np.float64)
@@ -157,9 +237,14 @@ def _plot_singular_spectrum(compression: SVD, output_dir: Path) -> None:
     plt.close(fig)
 
 
-def _plot_latent_histograms(latent_matrix: np.ndarray, output_dir: Path) -> None:
-    """Plot histograms for the first nine latent coordinates."""
-    latent_dim = latent_matrix.shape[1]
+def _plot_latent_histograms(latent_matrix: np.ndarray, source_latent_matrix: np.ndarray, output_dir: Path) -> None:
+    """Plot overlaid histograms for the first nine latent coordinates."""
+    if latent_matrix.size == 0:
+        raise ValueError("Compression latent matrix is empty.")
+    if source_latent_matrix.size == 0:
+        raise ValueError("Source latent matrix is empty.")
+
+    latent_dim = min(latent_matrix.shape[1], source_latent_matrix.shape[1])
     n_plots = min(9, latent_dim)
     fig, axes = plt.subplots(3, 3, figsize=(10, 8))
     axes_flat = axes.flat
@@ -170,8 +255,29 @@ def _plot_latent_histograms(latent_matrix: np.ndarray, output_dir: Path) -> None
             continue
 
         values = latent_matrix[:, idx]
-        ax.hist(values, bins=30, density=True, color="tab:blue", alpha=0.85, edgecolor="white")
+        source_values = source_latent_matrix[:, idx]
+        combined = np.concatenate([values, source_values], axis=0)
+        bin_min = float(np.min(combined))
+        bin_max = float(np.max(combined))
+        if np.isclose(bin_min, bin_max):
+            bin_min -= 0.5
+            bin_max += 0.5
+        bins = np.linspace(bin_min, bin_max, 31)
+
+        ax.hist(values, bins=bins, density=True, color="tab:blue", alpha=0.45, edgecolor="white", label="compression")
+        ax.hist(
+            source_values,
+            bins=bins,
+            density=True,
+            color="tab:orange",
+            histtype="step",
+            linewidth=1.6,
+            label="train/galerkin",
+        )
         ax.set_title(f"$z_{idx + 1}$")
+        ax.set_xlim(bin_min, bin_max)
+        if idx == 0:
+            ax.legend(frameon=False, fontsize=8)
         ax.grid(True, alpha=0.2)
 
     fig.suptitle("Latent Coordinate Histograms")
@@ -200,8 +306,10 @@ def main() -> dict[str, float]:
     output_dir = DEFAULT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    generator = _load_generator(DEFAULT_CONFIG_PATH)
+    config = _load_generation_config(DEFAULT_CONFIG_PATH)
+    generator = _load_generator(config)
     compression = generator.compression
+    source_latent_matrix = _load_source_latents(Path(config.root))
 
     t0 = time.perf_counter()
     samples = list(generator._iter_samples())
@@ -214,9 +322,10 @@ def main() -> dict[str, float]:
     minval, maxval = [b.tolist() for b in compression.latent_bounds()]
 
     _plot_singular_spectrum(compression, output_dir)
-    _plot_latent_histograms(latent_matrix, output_dir)
+    _plot_latent_histograms(latent_matrix, source_latent_matrix, output_dir)
     _plot_error_histogram(reconstruction_errors, output_dir)
     _plot_field_comparison(samples, compression, output_dir)
+    _plot_random_source_reconstructions(source_latent_matrix, compression, output_dir)
 
     metrics = {
         "n_samples": int(len(samples)),

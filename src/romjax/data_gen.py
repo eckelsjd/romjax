@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
@@ -44,6 +45,8 @@ __all__ = [
     "GenDataConfig",
     "LoadDataConfig",
 ]
+
+_BAR_TITLE_LEN = 20
 
 
 def _get_kwargs(fn: Callable) -> set[str]:
@@ -201,6 +204,10 @@ class LoadDataConfig[T: Any](BaseModel, ABC):
         """Select the full epoch reference order from a shuffled dataset index order."""
         return [refs[int(index)] for index in indices]
 
+    def count_epoch_refs(self, refs: Sequence[T], indices: jax.Array) -> int:
+        """Count the number of references selected for one epoch without materializing them."""
+        return len(indices)
+
     @abstractmethod
     def load_batch(self, refs: Sequence[T]) -> dict[str, PyTree]:
         """Load and stack a selected batch of dataset references."""
@@ -236,8 +243,7 @@ class GenImplicitModel(GenGraph):
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.input_samples) as bar:
-            bar.text(self.bar_text(path))
+        with alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
 
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
@@ -435,8 +441,7 @@ class GenImplicitModel(GenGraph):
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.input_samples) as bar:
-            bar.text(self.bar_text(path))
+        with alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
 
             if write_policy == 'error' and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
@@ -570,6 +575,33 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
 
         return selected_refs
 
+    def count_epoch_refs(self, refs: Sequence[ImplicitSampleRef], indices: jax.Array) -> int:
+        """Count a global shuffled subset of implicit samples subject to epoch-level caps."""
+        selected_count = 0
+        unique_inputs: set[Path] = set()
+        outputs_per_input: dict[Path, int] = {}
+
+        for index in indices:
+            sample_ref = refs[int(index)]
+            input_path, _, _ = sample_ref
+
+            next_total = selected_count + 1
+            next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
+            next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
+
+            if self.max_samples is not None and next_total > self.max_samples:
+                break
+            if self.max_input_samples is not None and next_input_total > self.max_input_samples:
+                continue
+            if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
+                continue
+
+            selected_count += 1
+            unique_inputs.add(input_path)
+            outputs_per_input[input_path] = next_outputs_per_input
+
+        return selected_count
+
     def load_batch(self, refs: Sequence[ImplicitSampleRef]) -> dict[str, PyTree]:
         """Load stacked implicit-model mini-batches."""
         loaded: dict[str, list[PyTree]] = {"inputs": [], "outputs": [], "residuals": []}
@@ -607,15 +639,17 @@ class GenSource(GenGraph):
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.samples) as bar:
-            bar.text(self.bar_text(path))
+        with alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
 
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
             path.mkdir(parents=True, exist_ok=True)
 
-            sample_source = model.sample_source
+            if hasattr(model, "resolve_source_sampler"):
+                model.resolve_source_sampler()  # may need to load from a compression
+
+            sample_source = eqx.filter_jit(model.sample_source)
             skip = (
                 lambda p: (Path(p) / "source.h5").exists()
                 if write_policy == "reuse"
@@ -637,7 +671,7 @@ class GenSource(GenGraph):
     def generate_batch(self, path, format, write_policy):
         """Generate source node data in batches using vmap."""
         
-        def _process_batch(batch, sample_source):
+        def _process_batch(batch, sample_source, bar):
             if not batch:
                 return
             
@@ -649,19 +683,22 @@ class GenSource(GenGraph):
                     save_h5(one_input, one_path / "source.h5", mode="w")
                 else:
                     raise RoutineError(f"Save format '{format}' not recognized.")
+                bar()
             
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.samples) as bar:
-            bar.text(self.bar_text(path))
+        with alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
 
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
             path.mkdir(parents=True, exist_ok=True)
 
-            sample_source = eqx.filter_vmap(model.sample_source)
+            if hasattr(model, "resolve_source_sampler"):
+                model.resolve_source_sampler()  # may need to load from a compression
+
+            sample_source = eqx.filter_jit(eqx.filter_vmap(model.sample_source))
             skip = (
                 lambda p: (Path(p) / "source.h5").exists()
                 if write_policy == "reuse"
@@ -679,12 +716,11 @@ class GenSource(GenGraph):
                     batch.append((input_key, input_dir))
                     continue
 
-                _process_batch(batch, sample_source)
+                _process_batch(batch, sample_source, bar)
                 batch.clear()
                 batch.append((input_key, input_dir))
-                bar()
             
-            _process_batch(batch, sample_source)
+            _process_batch(batch, sample_source, bar)
 
 
 class LoadSource(LoadDataConfig[Path]):
@@ -741,6 +777,12 @@ class LoadSource(LoadDataConfig[Path]):
             return selected_refs[: self.max_samples]
         return selected_refs
 
+    def count_epoch_refs(self, refs: Sequence[Path], indices: jax.Array) -> int:
+        """Count a global shuffled subset of source samples subject to epoch-level caps."""
+        if self.max_samples is not None:
+            return min(len(indices), self.max_samples)
+        return len(indices)
+
     def load_batch(self, refs: Sequence[Path]) -> dict[str, PyTree]:
         """
         Load stacked source mini-batches.
@@ -749,6 +791,17 @@ class LoadSource(LoadDataConfig[Path]):
         :return: Mapping containing the stacked ``source`` batch.
         """
         return pytree_stack([load_h5({}, ref / "source.h5", jax=True) for ref in refs])
+
+
+class _NullProgress:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+    def __call__(self):
+        pass
+    def text(self):
+        pass
 
 
 class GenLatent(GenDataConfig):
@@ -810,11 +863,18 @@ class GenLatent(GenDataConfig):
             merged = set_subtree(merged, path, get_subtree(sample, path))
         return merged if merged is not None else sample
 
-    def _iter_samples(self) -> Generator[PyTree, None, None]:
-        for batch in self.loader:
-            for dataset_name, loaded in batch.items():
-                for sample in pytree_iter(loaded):
-                    yield self._merge_selected_sample({dataset_name: sample})
+    def _iter_samples(self, progress: bool = True) -> Generator[PyTree, None, None]:
+        
+        ctxt = (alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN) 
+                if progress else _NullProgress())
+
+        with ctxt as bar:
+            bar.text("Loading compression samples...")
+            for batch in self.loader:
+                for dataset_name, loaded in batch.items():
+                    for sample in pytree_iter(loaded):
+                        yield self._merge_selected_sample({dataset_name: sample})
+                bar()
 
     def generate(self, path, format=None, write_policy=None):
         """Fit latent coordinates from loaded data and emit the compression artifact."""
@@ -825,12 +885,28 @@ class GenLatent(GenDataConfig):
             raise RoutineError(f"Latent compression artifact already exists at {artifact_path} and policy='error'")
         if write_policy == "reuse" and artifact_path.exists():
             return
-
+        
         samples = list(self._iter_samples())
+        
         logger.info("Fitting compression...")
         compression = self.compression.fit(samples)
         logger.info(f"Compression finished. Latent space: {compression.latent_size()}")
+
         compression.dump(artifact_path)
+        
+        latent_bounds = compression.latent_bounds()
+        latent_normal = compression.latent_normal()
+        manifest_path = artifact_path.with_suffix(".manifest.json")
+        manifest = {
+            "latent_size": compression.latent_size(),
+            "latent_bounds": None
+            if latent_bounds is None
+            else [np.asarray(bounds).tolist() for bounds in latent_bounds],
+            "latent_normal": None
+            if latent_normal is None
+            else [np.asarray(stats).tolist() for stats in latent_normal],
+        }
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
 
 
 def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
@@ -986,12 +1062,19 @@ class DataLoader(BaseModel):
         
         return self
 
-    def _iter_datasets(self, train_step: int = 0):
+    def _iter_datasets(
+        self, 
+        train_step: int = 0, 
+        refs_only: bool = False, 
+        max_epochs: int | None = None,
+    ) -> Generator[dict[str, PyTree], None, None]:
         """
         Walk over all available datasets at once, using available configurations to limit sample sizes.
         Yields a mapping of dataset names to PyTree batches of data.
         
         :param train_step: initialize from this training step (default: 0)
+        :param refs_only: only return the sample paths (don't load from disk)
+        :param max_epochs: override local dataset settings for max_epochs
         """
         ds_config = {}
         ds_paths = {}
@@ -1034,7 +1117,8 @@ class DataLoader(BaseModel):
         def _refresh_epoch(name: str) -> None:
             """Advance a dataset to the next epoch and reshuffle the selected sample pool."""
             ds_epochs[name] += 1
-            if ds_config[name].max_epochs is not None and ds_epochs[name] >= ds_config[name].max_epochs:
+            _max_epochs = max_epochs or ds_config[name].max_epochs
+            if _max_epochs is not None and ds_epochs[name] >= _max_epochs:
                 ds_active[name] = False
                 ds_cursors[name] = len(ds_selected_refs[name])
                 return
@@ -1071,7 +1155,7 @@ class DataLoader(BaseModel):
                 batch_paths = [
                     epoch_refs[int(index)] for index in ds_indices[name][ds_cursors[name]:ds_cursors[name] + batch_size]
                 ]
-                ds_batch[name] = ds_config[name].load_batch(batch_paths)
+                ds_batch[name] = batch_paths if refs_only else ds_config[name].load_batch(batch_paths)
                 ds_cursors[name] += len(batch_paths)
 
                 if ds_cursors[name] >= len(epoch_refs):
@@ -1093,3 +1177,30 @@ class DataLoader(BaseModel):
         """Restart iteration from 0."""
         self.set_iterator()
         return self
+    
+    def __len__(self):
+        """Return the number of mini-batches yielded in one epoch.
+
+        This avoids materializing the iterator so callers like ``list(loader)`` do not trigger an
+        extra dataset-selection pass via ``__len__`` preallocation.
+        """
+        batch_counts: list[int] = []
+
+        for path, ds_cfg in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+            ds_root = self.root / "/".join(path)
+            refs = ds_cfg.discover_sample_refs(ds_root)
+            if len(refs) == 0:
+                batch_counts.append(0)
+                continue
+
+            initial_indices = np.random.default_rng(np.random.SeedSequence([ds_cfg.shuffle_seed, 0])).permutation(
+                len(refs)
+            )
+            selected_count = ds_cfg.count_epoch_refs(refs, initial_indices)
+            if selected_count == 0:
+                batch_counts.append(0)
+                continue
+
+            batch_counts.append((selected_count + ds_cfg.batch_size - 1) // ds_cfg.batch_size)
+
+        return max(batch_counts, default=0)

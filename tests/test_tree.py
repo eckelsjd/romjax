@@ -15,6 +15,7 @@ from romjax.tree import (
     pytree_mean,
     pytree_merge,
     pytree_norm,
+    pytree_path_iter,
     pytree_reduce,
     pytree_size,
     to_pytree,
@@ -291,3 +292,17 @@ def test_pytree_iter():
     assert np.isclose(float(items[1]["b"]["c"]), 6.0)
     assert np.allclose(np.asarray(pytree_at(tree, 1)["a"]), np.asarray(jnp.array([3.0, 4.0])))
     assert pytree_size(tree) == 2
+
+
+def test_pytree_path_iter_preserves_container_order():
+    tree = {
+        "b": jnp.array(1.0),
+        "a": {"d": jnp.array(2.0), "c": jnp.array(3.0)},
+        "c": [jnp.array(4.0), jnp.array(5.0)],
+        "d": (jnp.array(6.0), jnp.array(7.0)),
+    }
+
+    items = list(pytree_path_iter(tree))
+    paths = [path for path, _ in items]
+
+    assert paths == [("b",), ("a", "d"), ("a", "c"), ("c", 0), ("c", 1), ("d", 0), ("d", 1)]
