@@ -77,10 +77,11 @@ class GraphRef(BaseModel):
         """Resolve this reference against a graph-like object."""
         from romjax.tree import get_subtree
 
-        value = get_subtree(graph, self.path)
         if len(self.path) == 0:
             return value
 
+        value = get_subtree(graph, self.path)
+        
         if value is None:
             parent = get_subtree(graph, self.path[:-1])
             field_name = str(self.path[-1])
