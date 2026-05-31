@@ -205,10 +205,10 @@ class YamlLoader(ConfigLoader):
             
             if isinstance(node, _yaml.MappingNode):
                 data = loader.construct_mapping(node, deep=True)
-                return cls_obj(**data)
+                return cls_obj.model_validate(data)
             if isinstance(node, _yaml.SequenceNode):
                 data = loader.construct_sequence(node, deep=True)
-                return cls_obj(data)
+                return cls_obj.model_validate(data)
             data = loader.construct_scalar(node)
             if isinstance(data, str):
                 try:
@@ -216,7 +216,7 @@ class YamlLoader(ConfigLoader):
                 except Exception:
                     pass
 
-            return cls_obj(data)
+            return cls_obj.model_validate(data)
 
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)

@@ -290,6 +290,13 @@ class UnaryOperator(BaseModel):
     op: str | UnaryCallable
     _callable: UnaryCallable = PrivateAttr()
 
+    @model_validator(mode="before")
+    def _from_str(cls, value):
+        if isinstance(value, Mapping | UnaryOperator):
+            return value
+        else:
+            return {"op": value}
+
     def __init__(
         self,
         value: str | UnaryCallable | Mapping | UnaryOperator | None = None,
@@ -796,14 +803,14 @@ def get_subtree(tree: PyTree, path: TreePath) -> PyTree:
     """Return subtree located at ``path``."""
     node = tree
     for token in path:
+        if node is None:
+            return None
         if isinstance(node, Mapping):
-            node = node[token]
-        elif isinstance(node, (list, tuple)):
-            node = node[token]
-        elif isinstance(token, int):
-            node = node[token]
+            node = node.get(token, None)
+        elif isinstance(node, (list, tuple)) and isinstance(token, int):
+            node = node[token] if token < len(node) else None
         else:
-            node = getattr(node, token)
+            node = getattr(node, token, None)
     return node
 
 
