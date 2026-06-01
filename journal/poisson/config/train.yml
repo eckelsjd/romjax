@@ -1,9 +1,9 @@
 !romx:Train
 routine_config: config/common.yml
 root: train
-write_policy: reuse
+write_policy: overwrite
 graph: config/graph.yml
-init_seed: 0
+init_seed: 10
 
 loss: !romx:GraphLoss
   - { callable: reconstruction, path: [coordinate transform] }
@@ -21,10 +21,10 @@ optimizer: { name: adam, args: [ 0.1 ] }
 dataloader: !romx:DataLoader 
   root: data/train
   datasets:
-    poisson: { batch_size: 32, shuffle_seed: 0 }
+    poisson: { batch_size: 16, shuffle_seed: 1 }
     # galerkin: { batch_size: 32, shuffle_seed: 1 }
 test: !romx:GraphTest
-  dataloader: !romx:DataLoader
+  loader:
     root: data/validation
     datasets:
       poisson: { batch_size: 32, shuffle_seed: 0 }
@@ -32,15 +32,16 @@ test: !romx:GraphTest
     - { callable: reconstruction, path: [coordinate transform] }
 
 termination: 
-  max_steps: 200
+  max_steps: 800
   max_runtime: 300
+  grad_tol: 1e-5
 diagnostics:
-  log_interval: 5
-  plot_interval: 5
-  test_interval: 20
+  log_interval: null
+  plot_interval: 50
+  test_interval: 50
   live_plot: true
 checkpointer:
-  save_decision_policy: { name: FixedIntervalPolicy, args: [1] }
+  save_decision_policy: { name: FixedIntervalPolicy, args: [100] }
   preservation_policy: 
     name: AnyPreservationPolicy
-    args: [ [{ name: LatestN, args: [10] }, {name: EveryNSteps, args: [5] }] ]
+    args: [ [{ name: LatestN, args: [10] }, {name: EveryNSteps, args: [100] }] ]

@@ -4,3 +4,5 @@ archive
 train
 *.pdf
 *.png
+*.npz
+*.json

@@ -34,12 +34,12 @@ from pydantic import (
     model_validator,
 )
 
-from romjax.data_gen import DataLoader
+from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
-from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree
+from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree, pytree_path_iter
 from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
@@ -421,8 +421,9 @@ class GraphTest(GraphLoss):
     Just compute a graph loss function over a set of validation data.
     """
 
-    dataloader: DataLoader
+    loader: DataLoader
     reduce: UnaryOperator | None = "mean"
+    _batch_loss: Callable[[PyTree, PyTree], ArrayLike] = PrivateAttr()
     
     @field_validator("reduce", mode="before")
     @classmethod
@@ -430,11 +431,19 @@ class GraphTest(GraphLoss):
         if value is not None:
             return get_unary_operator(value)
         return value
+    
+    @model_validator(mode="after")
+    def _validate_loader_and_loss(self):
+        for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+            ds_cfg.max_epochs = 1   # Only load data once
+
+        self._batch_loss = eqx.filter_jit(lambda batch, params: super(GraphTest, self).__call__(batch, params))
+        return self
 
     def __call__(self, params: Mapping[str, PyTree]) -> jax.Array:
-        values = jnp.asarray([super().__call__(params, batch) for batch in self.dataloader])
+        values = jnp.asarray([self._batch_loss(params, batch) for batch in self.loader])
         return self.reduce(values)
-
+    
 
 type SaveDecisionPolicy = Annotated[
     ThirdPartyType(default_modules=ocp.training.save_decision_policies.__name__),
@@ -695,7 +704,7 @@ class Train(Routine):
 
     def __call__(self) -> PyTree:
 
-        test_fn = eqx.filter_jit(self.test) if self.test is not None else None
+        test_fn = self.test if self.test is not None else None
         _, static_params = eqx.partition(self.init_params, eqx.is_array)
 
         def _checkpoint_params(params: PyTree) -> PyTree:

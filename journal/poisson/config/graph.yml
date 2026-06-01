@@ -1,9 +1,9 @@
 !romx:FunctionGraph
 nodes: 
-  - { name: hf_coord, ignore: inputs, error_op: norm }
-  - { name: hf_res,   ignore: inputs, error_op: norm }
-  - { name: lf_coord, ignore: inputs, error_op: norm }
-  - { name: lf_res,   ignore: inputs, error_op: norm }
+  - { name: hf_coord, ignore: inputs, error_op: sum-square }
+  - { name: hf_res,   ignore: inputs, error_op: sum-square }
+  - { name: lf_coord, ignore: inputs, error_op: sum-square }
+  - { name: lf_res,   ignore: inputs, error_op: sum-square }
 edges:
   - !romx:Poisson2D
     source: hf_coord
