@@ -5,4 +5,6 @@ import os
 os.chdir("journal/poisson")
 
 train = romx.load("config/train.yml")
+
+dl = train.test.dataloader
 print("hello")

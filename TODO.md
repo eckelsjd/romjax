@@ -2,6 +2,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
 - [ ] Normalization for eqx transforms
+- [ ] GraphTest dataloader can't jit
 
 ## Needs testing
 - [ ] Reconstruction matching SVD
@@ -41,8 +42,9 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Documentation
 - [ ] Pretty much everything
 - [ ] Some simple train and gen data examples would be good
+- [ ] How to use filter model with eqx_evaluate for projection, neural nets, etc.
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation
-- [ ] Make sure the expensive part of train is the optimizer update (be on the lookout for big recursive pytree operations)
+- [ ] Make sure the expensive part of train is the optimizer update (be on the lookout for big recursive pytree operations) -- within this, make sure we are spending most time computing rather than filtering/flattening/assembling/caching/allocating/etc.
 - [ ] Check performance of poisson and make sure it reasonable for the problem size (lookout for optx)
