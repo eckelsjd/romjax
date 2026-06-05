@@ -40,6 +40,7 @@ from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
+    TreeErrorOperator,
     UnaryOperator,
     get_subtree,
     get_unary_operator,
@@ -237,8 +238,15 @@ class BatchLoader[T: Any](BaseModel, Iterator):
         return self
 
 
-def reconstruction_loss(params: PyTree, single_data: PyTree, graph: FunctionGraph, path: list[str] = None):
-    return graph.reconstruction_error(single_data, path, edge_payload_patches=params)
+def reconstruction_loss(
+    params: PyTree, 
+    single_data: PyTree, 
+    graph: FunctionGraph, 
+    path: list[str] = None,
+    error_op: TreeErrorOperator | None = None,
+    ignore: set | None = None,
+):
+    return graph.reconstruction_error(single_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore)
 
 
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):

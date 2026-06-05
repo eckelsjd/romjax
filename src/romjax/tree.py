@@ -63,6 +63,7 @@ __all__ = [
     "stack",
     "pytree_iter",
     "pytree_path_iter",
+    "pytree_union",
     "to_pytree",
     "get_subtree",
     "set_subtree",
@@ -758,6 +759,64 @@ def pytree_merge(defaults: PyTree, overrides: PyTree) -> PyTree:
         return merged_list
 
     return overrides
+
+
+def pytree_union(
+    tree_one: PyTree, 
+    tree_two: PyTree, 
+    ignore: Sequence[TreePath] | None = None
+) -> tuple[PyTree | None, PyTree | None]:
+    """
+    Return two trees that represent the union of leaves possessed by both. Optionally ignore paths via `self.ignore`.
+    If there is no overlap, then (None, None) is returned.
+    """
+    ignore_set = set(ignore) if ignore is not None else set()
+    skip = object()
+
+    def _is_ignored(path: TreePath) -> bool:
+        return any(path[:idx] in ignore_set for idx in range(1, len(path) + 1))
+
+    def _select_shared(a: PyTree, b: PyTree, path: TreePath = ()) -> tuple[PyTree, PyTree] | object:
+        if _is_ignored(path):
+            return skip
+
+        if isinstance(a, Mapping) and isinstance(b, Mapping):
+            out_a: dict[Any, PyTree] = {}
+            out_b: dict[Any, PyTree] = {}
+            for key in b:
+                if key not in a:
+                    continue
+                child = _select_shared(a[key], b[key], (*path, key))
+                if child is skip:
+                    continue
+                child_a, child_b = child
+                out_a[key] = child_a
+                out_b[key] = child_b
+            return out_a, out_b
+
+        if isinstance(a, tuple) and isinstance(b, tuple):
+            shared: list[tuple[PyTree, PyTree]] = []
+            for idx in range(min(len(a), len(b))):
+                child = _select_shared(a[idx], b[idx], (*path, idx))
+                if child is not skip:
+                    shared.append(child)
+            return tuple(x for x, _ in shared), tuple(y for _, y in shared)
+
+        if isinstance(a, list) and isinstance(b, list):
+            shared: list[tuple[PyTree, PyTree]] = []
+            for idx in range(min(len(a), len(b))):
+                child = _select_shared(a[idx], b[idx], (*path, idx))
+                if child is not skip:
+                    shared.append(child)
+            return [x for x, _ in shared], [y for _, y in shared]
+
+        return a, b
+
+    filtered = _select_shared(tree_one, tree_two)
+    if filtered is skip:
+        return None, None
+    
+    return filtered
 
 
 def pytree_iter(tree: PyTree) -> Generator[PyTree, None, None]:
