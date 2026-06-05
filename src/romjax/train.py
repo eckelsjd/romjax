@@ -40,13 +40,13 @@ from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
-    UnaryOperator, 
-    get_subtree, 
-    get_unary_operator, 
-    pytree_norm, 
-    pytree_path_iter, 
-    set_subtree, 
-    pytree_square_norm
+    UnaryOperator,
+    get_subtree,
+    get_unary_operator,
+    pytree_norm,
+    pytree_path_iter,
+    pytree_square_norm,
+    set_subtree,
 )
 from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
 
