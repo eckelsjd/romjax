@@ -615,7 +615,7 @@ def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     test = GraphTest(
         terms=[{"function": graph_batch_squared_error, "dataset": "toy"}],
         graph=toy_graph,
-        dataloader=dataloader,
+        loader=dataloader,
         reduce="mean",
     )
 
@@ -646,7 +646,7 @@ train: !romx:Train
   test: !romx:GraphTest
     terms:
       - reconstruction
-    dataloader: !romx:DataLoader
+    loader: !romx:DataLoader
       root: {data_root}
       datasets:
         toyset:
@@ -764,7 +764,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
 
     test = GraphTest(
         terms=[{"function": validation_error}],
-        dataloader=validation_loader,
+        loader=validation_loader,
     )
 
     max_steps = 20

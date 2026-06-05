@@ -10,7 +10,7 @@ from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from romjax.graph import Edge, Node
-from romjax.tree import TreePath, coerce_tree_path, get_subtree, pytree_merge, set_subtree
+from romjax.tree import TreePath, coerce_tree_path, pytree_merge, set_subtree
 
 __all__ = ['eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel',
            'ImplicitSampleable', 'SourceSampleable']
@@ -522,7 +522,7 @@ def _assemble_inner_input(outer_payload: PyTree, routes: list[OuterToInnerRoute]
     """Construct one callable-facing inner tree from routed outer payload subtrees."""
     patch: PyTree | None = None
     for route in routes:
-        source_value = get_subtree(outer_payload, route.outer)
+        source_value = _get_required_subtree(outer_payload, route.outer)
         patch = set_subtree(patch, route.inner or (), source_value)
     return {} if patch is None else patch
 
@@ -531,9 +531,30 @@ def _assemble_outer_patch(inner_output: PyTree, routes: list[InnerToOuterRoute])
     """Construct one outer patch tree from routed inner callable output subtrees."""
     patch: PyTree | None = None
     for route in routes:
-        source_value = inner_output if len(route.inner) == 0 else get_subtree(inner_output, route.inner)
+        source_value = inner_output if len(route.inner) == 0 else _get_required_subtree(inner_output, route.inner)
         patch = set_subtree(patch, route.outer, source_value)
     return {} if patch is None else patch
+
+
+def _get_required_subtree(tree: PyTree, path: TreePath) -> PyTree:
+    """Return a routed subtree or raise when the path is missing."""
+    sentinel = object()
+    node = tree
+    for token in path:
+        if isinstance(node, Mapping):
+            node = node.get(token, sentinel)
+        elif isinstance(node, (list, tuple)) and isinstance(token, int):
+            node = node[token] if token < len(node) else sentinel
+        elif isinstance(token, int):
+            try:
+                node = node[token]
+            except (IndexError, TypeError):
+                node = sentinel
+        else:
+            node = getattr(node, token, sentinel)
+        if node is sentinel:
+            raise KeyError(f"Missing routed subtree at path {path!r}.")
+    return node
 
 
 def _get_callable_signature(fn: Callable[..., Any]) -> Signature | None:

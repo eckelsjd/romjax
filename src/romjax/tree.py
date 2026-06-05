@@ -809,6 +809,11 @@ def get_subtree(tree: PyTree, path: TreePath) -> PyTree:
             node = node.get(token, None)
         elif isinstance(node, (list, tuple)) and isinstance(token, int):
             node = node[token] if token < len(node) else None
+        elif isinstance(token, int):
+            try:
+                node = node[token]
+            except (IndexError, TypeError):
+                return None
         else:
             node = getattr(node, token, None)
     return node
