@@ -7,7 +7,7 @@ import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
-from romjax.tree import TreeErrorOperator, TreePath, coerce_tree_paths, get_tree_operator, pytree_merge
+from romjax.tree import TreeErrorOperator, TreePath, coerce_tree_paths, get_tree_operator, pytree_merge, pytree_union
 from romjax.typing import ListModel
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
@@ -65,53 +65,7 @@ class Node(BaseModel, Hashable):
         """
         Compute the pytree error at this node. Only consider shared paths, and optionally ignore paths via `self.ignore`
         """
-        ignore_set = set(self.ignore)
-        skip = object()
-
-        def _is_ignored(path: TreePath) -> bool:
-            return any(path[:idx] in ignore_set for idx in range(1, len(path) + 1))
-
-        def _select_shared(a: PyTree, b: PyTree, path: TreePath = ()) -> tuple[PyTree, PyTree] | object:
-            if _is_ignored(path):
-                return skip
-
-            if isinstance(a, Mapping) and isinstance(b, Mapping):
-                out_a: dict[Any, PyTree] = {}
-                out_b: dict[Any, PyTree] = {}
-                for key in b:
-                    if key not in a:
-                        continue
-                    child = _select_shared(a[key], b[key], (*path, key))
-                    if child is skip:
-                        continue
-                    child_a, child_b = child
-                    out_a[key] = child_a
-                    out_b[key] = child_b
-                return out_a, out_b
-
-            if isinstance(a, tuple) and isinstance(b, tuple):
-                shared: list[tuple[PyTree, PyTree]] = []
-                for idx in range(min(len(a), len(b))):
-                    child = _select_shared(a[idx], b[idx], (*path, idx))
-                    if child is not skip:
-                        shared.append(child)
-                return tuple(x for x, _ in shared), tuple(y for _, y in shared)
-
-            if isinstance(a, list) and isinstance(b, list):
-                shared: list[tuple[PyTree, PyTree]] = []
-                for idx in range(min(len(a), len(b))):
-                    child = _select_shared(a[idx], b[idx], (*path, idx))
-                    if child is not skip:
-                        shared.append(child)
-                return [x for x, _ in shared], [y for _, y in shared]
-
-            return a, b
-
-        filtered = _select_shared(value, value_hat)
-        if filtered is skip:
-            return jax.numpy.asarray(0.0)
-        value_filter, value_hat_filter = filtered
-        return self.error_op(value_filter, value_hat_filter)
+        return self.error_op(*pytree_union(value, value_hat, ignore=self.ignore))
 
 
 class Edge(BaseModel, Hashable, ABC):
@@ -605,6 +559,8 @@ class FunctionGraph(BaseModel):
         aux_a: EdgePatch | None = None,
         aux_b: EdgePatch | None = None,
         edge_payload_patches: EdgePatch | None = None,
+        error_op: TreeErrorOperator | None = None,
+        ignore: set | None = None,
     ) -> jax.Array:
         """
         Propagate one payload along two paths and compare the results at the common destination node.
@@ -635,7 +591,10 @@ class FunctionGraph(BaseModel):
             aux=aux_b,
             edge_payload_patches=edge_payload_patches,
         )
-        return end_a.error(out_a, out_b)
+        error_fn = end_a.error if error_op is None else (
+            lambda a, b: get_tree_operator(error_op)(*pytree_union(a, b, ignore=ignore or end_a.ignore))
+        )
+        return error_fn(out_a, out_b)
 
     def reconstruction_error(
         self,
@@ -645,6 +604,8 @@ class FunctionGraph(BaseModel):
         start: Node | str | None = None,
         aux: EdgePatch | None = None,
         edge_payload_patches: EdgePatch | None = None,
+        error_op: TreeErrorOperator | None = None,
+        ignore: set | None = None,
     ) -> jax.Array:
         """
         Compute reconstruction error by comparing a loopback path against forward-then-backward traversal.
@@ -669,4 +630,7 @@ class FunctionGraph(BaseModel):
             aux=aux_cache,
             edge_payload_patches=edge_payload_patches,
         )
-        return start_node.error(payload, reconstructed)
+        error_fn = start_node.error if error_op is None else (
+            lambda a, b: get_tree_operator(error_op)(*pytree_union(a, b, ignore=ignore or start_node.ignore))
+        )
+        return error_fn(payload, reconstructed)
