@@ -513,3 +513,28 @@ def test_load_implicit_model_can_disable_solution_sample_loading(tmp_path):
 
     refs = LoadImplicitModel(batch_size=4, load_solution=False).discover_sample_refs(tmp_path / "toy")
     assert [sample_kind for _, _, sample_kind in refs] == ["output"]
+
+
+def test_load_implicit_model_solution_only_skips_output_samples(tmp_path):
+    input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
+    save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
+    save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
+
+    output_dir = input_dir / "seed_0" / "sample_0"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
+    save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
+
+    refs = LoadImplicitModel(batch_size=4, solution_only=True).discover_sample_refs(tmp_path / "toy")
+
+    assert [sample_kind for _, _, sample_kind in refs] == ["solution"]
+    batch = LoadImplicitModel(batch_size=4, solution_only=True).load_batch(refs)
+    assert batch["outputs"]["y"][:, 0].tolist() == [2.0]
+    assert batch["residuals"]["r"][:, 0].tolist() == [-1.0]
+
+
+def test_load_implicit_model_solution_only_requires_solution_loading() -> None:
+    with pytest.raises(ValueError, match="solution_only=True requires load_solution=True"):
+        LoadImplicitModel(solution_only=True, load_solution=False)

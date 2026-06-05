@@ -601,7 +601,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     )
     recon_params = {"toy": {"weight": jnp.array(0.5), "bias": jnp.array(0.2)}}
     expected_reconstruction = np.mean((np.array([1.0, 2.0, 3.0]) - (0.5 * np.array([1.0, 2.0, 3.0]) + 0.2)) ** 2)
-    expected_regularization = 0.1 * float(pytree_norm(recon_params))
+    expected_regularization = 0.1 * float(pytree_norm(recon_params)**2)
     assert reconstructed(recon_params, batch) == pytest.approx(expected_reconstruction + expected_regularization)
 
 
