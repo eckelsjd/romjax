@@ -2,10 +2,8 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
 - [ ] Normalization for eqx transforms
-- [ ] GraphTest dataloader can't jit
 
 ## Needs testing
-- [ ] Reconstruction matching SVD
 - [ ] Training on param references
 
 ## Blind spots

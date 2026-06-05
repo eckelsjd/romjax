@@ -172,6 +172,131 @@ def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     _assert_round_trip(data)
 
 
+def test_yaml_overrides_merge_mappings_sequences_and_missing_branches(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_path.write_text(
+        """
+settings:
+  nested: {a: 1, b: 2}
+  items:
+    - one
+    - two
+    - {x: 1, y: 2}
+  scalar: old
+""",
+        encoding="utf-8",
+    )
+    override_path.write_text(
+        f"""
+!overrides:{base_path}
+settings:
+  nested: {{b: 3, c: 4}}
+  items:
+    - null
+    - value
+    - {{y: 9, z: 10}}
+    - extra
+  scalar: new
+  created:
+    branch: true
+""",
+        encoding="utf-8",
+    )
+
+    data = YamlLoader.load(override_path)
+
+    assert data == {
+        "settings": {
+            "nested": {"a": 1, "b": 3, "c": 4},
+            "items": ["one", "value", {"x": 1, "y": 9, "z": 10}, "extra"],
+            "scalar": "new",
+            "created": {"branch": True},
+        }
+    }
+
+
+def test_yaml_overrides_preserve_base_file_contents(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_text = "settings: {one: 1, two: 2}\n"
+    base_path.write_text(base_text, encoding="utf-8")
+    override_path.write_text(f"!overrides:{base_path}\nsettings: {{two: 3}}\n", encoding="utf-8")
+
+    assert YamlLoader.load(override_path) == {"settings": {"one": 1, "two": 3}}
+    assert base_path.read_text(encoding="utf-8") == base_text
+
+
+def test_yaml_overrides_construct_after_merging_root_tagged_base(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_path.write_text(
+        """
+!romx:tests.test_loader.CustomModel
+opts: {a: 1, b: 2}
+detail: base
+""",
+        encoding="utf-8",
+    )
+    override_path.write_text(f"!overrides:{base_path}\nopts: {{b: 3}}\n", encoding="utf-8")
+
+    model = YamlLoader.load(override_path)
+
+    assert isinstance(model, CustomModel)
+    assert model.opts == {"a": 1, "b": 3}
+    assert model.detail == "base"
+
+
+def test_yaml_overrides_tagged_override_subtree_replaces_base(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_path.write_text(
+        """
+solver: !romx:tests.test_loader.CustomModel
+  opts: {a: 1, b: 2}
+  detail: base
+""",
+        encoding="utf-8",
+    )
+    override_path.write_text(
+        f"""
+!overrides:{base_path}
+solver: !romx:tests.test_loader.CustomModel
+  opts: {{c: 3}}
+  detail: override
+""",
+        encoding="utf-8",
+    )
+
+    data = YamlLoader.load(override_path)
+
+    assert isinstance(data["solver"], CustomModel)
+    assert data["solver"].opts == {"c": 3}
+    assert data["solver"].detail == "override"
+
+
+def test_yaml_overrides_resolve_recursive_chains(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    middle_path = tmp_path / "middle.yml"
+    top_path = tmp_path / "top.yml"
+    base_path.write_text("settings: {one: base, two: base, three: base}\n", encoding="utf-8")
+    middle_path.write_text(f"!overrides:{base_path}\nsettings: {{two: middle, three: middle}}\n", encoding="utf-8")
+    top_path.write_text(f"!overrides:{middle_path}\nsettings: {{three: top}}\n", encoding="utf-8")
+
+    assert YamlLoader.load(top_path) == {"settings": {"one": "base", "two": "middle", "three": "top"}}
+
+
+def test_yaml_overrides_parent_path_resolves_from_declaring_file(tmp_path: Path) -> None:
+    parent_base = tmp_path / "base.yml"
+    child_dir = tmp_path / "child"
+    child_dir.mkdir()
+    override_path = child_dir / "override.yml"
+    parent_base.write_text("settings: {one: base, two: base}\n", encoding="utf-8")
+    override_path.write_text("!overrides:__parent__/../base.yml\nsettings: {two: override}\n", encoding="utf-8")
+
+    assert YamlLoader.load(override_path) == {"settings": {"one": "base", "two": "override"}}
+
+
 def test_yaml_invalid_cases() -> None:
     with pytest.raises(TypeError):
         YamlLoader.load(123)

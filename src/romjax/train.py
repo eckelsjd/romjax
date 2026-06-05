@@ -39,7 +39,7 @@ from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
-from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, set_subtree, pytree_path_iter
+from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, pytree_path_iter, set_subtree
 from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]

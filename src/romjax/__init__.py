@@ -8,9 +8,11 @@ __version__ = "0.0.1"
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
+from copy import deepcopy as _deepcopy
 from functools import partial as _partial
 from importlib import import_module as _import_module
 from inspect import getattr_static as _getattr_static
+from io import StringIO as _StringIO
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
 from types import BuiltinFunctionType as _BuiltinFunctionType
@@ -130,6 +132,7 @@ class YamlLoader(ConfigLoader):
     """
     PYDANTIC_TAG = "!pd:"
     ROMX_TAG = "!romx:"
+    OVERRIDES_TAG = "!overrides:"
 
     @classmethod
     def get_tag(cls, data: _Any) -> str:
@@ -253,6 +256,187 @@ class YamlLoader(ConfigLoader):
         return _Dumper
 
     @classmethod
+    def _read_stream(cls, stream: _Stream) -> tuple[str, _Path | None]:
+        """Read YAML input while preserving path context for override resolution.
+
+        :param stream: A YAML string, path, byte buffer, or file-like object.
+        :return: the YAML text and the source path when one is known.
+        """
+        if isinstance(stream, (_PathLike, _Path)):
+            path = _Path(stream)
+            return path.read_text(encoding="utf-8"), path
+        if isinstance(stream, str):
+            try:
+                path = _Path(stream)
+                exists = path.exists()
+                looks_like_path = stream.endswith((".yml", ".yaml")) or path.is_absolute() or stream.startswith(".")
+            except OSError:
+                return stream, None
+            if exists or looks_like_path:
+                return path.read_text(encoding="utf-8"), path
+            return stream, None
+        if isinstance(stream, (bytes, bytearray)):
+            return stream.decode("utf-8"), None
+        if hasattr(stream, "read"):
+            data = stream.read()
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            return data, None
+        raise TypeError("Unsupported stream type for YAML load.")
+
+    @classmethod
+    def _resolve_override_path(cls, path: str, source_path: _Path | None) -> _Path:
+        """Resolve an override target path.
+
+        :param path: The path suffix from a root ``!overrides:`` tag.
+        :param source_path: Path of the YAML file declaring the override, when known.
+        :return: the resolved path to load.
+        """
+        prefix = "__parent__/"
+        if path.startswith(prefix):
+            if source_path is None:
+                raise ValueError("The __parent__ override path requires loading from a file path.")
+            return source_path.parent / path[len(prefix):]
+        return _Path(path)
+
+    @classmethod
+    def _is_override_node(cls, node: _yaml.Node | None) -> bool:
+        """Return whether a raw YAML node declares a root-level override.
+
+        :param node: A raw YAML node.
+        :return: whether the node tag is an override tag.
+        """
+        return node is not None and node.tag.startswith(cls.OVERRIDES_TAG)
+
+    @classmethod
+    def _is_constructed_tag_node(cls, node: _yaml.Node) -> bool:
+        """Return whether a node should override as a complete tagged object.
+
+        :param node: A raw YAML node.
+        :return: whether the node is tagged for immediate romjax or pydantic construction.
+        """
+        return node.tag.startswith((cls.ROMX_TAG, cls.PYDANTIC_TAG))
+
+    @classmethod
+    def _is_null_node(cls, node: _yaml.Node) -> bool:
+        """Return whether a raw scalar node is YAML null.
+
+        :param node: A raw YAML node.
+        :return: whether the node is tagged as null.
+        """
+        return isinstance(node, _yaml.ScalarNode) and node.tag == "tag:yaml.org,2002:null"
+
+    @classmethod
+    def _copy_with_tag(cls, node: _yaml.Node, tag: str) -> _yaml.Node:
+        """Return a deep copy of a YAML node with a replacement tag.
+
+        :param node: The node to copy.
+        :param tag: The tag to apply to the copied node.
+        :return: the copied node.
+        """
+        copied = _deepcopy(node)
+        copied.tag = tag
+        return copied
+
+    @classmethod
+    def _default_node_tag(cls, node: _yaml.Node) -> str:
+        """Return the default YAML tag for a node's structural type.
+
+        :param node: The node whose type determines the tag.
+        :return: the default scalar, sequence, or mapping YAML tag.
+        """
+        if isinstance(node, _yaml.MappingNode):
+            return _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG
+        if isinstance(node, _yaml.SequenceNode):
+            return _yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG
+        return _yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG
+
+    @classmethod
+    def _mapping_pairs_by_key(cls, node: _yaml.MappingNode) -> dict[tuple[str, str], tuple[_yaml.Node, _yaml.Node]]:
+        """Index mapping node pairs by scalar key tag and value.
+
+        :param node: A raw mapping node.
+        :return: mapping from comparable scalar keys to original key/value node pairs.
+        """
+        pairs: dict[tuple[str, str], tuple[_yaml.Node, _yaml.Node]] = {}
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, _yaml.ScalarNode):
+                raise TypeError("YAML override merging only supports scalar mapping keys.")
+            pairs[(key_node.tag, key_node.value)] = (key_node, value_node)
+        return pairs
+
+    @classmethod
+    def _merge_nodes(cls, base: _yaml.Node | None, override: _yaml.Node) -> _yaml.Node:
+        """Merge raw YAML override nodes into raw base nodes.
+
+        :param base: The base YAML node, if one exists.
+        :param override: The override YAML node.
+        :return: a merged YAML node.
+        """
+        if base is None or cls._is_constructed_tag_node(override):
+            return _deepcopy(override)
+        if isinstance(base, _yaml.MappingNode) and isinstance(override, _yaml.MappingNode):
+            base_pairs = cls._mapping_pairs_by_key(base)
+            override_pairs = cls._mapping_pairs_by_key(override)
+            merged_pairs: list[tuple[_yaml.Node, _yaml.Node]] = []
+
+            for base_key, base_value in base.value:
+                key = (base_key.tag, base_key.value)
+                if key in override_pairs:
+                    _, override_value = override_pairs.pop(key)
+                    merged_pairs.append((_deepcopy(base_key), cls._merge_nodes(base_value, override_value)))
+                else:
+                    merged_pairs.append((_deepcopy(base_key), _deepcopy(base_value)))
+
+            for override_key, override_value in override_pairs.values():
+                merged_pairs.append((_deepcopy(override_key), _deepcopy(override_value)))
+
+            return _yaml.MappingNode(base.tag, merged_pairs, base.start_mark, base.end_mark, base.flow_style)
+        if isinstance(base, _yaml.SequenceNode) and isinstance(override, _yaml.SequenceNode):
+            merged_items = [_deepcopy(item) for item in base.value]
+            for index, override_item in enumerate(override.value):
+                if cls._is_null_node(override_item):
+                    continue
+                if index < len(merged_items):
+                    merged_items[index] = cls._merge_nodes(merged_items[index], override_item)
+                else:
+                    merged_items.append(_deepcopy(override_item))
+            return _yaml.SequenceNode(base.tag, merged_items, base.start_mark, base.end_mark, base.flow_style)
+        return _deepcopy(override)
+
+    @classmethod
+    def _compose_resolved_node(cls, stream: _Stream) -> _yaml.Node | None:
+        """Compose YAML into a raw node after resolving any root-level overrides.
+
+        :param stream: A YAML string, path, byte buffer, or file-like object.
+        :return: the composed YAML node with overrides already merged.
+        """
+        text, source_path = cls._read_stream(stream)
+        node = _yaml.compose(text, Loader=_yaml.SafeLoader)
+        if not cls._is_override_node(node):
+            return node
+
+        if node is None:
+            return None
+        override_path = cls._resolve_override_path(node.tag[len(cls.OVERRIDES_TAG):], source_path)
+        base_node = cls._compose_resolved_node(override_path)
+        override_node = cls._copy_with_tag(node, cls._default_node_tag(node))
+        return cls._merge_nodes(base_node, override_node)
+
+    @classmethod
+    def _node_to_yaml(cls, node: _yaml.Node | None) -> str:
+        """Serialize a raw YAML node to text without constructing custom objects.
+
+        :param node: The YAML node to serialize.
+        :return: YAML text.
+        """
+        if node is None:
+            return ""
+        stream = _StringIO()
+        _yaml.serialize(node, stream=stream)
+        return stream.getvalue()
+
+    @classmethod
     def load(cls, stream: _Stream, **kwargs: _Any) -> _Any:
         """Load a configuration from a yaml-like stream. Small wrapper around yaml.load
         
@@ -262,29 +446,8 @@ class YamlLoader(ConfigLoader):
         if "Loader" not in kwargs:
             kwargs["Loader"] = cls.get_loader()
 
-        if isinstance(stream, (_PathLike, _Path)):
-            with _Path(stream).open("r", encoding="utf-8") as fh:
-                return _yaml.load(fh, **kwargs)
-        if isinstance(stream, str):
-            try:
-                exists = _Path(stream).exists()
-                looks_like_path = (
-                    stream.endswith((".yml", ".yaml"))
-                    or _Path(stream).is_absolute()
-                    or stream.startswith(".")
-                )
-            except OSError:
-                return _yaml.load(stream, **kwargs)
-            else: 
-                if exists or looks_like_path:
-                    with _Path(stream).open("r", encoding="utf-8") as fh:
-                        return _yaml.load(fh, **kwargs)
-            return _yaml.load(stream, **kwargs)
-        if isinstance(stream, (bytes, bytearray)):
-            return _yaml.load(stream.decode("utf-8"), **kwargs)
-        if hasattr(stream, "read"):
-            return _yaml.load(stream, **kwargs)
-        raise TypeError("Unsupported stream type for YAML load.")
+        node = cls._compose_resolved_node(stream)
+        return _yaml.load(cls._node_to_yaml(node), **kwargs)
 
     @classmethod
     def dump(cls, obj: _Any, stream: _Stream | None = None, **kwargs: _Any) -> _Optional[str]:
