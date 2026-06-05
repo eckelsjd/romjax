@@ -220,6 +220,17 @@ def pytree_norm(tree: PyTree) -> jax.Array:
 
 
 @eqx.filter_jit
+def pytree_square_norm(tree: PyTree) -> jax.Array:
+    """Compute ||x||^2. Same as sum-square."""
+    total = jax.tree.reduce(
+        lambda acc, leaf: acc + jnp.sum(jnp.square(jnp.asarray(leaf))),
+        _array_tree(tree),
+        jnp.asarray(0.0),
+    )
+    return total
+
+
+@eqx.filter_jit
 def pytree_mean(tree: PyTree) -> jax.Array:
     """Compute the mean over the pytree. Equivalent to pytree_reduce(tree, 'mean') but quicker."""
     count, total = jax.tree.reduce(
@@ -240,6 +251,8 @@ def _build_tree_reducer(spec: str) -> Callable[[PyTree], jax.Array]:
         return pytree_mean
     if canonical == "norm":
         return pytree_norm
+    if canonical == "sum-square":
+        return pytree_square_norm
 
     unary_fn = _build_unary_callable(canonical)
 
