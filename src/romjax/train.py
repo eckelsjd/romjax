@@ -39,7 +39,15 @@ from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine, RoutineError
-from romjax.tree import UnaryOperator, get_subtree, get_unary_operator, pytree_norm, pytree_path_iter, set_subtree
+from romjax.tree import (
+    UnaryOperator, 
+    get_subtree, 
+    get_unary_operator, 
+    pytree_norm, 
+    pytree_path_iter, 
+    set_subtree, 
+    pytree_square_norm
+)
 from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
@@ -235,12 +243,23 @@ def reconstruction_loss(params: PyTree, single_data: PyTree, graph: FunctionGrap
 
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
     del single_data, graph
-    return pytree_norm(params)
+    return pytree_square_norm(params)
+
+
+def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph, ref: list[str] = None):
+    del single_data, graph
+    matrix = get_subtree(params, ref)  # expected Array[r x N] projection matrix
+    if matrix is None:
+        raise ValueError("Can't locate matrix for orthogonal regularization via ref: '{ref}'")
+    
+    gram = matrix @ matrix.T
+    return pytree_square_norm(gram - jnp.eye(gram.shape[0]))
 
 
 _LOSS_REGISTRY = {
     "reconstruction": reconstruction_loss,
     "tikhonov": tikhonov_regularization,
+    "orthogonal": orthogonal_regularization,
 }
 
 
