@@ -8,17 +8,17 @@ import jax.numpy as jnp
 import yaml
 from alive_progress import alive_bar
 from jaxtyping import PyTree
+from orbax.checkpoint import v1 as ocp
 from pydantic import (
+    BaseModel,
     BeforeValidator,
+    ConfigDict,
     Field,
+    PrivateAttr,
     SkipValidation,
     field_validator,
     model_validator,
-    BaseModel,
-    PrivateAttr,
-    ConfigDict
 )
-from orbax.checkpoint import v1 as ocp
 
 from romjax.data_gen import DataLoader
 from romjax.graph import FunctionGraph
