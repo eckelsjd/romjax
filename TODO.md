@@ -23,6 +23,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] from_registry items back to string
 - [ ] !include back to string paths
 - [ ] Ignoring large arrays and default items
+- [ ] Better abstract param templates for saving/loading with orbax. Would be nice for these templates to serialize/yaml with jax Dtype structs, and to be automatically handled
 
 ## Routines
 - [ ] Postprocess routine for plots, tables, metrics etc. for journal

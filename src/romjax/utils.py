@@ -13,6 +13,17 @@ from pydantic import BaseModel
 __all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'required_fields']
 
 
+class _NullProgress:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+    def __call__(self):
+        pass
+    def text(self, msg):
+        pass
+    
+
 def required_fields(model_cls: type[BaseModel], inherited: bool = True) -> set[str]:
     """Get the required fields of a pydantic model."""
     ignore = set()

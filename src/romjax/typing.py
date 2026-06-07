@@ -9,9 +9,12 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Sequence, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
+import equinox as eqx
 import lineax as lx
 import optax
 import optimistix as optx
+from jaxtyping import PyTree
+from orbax.checkpoint import v1 as ocp
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -25,8 +28,8 @@ from pydantic import (
     model_validator,
 )
 
-__all__ = ['DictModel', 'ListModel', 'CallableModel', 'GraphRef', 'ThirdPartyType', 'WriteStream', 'GraphRef',
-           'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'GraphRef', 'ThirdPartyType', 'WriteStream',
+           'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec', 'resolve_graph_refs']
 
 
 _SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
@@ -47,6 +50,45 @@ def require_attr(required_attr: str, value: Any):
     if not hasattr(value, required_attr):
         raise ValueError(f"Expected attribute '{required_attr}'")
     return value
+
+
+class OrbaxParams(BaseModel):
+    """Utility for loading params from orbax checkpoints."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    params: PyTree | str | Path
+    _resolved_params: PyTree | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_plain_params(cls, value):
+        if not isinstance(value, OrbaxParams):
+            return {"params": value}
+        return value
+
+    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
+        """Load parameters from orbax using a template."""
+        if self._resolved_params is not None:
+            return self._resolved_params
+        
+        if isinstance(self.params, str | Path):
+            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
+                if ckptr.latest is not None:
+                    if template is not None:
+                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
+                        _loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
+                        params = eqx.combine(_loaded["params"], static_params)
+                    else:
+                        params = ckptr.load_checkpointables()["params"]
+
+                    self._resolved_params = params
+                    return params
+            
+            return None
+
+        else:
+            return self.params
 
 
 class GraphRef(BaseModel):
@@ -92,6 +134,32 @@ class GraphRef(BaseModel):
                     return resolved
 
         return value
+
+
+def resolve_graph_refs(value: Any, graph) -> Any:
+    """Resolve graph-field references inside nested config trees. For use with init_params."""
+    if graph is None:
+        return value
+    if isinstance(value, GraphRef):
+        return value.resolve(graph)
+    if isinstance(value, BaseModel):
+        for field_name in type(value).model_fields:
+            if hasattr(value, field_name):
+                resolved = resolve_graph_refs(getattr(value, field_name), graph)
+                if resolved is not getattr(value, field_name):
+                    object.__setattr__(value, field_name, resolved)
+        for extra_name, extra_value in (value.model_extra or {}).items():
+            resolved = resolve_graph_refs(extra_value, graph)
+            if resolved is not extra_value:
+                setattr(value, extra_name, resolved)
+        return value
+    if isinstance(value, Mapping):
+        return {key: resolve_graph_refs(item, graph) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_graph_refs(item, graph) for item in value]
+    if isinstance(value, tuple):
+        return tuple(resolve_graph_refs(item, graph) for item in value)
+    return value
 
 
 def from_yaml(value: str | Path | bytes | Any) -> Any:

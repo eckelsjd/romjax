@@ -159,6 +159,13 @@ def _resolve_unary_part(name: str) -> UnaryCallable:
     override = {"norm": jnp.linalg.norm, "noop": _noop}
     if canonical in override:
         return override[canonical]
+    if canonical.startswith("p") and canonical[1:].isdigit():
+        q = int(canonical[1:])
+
+        def percentile(x: ArrayLike) -> ArrayLike:
+            return jnp.percentile(x, q)
+
+        return percentile
     if not hasattr(jnp, canonical):
         raise ValueError(f"Unknown jax unary operator part: {name!r}")
     return getattr(jnp, canonical)

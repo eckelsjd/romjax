@@ -52,8 +52,9 @@ def cli(argv: list[str] | None = None) -> int:
                 raise RoutineError(f"Top-level object loaded from '{args.config}' must implement `run()`.")
 
             if hasattr(routine, "root"):
-                Path(routine.root).mkdir(exist_ok=True, parents=True)
-                shutil.copy(Path(args.config), routine.root / Path(args.config).name)
+                if routine.root is not None:
+                    Path(routine.root).mkdir(exist_ok=True, parents=True)
+                    shutil.copy(Path(args.config), routine.root / Path(args.config).name)
             
             return routine.run()
             

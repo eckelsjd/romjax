@@ -1,0 +1,32 @@
+# Loads from several orbax checkpoints produced by Train.
+# Computes scalar metrics and saves/prints a table.
+# Rows are the orbax cases. Columns are the metrics.
+
+!romx:Compare
+routine_config: common/diagnostics.yml
+root: compare
+write_policy: reuse
+graph: common/graph.yml
+
+params_template: common/params.yml
+
+cases:
+  $J_{SR}$: train-sr
+  $J_{RM}$: train-rm
+
+table:
+  stats: [ mean, std ]
+  dataloaders:
+    train: !romx:DataLoader
+      root: data/train
+      datasets:
+        poisson: { batch_size: 1, shuffle_seed: 0 }
+    test: !romx:DataLoader
+      root: data/validation
+      datasets:
+        poisson: { batch_size: 1, shuffle_seed: 0 }
+  metrics:
+    sr: !romx:GraphLoss
+      - { function: { callable: reconstruction, path: [coordinate transform] } }
+    rm: !romx:GraphLoss
+      - { function: { callable: residual }}
