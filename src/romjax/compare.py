@@ -9,36 +9,104 @@ import yaml
 from alive_progress import alive_bar
 from jaxtyping import PyTree
 from pydantic import (
-    BaseModel,
     BeforeValidator,
-    ConfigDict,
     Field,
     SkipValidation,
     field_validator,
     model_validator,
+    BaseModel,
+    PrivateAttr,
+    ConfigDict
 )
+from orbax.checkpoint import v1 as ocp
 
 from romjax.data_gen import DataLoader
 from romjax.graph import FunctionGraph
 from romjax.routine import Routine
 from romjax.train import GraphLoss
 from romjax.tree import UnaryOperator, get_unary_operator
-from romjax.typing import OrbaxParams, from_yaml, resolve_graph_refs
+from romjax.typing import from_yaml, resolve_graph_refs
 from romjax.utils import _NullProgress
 
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 
-__all__ = ["Compare"]
+__all__ = ["CompareOrbax", "CompareTable", "OrbaxParams"]
 
 
-def _iter_loader_once(loader: Iterable[Any]) -> Iterator[Any]:
-    """Iterate a loader once, using one epoch for file-backed ``DataLoader`` instances."""
-    if isinstance(loader, DataLoader):
-        return loader._iter_datasets(max_epochs=1)
-    return iter(loader)
+class OrbaxParams(BaseModel):
+    """Utility for loading params from orbax checkpoints."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    params: PyTree | str | Path
+    _resolved_params: PyTree | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_plain_params(cls, value):
+        if not isinstance(value, OrbaxParams):
+            return {"params": value}
+        return value
+
+    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
+        """Load parameters from orbax using a template."""
+        if self._resolved_params is not None:
+            return self._resolved_params
         
+        if isinstance(self.params, str | Path):
+            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
+                if ckptr.latest is not None:
+                    if template is not None:
+                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
+                        _loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
+                        params = eqx.combine(_loaded["params"], static_params)
+                    else:
+                        params = ckptr.load_checkpointables()["params"]
 
-class CompareTableConfig(BaseModel):
+                    self._resolved_params = params
+                    return params
+            
+            return None
+
+        else:
+            return self.params
+
+
+class CompareOrbax(Routine):
+    """
+    Routine for comparing models via orbax checkpoints from `Train`.
+    """
+    cases: Mapping[str, OrbaxParams]
+
+    root: Path | None = None
+    write_policy: SUPPORTED_POLICIES = "reuse"
+    params_template: PyTree | Mapping[str, PyTree] | None = None
+    graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+
+    @model_validator(mode="after")
+    def _setup_graph_configs(self):
+        if ((isinstance(self.params_template, Mapping) and not all(case in self.params_template for case in self.cases))
+            or not isinstance(self.params_template, Mapping)):
+            # Use same params for all cases
+            self.params_template = {case: copy.deepcopy(self.params_template) for case in self.cases}
+        
+        for case in self.cases:
+            self.params_template[case] = from_yaml(self.params_template[case])  # validate from yaml (optional)
+
+        if self.graph is not None:
+            for case in self.cases:
+                self.params_template[case] = resolve_graph_refs(self.params_template[case], self.graph)
+        
+        # Initialize param templates just like in train
+        for case in self.cases:
+            sample_fn = getattr(self.params_template[case], "sample", None)
+            if callable(sample_fn):
+                self.params_template[case] = sample_fn(jax.random.key(0))
+        
+        return self
+
+
+class CompareTable(CompareOrbax):
     """
     Construct a table of the form: case (row) -> metric (col) -> dataset -> stat.
 
@@ -61,8 +129,6 @@ class CompareTableConfig(BaseModel):
     Stats are computed over all data loaded from each dataloader.
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
-
     dataloaders: SkipValidation[Mapping[str, Iterable[Any]]]
     metrics: Mapping[str, Callable[[PyTree, Any], float]]
 
@@ -70,6 +136,8 @@ class CompareTableConfig(BaseModel):
     latex_template: str | None = None
     col_format: Mapping[str, str] = r"{mean:5.3f} ({std:5.3f})"
     filename: str = "compare_table.yml"
+    show_table: bool = True
+    show_progress: bool = True
 
     @field_validator("stats", mode="before")
     @classmethod
@@ -92,19 +160,21 @@ class CompareTableConfig(BaseModel):
             value = {metric_name: value for metric_name in info.data["metrics"]}
 
         return value
-    
+
     @model_validator(mode="after")
-    def _jit_metrics(self):
-        for name in list(self.metrics.keys()):
-            metric = self.metrics[name]
-            if isinstance(metric, GraphLoss):
-                if metric.graph is not None:
-                    self.metrics[name] = eqx.filter_jit(metric.__call__)
+    def _bind_graph_and_jit_metrics(self):
+        """Bind a graph to any metrics that need it and jit them."""
+        for name, metric_fn in list(self.metrics.items()):
+            if isinstance(metric_fn, GraphLoss):
+                if metric_fn.graph is None:
+                    metric_fn.graph = self.graph
+                    metric_fn._set_default_datasets()
+                self.metrics[name] = eqx.filter_jit(metric_fn.__call__)
             else:
-                self.metrics[name] = eqx.filter_jit(metric)
+                self.metrics[name] = eqx.filter_jit(metric_fn)
         
         return self
-    
+
     def _format_table(self, data: Mapping) -> list[list[str]]:
         """Format computed comparison values as case rows with metric/dataset columns."""
         rows = []
@@ -192,118 +262,68 @@ class CompareTableConfig(BaseModel):
             ])
 
         path.write_text(text, encoding="utf-8")
-    
-    def _bind_graph(self, graph: FunctionGraph):
-        """Bind a graph to any metrics that need it."""
-        if graph is not None:
-            for name, metric_fn in list(self.metrics.items()):
-                if isinstance(metric_fn, GraphLoss):
-                    if metric_fn.graph is None:
-                        metric_fn.graph = graph
-                        metric_fn._set_default_datasets()
-                    self.metrics[name] = eqx.filter_jit(metric_fn.__call__)
-                elif hasattr(metric_fn, "graph"):
-                    if metric_fn.graph is None:
-                        metric_fn.graph = graph
 
-
-class Compare(Routine):
-    """
-    Routine for comparing models via orbax checkpoints from Train.
-    """
-    cases: Mapping[str, OrbaxParams]
-
-    table: CompareTableConfig | None = None
-    print_table: bool = True
-    show_progress: bool = True
-
-    root: Path | None = None
-    write_policy: SUPPORTED_POLICIES = "reuse"
-    params_template: PyTree | Mapping[str, PyTree] | None = None
-    graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
-
-    @model_validator(mode="after")
-    def _setup_graph_configs(self):
-        if ((isinstance(self.params_template, Mapping) and not all(case in self.params_template for case in self.cases))
-            or not isinstance(self.params_template, Mapping)):
-            # Use same params for all cases
-            self.params_template = {case: copy.deepcopy(self.params_template) for case in self.cases}
-        
-        for case in self.cases:
-            self.params_template[case] = from_yaml(self.params_template[case])  # validate from yaml (optional)
-
-        if self.graph is not None:
-            for case in self.cases:
-                self.params_template[case] = resolve_graph_refs(self.params_template[case], self.graph)
-            
-            if self.table is not None:
-                self.table._bind_graph(self.graph)
-        
-        # Initialize param templates just like in train
-        for case in self.cases:
-            sample_fn = getattr(self.params_template[case], "sample", None)
-            if callable(sample_fn):
-                self.params_template[case] = sample_fn(jax.random.key(0))
-        
-        return self
-    
     def run(self):
+        def _iter_loader_once(loader: Iterable[Any]) -> Iterator[Any]:
+            """Iterate a loader once, using one epoch for file-backed ``DataLoader`` instances."""
+            if isinstance(loader, DataLoader):
+                return loader._iter_datasets(max_epochs=1)
+            return iter(loader)
+        
         if self.root is not None:
             self.root = Path(self.root)
             self.root.mkdir(exist_ok=True, parents=True)
 
         # Construct a table with cases in rows and metrics in columns
-        if self.table is not None:
-            tab_results = {}
-            if self.root is not None:
-                tab_file = self.root / self.table.filename
-                if tab_file.exists():
-                    with tab_file.open("r", encoding="utf-8") as fh:
-                        tab_results = yaml.safe_load(fh)
-            
-            num_items = len(self.cases) * len(self.table.metrics)
-            ctxt = alive_bar(num_items) if self.show_progress else _NullProgress()
+        tab_results = {}
+        if self.root is not None:
+            tab_file = self.root / self.filename
+            if tab_file.exists():
+                with tab_file.open("r", encoding="utf-8") as fh:
+                    tab_results = yaml.safe_load(fh)
+        
+        num_items = len(self.cases) * len(self.metrics)
+        ctxt = alive_bar(num_items) if self.show_progress else _NullProgress()
 
-            with ctxt as bar:
-                for case_name, case in self.cases.items():
-                    bar.text(f"Comparing case: {case_name}")
-                    case_results = tab_results.setdefault(case_name, {})
+        with ctxt as bar:
+            for case_name, case in self.cases.items():
+                bar.text(f"Comparing case: {case_name}")
+                case_results = tab_results.setdefault(case_name, {})
 
-                    params = case.resolve_params(self.params_template[case_name])
+                params = case.resolve_params(self.params_template[case_name])
 
-                    for metric_name, metric_fn in self.table.metrics.items():
-                        metric_results = case_results.setdefault(metric_name, {})
-                    
-                        for ds_name, loader in self.table.dataloaders.items():
-                            ds_results = metric_results.setdefault(ds_name, {})
-
-                            has_stats = all(stat_name in ds_results for stat_name in self.table.stats)
-
-                            if has_stats and self.write_policy == "error":
-                                raise ValueError(f"Stats already computed for {case_name}->{metric_name}->{ds_name} "
-                                                f"and write_policy='error'")
-                            if has_stats and self.write_policy == "reuse":
-                                continue
-
-                            values = [metric_fn(params, single_data) for single_data in _iter_loader_once(loader)]
-                            if not values:
-                                raise ValueError(f"No data loaded for dataset '{ds_name}'")
-                            results = jnp.asarray(values)
-
-                            for stat_name, stat_fn in self.table.stats.items():
-                                ds_results[stat_name] = float(stat_fn(results))
-                            
-                        bar()
-            
-            if self.root is not None:
-                tab_file = self.root / self.table.filename
-                with tab_file.open("w", encoding="utf-8") as fh:
-                    yaml.dump(tab_results, fh, sort_keys=False)
+                for metric_name, metric_fn in self.metrics.items():
+                    metric_results = case_results.setdefault(metric_name, {})
                 
-                self.table.write_table(tab_results, tab_file.with_suffix(".tex"))
+                    for ds_name, loader in self.dataloaders.items():
+                        ds_results = metric_results.setdefault(ds_name, {})
+
+                        has_stats = all(stat_name in ds_results for stat_name in self.stats)
+
+                        if has_stats and self.write_policy == "error":
+                            raise ValueError(f"Stats already computed for {case_name}->{metric_name}->{ds_name} "
+                                            f"and write_policy='error'")
+                        if has_stats and self.write_policy == "reuse":
+                            continue
+
+                        values = [metric_fn(params, single_data) for single_data in _iter_loader_once(loader)]
+                        if not values:
+                            raise ValueError(f"No data loaded for dataset '{ds_name}'")
+                        results = jnp.asarray(values)
+
+                        for stat_name, stat_fn in self.stats.items():
+                            ds_results[stat_name] = float(stat_fn(results))
+                        
+                    bar()
+        
+        if self.root is not None:
+            tab_file = self.root / self.filename
+            with tab_file.open("w", encoding="utf-8") as fh:
+                yaml.dump(tab_results, fh, sort_keys=False)
             
-            if self.print_table:
-                self.table.print_table(tab_results)
+            self.write_table(tab_results, tab_file.with_suffix(".tex"))
+        
+        if self.show_table:
+            self.print_table(tab_results)
 
         return 0
-    

@@ -9,12 +9,9 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Sequence, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
-import equinox as eqx
 import lineax as lx
 import optax
 import optimistix as optx
-from jaxtyping import PyTree
-from orbax.checkpoint import v1 as ocp
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -50,45 +47,6 @@ def require_attr(required_attr: str, value: Any):
     if not hasattr(value, required_attr):
         raise ValueError(f"Expected attribute '{required_attr}'")
     return value
-
-
-class OrbaxParams(BaseModel):
-    """Utility for loading params from orbax checkpoints."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    params: PyTree | str | Path
-    _resolved_params: PyTree | None = PrivateAttr(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_plain_params(cls, value):
-        if not isinstance(value, OrbaxParams):
-            return {"params": value}
-        return value
-
-    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
-        """Load parameters from orbax using a template."""
-        if self._resolved_params is not None:
-            return self._resolved_params
-        
-        if isinstance(self.params, str | Path):
-            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
-                if ckptr.latest is not None:
-                    if template is not None:
-                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
-                        _loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
-                        params = eqx.combine(_loaded["params"], static_params)
-                    else:
-                        params = ckptr.load_checkpointables()["params"]
-
-                    self._resolved_params = params
-                    return params
-            
-            return None
-
-        else:
-            return self.params
 
 
 class GraphRef(BaseModel):
