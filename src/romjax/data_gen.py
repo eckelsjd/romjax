@@ -37,7 +37,7 @@ from romjax.tree import (
     set_subtree,
 )
 from romjax.typing import from_yaml
-from romjax.utils import load_h5, required_fields, save_h5
+from romjax.utils import _NullProgress, load_h5, required_fields, save_h5
 
 __all__ = [
     "DataGeneration",
@@ -805,17 +805,6 @@ class LoadSource(LoadDataConfig[Path]):
         :return: Mapping containing the stacked ``source`` batch.
         """
         return pytree_stack([load_h5({}, ref / "source.h5", jax=True) for ref in refs])
-
-
-class _NullProgress:
-    def __enter__(self):
-        return self
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-    def __call__(self):
-        pass
-    def text(self):
-        pass
 
 
 class GenLatent(GenDataConfig):

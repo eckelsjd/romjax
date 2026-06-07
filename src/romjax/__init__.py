@@ -63,6 +63,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "save_h5": ("romjax.utils", "save_h5"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
     "DataLoader": ("romjax.data_gen", "DataLoader"),
+    "Compare": ("romjax.compare", "Compare"),
     "Train": ("romjax.train", "Train"),
     "GraphLoss": ("romjax.train", "GraphLoss"),
     "GraphTest": ("romjax.train", "GraphTest"),
@@ -76,6 +77,7 @@ if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
     from .compression import Compression
+    from .compare import Compare
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate

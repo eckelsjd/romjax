@@ -49,7 +49,7 @@ from romjax.tree import (
     pytree_square_norm,
     set_subtree,
 )
-from romjax.typing import CallableModel, GraphRef, ThirdPartyType, from_registry, from_yaml, require_type
+from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type, resolve_graph_refs
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
 
@@ -67,32 +67,6 @@ def _prettify_timedelta(delta: float) -> str:
     if minutes > 0:
         return f"{minutes:02d}:{seconds:02d}"
     return f"{delta:.3f} s"
-
-
-def _resolve_graph_refs(value: Any, graph: FunctionGraph | None) -> Any:
-    """Resolve graph-field references inside nested config trees. For use with init_params."""
-    if graph is None:
-        return value
-    if isinstance(value, GraphRef):
-        return value.resolve(graph)
-    if isinstance(value, BaseModel):
-        for field_name in type(value).model_fields:
-            if hasattr(value, field_name):
-                resolved = _resolve_graph_refs(getattr(value, field_name), graph)
-                if resolved is not getattr(value, field_name):
-                    object.__setattr__(value, field_name, resolved)
-        for extra_name, extra_value in (value.model_extra or {}).items():
-            resolved = _resolve_graph_refs(extra_value, graph)
-            if resolved is not extra_value:
-                setattr(value, extra_name, resolved)
-        return value
-    if isinstance(value, Mapping):
-        return {key: _resolve_graph_refs(item, graph) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_resolve_graph_refs(item, graph) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_resolve_graph_refs(item, graph) for item in value)
-    return value
 
 
 class BatchLoader[T: Any](BaseModel, Iterator):
@@ -661,7 +635,7 @@ class Train(Routine):
 
     # Required
     loss: Callable[[PyTree, Any], float]
-    init_params: PyTree
+    init_params: Annotated[PyTree, BeforeValidator(from_yaml)]
     optimizer: GradientTransformation
 
     # Optional
@@ -696,7 +670,7 @@ class Train(Routine):
                         if isinstance(ele, GraphLoss):
                             ele._set_default_datasets()
 
-            self.init_params = _resolve_graph_refs(self.init_params, self.graph)
+            self.init_params = resolve_graph_refs(self.init_params, self.graph)
 
         sample_fn = getattr(self.init_params, "sample", None)
         if callable(sample_fn):
