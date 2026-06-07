@@ -10,7 +10,7 @@ import pytest
 import yaml
 from orbax.checkpoint import v1 as ocp
 
-from romjax.compare import Compare, CompareTableConfig
+from romjax.compare import CompareTable
 from romjax.data_gen import DataLoader
 from romjax.train import GraphLoss
 from tests.test_train import ToyLinearReconstructionEdge, _write_graph_dataset
@@ -38,7 +38,8 @@ class FiniteLoader:
 
 
 def test_compare_table_format_print_and_write(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
-    table = CompareTableConfig(
+    table = CompareTable(
+        cases={},
         dataloaders={"train": FiniteLoader([]), "test": FiniteLoader([])},
         metrics={"sq": squared_error, "abs": absolute_error},
         stats=["mean", "std"],
@@ -79,30 +80,29 @@ def test_compare_basic_callables_params_templates_and_multiple_dataloaders(tmp_p
             force=True,
         )
 
-    compare = Compare(
+    compare = CompareTable(
         root=tmp_path / "compare",
-        print_table=False,
+        show_table=False,
+        show_progress=False,
         cases={
             "direct": {"w": jnp.array(0.0), "label": "direct"},
             "orbax": checkpoint_root,
         },
         params_template={"w": jnp.array(0.0), "label": "static"},
-        table=CompareTableConfig(
-            dataloaders={
-                "train": FiniteLoader([
-                    {"x": jnp.array(0.0)},
-                    {"x": jnp.array(1.0)},
-                    {"x": jnp.array(2.0)},
-                ]),
-                "test": FiniteLoader([
-                    {"x": jnp.array(1.0)},
-                    {"x": jnp.array(3.0)},
-                ]),
-            },
-            metrics={"sq": squared_error, "abs": absolute_error},
-            stats={"mean": "mean", "max": "max"},
-            col_format="{mean:.2f}/{max:.2f}",
-        ),
+        dataloaders={
+            "train": FiniteLoader([
+                {"x": jnp.array(0.0)},
+                {"x": jnp.array(1.0)},
+                {"x": jnp.array(2.0)},
+            ]),
+            "test": FiniteLoader([
+                {"x": jnp.array(1.0)},
+                {"x": jnp.array(3.0)},
+            ]),
+        },
+        metrics={"sq": squared_error, "abs": absolute_error},
+        stats={"mean": "mean", "max": "max"},
+        col_format="{mean:.2f}/{max:.2f}",
     )
 
     assert compare.run() == 0
@@ -129,25 +129,24 @@ def test_compare_graph_loss_with_file_backed_dataloader(tmp_path: Path) -> None:
     _write_graph_dataset(data_root, "toy", n_inputs=2, n_outputs=1)
 
     graph = {"edges": {"toy": ToyLinearReconstructionEdge()}}
-    compare = Compare(
+    compare = CompareTable(
         root=tmp_path / "compare",
-        print_table=False,
+        show_table=False,
+        show_progress=False,
         graph=graph,
         cases={
             "zero": {"toy": {"weight": jnp.array(0.0)}},
             "one": {"toy": {"weight": jnp.array(1.0)}},
         },
-        table=CompareTableConfig(
-            dataloaders={
-                "validation": DataLoader(
-                    root=data_root,
-                    datasets={"toy": {"kind": "implicit", "batch_size": 1, "shuffle_seed": 0}},
-                ),
-            },
-            metrics={"loss": GraphLoss(terms=[{"function": graph_single_squared_error, "batch_reduce": None}])},
-            stats=["mean", "max"],
-            col_format="{mean:.1f}/{max:.1f}",
-        ),
+        dataloaders={
+            "validation": DataLoader(
+                root=data_root,
+                datasets={"toy": {"kind": "implicit", "batch_size": 1, "shuffle_seed": 0}},
+            ),
+        },
+        metrics={"loss": GraphLoss(terms=[{"function": graph_single_squared_error, "batch_reduce": None}])},
+        stats=["mean", "max"],
+        col_format="{mean:.1f}/{max:.1f}",
     )
 
     assert compare.run() == 0
