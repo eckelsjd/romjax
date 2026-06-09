@@ -896,6 +896,9 @@ class GenLatent(GenDataConfig):
         logger.info(f"Compression finished. Latent space: {compression.latent_size()}")
 
         compression.dump(artifact_path)
+
+        if hasattr(compression, "save_orbax"):
+            compression.save_orbax(path)
         
         latent_bounds = compression.latent_bounds()
         latent_normal = compression.latent_normal()

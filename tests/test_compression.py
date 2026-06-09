@@ -1,10 +1,13 @@
 from pathlib import Path
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from pydantic import TypeAdapter
 
+from romjax.compare import OrbaxParams
 from romjax.compression import SVD, Compression
+from romjax.nn import LinearProjection
 
 
 def _sample_pytree() -> list[dict[str, dict[str, jnp.ndarray]]]:
@@ -56,3 +59,33 @@ def test_compression_type_adapter_accepts_registry_dict() -> None:
 def test_svd_requires_rank_or_energy_tol() -> None:
     with pytest.raises(ValueError):
         SVD()
+
+
+def test_svd_orbax_checkpoint_matches_nested_compare_template(tmp_path):
+    samples = [
+        {"outputs": jnp.array([0.0, 1.0, 2.0, 3.0])},
+        {"outputs": jnp.array([1.0, 1.5, 2.5, 4.0])},
+        {"outputs": jnp.array([2.0, 3.0, 4.0, 6.0])},
+    ]
+    orbax_template = {
+        "coordinate transform": {"call_args": None},
+        "residual transform": "coordinate transform",
+    }
+
+    compression = SVD(rank=2, orbax_template=orbax_template).fit(samples)
+    assert compression.orbax_template == orbax_template
+
+    checkpoint_dir = tmp_path / "compression"
+    compression.save_orbax(checkpoint_dir)
+
+    params_template = {
+        "coordinate transform": {"call_args": LinearProjection(matrix=jnp.zeros((2, 4)))},
+        "residual transform": None,
+    }
+    params = OrbaxParams(params=checkpoint_dir).resolve_params(params_template)
+
+    projection = params["coordinate transform"]["call_args"]
+    assert isinstance(projection, LinearProjection)
+    np.testing.assert_allclose(projection.matrix, compression.basis)
+    assert params["residual transform"] is None
+    assert "matrix" not in params
