@@ -9,7 +9,7 @@ __all__ = ["LinearProjection"]
 class LinearProjection(eqx.Module):
     """Linear projection module with tied transpose reconstruction."""
 
-    matrix: ArrayLike
+    matrix: ArrayLike  # (r x N)
 
     def __init__(
         self,

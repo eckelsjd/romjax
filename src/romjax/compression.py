@@ -9,8 +9,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
+from orbax.checkpoint import v1 as ocp
 from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
 from pydantic_core import core_schema
+
+from romjax.nn import LinearProjection
 
 __all__ = ["Compression"]
 
@@ -177,7 +180,8 @@ class SVD(Compression):
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
     latent_std: np.ndarray | None = None
-    template: PyTree | None = None
+    template: PyTree | None = None  # for samples
+    orbax_template: PyTree | None = None
 
     @model_validator(mode="after")
     def _validate_rank_policy(self):
@@ -240,7 +244,33 @@ class SVD(Compression):
             latent_mean=np.asarray(latent_mean),
             latent_std=np.asarray(latent_std),
             template=samples[0],
+            orbax_template=self.orbax_template,
         )
+
+    def save_orbax(self, path: str | Path):
+        """Save POD basis to an orbax checkpoint using LinearProjection."""
+        if self.basis is None:
+            raise ValueError("Cannot save orbax with no basis. Must call fit() first.")
+
+        params = LinearProjection(matrix=self.basis)
+
+        if self.orbax_template is not None:
+            # Replaces all "Nones" in the template with the projection basis object
+            chkptable = jax.tree.map(
+                lambda value: params if value is None else value,
+                self.orbax_template,
+                is_leaf=lambda value: value is None,
+            )
+        else:
+            chkptable = params
+
+        with ocp.training.Checkpointer(Path(path).absolute()) as ckptr:
+            ckptr.save_checkpointables(
+                step=0,
+                checkpointables={"params": eqx.filter(chkptable, eqx.is_array)},
+                force=True,
+                overwrite=True,
+            )
 
     def compress(self, sample: PyTree) -> jax.Array:
         """Project one sample into latent coordinates."""

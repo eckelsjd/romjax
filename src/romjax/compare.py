@@ -45,6 +45,8 @@ class OrbaxParams(BaseModel):
     @classmethod
     def _from_plain_params(cls, value):
         if not isinstance(value, OrbaxParams):
+            if isinstance(value, Mapping) and "params" in value:
+                return value
             return {"params": value}
         return value
 
