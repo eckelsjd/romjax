@@ -21,9 +21,11 @@ class DemoRoutine(Routine):
     root: Path
     message: str = "demo"
     observed: ClassVar[dict[str, object] | None] = None
+    observed_messages: ClassVar[list[str]] = []
 
     def run(self) -> int:
         gridplot = self.routine_config.gridplot if self.routine_config is not None else None
+        DemoRoutine.observed_messages.append(self.message)
         DemoRoutine.observed = {
             "root": self.root,
             "message": self.message,
@@ -127,3 +129,40 @@ def test_run_with_globals(tmp_path, monkeypatch):
     assert calls["logger"]["handlers"][1]["sink"] == log_file
     assert calls["bar"]["file"] is sys.stderr
     assert calls["rc"] == {"axes.facecolor": "black"}
+
+
+def test_run_composite_routine(tmp_path):
+    DemoRoutine.observed_messages = []
+    root = tmp_path / "runs"
+    root.mkdir()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    child_path = config_dir / "child.yaml"
+    composite_path = config_dir / "composite.yaml"
+
+    child_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.DemoRoutine",
+                f"root: {root}",
+                "message: child",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "routines:",
+                "  - __parent__/child.yaml",
+                f"  - !pd:{MODULE_NAME}.DemoRoutine",
+                f"    root: {root}",
+                "    message: inline",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli(["run", str(composite_path)]) == 0
+    assert DemoRoutine.observed_messages == ["child", "inline"]

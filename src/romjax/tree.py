@@ -42,9 +42,10 @@ still accepted, but those instances are not shared through the module-level cach
 """
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Generator, Mapping
 from functools import lru_cache
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import equinox as eqx
 import jax
@@ -64,6 +65,7 @@ __all__ = [
     "pytree_iter",
     "pytree_path_iter",
     "pytree_union",
+    "pytree_resolve_refs",
     "to_pytree",
     "get_subtree",
     "set_subtree",
@@ -931,6 +933,53 @@ def set_subtree(tree: PyTree | None, path: TreePath, value: PyTree) -> PyTree:
 def pytree_stack(items: Sequence[PyTree]) -> PyTree:
     """Stack matching sample pytrees along a leading batch axis."""
     return jax.tree.map(lambda *xs: jnp.stack(xs), *items)
+
+
+def pytree_resolve_refs(tree: PyTree, reference_type: type = str):
+    """Resolve references in a pytree to other locations in the pytree. Replace the references with pointers."""
+    if reference_type is not str:
+        raise ValueError("Only str-type references are supported in a param PyTree.")
+
+    def _coerce_token(token: str) -> str | int:
+        token = token.strip()
+        if token.lstrip("-").isdigit():
+            return int(token)
+        return token
+
+    def _coerce_reference_path(reference: str) -> tuple[str | int, ...]:
+        return tuple(_coerce_token(token) for token in reference.split(","))
+
+    def _iter_reference_paths(
+        tree: PyTree,
+        path: tuple[str | int, ...] = (),
+    ) -> Iterator[tuple[tuple[str | int, ...], str]]:
+        if isinstance(tree, reference_type):
+            yield path, tree
+            return
+
+        if isinstance(tree, Mapping):
+            for key, value in tree.items():
+                yield from _iter_reference_paths(value, (*path, key))
+            return
+
+        if isinstance(tree, tuple | list):
+            for i, value in enumerate(tree):
+                yield from _iter_reference_paths(value, (*path, i))
+
+    resolved = tree
+    for ref_path, reference in _iter_reference_paths(tree):
+        target_path = _coerce_reference_path(reference)
+        try:
+            target = get_subtree(tree, target_path)
+        except (AttributeError, IndexError, KeyError, TypeError) as exc:
+            warnings.warn(
+                f"Could not resolve parameter reference {reference!r} at path {ref_path!r}: {exc}",
+                stacklevel=2,
+            )
+            continue
+        resolved = set_subtree(resolved, ref_path, target)
+
+    return resolved
 
 
 at = pytree_at

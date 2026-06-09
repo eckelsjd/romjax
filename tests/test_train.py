@@ -29,7 +29,7 @@ from romjax.train import (
     TerminationConfig,
     Train,
 )
-from romjax.tree import pytree_norm
+from romjax.tree import pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
 from romjax.utils import save_h5
 
@@ -567,7 +567,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
 
     reference = GraphLoss(terms=[{"function": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
     ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
-    resolved_params = reference._resolve_references(ref_params)
+    resolved_params = pytree_resolve_refs(ref_params)
     assert reference(ref_params, batch) == pytest.approx(squared(params, batch))
     assert eqx.filter_jit(reference)(ref_params, batch) == pytest.approx(squared(params, batch))
     assert jax.jit(lambda data: reference(resolved_params, data))(batch) == pytest.approx(squared(params, batch))

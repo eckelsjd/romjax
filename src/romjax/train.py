@@ -2,7 +2,6 @@
 import functools
 import shutil
 import time
-import warnings
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from functools import partial
@@ -46,8 +45,8 @@ from romjax.tree import (
     get_unary_operator,
     pytree_norm,
     pytree_path_iter,
+    pytree_resolve_refs,
     pytree_square_norm,
-    set_subtree,
 )
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type, resolve_graph_refs
 
@@ -356,60 +355,13 @@ class GraphLoss(BaseModel):
             for term in self.terms:
                 if term.dataset is None:
                     term.dataset = _default_edge
-    
-    @staticmethod
-    def _resolve_references(params: PyTree, reference_type: type = str):
-        """Resolve references in a pytree to other locations in the pytree. Replace the references with pointers."""
-        if reference_type is not str:
-            raise ValueError("Only str-type references are supported in a param PyTree.")
-
-        def _coerce_token(token: str) -> str | int:
-            token = token.strip()
-            if token.lstrip("-").isdigit():
-                return int(token)
-            return token
-
-        def _coerce_reference_path(reference: str) -> tuple[str | int, ...]:
-            return tuple(_coerce_token(token) for token in reference.split(","))
-
-        def _iter_reference_paths(
-            tree: PyTree,
-            path: tuple[str | int, ...] = (),
-        ) -> Iterator[tuple[tuple[str | int, ...], str]]:
-            if isinstance(tree, reference_type):
-                yield path, tree
-                return
-
-            if isinstance(tree, Mapping):
-                for key, value in tree.items():
-                    yield from _iter_reference_paths(value, (*path, key))
-                return
-
-            if isinstance(tree, tuple | list):
-                for i, value in enumerate(tree):
-                    yield from _iter_reference_paths(value, (*path, i))
-
-        resolved = params
-        for ref_path, reference in _iter_reference_paths(params):
-            target_path = _coerce_reference_path(reference)
-            try:
-                target = get_subtree(params, target_path)
-            except (AttributeError, IndexError, KeyError, TypeError) as exc:
-                warnings.warn(
-                    f"Could not resolve parameter reference {reference!r} at path {ref_path!r}: {exc}",
-                    stacklevel=2,
-                )
-                continue
-            resolved = set_subtree(resolved, ref_path, target)
-
-        return resolved
 
     def __call__(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
         """Parameters are specified on a per-edge basis. Data batches will also be passed per-edge."""
         if self.graph is None:
             raise ValueError("Must specify a FunctionGraph to evaluate GraphLoss")
         
-        params = self._resolve_references(params)
+        params = pytree_resolve_refs(params)
 
         total = 0.0
         for term in self.terms:
