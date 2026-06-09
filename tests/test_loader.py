@@ -188,14 +188,14 @@ settings:
         encoding="utf-8",
     )
     override_path.write_text(
-        f"""
-!overrides:{base_path}
+        """
+!overrides:__parent__/base.yml
 settings:
-  nested: {{b: 3, c: 4}}
+  nested: {b: 3, c: 4}
   items:
     - null
     - value
-    - {{y: 9, z: 10}}
+    - {y: 9, z: 10}
     - extra
   scalar: new
   created:
@@ -221,7 +221,7 @@ def test_yaml_overrides_preserve_base_file_contents(tmp_path: Path) -> None:
     override_path = tmp_path / "override.yml"
     base_text = "settings: {one: 1, two: 2}\n"
     base_path.write_text(base_text, encoding="utf-8")
-    override_path.write_text(f"!overrides:{base_path}\nsettings: {{two: 3}}\n", encoding="utf-8")
+    override_path.write_text("!overrides:__parent__/base.yml\nsettings: {two: 3}\n", encoding="utf-8")
 
     assert YamlLoader.load(override_path) == {"settings": {"one": 1, "two": 3}}
     assert base_path.read_text(encoding="utf-8") == base_text
@@ -238,7 +238,7 @@ detail: base
 """,
         encoding="utf-8",
     )
-    override_path.write_text(f"!overrides:{base_path}\nopts: {{b: 3}}\n", encoding="utf-8")
+    override_path.write_text("!overrides:__parent__/base.yml\nopts: {b: 3}\n", encoding="utf-8")
 
     model = YamlLoader.load(override_path)
 
@@ -259,10 +259,10 @@ solver: !romx:tests.test_loader.CustomModel
         encoding="utf-8",
     )
     override_path.write_text(
-        f"""
-!overrides:{base_path}
+        """
+!overrides:__parent__/base.yml
 solver: !romx:tests.test_loader.CustomModel
-  opts: {{c: 3}}
+  opts: {c: 3}
   detail: override
 """,
         encoding="utf-8",
@@ -280,8 +280,8 @@ def test_yaml_overrides_resolve_recursive_chains(tmp_path: Path) -> None:
     middle_path = tmp_path / "middle.yml"
     top_path = tmp_path / "top.yml"
     base_path.write_text("settings: {one: base, two: base, three: base}\n", encoding="utf-8")
-    middle_path.write_text(f"!overrides:{base_path}\nsettings: {{two: middle, three: middle}}\n", encoding="utf-8")
-    top_path.write_text(f"!overrides:{middle_path}\nsettings: {{three: top}}\n", encoding="utf-8")
+    middle_path.write_text("!overrides:__parent__/base.yml\nsettings: {two: middle, three: middle}\n", encoding="utf-8")
+    top_path.write_text("!overrides:__parent__/middle.yml\nsettings: {three: top}\n", encoding="utf-8")
 
     assert YamlLoader.load(top_path) == {"settings": {"one": "base", "two": "middle", "three": "top"}}
 
