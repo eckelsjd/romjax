@@ -8,6 +8,7 @@ __version__ = "0.0.1"
 
 from abc import ABC as _ABC
 from abc import abstractmethod as _abstractmethod
+from contextvars import ContextVar as _ContextVar
 from copy import deepcopy as _deepcopy
 from functools import partial as _partial
 from importlib import import_module as _import_module
@@ -56,6 +57,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ListModel": ("romjax.typing", "ListModel"),
     "CallableModel": ("romjax.typing", "CallableModel"),
     "ThirdPartyType": ("romjax.typing", "ThirdPartyType"),
+    "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "Routine": ("romjax.routine", "Routine"),
     "RoutineConfig": ("romjax.routine", "RoutineConfig"),
     "RoutineError": ("romjax.routine", "RoutineError"),
@@ -87,7 +89,7 @@ if TYPE_CHECKING:
     from .plotting import gridplot
     from .poisson import Poisson2D
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
-    from .routine import Routine, RoutineConfig, RoutineError
+    from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .train import (
         BatchLoader,
         GraphLoss,
@@ -136,6 +138,7 @@ class YamlLoader(ConfigLoader):
     PYDANTIC_TAG = "!pd:"
     ROMX_TAG = "!romx:"
     OVERRIDES_TAG = "!overrides:"
+    _SOURCE_PATH: _ContextVar[_Path | None] = _ContextVar("romjax_yaml_source_path", default=None)
 
     @classmethod
     def get_tag(cls, data: _Any) -> str:
@@ -303,6 +306,23 @@ class YamlLoader(ConfigLoader):
         return _Path(path)
 
     @classmethod
+    def current_source_path(cls) -> _Path | None:
+        """Return the YAML file path currently being constructed, if available.
+
+        :return: the current YAML source path
+        """
+        return cls._SOURCE_PATH.get()
+
+    @classmethod
+    def resolve_parent_path(cls, path: str | _Path) -> _Path:
+        """Resolve a path that may use the ``__parent__/`` prefix.
+
+        :param path: path string to resolve
+        :return: path relative to the active YAML source when prefixed, otherwise unchanged
+        """
+        return cls._resolve_override_path(str(path), cls.current_source_path())
+
+    @classmethod
     def _is_override_node(cls, node: _yaml.Node | None) -> bool:
         """Return whether a raw YAML node declares a root-level override.
 
@@ -408,23 +428,23 @@ class YamlLoader(ConfigLoader):
         return _deepcopy(override)
 
     @classmethod
-    def _compose_resolved_node(cls, stream: _Stream) -> _yaml.Node | None:
+    def _compose_resolved_node(cls, stream: _Stream) -> tuple[_yaml.Node | None, _Path | None]:
         """Compose YAML into a raw node after resolving any root-level overrides.
 
         :param stream: A YAML string, path, byte buffer, or file-like object.
-        :return: the composed YAML node with overrides already merged.
+        :return: the composed YAML node with overrides already merged and its source path.
         """
         text, source_path = cls._read_stream(stream)
         node = _yaml.compose(text, Loader=_yaml.SafeLoader)
         if not cls._is_override_node(node):
-            return node
+            return node, source_path
 
         if node is None:
-            return None
+            return None, source_path
         override_path = cls._resolve_override_path(node.tag[len(cls.OVERRIDES_TAG):], source_path)
-        base_node = cls._compose_resolved_node(override_path)
+        base_node, _ = cls._compose_resolved_node(override_path)
         override_node = cls._copy_with_tag(node, cls._default_node_tag(node))
-        return cls._merge_nodes(base_node, override_node)
+        return cls._merge_nodes(base_node, override_node), source_path
 
     @classmethod
     def _node_to_yaml(cls, node: _yaml.Node | None) -> str:
@@ -449,8 +469,12 @@ class YamlLoader(ConfigLoader):
         if "Loader" not in kwargs:
             kwargs["Loader"] = cls.get_loader()
 
-        node = cls._compose_resolved_node(stream)
-        return _yaml.load(cls._node_to_yaml(node), **kwargs)
+        node, source_path = cls._compose_resolved_node(stream)
+        token = cls._SOURCE_PATH.set(source_path)
+        try:
+            return _yaml.load(cls._node_to_yaml(node), **kwargs)
+        finally:
+            cls._SOURCE_PATH.reset(token)
 
     @classmethod
     def dump(cls, obj: _Any, stream: _Stream | None = None, **kwargs: _Any) -> _Optional[str]:

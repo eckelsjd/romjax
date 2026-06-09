@@ -9,6 +9,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Blind spots
 - [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
+- [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
 
 ## Backburner
 - [ ] Keep an eye on orbax checkpoint reloading with more complicated param trees
@@ -26,8 +27,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Better abstract param templates for saving/loading with orbax. Would be nice for these templates to serialize/yaml with jax Dtype structs, and to be automatically handled
 
 ## Routines
-- [ ] Postprocess routine for plots, tables, metrics etc. for journal
-- [ ] Composite routines
 - [ ] Automated batch routines (for hyperparameter optimization)
 - [ ] Routine dependencies and snakemake/makefile
 

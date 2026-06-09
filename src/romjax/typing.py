@@ -124,7 +124,8 @@ def from_yaml(value: str | Path | bytes | Any) -> Any:
     """Try to load from yaml. Useful as a pydantic validator."""
     if isinstance(value, str | Path | bytes):
         import romjax
-        return romjax.load(value)
+        stream = romjax.YamlLoader.resolve_parent_path(value) if isinstance(value, str | Path) else value
+        return romjax.load(stream)
     return value
 
 

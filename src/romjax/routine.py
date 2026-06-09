@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from importlib import import_module as _import_module
 from pathlib import Path
-from typing import Annotated, Any, Callable, Mapping
+from typing import Annotated, Any, Callable, Literal, Mapping
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -14,11 +14,20 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, TypeAdapter, field_
 from romjax.plotting import GridplotConfig
 from romjax.typing import DictModel, WriteStream, from_yaml
 
-__all__ = ["Routine", "RoutineConfig", "RoutineError", "LoggerConfig", "ProgressBarConfig"]
+__all__ = [
+    "CompositeRoutine",
+    "Routine",
+    "RoutineConfig",
+    "RoutineError",
+    "LoggerConfig",
+    "ProgressBarConfig",
+]
 
 _LAZY_EXPORTS = {
+    "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
-    "GraphTrain": ("romjax.train", "GraphTrain"),
+    "Train": ("romjax.train", "Train"),
+    "CompareTable": ("romjax.compare", "CompareTable")
 }
 
 available = list(_LAZY_EXPORTS.keys())
@@ -171,6 +180,104 @@ class Routine(BaseModel, ABC):
     @abstractmethod
     def run(self) -> int:
         raise NotImplementedError
+
+
+class CompositeRoutine(Routine):
+    """
+    Run a sequence of child routines.
+
+    :param routines: routines, inline routine objects, or YAML files resolving to routines
+    :param failure_policy: handling for non-zero child exits or raised exceptions
+    """
+
+    routines: list[Routine]
+    failure_policy: Literal["stop", "continue", "force"] = "stop"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_plain_list(cls, value):
+        """Allow direct validation from a list of routines."""
+        if isinstance(value, list | tuple):
+            return {"routines": value}
+        return value
+
+    @field_validator("routines", mode="before")
+    @classmethod
+    def _validate_routines(cls, value):
+        """Load child routines from YAML paths and require valid Routine instances."""
+        if not isinstance(value, list | tuple):
+            value = [value]
+
+        return [cls._validate_routine(item) for item in value]
+
+    @classmethod
+    def _validate_routine(cls, value: Any) -> Routine:
+        """Validate one child routine specification.
+
+        :param value: routine instance or YAML path
+        :return: validated routine
+        """
+        if isinstance(value, Routine):
+            return value
+
+        if isinstance(value, str | Path | bytes):
+            import romjax
+
+            stream = romjax.YamlLoader.resolve_parent_path(value) if isinstance(value, str | Path) else value
+            value = romjax.load(stream)
+
+        if not isinstance(value, Routine):
+            raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(value).__name__}.")
+
+        return value
+
+    @staticmethod
+    def _failure_summary(failures: list[str]) -> str:
+        """Return a compact multi-line failure summary.
+
+        :param failures: collected failure descriptions
+        :return: formatted summary
+        """
+        lines = ["CompositeRoutine failures:"]
+        lines.extend(f"- {failure}" for failure in failures)
+        return "\n".join(lines)
+
+    def run(self) -> int:
+        """Run child routines sequentially."""
+        failures: list[str] = []
+        exit_code = 0
+
+        for index, routine in enumerate(self.routines):
+            routine_label = f"child {index} ({type(routine).__name__})"
+            try:
+                child_code = int(routine.run())
+            except Exception as exc:
+                if self.failure_policy != "force":
+                    raise
+
+                summary = f"{routine_label} raised {type(exc).__name__}: {exc}"
+                failures.append(summary)
+                if exit_code == 0:
+                    exit_code = 1
+                logger.exception("CompositeRoutine {}", summary)
+                continue
+
+            if child_code == 0:
+                continue
+
+            summary = f"{routine_label} exited with code {child_code}"
+            failures.append(summary)
+            if exit_code == 0:
+                exit_code = child_code
+
+            if self.failure_policy == "stop":
+                logger.error(self._failure_summary(failures))
+                return child_code
+
+        if failures:
+            logger.error(self._failure_summary(failures))
+
+        return exit_code
 
 
 class RoutineError(RuntimeError):
