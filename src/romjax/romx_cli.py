@@ -54,7 +54,10 @@ def cli(argv: list[str] | None = None) -> int:
             if hasattr(routine, "root"):
                 if routine.root is not None:
                     Path(routine.root).mkdir(exist_ok=True, parents=True)
-                    shutil.copy(Path(args.config), routine.root / Path(args.config).name)
+                    src = Path(args.config)
+                    dest = routine.root / Path(args.config).name
+                    if src != dest:
+                        shutil.copy(src, dest)
             
             return routine.run()
             

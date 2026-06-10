@@ -1,7 +1,21 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
+**Short term**
+- use gpu+cpu on single device at same time with GridSearch (just change jax_platforms for child_env -- or maybe this is automatic)
+- GridSearch save policy -- update on rolling basis (e.g. if we have thousands of runs, only save best 10 at a time )
+- Make sure multiple grid search is compatible with a composite routine. Especially look at logging/progress/failing in the composite routine
+- Optimize single run (multi-threaded/jit/caching/overhead, poisson, etc.)
+- normalization before/after training
+
+**Long term**
+- EvolutionSearch or similar instead of grid search (still dispatch in parallel)
+- Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding
+- Get this all to work on the mac studios
+
+
 ## Critical
 - [ ] Normalization for eqx transforms
+- [ ] Make use of gpu at same time as cpu for grid search
 
 ## Needs testing
 - [ ] Training on param references
@@ -10,15 +24,18 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
+- [ ] Probably issues with absolute paths in GridSearch on Windows
 
 ## Backburner
 - [ ] Keep an eye on orbax checkpoint reloading with more complicated param trees
 - [ ] Go back and make sure graph loss functions actually give the same result as normal regresion (linear, mlp)
-- [ ] Need to be more consistent with suppressing or showing logger/progress bars in library code via logger.disable("romjax") for example
 - [ ] Other data save formats outside of H5
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file
+- [ ] Might be neat for the !include mechanism to work like python import, so we don't have to keep worrying about relative paths
+- [ ] More consistent handling of exceptions in the cli. For example, when to show messages, expected vs unexpected failures, etc.
+- [ ] Would be good to copy the entire resolved yaml config to routine root dirs, (after resolving all the overrides)
 
 ## Serialization
 - [ ] from_registry items back to string
@@ -27,8 +44,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Better abstract param templates for saving/loading with orbax. Would be nice for these templates to serialize/yaml with jax Dtype structs, and to be automatically handled
 
 ## Routines
-- [ ] Automated batch routines (for hyperparameter optimization)
-- [ ] Routine dependencies and snakemake/makefile
+- [ ] ~~Routine dependencies and snakemake/makefile~~
 
 ## Task CLI
 - [ ] [Issues with codex sandbox shell commands](https://github.com/openai/codex/issues/17525)

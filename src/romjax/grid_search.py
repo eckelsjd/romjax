@@ -1,0 +1,552 @@
+"""Grid-search routine for YAML-configured ROM experiments."""
+
+from __future__ import annotations
+
+import functools
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import product
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+import numpy as np
+import yaml
+from alive_progress import alive_bar
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PositiveInt, field_validator, model_validator
+
+import romjax
+from romjax.routine import Routine, RoutineError
+from romjax.tree import TreePath, coerce_tree_path, coerce_tree_paths, pytree_merge, set_subtree
+from romjax.typing import CallableModel, from_registry
+from romjax.utils import _NullProgress
+
+type WritePolicy = Literal["reuse", "overwrite", "error"]
+
+__all__ = [
+    "ExecutorConfig",
+    "GridOverride",
+    "GridSearch",
+    "GridSearchCaseResult",
+    "MetricCallable",
+]
+
+
+class GridOverride(BaseModel):
+    """One hyperparameter path and its candidate values.
+
+    :param path: path in the base YAML tree to override
+    :param cases: candidate values for the override path
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    path: TreePath
+    cases: tuple[Any, ...]
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _coerce_path(cls, value: Any) -> TreePath:
+        path = coerce_tree_path(value)
+        if not isinstance(path, tuple) or not all(isinstance(token, str | int) for token in path):
+            raise ValueError("Grid override path must be a sequence of string or integer tokens.")
+        if any(isinstance(token, int) and token < 0 for token in path):
+            raise ValueError("Grid override paths do not support negative list indices.")
+        return path
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def _coerce_cases(cls, value: Any) -> tuple[Any, ...]:
+        if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+            value = [value]
+        if not value:
+            raise ValueError("Grid override cases must contain at least one value.")
+        return tuple(value)
+
+
+class ExecutorConfig(BaseModel):
+    """Execution backend configuration.
+
+    :param kind: executor backend
+    :param max_workers: worker count for concurrent executors
+    """
+
+    kind: Literal["serial", "thread", "process"] = "serial"
+    max_workers: PositiveInt | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_string(cls, value: Any) -> Any:
+        aliases = {
+            "serial": "serial",
+            "thread": "thread",
+            "threads": "thread",
+            "threadpool": "thread",
+            "process": "process",
+            "processes": "process",
+            "ppool": "process",
+        }
+        if isinstance(value, str):
+            try:
+                return {"kind": aliases[value]}
+            except KeyError as exc:
+                raise ValueError(f"Unknown executor: {value!r}.") from exc
+        return value
+
+    def context(self) -> Executor | None:
+        """Return a concurrent executor, or ``None`` for serial execution."""
+        if self.kind == "serial":
+            return None
+        if self.kind == "thread":
+            return ThreadPoolExecutor(max_workers=self.max_workers)
+        if self.kind == "process":
+            return ProcessPoolExecutor(max_workers=self.max_workers)
+        raise RoutineError(f"Unsupported executor: {self.kind}")
+
+
+class _SavePolicy(BaseModel):
+    """Normalized case retention policy."""
+
+    mode: Literal["all", "best"] = "all"
+    count: PositiveInt | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if value == {}:
+            return {"mode": "all"}
+        if value == "all":
+            return {"mode": "all"}
+        if value == "best":
+            return {"mode": "best", "count": 1}
+        if isinstance(value, Mapping):
+            if set(value) != {"best"}:
+                raise ValueError("GridSearch save_policy mappings must have exactly one key: 'best'.")
+            return {"mode": "best", "count": value["best"]}
+        return value
+
+
+@dataclass(frozen=True)
+class _CaseSpec:
+    name: str
+    root: Path
+    config_path: Path
+    command: tuple[str, ...]
+    env: dict[str, str]
+    quiet: bool
+    reuse_existing: bool = False
+
+
+@dataclass(frozen=True)
+class GridSearchCaseResult:
+    """Subprocess execution result for one grid-search case.
+
+    :param name: case name
+    :param root: case root directory
+    :param config_path: generated case config path
+    :param exit_code: subprocess exit code
+    :param start_time: human-readable start timestamp
+    :param end_time: human-readable end timestamp
+    :param stdout_path: captured stdout path, if captured
+    :param stderr_path: captured stderr path, if captured
+    """
+
+    name: str
+    root: Path
+    config_path: Path
+    exit_code: int
+    start_time: str
+    end_time: str
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+
+    @property
+    def status(self) -> Literal["succeeded", "failed"]:
+        """Return the coarse case status."""
+        return "succeeded" if self.exit_code == 0 else "failed"
+
+
+def _timestamp() -> str:
+    """Return a human-readable local timestamp."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _run_case_subprocess(spec: _CaseSpec) -> GridSearchCaseResult:
+    """Run one generated case config in a child ``romx run`` process.
+
+    :param spec: prepared case execution spec
+    :return: subprocess result
+    """
+    start = _timestamp()
+    env = os.environ.copy()
+    env.update(spec.env)
+    stdout_path = spec.root / "stdout.log" if spec.quiet else None
+    stderr_path = spec.root / "stderr.log" if spec.quiet else None
+
+    # Run from the same working directory (to preserve all relative yaml paths)
+    if spec.quiet:
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+            process = subprocess.run(
+                spec.command,
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+            )
+    else:
+        process = subprocess.run(spec.command, env=env, check=False)
+
+    return GridSearchCaseResult(
+        name=spec.name,
+        root=spec.root,
+        config_path=spec.config_path,
+        exit_code=process.returncode,
+        start_time=start,
+        end_time=_timestamp(),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+
+def _reuse_case_result(spec: _CaseSpec) -> GridSearchCaseResult:
+    """Return a successful result for a reused case directory."""
+    timestamp = _timestamp()
+    return GridSearchCaseResult(
+        name=spec.name,
+        root=spec.root,
+        config_path=spec.config_path,
+        exit_code=0,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+
+def _set_override_path(tree: Any, path: TreePath, value: Any) -> Any:
+    """Set one sparse override path into a sparse tree.
+
+    :param tree: existing sparse tree
+    :param path: path to set
+    :param value: value to write
+    :return: updated sparse tree
+    """
+    return pytree_merge(tree, set_subtree(None, path, value))
+
+
+def _manifest_value(value: Any) -> Any:
+    """Return a YAML-safe manifest representation for an arbitrary override value."""
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _manifest_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return [_manifest_value(item) for item in value]
+    if callable(value):
+        return f"{value.__module__}.{value.__qualname__}"
+    return repr(value)
+
+
+def orbax_metric(case_root: Path) -> float:
+    """Return the best loss recorded for a training case.
+
+    The fast path reads ``loss.csv`` written by :class:`romjax.train.Train`. If no loss history is present, the
+    function attempts to inspect the latest Orbax checkpoint metrics.
+
+    :param case_root: root directory for one grid-search case
+    :return: minimum observed loss
+    :raises RoutineError: if no numeric loss metric can be found
+    """
+    loss_path = case_root / "loss.csv"
+    if loss_path.exists():
+        values = np.atleast_2d(np.loadtxt(loss_path, delimiter=",", skiprows=1))
+        if values.size and values.shape[1] >= 2:
+            return float(np.nanmin(values[:, 1]))
+
+    try:
+        from orbax.checkpoint import v1 as ocp
+
+        with ocp.training.Checkpointer(case_root.resolve()) as ckptr:
+            latest = ckptr.latest
+            metrics = getattr(latest, "metrics", None)
+            if isinstance(metrics, Mapping) and "loss" in metrics:
+                return float(metrics["loss"])
+    except Exception as exc:
+        raise RoutineError(f"No readable GridSearch metric found in {case_root}.") from exc
+
+    raise RoutineError(f"No readable GridSearch metric found in {case_root}.")
+
+
+_METRIC_REGISTRY = {
+    "orbax": orbax_metric
+}
+
+
+class MetricCallable(CallableModel):
+    """Rank grid search cases by a metric."""
+
+    callable: Annotated[Callable[[Path], float], BeforeValidator(functools.partial(from_registry, _METRIC_REGISTRY))]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_str(cls, value):
+        if isinstance(value, str):
+            return {"callable": value}
+        return value
+    
+
+class GridSearch(Routine):
+    """Run a Cartesian-product grid search by generating override YAML files and dispatching ``romx run`` cases.
+
+    :param root: directory containing generated cases, best-copy outputs, and manifest
+    :param base: base routine YAML file to override
+    :param override: hyperparameter override specifications
+    :param write_policy: behavior when root or case artifacts already exist
+    :param save_policy: which completed cases to retain after ranking
+    :param metric: metric alias or callable used to rank successful cases
+    :param show_progress: whether to show a parent progress bar
+    :param executor: execution backend configuration
+    :param case_root_path: path or paths to inject with the per-case root directory
+    :param child_env: extra environment variables for child subprocesses
+    :param child_quiet: whether to capture child stdout and stderr to files
+    :param command: optional command prefix replacing the default current-interpreter romx entrypoint
+    """
+
+    root: Path
+    base: Path
+    override: list[GridOverride]
+    write_policy: WritePolicy = "reuse"
+    save_policy: _SavePolicy = Field(default_factory=_SavePolicy)
+    metric: MetricCallable = "orbax"
+    show_progress: bool = True
+    executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    case_root_path: tuple[TreePath, ...] = (("root",),)
+    child_env: dict[str, str] = Field(default_factory=dict)
+    child_quiet: bool = True
+    command: tuple[str, ...] | None = None
+
+    @field_validator("base", mode="before")
+    @classmethod
+    def _resolve_base(cls, value: Any) -> Any:
+        if isinstance(value, str | Path):
+            return romjax.YamlLoader.resolve_parent_path(value)
+        return value
+
+    @field_validator("executor", mode="before")
+    @classmethod
+    def _coerce_executor(cls, value: Any) -> Any:
+        return ExecutorConfig.model_validate(value)
+
+    @field_validator("save_policy", mode="before")
+    @classmethod
+    def _coerce_save_policy(cls, value: Any) -> Any:
+        return _SavePolicy.model_validate(value)
+
+    @field_validator("case_root_path", mode="before")
+    @classmethod
+    def _coerce_case_root_path(cls, value: Any) -> tuple[TreePath, ...]:
+        paths = tuple(coerce_tree_paths(value))
+        if any(len(path) == 0 for path in paths):
+            raise ValueError("case_root_path entries cannot be empty.")
+        if any(any(isinstance(token, int) and token < 0 for token in path) for path in paths):
+            raise ValueError("case_root_path entries do not support negative list indices.")
+        return paths
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> "GridSearch":
+        self.root = self.root.resolve()
+        self.base = self.base.resolve()
+        if not self.base.exists():
+            raise RoutineError(f"GridSearch base config does not exist: {self.base}")
+        
+        if self.root.exists() and any(self.root.iterdir()):
+            if self.write_policy == "error":
+                raise RoutineError(f"GridSearch root already contains artifacts: {self.root}")
+            if self.write_policy == "overwrite":
+                for artifact in (self.root / "cases", self.root / "best"):
+                    if artifact.exists():
+                        shutil.rmtree(artifact)
+                (self.root / "grid_search_manifest.yml").unlink(missing_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+        return self
+
+    def _case_values(self) -> list[tuple[Any, ...]]:
+        """Return the Cartesian-product grid values."""
+        return list(product(*(item.cases for item in self.override)))
+
+    def _case_metadata(self, values: Sequence[Any]) -> dict[str, Any]:
+        """Return manifest metadata for a case's override values."""
+        return {
+            ".".join(str(token) for token in override.path): _manifest_value(value)
+            for override, value in zip(self.override, values)
+        }
+
+    def _case_command(self, config_path: Path) -> tuple[str, ...]:
+        """Return the command for a generated case config."""
+        if self.command is not None:
+            return (*self.command, str(config_path))
+        return (sys.executable, "-c", "from romjax.romx_cli import main; main()", "run", str(config_path))
+
+    def _write_case_config(self, case_root: Path, values: Sequence[Any]) -> Path:
+        """Write one case override config.
+
+        :param case_root: generated case root
+        :param values: override values for this case
+        :return: generated YAML path
+        """
+        case_root.mkdir(parents=True, exist_ok=True)
+        tree: Any = {}
+        for override, value in zip(self.override, values):
+            tree = _set_override_path(tree, override.path, value)
+        for root_path in self.case_root_path:
+            tree = _set_override_path(tree, root_path, str(case_root))
+
+        base_ref = os.path.relpath(self.base, start=case_root)
+        config_path = case_root / "case.yml"
+        yaml_body = romjax.YamlLoader.dump(tree, sort_keys=False)
+        config_path.write_text(f"!overrides:__parent__/{base_ref}\n{yaml_body}", encoding="utf-8")
+        return config_path
+
+    def _prepare_cases(self) -> tuple[list[_CaseSpec], dict[str, dict[str, Any]]]:
+        """Create all case directories/configs and return execution specs plus manifest entries."""
+        cases_dir = self.root / "cases"
+        specs: list[_CaseSpec] = []
+        manifest_cases: dict[str, dict[str, Any]] = {}
+        for index, values in enumerate(self._case_values()):
+            name = f"case_{index:04d}"
+            case_root = cases_dir / name
+            reuse_existing = self.write_policy == "reuse" and case_root.exists() and any(case_root.iterdir())
+            config_path = case_root / "case.yml" if reuse_existing else self._write_case_config(case_root, values)
+            specs.append(
+                _CaseSpec(
+                    name=name,
+                    root=case_root,
+                    config_path=config_path,
+                    command=self._case_command(config_path),
+                    env=dict(self.child_env),
+                    quiet=self.child_quiet,
+                    reuse_existing=reuse_existing,
+                )
+            )
+            manifest_cases[name] = {
+                "path": str(case_root),
+                "config": str(config_path),
+                "overrides": self._case_metadata(values),
+            }
+        return specs, manifest_cases
+
+    def _run_cases(self, specs: Sequence[_CaseSpec]) -> list[GridSearchCaseResult]:
+        """Run all case specs with configured dispatch."""
+        progress = alive_bar(len(specs)) if self.show_progress else _NullProgress()
+        results: list[GridSearchCaseResult] = []
+        with progress as bar:
+            executor = self.executor.context()
+            if executor is None:
+                for spec in specs:
+                    result = _reuse_case_result(spec) if spec.reuse_existing else _run_case_subprocess(spec)
+                    results.append(result)
+                    bar()
+                return results
+
+            with executor:
+                future_to_name: dict[Future[GridSearchCaseResult], str] = {
+                    executor.submit(_run_case_subprocess, spec): spec.name
+                    for spec in specs
+                    if not spec.reuse_existing
+                }
+                for spec in specs:
+                    if spec.reuse_existing:
+                        results.append(_reuse_case_result(spec))
+                        bar()
+                for future in as_completed(future_to_name):
+                    results.append(future.result())
+                    bar()
+        return results
+
+    def _rank_cases(self, results: Sequence[GridSearchCaseResult]) -> list[tuple[str, float]]:
+        """Evaluate metrics and return successful cases ordered from best (least) to worst (most)."""
+        metric_fn = self.metric
+        ranked: list[tuple[str, float]] = []
+        for result in results:
+            if result.exit_code != 0:
+                continue
+            try:
+                ranked.append((result.name, float(metric_fn(result.root))))
+            except Exception:
+                continue
+        return sorted(ranked, key=lambda item: item[1])
+
+    def _apply_save_policy(self, ranked: Sequence[tuple[str, float]]) -> list[str]:
+        """Apply retention policy and copy the best case.
+
+        :param ranked: ranked successful cases
+        :return: retained case names
+        """
+        if self.save_policy.mode == "all":
+            retained = [case_root.name for case_root in sorted((self.root / "cases").iterdir()) if case_root.is_dir()]
+        else:
+            retained = [name for name, _ in ranked[: self.save_policy.count]]
+            for case_root in (self.root / "cases").iterdir():
+                if case_root.is_dir() and case_root.name not in retained:
+                    shutil.rmtree(case_root)
+
+        if ranked:
+            best_name = ranked[0][0]
+            best_path = self.root / "best"
+            if best_path.exists():
+                shutil.rmtree(best_path)
+            shutil.copytree(self.root / "cases" / best_name, best_path)
+
+        return retained
+
+    def _write_manifest(self, manifest: Mapping[str, Any]) -> None:
+        """Write the grid-search manifest."""
+        path = self.root / "grid_search_manifest.yml"
+        with path.open("w", encoding="utf-8") as fh:
+            yaml.safe_dump(dict(manifest), fh, sort_keys=False)
+
+    def run(self) -> int:
+        """Run the grid search and write a manifest."""
+        specs, manifest_cases = self._prepare_cases()
+        results = self._run_cases(specs)
+        result_by_name = {result.name: result for result in results}
+        ranked = self._rank_cases(results)
+        metric_by_name = dict(ranked)
+        retained = self._apply_save_policy(ranked)
+
+        exit_code = 0
+        for spec in specs:
+            result = result_by_name[spec.name]
+            if result.exit_code != 0 and exit_code == 0:
+                exit_code = result.exit_code
+            manifest_cases[spec.name].update(
+                {
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "metric": metric_by_name.get(spec.name),
+                    "start_time": result.start_time,
+                    "end_time": result.end_time,
+                    "stdout": str(result.stdout_path) if result.stdout_path is not None else None,
+                    "stderr": str(result.stderr_path) if result.stderr_path is not None else None,
+                    "retained": spec.name in retained,
+                }
+            )
+
+        self._write_manifest(
+            {
+                "root": str(self.root),
+                "base": str(self.base),
+                "executor": self.executor.model_dump(),
+                "save_policy": self.save_policy.model_dump(),
+                "best": ranked[0][0] if ranked else None,
+                "ranking": [{"case": name, "metric": metric} for name, metric in ranked],
+                "cases": manifest_cases,
+            }
+        )
+        return exit_code

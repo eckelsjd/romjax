@@ -59,7 +59,7 @@ def update_readme_coverage_badge():
 
 def pytest_sessionfinish(session, exitstatus):
     """Do things after pytest session finishes."""
-    update_readme_coverage_badge()
+    # update_readme_coverage_badge()
     # logging.shutdown()
 
     # Write an exitstatus to file (for pre-commit checking)

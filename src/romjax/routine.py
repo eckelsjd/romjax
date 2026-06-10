@@ -26,6 +26,7 @@ __all__ = [
 _LAZY_EXPORTS = {
     "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
+    "GridSearch": ("romjax.grid_search", "GridSearch"),
     "Train": ("romjax.train", "Train"),
     "CompareTable": ("romjax.compare", "CompareTable")
 }
@@ -109,6 +110,7 @@ class RoutineConfig(BaseModel):
     """
     Global configurations for routines. Will toggle global settings during model validation.
     
+    :ivar device: jax device (comma-separated string compatiable with 'jax_platforms')
     :ivar mplstyle: matplotlib plot style
     :ivar gridplot: gridplot style
     :ivar logger: loguru configuration
@@ -117,6 +119,7 @@ class RoutineConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="forbid")
 
+    device: str | None = None
     mplstyle: str | Path | Mapping | None = None
     gridplot: GridplotConfig | None = None
     logger: LoggerConfig | None = None
@@ -124,6 +127,10 @@ class RoutineConfig(BaseModel):
 
     @model_validator(mode="after")
     def configure(self):
+        if (device := self.device) is not None:
+            import jax
+            jax.config.update('jax_platforms', device)
+
         if (style := self.mplstyle) is not None:    # plt style
             if isinstance(style, str | Path):
                 plt.style.use(style)
