@@ -9,9 +9,6 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Annotated, Any, Callable, Iterator, Mapping, MutableMapping, Sequence, TypeVar, get_args
 from weakref import WeakKeyDictionary
 
-import lineax as lx
-import optax
-import optimistix as optx
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -31,7 +28,6 @@ __all__ = ['DictModel', 'ListModel', 'CallableModel', 'GraphRef', 'ThirdPartyTyp
 
 _SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
 _SPEC_ID_REGISTRY: dict[int, tuple[type, dict[str, Any]]] = {}
-_THIRD_PARTY_MODULES = (lx, optx, optax)
 type _DefaultModules = str | ModuleType | Sequence[str | ModuleType] | None
 
 T = TypeVar("T")
@@ -433,16 +429,6 @@ def _resolve_name(name: str, *, default_modules: _DefaultModules = None) -> Any:
     for module in _normalize_default_modules(default_modules):
         if hasattr(module, name):
             return getattr(module, name)
-
-    matches = [
-        getattr(module, name)
-        for module in _THIRD_PARTY_MODULES
-        if isinstance(module, ModuleType) and hasattr(module, name)
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise ValueError(f"Ambiguous third-party name {name!r}; use a fully qualified import path.")
 
     raise ValueError(f"Could not resolve third-party name {name!r}.")
 

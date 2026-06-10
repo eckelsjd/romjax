@@ -7,8 +7,16 @@ import os
 import shutil
 import subprocess
 import sys
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import product
@@ -18,7 +26,16 @@ from typing import Annotated, Any, Literal
 import numpy as np
 import yaml
 from alive_progress import alive_bar
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PositiveInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    field_validator,
+    model_validator,
+)
 
 import romjax
 from romjax.routine import Routine, RoutineError
@@ -27,14 +44,330 @@ from romjax.typing import CallableModel, from_registry
 from romjax.utils import _NullProgress
 
 type WritePolicy = Literal["reuse", "overwrite", "error"]
+type _DeviceKind = Literal["cpu", "gpu"]
+
+_HYBRID_ENV_KEYS = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "JAX_PLATFORMS",
+        "XLA_PYTHON_CLIENT_MEM_FRACTION",
+        "XLA_PYTHON_CLIENT_PREALLOCATE",
+    }
+)
 
 __all__ = [
     "ExecutorConfig",
-    "GridOverride",
     "GridSearch",
-    "GridSearchCaseResult",
     "MetricCallable",
 ]
+
+
+class ExecutorConfig(BaseModel, ABC):
+    """Abstract execution backend configuration for grid-search cases."""
+
+    show_progress: bool = True
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ExecutorConfig":
+        """Construct the concrete executor config requested by a YAML-friendly value.
+
+        :param value: string, mapping, or already-validated executor config
+        :return: concrete executor config
+        """
+        if isinstance(value, ExecutorConfig):
+            return value
+
+        aliases = {
+            "serial": "serial",
+            "thread": "thread",
+            "threads": "thread",
+            "threadpool": "thread",
+            "process": "process",
+            "processes": "process",
+            "ppool": "process",
+            "hybrid": "hybrid",
+        }
+        if isinstance(value, str):
+            try:
+                value = {"kind": aliases[value]}
+            except KeyError as exc:
+                raise ValueError(f"Unknown executor: {value!r}.") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError("GridSearch executor must be a string, mapping, or ExecutorConfig.")
+
+        kind = aliases.get(str(value.get("kind", "serial")))
+        if kind is None:
+            raise ValueError(f"Unknown executor: {value.get('kind')!r}.")
+
+        if kind == "serial":
+            return SerialExecutorConfig.model_validate(value)
+        if kind in {"thread", "process"}:
+            return ConcurrentExecutorConfig.model_validate({**value, "kind": kind})
+        if kind == "hybrid":
+            data = dict(value)
+            if isinstance(data.get("hybrid"), Mapping):
+                data = {**data, **data["hybrid"]}
+            data.pop("hybrid", None)
+            return HybridExecutorConfig.model_validate(data)
+        raise RoutineError(f"Unsupported executor: {kind}")
+    
+    def progress_context(self, total: int):
+        return alive_bar(total) if self.show_progress else _NullProgress()
+
+    @abstractmethod
+    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+        """Run all prepared case specs.
+
+        :param specs: prepared case specs
+        :return: case results
+        """
+        raise NotImplementedError
+
+    def validate_child_env(self, child_env: Mapping[str, str]) -> None:
+        """Validate executor-specific compatibility with global child environment variables.
+
+        :param child_env: shared child-process environment overrides
+        """
+        pass
+
+
+class HybridGpuConfig(BaseModel):
+    """GPU scheduling options for the hybrid grid-search executor.
+
+    :param devices: visible GPU indices to schedule, or ``"auto"`` to use JAX-visible GPUs
+    :param workers_per_device: number of simultaneous child processes per GPU
+    :param memory_fraction: optional JAX/XLA GPU memory fraction for child processes
+    :param preallocate: optional JAX/XLA GPU preallocation flag for child processes
+    """
+
+    devices: Literal["auto"] | tuple[NonNegativeInt, ...] = "auto"
+    workers_per_device: PositiveInt = 1
+    memory_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    preallocate: bool | None = None
+
+    @field_validator("devices", mode="before")
+    @classmethod
+    def _coerce_devices(cls, value: Any) -> Any:
+        if value == "auto":
+            return value
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            return tuple(value)
+        return value
+    
+    @model_validator(mode="before")
+    @classmethod
+    def _from_devices(cls, value):
+        if not isinstance(value, Mapping | HybridGpuConfig):
+            if isinstance(value, str, tuple | list):
+                return {"devices": value}
+            if isinstance(value, int):
+                return {"workers_per_device": value}
+        return value
+    
+    def get_env(self, device_index: int) -> dict[str, str]:
+        """Return child environment overrides for one GPU slot."""
+        env = {"CUDA_VISIBLE_DEVICES": str(device_index)}
+        if self.memory_fraction is not None:
+            env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(self.memory_fraction)
+        if self.preallocate is not None:
+            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = str(self.preallocate).lower()
+        return env
+
+
+class HybridCpuConfig(BaseModel):
+    """CPU scheduling options for the hybrid grid-search executor.
+
+    :param max_workers: CPU child-process slots, or ``None`` to use all local CPU cores
+    """
+
+    max_workers: NonNegativeInt | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_workers(cls, value):
+        if ((isinstance(value, str) and value.lstrip("-").isdigit()) or 
+            isinstance(value, int) or value is None):
+            return {"max_workers": value}
+        return value
+
+
+class HybridExecutorConfig(ExecutorConfig):
+    """Device-aware executor settings for running grid-search cases on GPU and CPU slots.
+
+    :param gpu: GPU slot and JAX/XLA memory settings
+    :param cpu: CPU slot settings
+    """
+
+    kind: Literal["hybrid"] = "hybrid"
+    gpu: HybridGpuConfig = Field(default_factory=HybridGpuConfig)
+    cpu: HybridCpuConfig = Field(default_factory=HybridCpuConfig)
+
+    def build_slots(self) -> list[_DeviceSlot]:
+        """Build concrete CPU/GPU scheduling slots from a hybrid executor config.
+
+        :return: ordered device slots
+        """
+        if self.gpu.devices == "auto":
+            gpu_indices = _jax_visible_gpu_indices()
+        else:
+            gpu_indices = tuple(self.gpu.devices)
+
+        slots: list[_DeviceSlot] = []
+        for device_index in gpu_indices:
+            for _ in range(self.gpu.workers_per_device):
+                slots.append(
+                    _DeviceSlot(
+                        kind="gpu",
+                        index=int(device_index),
+                        env=self.gpu.get_env(int(device_index)),
+                    )
+                )
+
+        cpu_workers = self.cpu.max_workers
+        if cpu_workers is None:
+            cpu_workers = os.cpu_count() or 1
+        for _ in range(cpu_workers):
+            slots.append(_DeviceSlot(kind="cpu", index=None, env={"JAX_PLATFORMS": "cpu"}))
+
+        if not slots:
+            raise RoutineError("Hybrid GridSearch executor has no available GPU or CPU slots.")
+        return slots
+
+    def validate_child_env(self, child_env: Mapping[str, str]) -> None:
+        """Validate that hybrid-owned JAX device environment is configured on the executor.
+
+        :param child_env: shared child-process environment overrides
+        :raises RoutineError: if ``child_env`` contains scheduler-owned keys
+        """
+        reserved = sorted(set(child_env) & _HYBRID_ENV_KEYS)
+        if reserved:
+            keys = ", ".join(reserved)
+            raise RoutineError(f"Hybrid GridSearch controls these child_env keys through executor config: {keys}")
+
+    def _spec_for_slot(self, spec: "_CaseSpec", slot: "_DeviceSlot") -> "_CaseSpec":
+        """Return a case spec with slot-specific environment and manifest metadata."""
+        env = dict(spec.env)
+        env.update(slot.env)
+        return _CaseSpec(
+            name=spec.name,
+            root=spec.root,
+            config_path=spec.config_path,
+            command=spec.command,
+            env=env,
+            quiet=spec.quiet,
+            reuse_existing=spec.reuse_existing,
+            device=slot.manifest(),
+        )
+
+    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+        """Run cases on dynamically assigned CPU/GPU subprocess slots.
+
+        :param specs: prepared case specs
+        :param show_progress: whether to show a progress bar
+        :return: case results
+        """
+        slots = self.build_slots()
+        results: list[GridSearchCaseResult] = []
+        with self.progress_context(len(specs)) as bar:
+            pending = iter(spec for spec in specs if not spec.reuse_existing)
+            for spec in specs:
+                if spec.reuse_existing:
+                    results.append(_reuse_case_result(spec))
+                    bar()
+
+            active: dict[Future[GridSearchCaseResult], _DeviceSlot] = {}
+            with ThreadPoolExecutor(max_workers=len(slots)) as executor:
+                for slot in slots:
+                    try:
+                        spec = next(pending)
+                    except StopIteration:
+                        break
+                    active[executor.submit(_run_case_subprocess, self._spec_for_slot(spec, slot))] = slot
+
+                while active:
+                    done, _ = wait(active, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        slot = active.pop(future)
+                        results.append(future.result())
+                        bar()
+                        try:
+                            spec = next(pending)
+                        except StopIteration:
+                            continue
+                        active[executor.submit(_run_case_subprocess, self._spec_for_slot(spec, slot))] = slot
+        return results
+
+
+class SerialExecutorConfig(ExecutorConfig):
+    """Serial grid-search executor."""
+
+    kind: Literal["serial"] = "serial"
+
+    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+        """Run case specs one at a time in the parent process.
+
+        :param specs: prepared case specs
+        :return: case results
+        """
+        results: list[GridSearchCaseResult] = []
+        with self.progress_context(len(specs)) as bar:
+            for spec in specs:
+                result = _reuse_case_result(spec) if spec.reuse_existing else _run_case_subprocess(spec)
+                results.append(result)
+                bar()
+        return results
+
+
+class ConcurrentExecutorConfig(ExecutorConfig):
+    """Concurrent-futures grid-search executor.
+
+    :param kind: concurrent executor backend
+    :param max_workers: worker count for the underlying executor
+    """
+
+    kind: Literal["thread", "process"] = "process"
+    max_workers: PositiveInt | None = None
+
+    def context(self) -> ThreadPoolExecutor | ProcessPoolExecutor:
+        """Return the configured concurrent-futures executor."""
+        if self.kind == "thread":
+            return ThreadPoolExecutor(max_workers=self.max_workers)
+        if self.kind == "process":
+            return ProcessPoolExecutor(max_workers=self.max_workers)
+        raise RoutineError(f"Unsupported concurrent executor: {self.kind}")
+
+    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+        """Run case specs with a concurrent-futures executor.
+
+        :param specs: prepared case specs
+        :return: case results
+        """
+        results: list[GridSearchCaseResult] = []
+        with self.progress_context(len(specs)) as bar, self.context() as executor:
+            future_to_name: dict[Future[GridSearchCaseResult], str] = {
+                executor.submit(_run_case_subprocess, spec): spec.name
+                for spec in specs
+                if not spec.reuse_existing
+            }
+            for spec in specs:
+                if spec.reuse_existing:
+                    results.append(_reuse_case_result(spec))
+                    bar()
+            for future in as_completed(future_to_name):
+                results.append(future.result())
+                bar()
+        return results
+
+
+@dataclass(frozen=True)
+class _DeviceSlot:
+    kind: _DeviceKind
+    index: int | None
+    env: dict[str, str]
+
+    def manifest(self) -> dict[str, int | str | None]:
+        """Return a YAML-safe representation of this device slot."""
+        return {"kind": self.kind, "index": self.index}
 
 
 class GridOverride(BaseModel):
@@ -69,46 +402,6 @@ class GridOverride(BaseModel):
         return tuple(value)
 
 
-class ExecutorConfig(BaseModel):
-    """Execution backend configuration.
-
-    :param kind: executor backend
-    :param max_workers: worker count for concurrent executors
-    """
-
-    kind: Literal["serial", "thread", "process"] = "serial"
-    max_workers: PositiveInt | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_string(cls, value: Any) -> Any:
-        aliases = {
-            "serial": "serial",
-            "thread": "thread",
-            "threads": "thread",
-            "threadpool": "thread",
-            "process": "process",
-            "processes": "process",
-            "ppool": "process",
-        }
-        if isinstance(value, str):
-            try:
-                return {"kind": aliases[value]}
-            except KeyError as exc:
-                raise ValueError(f"Unknown executor: {value!r}.") from exc
-        return value
-
-    def context(self) -> Executor | None:
-        """Return a concurrent executor, or ``None`` for serial execution."""
-        if self.kind == "serial":
-            return None
-        if self.kind == "thread":
-            return ThreadPoolExecutor(max_workers=self.max_workers)
-        if self.kind == "process":
-            return ProcessPoolExecutor(max_workers=self.max_workers)
-        raise RoutineError(f"Unsupported executor: {self.kind}")
-
-
 class _SavePolicy(BaseModel):
     """Normalized case retention policy."""
 
@@ -140,6 +433,7 @@ class _CaseSpec:
     env: dict[str, str]
     quiet: bool
     reuse_existing: bool = False
+    device: dict[str, int | str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +448,7 @@ class GridSearchCaseResult:
     :param end_time: human-readable end timestamp
     :param stdout_path: captured stdout path, if captured
     :param stderr_path: captured stderr path, if captured
+    :param device: device slot assigned by a device-aware executor
     """
 
     name: str
@@ -164,6 +459,7 @@ class GridSearchCaseResult:
     end_time: str
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    device: dict[str, int | str | None] | None = None
 
     @property
     def status(self) -> Literal["succeeded", "failed"]:
@@ -210,6 +506,7 @@ def _run_case_subprocess(spec: _CaseSpec) -> GridSearchCaseResult:
         end_time=_timestamp(),
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        device=spec.device,
     )
 
 
@@ -223,7 +520,18 @@ def _reuse_case_result(spec: _CaseSpec) -> GridSearchCaseResult:
         exit_code=0,
         start_time=timestamp,
         end_time=timestamp,
+        device=spec.device,
     )
+
+
+def _jax_visible_gpu_indices() -> tuple[int, ...]:
+    """Return GPU indices visible to JAX without failing when no GPU backend is available."""
+    try:
+        import jax
+
+        return tuple(range(len(jax.devices("gpu"))))
+    except Exception:
+        return ()
 
 
 def _set_override_path(tree: Any, path: TreePath, value: Any) -> Any:
@@ -309,7 +617,6 @@ class GridSearch(Routine):
     :param write_policy: behavior when root or case artifacts already exist
     :param save_policy: which completed cases to retain after ranking
     :param metric: metric alias or callable used to rank successful cases
-    :param show_progress: whether to show a parent progress bar
     :param executor: execution backend configuration
     :param case_root_path: path or paths to inject with the per-case root directory
     :param child_env: extra environment variables for child subprocesses
@@ -323,8 +630,7 @@ class GridSearch(Routine):
     write_policy: WritePolicy = "reuse"
     save_policy: _SavePolicy = Field(default_factory=_SavePolicy)
     metric: MetricCallable = "orbax"
-    show_progress: bool = True
-    executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    executor: ExecutorConfig = Field(default_factory=SerialExecutorConfig)
     case_root_path: tuple[TreePath, ...] = (("root",),)
     child_env: dict[str, str] = Field(default_factory=dict)
     child_quiet: bool = True
@@ -340,7 +646,7 @@ class GridSearch(Routine):
     @field_validator("executor", mode="before")
     @classmethod
     def _coerce_executor(cls, value: Any) -> Any:
-        return ExecutorConfig.model_validate(value)
+        return ExecutorConfig.from_dict(value)
 
     @field_validator("save_policy", mode="before")
     @classmethod
@@ -363,6 +669,7 @@ class GridSearch(Routine):
         self.base = self.base.resolve()
         if not self.base.exists():
             raise RoutineError(f"GridSearch base config does not exist: {self.base}")
+        self.executor.validate_child_env(self.child_env)
         
         if self.root.exists() and any(self.root.iterdir()):
             if self.write_policy == "error":
@@ -441,34 +748,6 @@ class GridSearch(Routine):
             }
         return specs, manifest_cases
 
-    def _run_cases(self, specs: Sequence[_CaseSpec]) -> list[GridSearchCaseResult]:
-        """Run all case specs with configured dispatch."""
-        progress = alive_bar(len(specs)) if self.show_progress else _NullProgress()
-        results: list[GridSearchCaseResult] = []
-        with progress as bar:
-            executor = self.executor.context()
-            if executor is None:
-                for spec in specs:
-                    result = _reuse_case_result(spec) if spec.reuse_existing else _run_case_subprocess(spec)
-                    results.append(result)
-                    bar()
-                return results
-
-            with executor:
-                future_to_name: dict[Future[GridSearchCaseResult], str] = {
-                    executor.submit(_run_case_subprocess, spec): spec.name
-                    for spec in specs
-                    if not spec.reuse_existing
-                }
-                for spec in specs:
-                    if spec.reuse_existing:
-                        results.append(_reuse_case_result(spec))
-                        bar()
-                for future in as_completed(future_to_name):
-                    results.append(future.result())
-                    bar()
-        return results
-
     def _rank_cases(self, results: Sequence[GridSearchCaseResult]) -> list[tuple[str, float]]:
         """Evaluate metrics and return successful cases ordered from best (least) to worst (most)."""
         metric_fn = self.metric
@@ -514,7 +793,7 @@ class GridSearch(Routine):
     def run(self) -> int:
         """Run the grid search and write a manifest."""
         specs, manifest_cases = self._prepare_cases()
-        results = self._run_cases(specs)
+        results = self.executor.run_cases(specs)
         result_by_name = {result.name: result for result in results}
         ranked = self._rank_cases(results)
         metric_by_name = dict(ranked)
@@ -534,6 +813,7 @@ class GridSearch(Routine):
                     "end_time": result.end_time,
                     "stdout": str(result.stdout_path) if result.stdout_path is not None else None,
                     "stderr": str(result.stderr_path) if result.stderr_path is not None else None,
+                    "device": result.device,
                     "retained": spec.name in retained,
                 }
             )

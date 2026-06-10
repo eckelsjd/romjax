@@ -1,10 +1,11 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
 **Short term**
-- use gpu+cpu on single device at same time with GridSearch (just change jax_platforms for child_env -- or maybe this is automatic)
 - GridSearch save policy -- update on rolling basis (e.g. if we have thousands of runs, only save best 10 at a time )
 - Make sure multiple grid search is compatible with a composite routine. Especially look at logging/progress/failing in the composite routine
 - Optimize single run (multi-threaded/jit/caching/overhead, poisson, etc.)
+  - gpu seems slower
+  - cpu is only going up to 100%, sometimes more -- not much multi-threading going on in the jit
 - normalization before/after training
 
 **Long term**
@@ -15,7 +16,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Critical
 - [ ] Normalization for eqx transforms
-- [ ] Make use of gpu at same time as cpu for grid search
 
 ## Needs testing
 - [ ] Training on param references
