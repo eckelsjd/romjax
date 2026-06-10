@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 import romjax
 from romjax.grid_search import (
-    ExecutorConfig,
     GridSearch,
     GridSearchCaseResult,
+    HybridExecutorConfig,
+    SerialExecutorConfig,
     _set_override_path,
     orbax_metric,
 )
+from romjax.routine import RoutineError
 
 
 def test_sparse_override_sets_mapping_and_sequence_paths() -> None:
@@ -48,7 +52,6 @@ loss:
             {"path": ["loss", "terms", 1, "weight"], "cases": [0.3]},
             {"path": ["loss", "terms", 0, "alpha"], "cases": [0.01]},
         ],
-        show_progress=False,
     )
 
     case_root = search.root / "cases" / "case_0000"
@@ -72,7 +75,6 @@ base: __parent__/base.yml
 override:
   - path: [value]
     cases: [1, 2]
-show_progress: false
 executor: serial
 """,
         encoding="utf-8",
@@ -82,8 +84,99 @@ executor: serial
 
     assert isinstance(search, GridSearch)
     assert search.base == base_path.resolve()
-    assert search.executor == ExecutorConfig(kind="serial")
+    assert search.executor == SerialExecutorConfig()
     assert search.case_root_path == (("root",),)
+
+
+def test_grid_search_loads_hybrid_executor_from_yaml(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    config_path = tmp_path / "grid.yml"
+    config_path.write_text(
+        """
+!romx:GridSearch
+root: grid
+base: __parent__/base.yml
+override:
+  - path: [value]
+    cases: [1, 2]
+executor:
+  show_progress: false
+  kind: hybrid
+  gpu:
+    devices: [0, 1]
+    workers_per_device: 2
+    memory_fraction: 0.5
+    preallocate: false
+  cpu:
+    max_workers: 3
+""",
+        encoding="utf-8",
+    )
+
+    search = romjax.load(config_path)
+
+    assert isinstance(search, GridSearch)
+    assert isinstance(search.executor, HybridExecutorConfig)
+    assert search.executor.kind == "hybrid"
+    assert search.executor.gpu.devices == (0, 1)
+    assert search.executor.gpu.workers_per_device == 2
+    assert search.executor.gpu.memory_fraction == 0.5
+    assert search.executor.gpu.preallocate is False
+    assert search.executor.cpu.max_workers == 3
+
+
+def test_hybrid_grid_search_rejects_scheduler_owned_child_env(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+
+    with pytest.raises(RoutineError, match="Hybrid GridSearch controls"):
+        GridSearch(
+            root=tmp_path / "grid",
+            base=base_path,
+            override=[{"path": ["value"], "cases": [10]}],
+            executor={"kind": "hybrid", "show_progress": False},
+            child_env={"JAX_PLATFORMS": "cpu"},
+        )
+
+
+def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
+    config = HybridExecutorConfig.model_validate(
+        {
+            "gpu": {
+                "devices": [2, 3],
+                "workers_per_device": 2,
+                "memory_fraction": 0.75,
+                "preallocate": False,
+            },
+            "cpu": {"max_workers": 1},
+        }
+    )
+    slots = config.build_slots()
+
+    assert [slot.manifest() for slot in slots] == [
+        {"kind": "gpu", "index": 2},
+        {"kind": "gpu", "index": 2},
+        {"kind": "gpu", "index": 3},
+        {"kind": "gpu", "index": 3},
+        {"kind": "cpu", "index": None},
+    ]
+    assert slots[0].env == {
+        "CUDA_VISIBLE_DEVICES": "2",
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.75",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    assert slots[-1].env == {"JAX_PLATFORMS": "cpu"}
+
+
+def test_build_hybrid_slots_allows_cpu_only() -> None:
+    config = HybridExecutorConfig.model_validate({"gpu": {"devices": []}, "cpu": {"max_workers": 2}})
+    slots = config.build_slots()
+
+    assert [slot.manifest() for slot in slots] == [
+        {"kind": "cpu", "index": None},
+        {"kind": "cpu", "index": None},
+    ]
 
 
 def test_default_orbax_metric_reads_loss_csv(tmp_path: Path) -> None:
@@ -116,9 +209,9 @@ def test_grid_search_run_writes_manifest_and_copies_best(tmp_path: Path, monkeyp
         base=base_path,
         override=[{"path": ["value"], "cases": [10, 20]}],
         save_policy={"best": 1},
-        show_progress=False,
     )
 
+    search.executor.show_progress = False
     assert search.run() == 0
 
     manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
@@ -149,11 +242,71 @@ def test_grid_search_reuse_policy_skips_existing_cases(tmp_path: Path, monkeypat
         base=base_path,
         override=[{"path": ["value"], "cases": [10]}],
         write_policy="reuse",
-        show_progress=False,
     )
 
+    search.executor.show_progress = False
     assert search.run() == 0
 
     manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
     assert manifest["cases"]["case_0000"]["metric"] == 0.5
     assert (case_root / "case.yml").read_text(encoding="utf-8") == "existing: true\n"
+
+
+def test_hybrid_grid_search_dynamically_reuses_finished_slots(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    release_gpu = threading.Event()
+    launched: dict[str, dict[str, str]] = {}
+    devices: dict[str, dict[str, int | str | None] | None] = {}
+
+    def fake_run_case(spec):
+        launched[spec.name] = dict(spec.env)
+        devices[spec.name] = spec.device
+        if spec.name == "case_0000":
+            release_gpu.wait(timeout=5.0)
+        if spec.name == "case_0002":
+            release_gpu.set()
+        loss = {"case_0000": 3.0, "case_0001": 2.0, "case_0002": 1.0}[spec.name]
+        (spec.root / "loss.csv").write_text(f"Iteration,Value\n0,{loss}\n", encoding="utf-8")
+        return GridSearchCaseResult(
+            name=spec.name,
+            root=spec.root,
+            config_path=spec.config_path,
+            exit_code=0,
+            start_time="2026-06-09T10:00:00-04:00",
+            end_time="2026-06-09T10:00:01-04:00",
+            stdout_path=spec.root / "stdout.log",
+            stderr_path=spec.root / "stderr.log",
+            device=spec.device,
+        )
+
+    monkeypatch.setattr("romjax.grid_search._run_case_subprocess", fake_run_case)
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10, 20, 30]}],
+        executor={
+            "kind": "hybrid",
+            "gpu": {"devices": [0], "workers_per_device": 1, "memory_fraction": 0.5},
+            "cpu": {"max_workers": 1},
+            "show_progress": False
+        },
+        child_env={"ROMJAX_TEST": "1"},
+    )
+
+    assert search.run() == 0
+
+    assert launched["case_0000"]["CUDA_VISIBLE_DEVICES"] == "0"
+    assert launched["case_0000"]["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.5"
+    assert "JAX_PLATFORMS" not in launched["case_0000"]
+    assert launched["case_0001"]["JAX_PLATFORMS"] == "cpu"
+    assert launched["case_0002"]["JAX_PLATFORMS"] == "cpu"
+    assert all(env["ROMJAX_TEST"] == "1" for env in launched.values())
+    assert devices["case_0000"] == {"kind": "gpu", "index": 0}
+    assert devices["case_0001"] == {"kind": "cpu", "index": None}
+    assert devices["case_0002"] == {"kind": "cpu", "index": None}
+
+    manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["cases"]["case_0000"]["device"] == {"kind": "gpu", "index": 0}
+    assert manifest["cases"]["case_0001"]["device"] == {"kind": "cpu", "index": None}
+    assert manifest["cases"]["case_0002"]["device"] == {"kind": "cpu", "index": None}

@@ -1,25 +1,25 @@
-from functools import partial
 from pathlib import Path
-from typing import Annotated
 
 import lineax as lx
 import optax
 import optimistix as optx
 import pytest
 from orbax.checkpoint import v1 as ocp
-from pydantic import AfterValidator, BaseModel, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, TypeAdapter, ValidationError, field_validator, model_validator
 
 from romjax import DictModel, YamlLoader
 from romjax.typing import ListModel, ThirdPartyType, require_type
 
-type GradientTransformation = Annotated[
-    ThirdPartyType,
-    AfterValidator(partial(require_type, optax.GradientTransformation)),
-]
+GradientTransformation = ThirdPartyType(default_modules="optax")
 
 
 class GradientConfig(BaseModel):
     transform: GradientTransformation
+
+    @field_validator("transform")
+    @classmethod
+    def _require_gradient_transformation(cls, value):
+        return require_type(optax.GradientTransformation, value)
 
 
 def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
@@ -27,9 +27,9 @@ def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
         "name": "optax.chain",
         "args": [
             {"name": "optax.clip_by_global_norm", "args": [1.0]},
-            {"name": "scale_by_adam"},
+            {"name": "optax.scale_by_adam"},
             {
-                "name": "scale_by_schedule",
+                "name": "optax.scale_by_schedule",
                 "args": [
                     {
                         "name": "optax.exponential_decay",
@@ -45,7 +45,7 @@ def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
         ],
     }
 
-    adapter = TypeAdapter(ThirdPartyType)
+    adapter = TypeAdapter(ThirdPartyType(default_modules="optax"))
     transform = adapter.validate_python(data)
     dumped = adapter.dump_python(transform)
 
@@ -54,7 +54,7 @@ def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
 
 
 def test_third_party_type_accepts_partially_validated_nested_objects():
-    adapter = TypeAdapter(ThirdPartyType)
+    adapter = TypeAdapter(ThirdPartyType(default_modules="optax"))
     clip = adapter.validate_python({"name": "optax.clip_by_global_norm", "args": [1.0]})
     schedule = adapter.validate_python(
         {
@@ -122,7 +122,7 @@ def test_gradient_transformation_model_round_trip():
             "name": "optax.chain",
             "args": [
                 {"name": "optax.clip_by_global_norm", "args": [1.0]},
-                {"name": "scale_by_adam"},
+                {"name": "optax.scale_by_adam"},
                 {"name": "optax.scale", "args": [-1.0]},
             ],
         }

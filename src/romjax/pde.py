@@ -256,10 +256,13 @@ class UniformGrid(DictModel):
 
 
 type AbstractIterativeSolver = Annotated[
-    ThirdPartyType, 
+    ThirdPartyType(default_modules="optimistix"), 
     AfterValidator(partial(require_type, optx.AbstractIterativeSolver))
 ]
-type AbstractAdjoint = Annotated[ThirdPartyType, AfterValidator(partial(require_type, optx.AbstractAdjoint))]
+type AbstractAdjoint = Annotated[
+    ThirdPartyType(default_modules="optimistix"), 
+    AfterValidator(partial(require_type, optx.AbstractAdjoint))
+]
 
 
 class IterativeSolver(DictModel):
