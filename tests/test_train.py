@@ -291,7 +291,12 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
 
     overwrite_root = tmp_path.resolve() / "overwrite"
     overwrite_root.mkdir(parents=True, exist_ok=True)
-    overwrite_root.joinpath("sentinel.txt").write_text("remove-me")
+    overwrite_root.joinpath("sentinel.txt").write_text("keep-me")
+    overwrite_root.joinpath("loss.csv").write_text("Iteration,Value\n0,1.0\n")
+    overwrite_root.joinpath("history.pdf").write_text("old-figure")
+    overwrite_root.joinpath("notes").mkdir()
+    overwrite_root.joinpath("train_999").mkdir()
+    overwrite_root.joinpath("train_999", "_CHECKPOINT_METADATA").write_text("")
     overwrite = Train(
         loss=scalar_quadratic_loss,
         init_params={"w": jnp.array(0.0)},
@@ -301,7 +306,11 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
         write_policy="overwrite",
         checkpointer=checkpointer,
     )
-    assert not overwrite_root.joinpath("sentinel.txt").exists()
+    assert overwrite_root.joinpath("sentinel.txt").exists()
+    assert overwrite_root.joinpath("notes").exists()
+    assert not overwrite_root.joinpath("loss.csv").exists()
+    assert not overwrite_root.joinpath("history.pdf").exists()
+    assert not overwrite_root.joinpath("train_999").exists()
     assert overwrite.run() == 0
 
     error_root = tmp_path.resolve() / "error"

@@ -79,7 +79,7 @@ class AnimateOptions(DictModel):
             def save_progress(i, n):
                 n = n or num_frames
                 if i % interval == 0:
-                    logger.info(f"Frame {i}/{n-1}" if n is not None else f"Frame {i}")
+                    logger.debug(f"Frame {i}/{n-1}" if n is not None else f"Frame {i}")
             d["progress_callback"] = save_progress
         elif self.progress_callback == "bar":
             d["progress_callback"] = lambda bar, i, n: bar()
@@ -726,7 +726,7 @@ def gridplot(
                             cache_frame_data=False, blit=blit, interval=interval)
 
         if cfg.save is not None:
-            logger.info(f"Saving animation to '{cfg.save}'")
+            logger.debug(f"Saving animation to '{cfg.save}'")
             save_kwargs = a_opts.get_save_kwargs()
 
             if a_opts.progress_callback == "bar":

@@ -38,6 +38,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "Compression": ("romjax.compression", "Compression"),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
+    "GridSearch": ("romjax.grid_search", "GridSearch"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
     "FilterModel": ("romjax.model", "FilterModel"),
     "ImplicitModel": ("romjax.model", "ImplicitModel"),
@@ -83,6 +84,7 @@ if TYPE_CHECKING:
     from .compare import CompareOrbax, CompareTable
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph
+    from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
     from .pde import ImplicitIterativeGalerkin

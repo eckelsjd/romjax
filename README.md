@@ -20,12 +20,8 @@ uv sync --all-groups # use --extra cu13 for gpu-support
 Right now, we have the basic `FunctionGraph` API up and running with the `Poisson2D` model as a good PDE test case. The following list summarizes where we are heading next.
 
 
-- Testing dataloading and optimization of simple linear projection on some Poisson data.
-- Implementing a Galerkin projection ROM ImplicitModel.
 - Implementing various graph-theoretic objective functions (state reconstruction, solution error, etc.)
 - Automate running multiple cases with different configurations (maybe scaling up hardware too)
-- Automate hyperparameter optimization
-- Post-processing scripts for comparing methods, plots, tables, etc.
 - Automate everything from a repeatable snakemake workflow
 - Then start looking at different modeling options (Vlasov, Conv2D, etc.)
 

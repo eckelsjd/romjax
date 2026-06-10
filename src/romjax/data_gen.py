@@ -891,9 +891,9 @@ class GenLatent(GenDataConfig):
         
         samples = list(self._iter_samples())
         
-        logger.info("Fitting compression...")
+        logger.debug("Fitting compression...")
         compression = self.compression.fit(samples)
-        logger.info(f"Compression finished. Latent space: {compression.latent_size()}")
+        logger.debug(f"Compression finished. Latent space: {compression.latent_size()}")
 
         compression.dump(artifact_path)
 

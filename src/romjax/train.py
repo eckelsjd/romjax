@@ -49,6 +49,7 @@ from romjax.tree import (
     pytree_square_norm,
 )
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type, resolve_graph_refs
+from romjax.utils import _NullProgress
 
 __all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
 
@@ -477,6 +478,7 @@ class DiagnosticsConfig(BaseModel):
     log_interval: PositiveInt | None = None
     plot_interval: PositiveInt | None = None
     test_interval: PositiveInt | None = None
+    show_progress: bool = True  # progress bar
     callback_interval: PositiveInt | None = None
     progress_callback: Callable[[PyTree, FunctionGraph, Path], None] | None = None
     live_plot: bool = False
@@ -645,7 +647,12 @@ class Train(Routine):
                 if policy == "error":
                     raise RoutineError(f"Training root already contains artifacts: {root} and policy is '{policy}'")
                 if policy == "overwrite":
-                    shutil.rmtree(root)
+                    # Just rm previous train artifacts
+                    for path in root.iterdir():
+                        if path.is_dir() and path.joinpath("_CHECKPOINT_METADATA").is_file():
+                            shutil.rmtree(path)
+                        elif path.is_file() and path.suffix in {".csv", ".pdf"}:
+                            path.unlink()
             root.mkdir(parents=True, exist_ok=True)
         
         return policy
@@ -722,7 +729,7 @@ class Train(Routine):
                 opt_state = abstract_checkpointables["opt_state"]
                 curr_step = 0
                 total_steps = self.termination.max_steps
-                logger.info("Initialized train")
+                logger.debug("Initialized train")
             else:
                 _loaded = ckptr.load_checkpointables(abstract_checkpointables=abstract_checkpointables)
                 params = _restore_params(_loaded["params"])
@@ -731,10 +738,10 @@ class Train(Routine):
                 total_steps = self.termination.max_steps - curr_step
 
                 if total_steps <= 0:
-                    logger.info(f"Training already reached max_steps={self.termination.max_steps} from checkpoint.")
+                    logger.debug(f"Training already reached max_steps={self.termination.max_steps} from checkpoint.")
                     return 0
                 
-                logger.info(f"Restarting train from step {curr_step-1}")
+                logger.debug(f"Restarting train from step {curr_step-1}")
             
             log_interval = self.diagnostics.log_interval or float('inf')
             test_interval = self.diagnostics.test_interval or float('inf')
@@ -777,8 +784,10 @@ class Train(Routine):
                     _save_history_csv("test.csv", *test_hist)
 
             t_start = time.time()
+
+            ctxt = alive_bar(total_steps) if self.diagnostics.show_progress else _NullProgress()
                 
-            with alive_bar(total_steps) as bar:
+            with ctxt as bar:
                 while True:
                     ## OPTIMIZER UPDATES
                     try:
@@ -828,7 +837,7 @@ class Train(Routine):
                     bar.text = stats_str
 
                     if curr_step % log_interval == 0:
-                        logger.info(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
+                        logger.debug(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
                                     f"| step={curr_step} {stats_str}")
                     
                     if 0 < plot_interval < float('inf') and curr_step % plot_interval == 0:
@@ -886,7 +895,7 @@ class Train(Routine):
 
                     curr_step += 1
             
-            logger.info(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
+            logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
             _save_final(metrics)
         
         return params
