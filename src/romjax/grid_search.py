@@ -20,6 +20,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import product
+from os import PathLike
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -588,7 +589,7 @@ def _manifest_value(value: Any) -> Any:
     if isinstance(value, str | int | float | bool) or value is None:
         return value
     if isinstance(value, Path):
-        return str(value)
+        return _yaml_path_text(value)
     if isinstance(value, Mapping):
         return {str(key): _manifest_value(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
@@ -596,6 +597,11 @@ def _manifest_value(value: Any) -> Any:
     if callable(value):
         return f"{value.__module__}.{value.__qualname__}"
     return repr(value)
+
+
+def _yaml_path_text(path: str | Path | PathLike[str]) -> str:
+    """Return a YAML-safe path string that uses forward slashes."""
+    return str(path).replace("\\", "/")
 
 
 def orbax_metric(case_root: Path) -> float:
@@ -777,12 +783,16 @@ class GridSearch(Routine):
         for override, value in zip(self.override, values):
             tree = _set_override_path(tree, override.path, value)
         for root_path in self.case_root_path:
-            tree = _set_override_path(tree, root_path, str(case_root))
+            tree = _set_override_path(tree, root_path, _yaml_path_text(case_root))
 
-        base_ref = os.path.relpath(self.base, start=case_root)
+        try:
+            base_ref = _yaml_path_text(os.path.relpath(self.base, start=case_root))
+            override_tag = f"!overrides:__parent__/{base_ref}"
+        except ValueError:
+            override_tag = f"!overrides:{_yaml_path_text(self.base)}"
         config_path = case_root / "case.yml"
         yaml_body = romjax.YamlLoader.dump(tree, sort_keys=False)
-        config_path.write_text(f"!overrides:__parent__/{base_ref}\n{yaml_body}", encoding="utf-8")
+        config_path.write_text(f"{override_tag}\n{yaml_body}", encoding="utf-8")
         return config_path
 
     def _prepare_cases(self) -> tuple[list[_CaseSpec], dict[str, dict[str, Any]]]:
@@ -807,8 +817,8 @@ class GridSearch(Routine):
                 )
             )
             manifest_cases[name] = {
-                "path": str(case_root),
-                "config": str(config_path),
+                "path": _yaml_path_text(case_root),
+                "config": _yaml_path_text(config_path),
                 "overrides": self._case_metadata(values),
             }
         return specs, manifest_cases
@@ -915,8 +925,8 @@ class GridSearch(Routine):
                     "metric": metric_by_name.get(spec.name),
                     "start_time": result.start_time,
                     "end_time": result.end_time,
-                    "stdout": str(result.stdout_path) if result.stdout_path is not None else None,
-                    "stderr": str(result.stderr_path) if result.stderr_path is not None else None,
+                    "stdout": _yaml_path_text(result.stdout_path) if result.stdout_path is not None else None,
+                    "stderr": _yaml_path_text(result.stderr_path) if result.stderr_path is not None else None,
                     "device": result.device,
                     "retained": spec.name in retained,
                 }
@@ -924,8 +934,8 @@ class GridSearch(Routine):
 
         self._write_manifest(
             {
-                "root": str(self.root),
-                "base": str(self.base),
+                "root": _yaml_path_text(self.root),
+                "base": _yaml_path_text(self.base),
                 "executor": self.executor.model_dump(),
                 "save_policy": self.save_policy.model_dump(),
                 "best": ranked[0][0] if ranked else None,

@@ -9,7 +9,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from alive_progress import config_handler
 from loguru import logger
-from pydantic import BaseModel, BeforeValidator, ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PrivateAttr, TypeAdapter, field_validator, model_validator
 
 from romjax.plotting import GridplotConfig
 from romjax.typing import DictModel, WriteStream, from_yaml
@@ -197,8 +197,9 @@ class CompositeRoutine(Routine):
     :param failure_policy: handling for non-zero child exits or raised exceptions
     """
 
-    routines: list[Routine]
+    routines: list[Any]
     failure_policy: Literal["stop", "continue", "force"] = "stop"
+    _source_path: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -211,14 +212,21 @@ class CompositeRoutine(Routine):
     @field_validator("routines", mode="before")
     @classmethod
     def _validate_routines(cls, value):
-        """Load child routines from YAML paths and require valid Routine instances."""
+        """Normalize child routine inputs without validating them yet."""
         if not isinstance(value, list | tuple):
             value = [value]
 
-        return [cls._validate_routine(item) for item in value]
+        return list(value)
 
-    @classmethod
-    def _validate_routine(cls, value: Any) -> Routine:
+    @model_validator(mode="after")
+    def _capture_source_path(self):
+        """Remember the YAML source path for runtime child resolution."""
+        import romjax
+
+        object.__setattr__(self, "_source_path", romjax.YamlLoader.current_source_path())
+        return self
+
+    def _validate_routine(self, value: Any) -> Routine:
         """Validate one child routine specification.
 
         :param value: routine instance or YAML path
@@ -230,7 +238,14 @@ class CompositeRoutine(Routine):
         if isinstance(value, str | Path | bytes):
             import romjax
 
-            stream = romjax.YamlLoader.resolve_parent_path(value) if isinstance(value, str | Path) else value
+            if isinstance(value, str | Path):
+                source_path = self._source_path
+                if source_path is not None:
+                    stream = romjax.YamlLoader._resolve_override_path(str(value), source_path)
+                else:
+                    stream = romjax.YamlLoader.resolve_parent_path(value)
+            else:
+                stream = value
             value = romjax.load(stream)
 
         if not isinstance(value, Routine):
@@ -254,8 +269,22 @@ class CompositeRoutine(Routine):
         failures: list[str] = []
         exit_code = 0
 
-        for index, routine in enumerate(self.routines):
-            routine_label = f"child {index} ({type(routine).__name__})"
+        for index, routine_spec in enumerate(self.routines):
+            routine_label = f"child {index}"
+            try:
+                routine = self._validate_routine(routine_spec)
+            except Exception as exc:
+                if self.failure_policy != "force":
+                    raise
+
+                summary = f"{routine_label} failed validation with {type(exc).__name__}: {exc}"
+                failures.append(summary)
+                if exit_code == 0:
+                    exit_code = 1
+                logger.exception("CompositeRoutine {}", summary)
+                continue
+
+            routine_label = f"{routine_label} ({type(routine).__name__})"
             try:
                 child_code = int(routine.run())
             except Exception as exc:

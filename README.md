@@ -21,11 +21,7 @@ Right now, we have the basic `FunctionGraph` API up and running with the `Poisso
 
 
 - Implementing various graph-theoretic objective functions (state reconstruction, solution error, etc.)
-- Automate running multiple cases with different configurations (maybe scaling up hardware too)
-- Automate everything from a repeatable snakemake workflow
 - Then start looking at different modeling options (Vlasov, Conv2D, etc.)
-
-When we are done, we will have all of these features implemented with a thorough regression test suite in place and passing. You will generally only be working on one of these tasks at a time with a more specific set of instructions and "doneness" criteria provided when ready.
 
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.

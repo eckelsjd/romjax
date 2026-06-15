@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 import yaml
@@ -13,6 +13,7 @@ from romjax.grid_search import (
     HybridExecutorConfig,
     SerialExecutorConfig,
     _set_override_path,
+    _yaml_path_text,
     orbax_metric,
 )
 from romjax.routine import RoutineError
@@ -61,6 +62,12 @@ loss:
     assert loaded["root"] == str(case_root)
     assert loaded["loss"]["terms"][0]["alpha"] == 0.01
     assert loaded["loss"]["terms"][1]["weight"] == 0.3
+
+
+def test_yaml_path_text_normalizes_windows_paths() -> None:
+    path = PureWindowsPath(r"C:\Users\alice\grid\cases\case_0000")
+
+    assert _yaml_path_text(path) == "C:/Users/alice/grid/cases/case_0000"
 
 
 def test_grid_search_loads_from_yaml(tmp_path: Path) -> None:
@@ -149,6 +156,24 @@ save_policy:
     assert isinstance(search, GridSearch)
     assert search.save_policy.mode == "rolling"
     assert search.save_policy.count == 2
+
+
+def test_grid_search_writes_windows_style_parent_override_as_posix_yaml(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "grid" / "base.yml"
+    base_path.parent.mkdir(parents=True)
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10]}],
+    )
+
+    monkeypatch.setattr("romjax.grid_search.os.path.relpath", lambda *_args, **_kwargs: "..\\..\\base.yml")
+    case_root = search.root / "cases" / "case_0000"
+    config_path = search._write_case_config(case_root, (10,))
+
+    assert config_path.read_text(encoding="utf-8").startswith("!overrides:__parent__/../../base.yml\n")
+    assert romjax.YamlLoader.load(config_path)["root"] == str(case_root).replace("\\", "/")
 
 
 def test_hybrid_grid_search_rejects_scheduler_owned_child_env(tmp_path: Path) -> None:

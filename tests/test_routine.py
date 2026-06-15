@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import pytest
 from alive_progress import config_handler
 from loguru import logger
-from pydantic import ValidationError
 
 import romjax
 from romjax import plotting
@@ -201,12 +200,67 @@ def test_composite_routine_parent_relative_child_path(tmp_path) -> None:
     assert DemoRoutine.observed == ["parent-relative"]
 
 
+def test_composite_routine_defers_child_validation_until_run(tmp_path, monkeypatch) -> None:
+    DemoRoutine.observed = []
+    calls: list[str] = []
+    monkeypatch.setattr(plt.style, "use", lambda style: calls.append(str(style)))
+
+    child1 = tmp_path / "child1.yml"
+    child2 = tmp_path / "child2.yml"
+    composite_path = tmp_path / "composite.yml"
+
+    child1.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.DemoRoutine",
+                "name: first",
+                "routine_config:",
+                "  mplstyle: first-style",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    child2.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.DemoRoutine",
+                "name: second",
+                "routine_config:",
+                "  mplstyle: second-style",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "routines:",
+                f"  - __parent__/{child1.name}",
+                f"  - __parent__/{child2.name}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    composite = romjax.load(composite_path)
+
+    assert isinstance(composite, CompositeRoutine)
+    assert calls == []
+
+    assert composite.run() == 0
+    assert calls == ["first-style", "second-style"]
+    assert DemoRoutine.observed == ["first", "second"]
+
+
 def test_composite_routine_rejects_non_routine_child(tmp_path) -> None:
     child_path = tmp_path / "child.yml"
     child_path.write_text("not: a routine\n", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="must validate to Routine"):
-        CompositeRoutine.model_validate({"routines": [child_path]})
+    composite = CompositeRoutine.model_validate({"routines": [child_path]})
+
+    with pytest.raises(ValueError, match="must validate to Routine"):
+        composite.run()
 
 
 def test_composite_routine_failure_policy_stop() -> None:

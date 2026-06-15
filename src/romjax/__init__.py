@@ -300,12 +300,13 @@ class YamlLoader(ConfigLoader):
         :param source_path: Path of the YAML file declaring the override, when known.
         :return: the resolved path to load.
         """
+        normalized = path.replace("\\", "/")
         prefix = "__parent__/"
-        if path.startswith(prefix):
+        if normalized.startswith(prefix):
             if source_path is None:
                 raise ValueError("The __parent__ override path requires loading from a file path.")
-            return source_path.parent / path[len(prefix):]
-        return _Path(path)
+            return source_path.parent / normalized[len(prefix):]
+        return _Path(normalized)
 
     @classmethod
     def current_source_path(cls) -> _Path | None:
