@@ -17,7 +17,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import product
 from pathlib import Path
@@ -115,10 +115,15 @@ class ExecutorConfig(BaseModel, ABC):
         return alive_bar(total) if self.show_progress else _NullProgress()
 
     @abstractmethod
-    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+    def run_cases(
+        self,
+        specs: Sequence["_CaseSpec"],
+        on_result: Callable[["GridSearchCaseResult"], None] | None = None,
+    ) -> list["GridSearchCaseResult"]:
         """Run all prepared case specs.
 
         :param specs: prepared case specs
+        :param on_result: optional callback invoked after each completed case result is available
         :return: case results
         """
         raise NotImplementedError
@@ -259,11 +264,16 @@ class HybridExecutorConfig(ExecutorConfig):
             device=slot.manifest(),
         )
 
-    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+    def run_cases(
+        self,
+        specs: Sequence["_CaseSpec"],
+        on_result: Callable[["GridSearchCaseResult"], None] | None = None,
+    ) -> list["GridSearchCaseResult"]:
         """Run cases on dynamically assigned CPU/GPU subprocess slots.
 
         :param specs: prepared case specs
         :param show_progress: whether to show a progress bar
+        :param on_result: optional callback invoked after each completed case result is available
         :return: case results
         """
         slots = self.build_slots()
@@ -288,7 +298,10 @@ class HybridExecutorConfig(ExecutorConfig):
                     done, _ = wait(active, return_when=FIRST_COMPLETED)
                     for future in done:
                         slot = active.pop(future)
-                        results.append(future.result())
+                        result = future.result()
+                        results.append(result)
+                        if on_result is not None:
+                            on_result(result)
                         bar()
                         try:
                             spec = next(pending)
@@ -303,10 +316,15 @@ class SerialExecutorConfig(ExecutorConfig):
 
     kind: Literal["serial"] = "serial"
 
-    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+    def run_cases(
+        self,
+        specs: Sequence["_CaseSpec"],
+        on_result: Callable[["GridSearchCaseResult"], None] | None = None,
+    ) -> list["GridSearchCaseResult"]:
         """Run case specs one at a time in the parent process.
 
         :param specs: prepared case specs
+        :param on_result: optional callback invoked after each completed case result is available
         :return: case results
         """
         results: list[GridSearchCaseResult] = []
@@ -314,6 +332,8 @@ class SerialExecutorConfig(ExecutorConfig):
             for spec in specs:
                 result = _reuse_case_result(spec) if spec.reuse_existing else _run_case_subprocess(spec)
                 results.append(result)
+                if on_result is not None:
+                    on_result(result)
                 bar()
         return results
 
@@ -336,10 +356,15 @@ class ConcurrentExecutorConfig(ExecutorConfig):
             return ProcessPoolExecutor(max_workers=self.max_workers)
         raise RoutineError(f"Unsupported concurrent executor: {self.kind}")
 
-    def run_cases(self, specs: Sequence["_CaseSpec"]) -> list["GridSearchCaseResult"]:
+    def run_cases(
+        self,
+        specs: Sequence["_CaseSpec"],
+        on_result: Callable[["GridSearchCaseResult"], None] | None = None,
+    ) -> list["GridSearchCaseResult"]:
         """Run case specs with a concurrent-futures executor.
 
         :param specs: prepared case specs
+        :param on_result: optional callback invoked after each completed case result is available
         :return: case results
         """
         results: list[GridSearchCaseResult] = []
@@ -351,10 +376,16 @@ class ConcurrentExecutorConfig(ExecutorConfig):
             }
             for spec in specs:
                 if spec.reuse_existing:
-                    results.append(_reuse_case_result(spec))
+                    result = _reuse_case_result(spec)
+                    results.append(result)
+                    if on_result is not None:
+                        on_result(result)
                     bar()
             for future in as_completed(future_to_name):
-                results.append(future.result())
+                result = future.result()
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
                 bar()
         return results
 
@@ -405,7 +436,7 @@ class GridOverride(BaseModel):
 class _SavePolicy(BaseModel):
     """Normalized case retention policy."""
 
-    mode: Literal["all", "best"] = "all"
+    mode: Literal["all", "best", "rolling"] = "all"
     count: PositiveInt | None = None
 
     @model_validator(mode="before")
@@ -417,10 +448,17 @@ class _SavePolicy(BaseModel):
             return {"mode": "all"}
         if value == "best":
             return {"mode": "best", "count": 1}
+        if value == "rolling":
+            return {"mode": "rolling", "count": 1}
         if isinstance(value, Mapping):
-            if set(value) != {"best"}:
-                raise ValueError("GridSearch save_policy mappings must have exactly one key: 'best'.")
-            return {"mode": "best", "count": value["best"]}
+            if len(value) != 1:
+                raise ValueError("GridSearch save_policy mappings must have exactly one key: 'best' or 'rolling'.")
+            key = next(iter(value))
+            if key == "best":
+                return {"mode": "best", "count": value[key]}
+            if key == "rolling":
+                return {"mode": "rolling", "count": value[key]}
+            raise ValueError("GridSearch save_policy mappings must have exactly one key: 'best' or 'rolling'.")
         return value
 
 
@@ -606,7 +644,34 @@ class MetricCallable(CallableModel):
         if isinstance(value, str):
             return {"callable": value}
         return value
-    
+
+
+@dataclass
+class _RollingSaveTracker:
+    """Track and prune the current best case directories on a rolling basis."""
+
+    count: int
+    ranked: list[tuple[float, str, Path]] = field(default_factory=list)
+
+    @property
+    def retained(self) -> set[str]:
+        """Return the currently retained case names."""
+        return {name for _, name, _ in self.ranked}
+
+    def observe(self, result: GridSearchCaseResult, metric: float) -> None:
+        """Update the tracked top cases with one completed result."""
+        self.ranked.append((metric, result.name, result.root))
+        self.ranked.sort(key=lambda item: item[0])
+        if len(self.ranked) > self.count:
+            _, _, evicted_root = self.ranked.pop()
+            if evicted_root.exists():
+                shutil.rmtree(evicted_root)
+
+    def reject(self, result: GridSearchCaseResult) -> None:
+        """Delete a completed case that cannot participate in rolling retention."""
+        if result.root.exists():
+            shutil.rmtree(result.root)
+
 
 class GridSearch(Routine):
     """Run a Cartesian-product grid search by generating override YAML files and dispatching ``romx run`` cases.
@@ -761,6 +826,30 @@ class GridSearch(Routine):
                 continue
         return sorted(ranked, key=lambda item: item[1])
 
+    def _build_rolling_tracker(self) -> _RollingSaveTracker:
+        """Return a rolling save-policy tracker for this search."""
+        if self.save_policy.count is None:
+            raise RoutineError("Rolling GridSearch save_policy requires a positive case count.")
+        return _RollingSaveTracker(count=self.save_policy.count)
+
+    def _handle_rolling_result(
+        self,
+        tracker: _RollingSaveTracker,
+        scores: dict[str, float],
+        result: GridSearchCaseResult,
+    ) -> None:
+        """Apply rolling retention logic to one completed case result."""
+        if result.exit_code != 0:
+            tracker.reject(result)
+            return
+        try:
+            metric = float(self.metric(result.root))
+        except Exception:
+            tracker.reject(result)
+            return
+        scores[result.name] = metric
+        tracker.observe(result, metric)
+
     def _apply_save_policy(self, ranked: Sequence[tuple[str, float]]) -> list[str]:
         """Apply retention policy and copy the best case.
 
@@ -775,14 +864,14 @@ class GridSearch(Routine):
                 if case_root.is_dir() and case_root.name not in retained:
                     shutil.rmtree(case_root)
 
-        if ranked:
-            best_name = ranked[0][0]
-            best_path = self.root / "best"
-            if best_path.exists():
-                shutil.rmtree(best_path)
-            shutil.copytree(self.root / "cases" / best_name, best_path)
-
         return retained
+
+    def _copy_best_case(self, best_name: str) -> None:
+        """Copy the current best case directory to ``best/``."""
+        best_path = self.root / "best"
+        if best_path.exists():
+            shutil.rmtree(best_path)
+        shutil.copytree(self.root / "cases" / best_name, best_path)
 
     def _write_manifest(self, manifest: Mapping[str, Any]) -> None:
         """Write the grid-search manifest."""
@@ -793,11 +882,26 @@ class GridSearch(Routine):
     def run(self) -> int:
         """Run the grid search and write a manifest."""
         specs, manifest_cases = self._prepare_cases()
-        results = self.executor.run_cases(specs)
+        rolling_tracker = self._build_rolling_tracker() if self.save_policy.mode == "rolling" else None
+        rolling_scores: dict[str, float] = {}
+        results = self.executor.run_cases(
+            specs,
+            on_result=(
+                functools.partial(self._handle_rolling_result, rolling_tracker, rolling_scores)
+                if rolling_tracker is not None
+                else None
+            ),
+        )
         result_by_name = {result.name: result for result in results}
-        ranked = self._rank_cases(results)
+        ranked = (
+            sorted(rolling_scores.items(), key=lambda item: item[1])
+            if rolling_tracker is not None
+            else self._rank_cases(results)
+        )
         metric_by_name = dict(ranked)
-        retained = self._apply_save_policy(ranked)
+        retained = rolling_tracker.retained if rolling_tracker is not None else self._apply_save_policy(ranked)
+        if ranked:
+            self._copy_best_case(ranked[0][0])
 
         exit_code = 0
         for spec in specs:

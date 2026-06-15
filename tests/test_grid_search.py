@@ -126,6 +126,31 @@ executor:
     assert search.executor.cpu.max_workers == 3
 
 
+def test_grid_search_loads_rolling_save_policy_from_yaml(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    config_path = tmp_path / "grid.yml"
+    config_path.write_text(
+        """
+!romx:GridSearch
+root: grid
+base: __parent__/base.yml
+override:
+  - path: [value]
+    cases: [1, 2]
+save_policy:
+  rolling: 2
+""",
+        encoding="utf-8",
+    )
+
+    search = romjax.load(config_path)
+
+    assert isinstance(search, GridSearch)
+    assert search.save_policy.mode == "rolling"
+    assert search.save_policy.count == 2
+
+
 def test_hybrid_grid_search_rejects_scheduler_owned_child_env(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yml"
     base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
@@ -223,6 +248,93 @@ def test_grid_search_run_writes_manifest_and_copies_best(tmp_path: Path, monkeyp
     assert manifest["cases"]["case_0001"]["end_time"] == "2026-06-09T10:00:01-04:00"
     assert (search.root / "best" / "case.yml").exists()
     assert not (search.root / "cases" / "case_0000").exists()
+
+
+def test_grid_search_rolling_save_policy_deletes_losers_as_new_cases_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+
+    def fake_run_case(spec):
+        if spec.name == "case_0002":
+            assert not (tmp_path / "grid" / "cases" / "case_0000").exists()
+        loss = {"case_0000": 3.0, "case_0001": 2.0, "case_0002": 1.0}[spec.name]
+        (spec.root / "loss.csv").write_text(f"Iteration,Value\n0,{loss}\n", encoding="utf-8")
+        return GridSearchCaseResult(
+            name=spec.name,
+            root=spec.root,
+            config_path=spec.config_path,
+            exit_code=0,
+            start_time="2026-06-09T10:00:00-04:00",
+            end_time="2026-06-09T10:00:01-04:00",
+            stdout_path=spec.root / "stdout.log",
+            stderr_path=spec.root / "stderr.log",
+        )
+
+    monkeypatch.setattr("romjax.grid_search._run_case_subprocess", fake_run_case)
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10, 20, 30]}],
+        save_policy={"rolling": 1},
+    )
+
+    search.executor.show_progress = False
+    assert search.run() == 0
+
+    manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["best"] == "case_0002"
+    assert manifest["cases"]["case_0000"]["retained"] is False
+    assert manifest["cases"]["case_0001"]["retained"] is False
+    assert manifest["cases"]["case_0002"]["retained"] is True
+    assert (search.root / "best" / "case.yml").exists()
+    assert not (search.root / "cases" / "case_0000").exists()
+    assert (search.root / "cases" / "case_0002").exists()
+
+
+def test_grid_search_rolling_save_policy_works_with_out_of_order_completion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    release_slow_case = threading.Event()
+
+    def fake_run_case(spec):
+        if spec.name == "case_0000":
+            release_slow_case.wait(timeout=5.0)
+        if spec.name == "case_0001":
+            release_slow_case.set()
+        loss = {"case_0000": 2.0, "case_0001": 1.0}[spec.name]
+        (spec.root / "loss.csv").write_text(f"Iteration,Value\n0,{loss}\n", encoding="utf-8")
+        return GridSearchCaseResult(
+            name=spec.name,
+            root=spec.root,
+            config_path=spec.config_path,
+            exit_code=0,
+            start_time="2026-06-09T10:00:00-04:00",
+            end_time="2026-06-09T10:00:01-04:00",
+            stdout_path=spec.root / "stdout.log",
+            stderr_path=spec.root / "stderr.log",
+        )
+
+    monkeypatch.setattr("romjax.grid_search._run_case_subprocess", fake_run_case)
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10, 20]}],
+        save_policy={"rolling": 1},
+        executor={"kind": "thread", "max_workers": 2, "show_progress": False},
+    )
+
+    assert search.run() == 0
+
+    manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["best"] == "case_0001"
+    assert manifest["cases"]["case_0000"]["retained"] is False
+    assert manifest["cases"]["case_0001"]["retained"] is True
+    assert not (search.root / "cases" / "case_0000").exists()
+    assert (search.root / "cases" / "case_0001").exists()
 
 
 def test_grid_search_reuse_policy_skips_existing_cases(tmp_path: Path, monkeypatch) -> None:
