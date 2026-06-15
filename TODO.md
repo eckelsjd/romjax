@@ -1,7 +1,6 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
 **Short term**
-- GridSearch save policy -- update on rolling basis (e.g. if we have thousands of runs, only save best 10 at a time )
 - Make sure multiple grid search is compatible with a composite routine. Especially look at logging/progress/failing in the composite routine
 - Optimize single run (multi-threaded/jit/caching/overhead, poisson, etc.)
   - gpu seems slower
