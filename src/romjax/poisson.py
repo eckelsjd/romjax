@@ -348,3 +348,5 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}
     
+    def resolve_dof(self) -> int:
+        return self.grid.coords[0].shape[0] * self.grid.coords[0].shape[1]  # Nx x Ny
