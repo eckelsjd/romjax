@@ -1,5 +1,6 @@
 """Reduced-order model training routine."""
 import functools
+import os
 import shutil
 import time
 from collections.abc import Mapping, Sequence
@@ -37,6 +38,7 @@ from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.plotting import PlotSpec, gridplot
+from romjax.profiling import profile_annotation, profile_step, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
     TreeErrorOperator,
@@ -716,186 +718,205 @@ class Train(Routine):
             checkpointer_context = ocp.training.Checkpointer(self.root, **dict(self.checkpointer))
         else:
             checkpointer_context = _NullCheckpointer()
-            
-        with checkpointer_context as ckptr:
-            ## INITIALIZE/LOAD
-            abstract_checkpointables = {
-                "params": _checkpoint_params(self.init_params),
-                "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
-            }
 
-            if ckptr.latest is None:
-                params = self.init_params
-                opt_state = abstract_checkpointables["opt_state"]
-                curr_step = 0
-                total_steps = self.termination.max_steps
-                logger.debug("Initialized train")
-            else:
-                _loaded = ckptr.load_checkpointables(abstract_checkpointables=abstract_checkpointables)
-                params = _restore_params(_loaded["params"])
-                opt_state = _loaded["opt_state"]
-                curr_step = ckptr.latest.step + 1  # starting on next iteration
-                total_steps = self.termination.max_steps - curr_step
+        with profile_trace("train", self.root):
+            with checkpointer_context as ckptr:
+                ## INITIALIZE/LOAD
+                abstract_checkpointables = {
+                    "params": _checkpoint_params(self.init_params),
+                    "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
+                }
 
-                if total_steps <= 0:
-                    logger.debug(f"Training already reached max_steps={self.termination.max_steps} from checkpoint.")
-                    return 0
+                if ckptr.latest is None:
+                    params = self.init_params
+                    opt_state = abstract_checkpointables["opt_state"]
+                    curr_step = 0
+                    total_steps = self.termination.max_steps
+                    logger.debug("Initialized train")
+                else:
+                    _loaded = ckptr.load_checkpointables(abstract_checkpointables=abstract_checkpointables)
+                    params = _restore_params(_loaded["params"])
+                    opt_state = _loaded["opt_state"]
+                    curr_step = ckptr.latest.step + 1  # starting on next iteration
+                    total_steps = self.termination.max_steps - curr_step
+
+                    if total_steps <= 0:
+                        logger.debug(
+                            f"Training already reached max_steps={self.termination.max_steps} from checkpoint."
+                        )
+                        return 0
+                    
+                    logger.debug(f"Restarting train from step {curr_step-1}")
                 
-                logger.debug(f"Restarting train from step {curr_step-1}")
-            
-            log_interval = self.diagnostics.log_interval or float('inf')
-            test_interval = self.diagnostics.test_interval or float('inf')
-            plot_interval = self.diagnostics.plot_interval or float('inf')
-            callback_interval = self.diagnostics.callback_interval or float('inf')
-            
-            loss_hist = _load_history_csv("loss.csv")
-            test_hist = _load_history_csv("test.csv")
-            fig, axs, lines = None, None, None
-
-            if 0 < plot_interval < float('inf'):
-                if self.diagnostics.live_plot:
-                    plt.ion()
-
-                plot_specs = [self.diagnostics.train_plot]
-
-                if test_fn is not None:
-                    plot_specs.append(self.diagnostics.validation_plot)
+                log_interval = self.diagnostics.log_interval or float('inf')
+                test_interval = self.diagnostics.test_interval or float('inf')
+                plot_interval = self.diagnostics.plot_interval or float('inf')
+                callback_interval = self.diagnostics.callback_interval or float('inf')
                 
-                fig, axs = gridplot(plot_specs)
-                lines = [ax.lines[0] for ax in axs.ravel()]
-                lines[0].set_data(*loss_hist)
+                loss_hist = _load_history_csv("loss.csv")
+                test_hist = _load_history_csv("test.csv")
+                fig, axs, lines = None, None, None
 
-                if test_fn is not None:
-                    lines[1].set_data(*test_hist)
-            
-            def _save_final(metrics=None):
-                if 0 < plot_interval < float('inf') and self.diagnostics.live_plot:
-                    plt.ioff()
-                ckptr.save_checkpointables(
-                    step=curr_step, 
-                    checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state}, 
-                    metrics=metrics, 
-                    force=True,
-                    overwrite=True
-                )
-                _save_plot(fig)
-                _save_history_csv("loss.csv", *loss_hist)
-                if test_fn is not None:
-                    _save_history_csv("test.csv", *test_hist)
+                if 0 < plot_interval < float('inf'):
+                    if self.diagnostics.live_plot:
+                        plt.ion()
 
-            t_start = time.time()
+                    plot_specs = [self.diagnostics.train_plot]
 
-            ctxt = alive_bar(total_steps) if self.diagnostics.show_progress else _NullProgress()
+                    if test_fn is not None:
+                        plot_specs.append(self.diagnostics.validation_plot)
+                    
+                    fig, axs = gridplot(plot_specs)
+                    lines = [ax.lines[0] for ax in axs.ravel()]
+                    lines[0].set_data(*loss_hist)
+
+                    if test_fn is not None:
+                        lines[1].set_data(*test_hist)
                 
-            with ctxt as bar:
-                while True:
-                    ## OPTIMIZER UPDATES
-                    try:
-                        batch = next(self.dataloader)
-                    except StopIteration:
-                        logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
-                        break
-                    
-                    try:
-                        params, opt_state, loss, grads = _step(params, opt_state, batch)
-                        loss = jax.block_until_ready(loss)
-                        loss_hist[0].append(curr_step)
-                        loss_hist[1].append(float(loss))
-                    except Exception as exc:
-                        logger.exception(f"Exception encountered during train step {curr_step}. Saving checkpoint...")
-                        _save_final()
-                        raise RoutineError("Optimizer update failure") from exc
-                    
-                    ## METRICS AND CHECKPOINT
-                    metrics = {"loss": float(loss)}
-                    test_score, grad_norm = None, None
-
-                    if test_fn is not None and 0 < test_interval < float('inf') and curr_step % test_interval == 0:
-                        test_score = float(test_fn(params))
-                        test_hist[0].append(curr_step)
-                        test_hist[1].append(test_score)
-                        metrics["test_score"] = test_score
-
-                    if self.termination.grad_tol:
-                        grad_norm = pytree_norm(grads)
-                        metrics["grad_norm"] = float(grad_norm)
-                    
-                    ckptr.save_checkpointables(
-                        step=curr_step, 
-                        checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
-                        metrics=metrics
-                    )
-
-                    ## DIAGNOSTICS
-                    stats_str = f"loss={float(loss):.2e}"
-                    if test_score is not None:
-                        stats_str += f" test={test_score:.2e}"
-                    if grad_norm is not None:
-                        stats_str += f" grad={grad_norm:.2e}"
-                    
-                    bar()
-                    bar.text = stats_str
-
-                    if curr_step % log_interval == 0:
-                        logger.debug(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
-                                    f"| step={curr_step} {stats_str}")
-                    
-                    if 0 < plot_interval < float('inf') and curr_step % plot_interval == 0:
-                        lines[0].set_data(*loss_hist)
-                        _save_history_csv("loss.csv", *loss_hist)
-
-                        if test_fn is not None:
-                            lines[1].set_data(*test_hist)
-                            _save_history_csv("test.csv", *test_hist)
-                        
-                        for ax in axs.ravel():
-                            ax.relim()
-                            ax.autoscale_view()
-                        fig.canvas.draw_idle()
-                        fig.canvas.flush_events()
-                        
+                def _save_final(metrics=None):
+                    if 0 < plot_interval < float('inf') and self.diagnostics.live_plot:
+                        plt.ioff()
+                    with profile_annotation("checkpoint_save", env=os.environ):
+                        ckptr.save_checkpointables(
+                            step=curr_step,
+                            checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
+                            metrics=metrics,
+                            force=True,
+                            overwrite=True,
+                        )
+                    with profile_annotation("plot_save", env=os.environ):
                         _save_plot(fig)
+                    _save_history_csv("loss.csv", *loss_hist)
+                    if test_fn is not None:
+                        _save_history_csv("test.csv", *test_hist)
+
+                t_start = time.time()
+                metrics = None
+
+                ctxt = alive_bar(total_steps) if self.diagnostics.show_progress else _NullProgress()
                     
-                    if (self.diagnostics.progress_callback is not None
-                        and 0 < callback_interval < float('inf')
-                        and curr_step % callback_interval == 0):
-                        self.diagnostics.progress_callback(params, self.graph, self.root)
-                    
-                    ## END CONDITIONS
-                    if self.termination.test_tol and test_score is not None and test_score < self.termination.test_tol:
-                        logger.info(f"Termination criteria reached: test score "
-                                    f"{test_score:.2e} < {self.termination.test_tol:.2e}")
-                        break
+                with ctxt as bar:
+                    while True:
+                        ## OPTIMIZER UPDATES
+                        try:
+                            batch = next(self.dataloader)
+                        except StopIteration:
+                            logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
+                            break
                         
-                    if self.termination.grad_tol and grad_norm is not None:
-                        if not jnp.isfinite(grad_norm):
-                            logger.warning("Grad norm is not finite. Terminating...")
+                        try:
+                            with profile_step("train", step_num=curr_step, env=os.environ):
+                                with profile_annotation("optimizer_step", env=os.environ):
+                                    params, opt_state, loss, grads = _step(params, opt_state, batch)
+                            loss = jax.block_until_ready(loss)
+                            loss_hist[0].append(curr_step)
+                            loss_hist[1].append(float(loss))
+                        except Exception as exc:
+                            logger.exception(
+                                f"Exception encountered during train step {curr_step}. Saving checkpoint..."
+                            )
+                            _save_final()
+                            raise RoutineError("Optimizer update failure") from exc
+                        
+                        ## METRICS AND CHECKPOINT
+                        metrics = {"loss": float(loss)}
+                        test_score, grad_norm = None, None
+
+                        if test_fn is not None and 0 < test_interval < float('inf') and curr_step % test_interval == 0:
+                            with profile_annotation("validation", env=os.environ):
+                                test_score = float(test_fn(params))
+                            test_hist[0].append(curr_step)
+                            test_hist[1].append(test_score)
+                            metrics["test_score"] = test_score
+
+                        if self.termination.grad_tol:
+                            with profile_annotation("grad_norm", env=os.environ):
+                                grad_norm = pytree_norm(grads)
+                            metrics["grad_norm"] = float(grad_norm)
+                        
+                        with profile_annotation("checkpoint_save", env=os.environ):
+                            ckptr.save_checkpointables(
+                                step=curr_step,
+                                checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
+                                metrics=metrics,
+                            )
+
+                        ## DIAGNOSTICS
+                        stats_str = f"loss={float(loss):.2e}"
+                        if test_score is not None:
+                            stats_str += f" test={test_score:.2e}"
+                        if grad_norm is not None:
+                            stats_str += f" grad={grad_norm:.2e}"
+                        
+                        bar()
+                        bar.text = stats_str
+
+                        if curr_step % log_interval == 0:
+                            logger.debug(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
+                                        f"| step={curr_step} {stats_str}")
+                        
+                        if 0 < plot_interval < float('inf') and curr_step % plot_interval == 0:
+                            with profile_annotation("plot_update", env=os.environ):
+                                lines[0].set_data(*loss_hist)
+                                _save_history_csv("loss.csv", *loss_hist)
+
+                                if test_fn is not None:
+                                    lines[1].set_data(*test_hist)
+                                    _save_history_csv("test.csv", *test_hist)
+                                
+                                for ax in axs.ravel():
+                                    ax.relim()
+                                    ax.autoscale_view()
+                                fig.canvas.draw_idle()
+                                fig.canvas.flush_events()
+                                
+                                _save_plot(fig)
+                        
+                        if (self.diagnostics.progress_callback is not None
+                            and 0 < callback_interval < float('inf')
+                            and curr_step % callback_interval == 0):
+                            with profile_annotation("progress_callback", env=os.environ):
+                                self.diagnostics.progress_callback(params, self.graph, self.root)
+                        
+                        ## END CONDITIONS
+                        if (
+                            self.termination.test_tol
+                            and test_score is not None
+                            and test_score < self.termination.test_tol
+                        ):
+                            logger.info(f"Termination criteria reached: test score "
+                                        f"{test_score:.2e} < {self.termination.test_tol:.2e}")
+                            break
+                            
+                        if self.termination.grad_tol and grad_norm is not None:
+                            if not jnp.isfinite(grad_norm):
+                                logger.warning("Grad norm is not finite. Terminating...")
+                                break
+
+                            if grad_norm < self.termination.grad_tol:
+                                logger.info(f"Termination criteria reached: gradient norm "
+                                            f"{grad_norm:.2e} < {self.termination.grad_tol:.2e}")
+                                break
+                        
+                        if self.termination.loss_tol and float(loss) < self.termination.loss_tol:
+                            logger.info(f"Termination criteria reached: loss "
+                                        f"{float(loss):.2e} < {self.termination.loss_tol:.2e}")
                             break
 
-                        if grad_norm < self.termination.grad_tol:
-                            logger.info(f"Termination criteria reached: gradient norm "
-                                        f"{grad_norm:.2e} < {self.termination.grad_tol:.2e}")
+                        if curr_step+1 >= self.termination.max_steps:
+                            logger.info(f"Termination criteria reached: "
+                                        f"{curr_step+1} / {self.termination.max_steps} iterations")
                             break
-                    
-                    if self.termination.loss_tol and float(loss) < self.termination.loss_tol:
-                        logger.info(f"Termination criteria reached: loss "
-                                    f"{float(loss):.2e} < {self.termination.loss_tol:.2e}")
-                        break
 
-                    if curr_step+1 >= self.termination.max_steps:
-                        logger.info(f"Termination criteria reached: "
-                                    f"{curr_step+1} / {self.termination.max_steps} iterations")
-                        break
+                        if (t_diff := time.time() - t_start) >= self.termination.max_runtime.total_seconds():
+                            logger.info(f"Termination criteria reached: max runtime "
+                                        f"{_prettify_timedelta(t_diff)} / "
+                                        f"{_prettify_timedelta(self.termination.max_runtime.total_seconds())}")
+                            break
 
-                    if (t_diff := time.time() - t_start) >= self.termination.max_runtime.total_seconds():
-                        logger.info(f"Termination criteria reached: max runtime "
-                                    f"{_prettify_timedelta(t_diff)} / "
-                                    f"{_prettify_timedelta(self.termination.max_runtime.total_seconds())}")
-                        break
-
-                    curr_step += 1
-            
-            logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
-            _save_final(metrics)
+                        curr_step += 1
+                
+                logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
+                _save_final(metrics)
         
         return params

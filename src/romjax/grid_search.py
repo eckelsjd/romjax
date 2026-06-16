@@ -39,6 +39,7 @@ from pydantic import (
 )
 
 import romjax
+from romjax.profiling import build_profile_env, profile_annotation, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import TreePath, coerce_tree_path, coerce_tree_paths, pytree_merge, set_subtree
 from romjax.typing import CallableModel, from_registry
@@ -805,13 +806,15 @@ class GridSearch(Routine):
             case_root = cases_dir / name
             reuse_existing = self.write_policy == "reuse" and case_root.exists() and any(case_root.iterdir())
             config_path = case_root / "case.yml" if reuse_existing else self._write_case_config(case_root, values)
+            env = dict(self.child_env)
+            env.update(build_profile_env("train", case_root, os.environ))
             specs.append(
                 _CaseSpec(
                     name=name,
                     root=case_root,
                     config_path=config_path,
                     command=self._case_command(config_path),
-                    env=dict(self.child_env),
+                    env=env,
                     quiet=self.child_quiet,
                     reuse_existing=reuse_existing,
                 )
@@ -891,56 +894,62 @@ class GridSearch(Routine):
 
     def run(self) -> int:
         """Run the grid search and write a manifest."""
-        specs, manifest_cases = self._prepare_cases()
-        rolling_tracker = self._build_rolling_tracker() if self.save_policy.mode == "rolling" else None
-        rolling_scores: dict[str, float] = {}
-        results = self.executor.run_cases(
-            specs,
-            on_result=(
-                functools.partial(self._handle_rolling_result, rolling_tracker, rolling_scores)
-                if rolling_tracker is not None
-                else None
-            ),
-        )
-        result_by_name = {result.name: result for result in results}
-        ranked = (
-            sorted(rolling_scores.items(), key=lambda item: item[1])
-            if rolling_tracker is not None
-            else self._rank_cases(results)
-        )
-        metric_by_name = dict(ranked)
-        retained = rolling_tracker.retained if rolling_tracker is not None else self._apply_save_policy(ranked)
-        if ranked:
-            self._copy_best_case(ranked[0][0])
+        with profile_trace("grid_search", self.root):
+            with profile_annotation("prepare_cases", env=os.environ):
+                specs, manifest_cases = self._prepare_cases()
+            rolling_tracker = self._build_rolling_tracker() if self.save_policy.mode == "rolling" else None
+            rolling_scores: dict[str, float] = {}
+            with profile_annotation("run_cases", env=os.environ):
+                results = self.executor.run_cases(
+                    specs,
+                    on_result=(
+                        functools.partial(self._handle_rolling_result, rolling_tracker, rolling_scores)
+                        if rolling_tracker is not None
+                        else None
+                    ),
+                )
+            result_by_name = {result.name: result for result in results}
+            with profile_annotation("rank_cases", env=os.environ):
+                ranked = (
+                    sorted(rolling_scores.items(), key=lambda item: item[1])
+                    if rolling_tracker is not None
+                    else self._rank_cases(results)
+                )
+                metric_by_name = dict(ranked)
+                retained = rolling_tracker.retained if rolling_tracker is not None else self._apply_save_policy(ranked)
+            if ranked:
+                with profile_annotation("copy_best_case", env=os.environ):
+                    self._copy_best_case(ranked[0][0])
 
-        exit_code = 0
-        for spec in specs:
-            result = result_by_name[spec.name]
-            if result.exit_code != 0 and exit_code == 0:
-                exit_code = result.exit_code
-            manifest_cases[spec.name].update(
-                {
-                    "status": result.status,
-                    "exit_code": result.exit_code,
-                    "metric": metric_by_name.get(spec.name),
-                    "start_time": result.start_time,
-                    "end_time": result.end_time,
-                    "stdout": _yaml_path_text(result.stdout_path) if result.stdout_path is not None else None,
-                    "stderr": _yaml_path_text(result.stderr_path) if result.stderr_path is not None else None,
-                    "device": result.device,
-                    "retained": spec.name in retained,
-                }
-            )
+            exit_code = 0
+            for spec in specs:
+                result = result_by_name[spec.name]
+                if result.exit_code != 0 and exit_code == 0:
+                    exit_code = result.exit_code
+                manifest_cases[spec.name].update(
+                    {
+                        "status": result.status,
+                        "exit_code": result.exit_code,
+                        "metric": metric_by_name.get(spec.name),
+                        "start_time": result.start_time,
+                        "end_time": result.end_time,
+                        "stdout": _yaml_path_text(result.stdout_path) if result.stdout_path is not None else None,
+                        "stderr": _yaml_path_text(result.stderr_path) if result.stderr_path is not None else None,
+                        "device": result.device,
+                        "retained": spec.name in retained,
+                    }
+                )
 
-        self._write_manifest(
-            {
-                "root": _yaml_path_text(self.root),
-                "base": _yaml_path_text(self.base),
-                "executor": self.executor.model_dump(),
-                "save_policy": self.save_policy.model_dump(),
-                "best": ranked[0][0] if ranked else None,
-                "ranking": [{"case": name, "metric": metric} for name, metric in ranked],
-                "cases": manifest_cases,
-            }
-        )
-        return exit_code
+            with profile_annotation("write_manifest", env=os.environ):
+                self._write_manifest(
+                    {
+                        "root": _yaml_path_text(self.root),
+                        "base": _yaml_path_text(self.base),
+                        "executor": self.executor.model_dump(),
+                        "save_policy": self.save_policy.model_dump(),
+                        "best": ranked[0][0] if ranked else None,
+                        "ranking": [{"case": name, "metric": metric} for name, metric in ranked],
+                        "cases": manifest_cases,
+                    }
+                )
+            return exit_code

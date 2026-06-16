@@ -2,7 +2,7 @@
 
 ## Project goal
 
-`romjax` implements a `jax`-based framework for learning reduced-order models (ROMs) using graph commutativity objectives. Nodes represent input/output vector spaces and edges represent models between them. The full method is described in `.agents/assets/draft-graph-commutativity.pdf`.
+`romjax` implements a `jax`-based framework for learning reduced-order models (ROMs) using graph commutativity objectives. Nodes represent input/output vector spaces and edges represent models between them.
 
 Success means demonstrating improvement over traditional ROM methods on representative PDE problems and releasing `romjax` as a reproducible Python library alongside the journal article.
 
