@@ -1,16 +1,10 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
 **Short term**
-- Make sure multiple grid search is compatible with a composite routine. Especially look at logging/progress/failing in the composite routine
 - Optimize single run (multi-threaded/jit/caching/overhead, poisson, etc.)
   - gpu seems slower
   - cpu is only going up to 100%, sometimes more -- not much multi-threading going on in the jit
 - normalization before/after training
-
-**Long term**
-- EvolutionSearch or similar instead of grid search (still dispatch in parallel)
-- Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding
-- Get this all to work on the mac studios
 
 
 ## Critical
@@ -23,10 +17,8 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
-- [ ] Probably issues with absolute paths in GridSearch on Windows
 
 ## Backburner
-- [ ] Keep an eye on orbax checkpoint reloading with more complicated param trees
 - [ ] Go back and make sure graph loss functions actually give the same result as normal regresion (linear, mlp)
 - [ ] Other data save formats outside of H5
 
@@ -61,3 +53,12 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Make sure the expensive part of data generation is the model evaluation
 - [ ] Make sure the expensive part of train is the optimizer update (be on the lookout for big recursive pytree operations) -- within this, make sure we are spending most time computing rather than filtering/flattening/assembling/caching/allocating/etc.
 - [ ] Check performance of poisson and make sure it reasonable for the problem size (lookout for optx)
+
+## Training
+- [ ] EvolutionSearch or similar instead of grid search (still dispatch in parallel)
+- [ ] Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding
+- [ ] Get this all to work on Mac OS
+
+## Future projects
+- Building surrogate for graph comm as a model error indicator (scalar or field)
+- Online adaptive time-stepping for time-based simulations

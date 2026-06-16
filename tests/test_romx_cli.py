@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import ClassVar
@@ -8,6 +9,7 @@ import matplotlib
 from alive_progress import config_handler
 from loguru import logger
 
+import romjax
 from romjax import plotting
 from romjax.romx_cli import cli
 from romjax.routine import Routine
@@ -129,6 +131,60 @@ def test_run_with_globals(tmp_path, monkeypatch):
     assert calls["logger"]["handlers"][1]["sink"] == log_file
     assert calls["bar"]["file"] is sys.stderr
     assert calls["rc"] == {"axes.facecolor": "black"}
+
+
+def test_run_profile_flags_set_environment(tmp_path, monkeypatch):
+    config_path = tmp_path / "routine.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.DemoRoutine",
+                f"root: {tmp_path / 'runs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    observed: dict[str, str | None] = {}
+
+    class DummyRoutine:
+        def run(self) -> int:
+            observed["run_profile"] = os.environ.get("ROMJAX_PROFILE")
+            observed["run_dir"] = os.environ.get("ROMJAX_PROFILE_DIR")
+            observed["run_label"] = os.environ.get("ROMJAX_PROFILE_LABEL")
+            return 0
+
+    def fake_load(path):
+        observed["load_profile"] = os.environ.get("ROMJAX_PROFILE")
+        observed["load_dir"] = os.environ.get("ROMJAX_PROFILE_DIR")
+        observed["load_label"] = os.environ.get("ROMJAX_PROFILE_LABEL")
+        return DummyRoutine()
+
+    monkeypatch.setattr(romjax, "load", fake_load)
+    try:
+        assert (
+            cli(
+                [
+                    "run",
+                    "--profile",
+                    "--profile-dir",
+                    str(tmp_path / "traces"),
+                    "--profile-label",
+                    "cli-trace",
+                    str(config_path),
+                ]
+            )
+            == 0
+        )
+        assert observed["load_profile"] == "1"
+        assert Path(observed["load_dir"]) == (tmp_path / "traces")
+        assert observed["load_label"] == "cli-trace"
+        assert observed["run_profile"] == "1"
+        assert Path(observed["run_dir"]) == (tmp_path / "traces")
+        assert observed["run_label"] == "cli-trace"
+    finally:
+        for key in ("ROMJAX_PROFILE", "ROMJAX_PROFILE_DIR", "ROMJAX_PROFILE_LABEL"):
+            monkeypatch.delenv(key, raising=False)
 
 
 def test_run_composite_routine(tmp_path):

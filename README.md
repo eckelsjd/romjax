@@ -15,13 +15,38 @@ git clone https://github.com/eckelsjd/romjax.git && cd romjax
 uv sync --all-groups # use --extra cu13 for gpu-support
 ```
 
-## Project roadmap
+## 🔬 Profiling
+The built-in harness uses `jax.profiler.trace(...)` and `StepTraceAnnotation` so you can inspect both Python
+orchestration and JAX-compiled execution in TensorBoard.
 
-Right now, we have the basic `FunctionGraph` API up and running with the `Poisson2D` model as a good PDE test case. The following list summarizes where we are heading next.
+Enable tracing with CLI flags:
 
+```shell
+uv run python -m romjax.romx_cli run \
+  --profile \
+  --profile-dir /tmp/romjax-traces \
+  --profile-label train-debug \
+  path/to/train.yml
+```
 
-- Implementing various graph-theoretic objective functions (state reconstruction, solution error, etc.)
-- Then start looking at different modeling options (Vlasov, Conv2D, etc.)
+The CLI sets `ROMJAX_PROFILE`, `ROMJAX_PROFILE_DIR`, and `ROMJAX_PROFILE_LABEL` for the launched routine so the
+same flags also enable `GridSearch` child traces.
+
+For a direct `Train` run, the trace is written under `--profile-dir` if provided, otherwise under
+`<train_root>/profiles/`.
+
+For `GridSearch`, the parent search is traced and each spawned training case gets its own trace directory under
+`<case_root>/profiles/` automatically. If `--profile-dir` is set on the parent CLI, child traces are written under a
+case-named subdirectory inside that root.
+
+Open the results with TensorBoard:
+
+```shell
+tensorboard --logdir /tmp/romjax-traces
+```
+
+If you want a host-side flame graph for Python overhead, run the parent process under `py-spy`. For allocation and
+copy-volume analysis, `Scalene` is the better follow-up tool.
 
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.

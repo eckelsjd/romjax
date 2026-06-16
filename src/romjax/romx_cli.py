@@ -27,8 +27,37 @@ def build_parser() -> argparse.ArgumentParser:
     
     gen = subparsers.add_parser("run", help="Run a romjax routine from yaml config file.")
     gen.add_argument("config", help=f"Path to config file. Provided routines: {romjax.routine.available}")
+    gen.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable JAX profiling for the current routine and any grid-search children.",
+    )
+    gen.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=None,
+        help="Write profiler traces under this directory.",
+    )
+    gen.add_argument(
+        "--profile-label",
+        default=None,
+        help="Override the profiler label used for trace directories.",
+    )
 
     return parser
+
+
+def _configure_profile_env(profile: bool, profile_dir: Path | None, profile_label: str | None) -> None:
+    """Populate environment variables that enable the profiling harness."""
+    enabled = profile or profile_dir is not None or profile_label is not None
+    if not enabled:
+        return
+
+    os.environ["ROMJAX_PROFILE"] = "1"
+    if profile_dir is not None:
+        os.environ["ROMJAX_PROFILE_DIR"] = str(profile_dir.expanduser().resolve())
+    if profile_label is not None:
+        os.environ["ROMJAX_PROFILE_LABEL"] = profile_label
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -42,6 +71,7 @@ def cli(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         try:
+            _configure_profile_env(args.profile, args.profile_dir, args.profile_label)
             if not Path(args.config).exists():
                 raise RoutineError(f"Config file '{args.config}' not found")
             
