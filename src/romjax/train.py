@@ -305,13 +305,17 @@ class GraphLossTerm(BaseModel):
         if self.batch_reduce is not None:
             if self.dataset is not None and self.dataset not in batch_data:
                 return jnp.asarray(0.0)  # if a dataset runs out during iteration
-            
+
             term_batch = batch_data[self.dataset] if self.dataset is not None else batch_data
+            if isinstance(term_batch, (list, tuple)):
+                if len(term_batch) == 0:
+                    return jnp.asarray(0.0)
+                losses = jnp.asarray([self.function(params, single_data, graph) for single_data in term_batch])
+            else:
+                def body(carry, single_data):
+                    return carry, self.function(params, single_data, graph)
 
-            def body(carry, single_data):
-                return carry, self.function(params, single_data, graph)
-
-            _, losses = jax.lax.scan(body, None, term_batch)
+                _, losses = jax.lax.scan(body, None, term_batch)
             return jnp.asarray(self.weight) * self.batch_reduce(losses)
     
         else:
@@ -419,8 +423,11 @@ class CheckpointerConfig(BaseModel):
     """
     Orbax-policy checkpoint configuration for :class:`GraphTrain`.
 
+    Note that the default save_decision_policy=None is different from Orbax. In Orbax, this means save every step.
+    Here, it means don't save.
+
     :param save_decision_policy: Orbax save policy; short names resolve from
-        ``ocp.training.save_decision_policies``
+        ``ocp.training.save_decision_policies``, default=None, which will not save any (for performance)
     :param preservation_policy: Orbax preservation policy; short names resolve from
         ``ocp.training.preservation_policies``
     :param step_name_format: Orbax name format for saving training steps
@@ -431,15 +438,8 @@ class CheckpointerConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="allow")
 
-    save_decision_policy: SaveDecisionPolicy | None = Field(
-        default_factory=lambda: ocp.training.save_decision_policies.FixedIntervalPolicy(1)
-    )
-    preservation_policy: PreservationPolicy | None = Field(
-        default_factory=lambda: ocp.training.preservation_policies.AnyPreservationPolicy([
-            ocp.training.preservation_policies.LatestN(10),
-            ocp.training.preservation_policies.EveryNSteps(5),
-        ])
-    )
+    save_decision_policy: SaveDecisionPolicy | None = None
+    preservation_policy: PreservationPolicy | None = None
     step_name_format: Any | None = None
     custom_metadata: dict | None = None
     cleanup_tmp_directories: bool = False
@@ -835,11 +835,12 @@ class Train(Routine):
                             metrics["grad_norm"] = float(grad_norm)
                         
                         with profile_annotation("checkpoint_save", env=os.environ):
-                            ckptr.save_checkpointables(
-                                step=curr_step,
-                                checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
-                                metrics=metrics,
-                            )
+                            if self.checkpointer.save_decision_policy is not None:
+                                ckptr.save_checkpointables(
+                                    step=curr_step,
+                                    checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
+                                    metrics=metrics,
+                                )
 
                         ## DIAGNOSTICS
                         stats_str = f"loss={float(loss):.2e}"

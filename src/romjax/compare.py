@@ -201,6 +201,30 @@ class CompareTable(CompareOrbax):
         """Return metric/dataset column labels in table order."""
         return [(metric_name, ds_name) for metric_name in self.metrics for ds_name in self.dataloaders]
 
+    @staticmethod
+    def _iter_sample_payloads(batch: Any) -> Iterator[Any]:
+        """Yield sample-level payloads from a loader batch when possible.
+
+        ``DataLoader`` yields per-dataset batches, but file-backed datasets commonly return a list of individual
+        sample pytrees. In that case, CompareTable should score each sample independently rather than handing the
+        whole list to a metric that expects a single sample.
+        """
+        if isinstance(batch, Mapping) and batch:
+            values = list(batch.values())
+            if all(isinstance(value, (list, tuple)) for value in values):
+                lengths = {len(value) for value in values}
+                if len(lengths) == 1:
+                    batch_size = lengths.pop()
+                    for index in range(batch_size):
+                        yield {key: value[index] for key, value in batch.items()}
+                    return
+
+        if isinstance(batch, (list, tuple)):
+            yield from batch
+            return
+
+        yield batch
+
     def print_table(self, data: Mapping):
         """Print a fixed-width comparison table to stdout."""
         rows = self._format_table(data)
@@ -308,7 +332,11 @@ class CompareTable(CompareOrbax):
                         if has_stats and self.write_policy == "reuse":
                             continue
 
-                        values = [metric_fn(params, single_data) for single_data in _iter_loader_once(loader)]
+                        values = [
+                            metric_fn(params, single_data)
+                            for batch in _iter_loader_once(loader)
+                            for single_data in self._iter_sample_payloads(batch)
+                        ]
                         if not values:
                             raise ValueError(f"No data loaded for dataset '{ds_name}'")
                         results = jnp.asarray(values)

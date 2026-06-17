@@ -3,6 +3,7 @@ import functools
 from collections.abc import Mapping
 from typing import Annotated, Callable, Literal, TypedDict
 
+import jax
 import jax.numpy as jnp
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
@@ -200,13 +201,17 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
             raise ValueError("Only 2D grid supported for Poisson")
         
         return value
+
+    def _jax_coords(self) -> tuple[jax.Array, ...]:
+        """Return grid coordinates as JAX arrays for numerical routines."""
+        return tuple(jnp.asarray(coord) for coord in self.grid.coords)
     
-    def _merge_coords(self, inputs: PoissonInputs) -> PoissonInputs:
+    def _merge_coords(self, inputs: PoissonInputs, coords: Coordinates | None = None) -> PoissonInputs:
         """Merge grid coords into incoming inputs."""
         inputs = to_pytree(inputs)
         for name in ("forcing", "conductivity", "boundary"):
             inputs.setdefault(name, {})
-        coords = {'coords': self.grid['coords']}
+        coords = {"coords": self._jax_coords() if coords is None else coords}
         for k in inputs:
             inputs[k].update(coords)
         
@@ -284,7 +289,8 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
         :param outputs: the scalar potential on a 2D grid
         :return: the scalar residual on the 2D grid
         """
-        return self._compute_residual(self._merge_coords(inputs), outputs)
+        coords = self._jax_coords()
+        return self._compute_residual(self._merge_coords(inputs, coords), outputs)
 
     def solve(
         self, 
@@ -301,17 +307,18 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
         """
         inputs = {} if inputs is None else inputs
         residuals = {} if residuals is None else residuals
+        grid_coords = self._jax_coords()
         if self.residual_name in residuals:
             target = jnp.asarray(residuals[self.residual_name])
         else:
-            target = jnp.zeros_like(self.grid.coords[0])
-        args = {'inputs': self._merge_coords(inputs), 'target': target}
+            target = jnp.zeros_like(grid_coords[0])
+        args = {'inputs': self._merge_coords(inputs, grid_coords), 'target': target}
 
         def residual_fn(phi: ArrayLike, args: PyTree) -> ArrayLike:
             residual = self._compute_residual(args['inputs'], {self.field_name: phi})
             return residual[self.residual_name] - args['target']
         
-        y0 = jnp.asarray(self.initial_guess(self.grid.coords))
+        y0 = jnp.asarray(self.initial_guess(grid_coords))
         solution = self.solver.root_find(residual_fn, y0, args, return_sol=return_sol)
 
         ret = solution if return_sol else {self.field_name: solution} 

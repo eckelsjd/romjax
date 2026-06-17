@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
 import jax.numpy as jnp
+import numpy as np
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import (
     AfterValidator,
     BeforeValidator,
+    ConfigDict,
     Field,
     PositiveFloat,
     PositiveInt,
@@ -163,6 +165,9 @@ class UniformGrid(DictModel):
     :ivar coords: (xgrid, ...) with each the same shape as the grid,
                   if 1D grids are passed, will be meshed to ND.
     """
+
+    model_config = ConfigDict(validate_assignment=False)
+
     shape: tuple[PositiveInt, ...] | None = None
     spacing: tuple[PositiveFloat, ...] | None = None
     bounds: tuple[tuple[float, float], ...] | None = None
@@ -171,56 +176,72 @@ class UniformGrid(DictModel):
     @model_validator(mode='after')
     def _coerce_grid(self) -> 'UniformGrid':
         """Ultimately, we need coords to be defined. Also check everything is consistent."""
+        def _as_numpy(value: Any) -> np.ndarray:
+            return np.asarray(value)
+
         spacing_provided = self.spacing is not None and len(self.spacing) > 0
         shape_provided = self.shape is not None and len(self.shape) > 0
         if self.coords is None:
             if self.bounds is None:
                 raise ValueError("Can't construct grid without bounds.")
-            
-            lengths = tuple(b[1] - b[0] for b in self.bounds)
-                
-            if any([L <= 0 for L in lengths]):
+
+            bounds = tuple(tuple(float(v) for v in bound) for bound in self.bounds)
+            lengths = tuple(b[1] - b[0] for b in bounds)
+
+            if any(L <= 0 for L in lengths):
                 raise ValueError("Grid bounds must be ordered as (lower, upper).")
-            
+
             # Try to construct from spacing and shape
             if not shape_provided and not spacing_provided:
                 raise ValueError("Can't construct grid without either spacing or shape.")
-            
+
             if shape_provided and spacing_provided:
                 expected_spacing = tuple(L/Nl for L, Nl in zip(lengths, self.shape))
-                spacing_checks = jnp.array(
-                    [jnp.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(expected_spacing, self.spacing)]
+                spacing_checks = np.array(
+                    [np.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(expected_spacing, self.spacing)]
                 )
-                if not bool(jnp.all(spacing_checks)):
+                if not bool(np.all(spacing_checks)):
                     raise ValueError("Specified spacing is not consistent with bounds and shape.")
                 
             if not shape_provided:
-                self.shape = tuple(L/dl for L, dl in zip(lengths, self.spacing))
+                inferred_shape = tuple(int(np.rint(L / dl)) for L, dl in zip(lengths, self.spacing))
+                if not np.allclose(
+                    tuple(L / dl for L, dl in zip(lengths, self.spacing)),
+                    inferred_shape,
+                    atol=1e-6,
+                    rtol=1e-6,
+                ):
+                    raise ValueError("Specified spacing is not consistent with bounds and an integer grid shape.")
+                self.shape = inferred_shape
 
             if not spacing_provided:
                 self.spacing = tuple(L/Nl for L, Nl in zip(lengths, self.shape))
 
-            grids = [jnp.linspace(b[0]+dl/2, b[1]-dl/2, Nl) for b, dl, Nl in 
-                     zip(self.bounds, self.spacing, self.shape)]
-            self.coords = tuple(jnp.meshgrid(*grids, indexing='ij'))
+            grids = [
+                np.linspace(b[0] + dl / 2, b[1] - dl / 2, Nl)
+                for b, dl, Nl in zip(bounds, self.spacing, self.shape)
+            ]
+            self.coords = tuple(np.asarray(arr) for arr in np.meshgrid(*grids, indexing='ij'))
         
         else:
-            if self.coords[0].ndim == 1:
-                if not all([arr.ndim == 1 for arr in self.coords]): 
+            coords = tuple(_as_numpy(arr) for arr in self.coords)
+
+            if coords[0].ndim == 1:
+                if not all(arr.ndim == 1 for arr in coords):
                     raise ValueError("Must have all 1d coord arrays or all N-dim")
-                self.coords = tuple(jnp.meshgrid(*self.coords, indexing='ij'))
+                coords = tuple(np.asarray(arr) for arr in np.meshgrid(*coords, indexing='ij'))
             
             # Make sure shape, spacing, and bounds are consistent
-            ndim = self.coords[0].ndim
-            shape = self.coords[0].shape
-            if not all([arr.ndim == ndim for arr in self.coords]):
+            ndim = coords[0].ndim
+            shape = coords[0].shape
+            if not all(arr.ndim == ndim for arr in coords):
                 raise ValueError("All arrays must have same ndim")
-            if not all([arr.shape == shape for arr in self.coords]):
+            if not all(arr.shape == shape for arr in coords):
                 raise ValueError("All arrays must have same shape")
-            if not len(self.coords) == ndim:
+            if not len(coords) == ndim:
                 raise ValueError("Must have exactly ndim coord arrays")
 
-            bounds = tuple((float(jnp.min(arr)), float(jnp.max(arr))) for arr in self.coords)
+            bounds = tuple((float(np.min(arr)), float(np.max(arr))) for arr in coords)
             lengths = tuple(b[1] - b[0] for b in bounds)
             spacing = tuple(L / (Nl - 1) if Nl > 1 else 0.0 for L, Nl in zip(lengths, shape))  # cell-centered
             edge_bounds = tuple((b[0] - dl / 2, b[1] + dl / 2) for b, dl in zip(bounds, spacing))
@@ -234,23 +255,24 @@ class UniformGrid(DictModel):
             if self.bounds is None:
                 self.bounds = edge_bounds
             else:
-                bounds_checks = jnp.array(
+                bounds_checks = np.array(
                     [
-                        jnp.allclose(jnp.asarray(b1), jnp.asarray(b2), atol=1e-6, rtol=1e-6)
+                        np.allclose(np.asarray(b1), np.asarray(b2), atol=1e-6, rtol=1e-6)
                         for b1, b2 in zip(edge_bounds, self.bounds)
                     ]
                 )
-                if not bool(jnp.all(bounds_checks)):
+                if not bool(np.all(bounds_checks)):
                     raise ValueError("Specified bounds are not consistent with provided coords")
             
             if self.spacing is None:
                 self.spacing = spacing
             else:
-                spacing_checks = jnp.array(
-                    [jnp.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(spacing, self.spacing)]
+                spacing_checks = np.array(
+                    [np.allclose(s1, s2, atol=1e-6, rtol=1e-6) for s1, s2 in zip(spacing, self.spacing)]
                 )
-                if not bool(jnp.all(spacing_checks)):
+                if not bool(np.all(spacing_checks)):
                     raise ValueError("Specified spacings are not consistent with provided coords")
+            self.coords = tuple(np.asarray(arr) for arr in coords)
             
         return self
 

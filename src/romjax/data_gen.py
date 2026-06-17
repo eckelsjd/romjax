@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import json
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
 
@@ -18,6 +19,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveInt,
     PrivateAttr,
     model_validator,
@@ -187,6 +189,11 @@ class LoadDataConfig[T: Any](BaseModel, ABC):
     :param batch_size: number of output samples per yielded mini-batch
     :param shuffle_seed: seed for shuffling mini-batch data
     :param max_epochs: maximum times to iterate through all available data (defaults to infinite loop)
+    :param cache_policy: file-cache policy for loaded samples
+    :param cache_storage: storage location for cached samples
+    :param cache_max_items: maximum number of cached samples, if any
+    :param cache_max_bytes: maximum total cached sample size, if any
+    :param stack_batch: stack samples into a batched pytree before returning them
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -194,11 +201,31 @@ class LoadDataConfig[T: Any](BaseModel, ABC):
     batch_size: PositiveInt = 16
     shuffle_seed: int = 0
     max_epochs: PositiveInt | None = None
+    cache_policy: Literal["none", "lru", "epoch"] = "none"
+    cache_storage: Literal["host", "device"] = "host"
+    cache_max_items: NonNegativeInt | None = None
+    cache_max_bytes: NonNegativeInt | None = None
+    stack_batch: bool = False
+
+    _cache_entries: OrderedDict[Any, tuple[PyTree, int]] = PrivateAttr(default_factory=OrderedDict)
+    _cache_bytes: int = PrivateAttr(default=0)
+    _epoch_cache_items: int | None = PrivateAttr(default=None)
 
     @abstractmethod
     def discover_sample_refs(self, root: Path) -> list[T]:
         """Discover sample references below one dataset root."""
         raise NotImplementedError
+
+    @abstractmethod
+    def load_sample(self, ref: T) -> PyTree:
+        """Load one sample referenced from disk."""
+        raise NotImplementedError
+
+    def configure_epoch_cache(self, epoch_size: int | None) -> None:
+        """Set the selected epoch size used by ``cache_policy='epoch'``."""
+        self._epoch_cache_items = epoch_size
+        if self.cache_policy == "epoch":
+            self._enforce_cache_limits()
 
     def select_epoch_refs(self, refs: Sequence[T], indices: jax.Array) -> list[T]:
         """Select the full epoch reference order from a shuffled dataset index order."""
@@ -208,10 +235,118 @@ class LoadDataConfig[T: Any](BaseModel, ABC):
         """Count the number of references selected for one epoch without materializing them."""
         return len(indices)
 
-    @abstractmethod
-    def load_batch(self, refs: Sequence[T]) -> dict[str, PyTree]:
-        """Load and stack a selected batch of dataset references."""
-        raise NotImplementedError
+    def load_batch(self, refs: Sequence[T]) -> PyTree | list[PyTree]:
+        """Load a selected batch of dataset references."""
+        samples = [self._load_cached_sample(ref) for ref in refs]
+        if len(samples) == 0:
+            return {}
+        if self.stack_batch:
+            return pytree_stack(samples)
+        return samples
+
+    def _cache_key(self, ref: T) -> Any:
+        """Return a hashable cache key for one sample reference."""
+        def _normalize(value: Any) -> Any:
+            # if isinstance(value, Path):
+            #     return value.resolve()
+            if isinstance(value, tuple):
+                return tuple(_normalize(item) for item in value)
+            if isinstance(value, list):
+                return tuple(_normalize(item) for item in value)
+            return value
+
+        return _normalize(ref)
+
+    def _cache_limit_items(self) -> int | None:
+        """Return the effective item cap for the current cache policy."""
+        if self.cache_policy != "epoch":
+            return self.cache_max_items
+        if self._epoch_cache_items is None:
+            return self.cache_max_items
+        if self.cache_max_items is None:
+            return self._epoch_cache_items
+        return max(self.cache_max_items, self._epoch_cache_items)
+
+    def _cache_limit_bytes(self) -> int | None:
+        """Return the effective byte cap for the current cache policy."""
+        return self.cache_max_bytes
+
+    @staticmethod
+    def _sample_nbytes(sample: PyTree) -> int:
+        """Estimate the in-memory size of one cached sample in bytes."""
+        total = 0
+        for leaf in jax.tree.leaves(sample):
+            if leaf is None:
+                continue
+            if hasattr(leaf, "nbytes"):
+                total += int(leaf.nbytes)
+                continue
+            if hasattr(leaf, "size") and hasattr(leaf, "dtype"):
+                total += int(leaf.size * leaf.dtype.itemsize)
+                continue
+            total += int(np.asarray(leaf).nbytes)
+        return total
+
+    def _materialize_for_cache(self, sample: PyTree) -> PyTree:
+        """Convert one loaded sample to the configured cache storage."""
+        if self.cache_storage == "device":
+            return jax.device_put(sample)
+        return sample
+
+    def _load_cached_sample(self, ref: T) -> PyTree:
+        """Load a sample through the in-memory cache when enabled."""
+        if self.cache_policy == "none":
+            return self.load_sample(ref)
+
+        # key = self._cache_key(ref)
+        key = ref
+        if key in self._cache_entries:
+            cached_sample, cached_size = self._cache_entries.pop(key)
+            self._cache_entries[key] = (cached_sample, cached_size)
+            return cached_sample
+
+        sample = self._materialize_for_cache(self.load_sample(ref))
+        sample_size = self._sample_nbytes(sample)
+        byte_limit = self._cache_limit_bytes()
+        item_limit = self._cache_limit_items()
+        if item_limit == 0:
+            return sample
+        if byte_limit is not None and sample_size > byte_limit:
+            return sample
+
+        self._evict_for_insert(sample_size)
+        self._cache_entries[key] = (sample, sample_size)
+        self._cache_bytes += sample_size
+        return sample
+
+    def _evict_for_insert(self, sample_size: int) -> None:
+        """Evict least-recently-used samples until the next insert fits."""
+        item_limit = self._cache_limit_items()
+        byte_limit = self._cache_limit_bytes()
+
+        while self._cache_entries:
+            over_items = item_limit is not None and len(self._cache_entries) >= item_limit
+            over_bytes = byte_limit is not None and self._cache_bytes + sample_size > byte_limit
+            if not over_items and not over_bytes:
+                break
+            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
+            self._cache_bytes -= evicted_size
+
+    def _enforce_cache_limits(self) -> None:
+        """Prune the cache to the current effective policy limits."""
+        item_limit = self._cache_limit_items()
+        byte_limit = self._cache_limit_bytes()
+
+        while self._cache_entries and item_limit is not None and len(self._cache_entries) > item_limit:
+            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
+            self._cache_bytes -= evicted_size
+
+        if byte_limit is None:
+            return
+
+        while self._cache_entries and self._cache_bytes > byte_limit:
+            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
+            self._cache_bytes -= evicted_size
 
 
 class GenImplicitModel(GenGraph):
@@ -616,27 +751,21 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
 
         return selected_count
 
-    def load_batch(self, refs: Sequence[ImplicitSampleRef]) -> dict[str, PyTree]:
-        """Load stacked implicit-model mini-batches."""
-        loaded: dict[str, list[PyTree]] = {"inputs": [], "outputs": [], "residuals": []}
+    def load_sample(self, ref: ImplicitSampleRef) -> PyTree:
+        """Load one implicit-model sample from disk."""
+        input_path, output_path, sample_kind = ref
+        sample: dict[str, PyTree] = {"inputs": load_h5({}, input_path / "input.h5", jax=False)}
 
-        for input_path, output_path, sample_kind in refs:
-            loaded["inputs"].append(load_h5({}, input_path / "input.h5", jax=True))
+        output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
+        if output_file.exists():
+            sample["outputs"] = load_h5({}, output_file, jax=False)
 
-            output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
-            if output_file.exists():
-                loaded["outputs"].append(load_h5({}, output_file, jax=True))
+        residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
+        residual_file = output_path / residual_name
+        if residual_file.exists():
+            sample["residuals"] = load_h5({}, residual_file, jax=False)
 
-            residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
-            residual_file = output_path / residual_name
-            if residual_file.exists():
-                loaded["residuals"].append(load_h5({}, residual_file, jax=True))
-
-        return {
-            key: pytree_stack(value)
-            for key, value in loaded.items()
-            if len(value) > 0
-        }
+        return sample
 
 
 class GenSource(GenGraph):
@@ -797,14 +926,9 @@ class LoadSource(LoadDataConfig[Path]):
             return min(len(indices), self.max_samples)
         return len(indices)
 
-    def load_batch(self, refs: Sequence[Path]) -> dict[str, PyTree]:
-        """
-        Load stacked source mini-batches.
-
-        :param refs: Sample directories to load.
-        :return: Mapping containing the stacked ``source`` batch.
-        """
-        return pytree_stack([load_h5({}, ref / "source.h5", jax=True) for ref in refs])
+    def load_sample(self, ref: Path) -> PyTree:
+        """Load one source sample from disk."""
+        return load_h5({}, ref / "source.h5", jax=False)
 
 
 class GenLatent(GenDataConfig):
@@ -815,6 +939,15 @@ class GenLatent(GenDataConfig):
     gather_paths: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
     gather_template: Any | None = None
     compression: Compression = Field(default_factory=lambda: SVD(energy_tol=0.999))
+
+    @staticmethod
+    def _iter_loaded_samples(loaded: PyTree) -> Generator[PyTree, None, None]:
+        """Yield individual samples from either a stacked pytree or a plain sample list."""
+        if isinstance(loaded, (list, tuple)):
+            yield from loaded
+            return
+
+        yield from pytree_iter(loaded)
 
     @model_validator(mode="before")
     @classmethod
@@ -875,7 +1008,7 @@ class GenLatent(GenDataConfig):
             bar.text("Loading compression samples...")
             for batch in self.loader:
                 for dataset_name, loaded in batch.items():
-                    for sample in pytree_iter(loaded):
+                    for sample in self._iter_loaded_samples(loaded):
                         yield self._merge_selected_sample({dataset_name: sample})
                 bar()
 
@@ -1103,6 +1236,7 @@ class DataLoader(BaseModel):
                 raise ValueError(f"No samples selected for dataset '{ds_name}' in {ds_root}")
 
             ds_totals[ds_name] = len(ds_selected_refs[ds_name])
+            ds_cfg.configure_epoch_cache(ds_totals[ds_name])
             ds_config[ds_name] = ds_cfg
 
         # Advance dataset epoch and cursor indices based on current training step

@@ -492,12 +492,15 @@ def test_data_loader(tmp_path: Path) -> None:
     loader = DataLoader(root=root)
     assert sorted(loader.datasets) == ["alpha", "beta"]
     assert isinstance(loader.datasets["alpha"], LoadImplicitModel)
+    assert loader.datasets["alpha"].stack_batch is False
 
     first_batch = next(loader)
     assert set(first_batch) == {"alpha", "beta"}
-    assert first_batch["alpha"]["inputs"]["x"].shape == (6,)
-    assert first_batch["alpha"]["outputs"]["y"].shape == (6,)
-    assert first_batch["alpha"]["residuals"]["r"].shape == (6,)
+    assert len(first_batch["alpha"]) == 6
+    assert len(first_batch["beta"]) == 6
+    assert first_batch["alpha"][0]["inputs"]["x"].shape == ()
+    assert first_batch["alpha"][0]["outputs"]["y"].shape == ()
+    assert first_batch["alpha"][0]["residuals"]["r"].shape == ()
 
     skipped = DataLoader(
         root=root,
@@ -513,8 +516,9 @@ def test_data_loader(tmp_path: Path) -> None:
         },
     )
     skipped_batch = next(skipped)
-    assert skipped_batch["alpha"]["inputs"]["x"].tolist() == [11]
-    assert skipped_batch["alpha"]["outputs"]["y"].tolist() == [101]
+    assert len(skipped_batch["alpha"]) == 1
+    assert skipped_batch["alpha"][0]["inputs"]["x"].tolist() == 11
+    assert skipped_batch["alpha"][0]["outputs"]["y"].tolist() == 101
 
     limited = DataLoader(
         root=root,
@@ -531,8 +535,9 @@ def test_data_loader(tmp_path: Path) -> None:
         },
     )
     limited_batch = next(limited)
-    assert limited_batch["alpha"]["inputs"]["x"].shape == (1,)
-    assert limited_batch["alpha"]["outputs"]["y"].shape == (1,)
+    assert len(limited_batch["alpha"]) == 1
+    assert limited_batch["alpha"][0]["inputs"]["x"].shape == ()
+    assert limited_batch["alpha"][0]["outputs"]["y"].shape == ()
 
     iterator = iter(DataLoader(root=root))
     assert set(next(iterator)) == {"alpha", "beta"}
@@ -568,7 +573,7 @@ def test_data_loader_config_types(tmp_path: Path) -> None:
 
 
 def test_graph_loss(toy_graph: FunctionGraph) -> None:
-    batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
+    batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
 
     squared = GraphLoss(terms=[{"function": graph_batch_squared_error, "dataset": "toy"}], graph=toy_graph)
     params = {"toy": {"weight": jnp.array(0.5)}}

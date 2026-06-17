@@ -54,6 +54,13 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Make sure the expensive part of train is the optimizer update (be on the lookout for big recursive pytree operations) -- within this, make sure we are spending most time computing rather than filtering/flattening/assembling/caching/allocating/etc.
 - [ ] Check performance of poisson and make sure it reasonable for the problem size (lookout for optx)
 
+## Optimizations
+- [ ] Prefetching for dataloader
+- [ ] Caching data globally across training runs (train data and graph/models to avoid repeated pydantic validation)
+- [ ] Stacked h5 datasets (many samples per file)
+- [ ] Something with pre-compiling (globally) jax loss functions to avoid jit cache misses
+- [ ] Seems to be some recompiling when using cached data versus disk data -- keep an eye on this
+
 ## Training
 - [ ] EvolutionSearch or similar instead of grid search (still dispatch in parallel)
 - [ ] Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding

@@ -18,7 +18,7 @@ from romjax.data_gen import (
 )
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
-from romjax.utils import save_h5
+from romjax.utils import load_h5, save_h5
 
 
 class _ToySampleableEdge(Edge, ImplicitSampleable):
@@ -131,11 +131,34 @@ class _TrackingLoadSource(LoadSource):
         return super().select_epoch_refs(refs, indices)
 
 
-def _write_source_dataset(root: Path, dataset_name: str = "train/source", sample_count: int = 6) -> None:
+def _write_source_dataset(root: Path, dataset_name: str = "source", sample_count: int = 6) -> None:
     for sample_idx in range(sample_count):
         sample_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
         sample_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"state": {"x": np.asarray([sample_idx], dtype=np.float32)}}, sample_dir / "source.h5", mode="w")
+
+
+def _write_implicit_dataset(
+    root: Path,
+    dataset_name: str = "toy",
+    sample_count: int = 2,
+    output_width: int = 1,
+) -> None:
+    for sample_idx in range(sample_count):
+        input_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        save_h5({"x": np.asarray([sample_idx], dtype=np.float32)}, input_dir / "input.h5", mode="w")
+        save_h5({"y": np.asarray([sample_idx + 1], dtype=np.float32)}, input_dir / "solution.h5", mode="w")
+        save_h5({"r": np.asarray([0.0], dtype=np.float32)}, input_dir / "solution_residual.h5", mode="w")
+
+        output_dir = input_dir / "seed_0" / "sample_0"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_h5(
+            {"y": np.arange(output_width, dtype=np.float32) + sample_idx},
+            output_dir / "output.h5",
+            mode="w",
+        )
+        save_h5({"r": np.asarray([0.0], dtype=np.float32)}, output_dir / "residual.h5", mode="w")
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -237,6 +260,140 @@ def test_source_data_config_types(tmp_path):
 
     assert isinstance(generation.datasets["source"], GenSource)
     assert isinstance(loader.datasets["source"], LoadSource)
+    assert loader.datasets["source"].stack_batch is False
+
+
+def test_data_loader_source_lru_cache_reuses_samples(tmp_path, monkeypatch):
+    _write_source_dataset(tmp_path, sample_count=1)
+    counts: dict[Path, int] = {}
+    real_load_h5 = load_h5
+
+    def counting_load_h5(data, filename, mode="r", jax=False):
+        path = Path(filename)
+        counts[path] = counts.get(path, 0) + 1
+        return real_load_h5(data, filename, mode=mode, jax=jax)
+
+    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "source": {
+                "kind": "source",
+                "batch_size": 1,
+                "max_epochs": 2,
+                "cache_policy": "lru",
+                "cache_max_items": 1,
+            }
+        },
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 2
+    assert sorted(counts.values()) == [1]
+
+
+def test_data_loader_source_cache_storage_device_returns_device_arrays(tmp_path, monkeypatch):
+    _write_source_dataset(tmp_path, sample_count=1)
+    device_put_calls: list[object] = []
+    real_device_put = jax.device_put
+
+    def counting_device_put(value, device=None):
+        device_put_calls.append(value)
+        return real_device_put(value, device=device)
+
+    monkeypatch.setattr("romjax.data_gen.jax.device_put", counting_device_put)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "source": {
+                "kind": "source",
+                "batch_size": 1,
+                "max_epochs": 2,
+                "cache_policy": "lru",
+                "cache_storage": "device",
+                "cache_max_items": 1,
+            }
+        },
+    )
+
+    batch = next(loader)
+
+    assert len(device_put_calls) == 1
+    assert len(batch["source"]) == 1
+    assert isinstance(batch["source"][0]["state"]["x"], jax.Array)
+
+
+def test_data_loader_source_cache_max_bytes_skips_oversized_items(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    small_dir = root / "train" / "source" / "seed_0" / "sample_0"
+    small_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"state": {"x": np.asarray([0.0], dtype=np.float32)}}, small_dir / "source.h5", mode="w")
+    large_dir = root / "train" / "source" / "seed_0" / "sample_1"
+    large_dir.mkdir(parents=True, exist_ok=True)
+    save_h5({"state": {"x": np.arange(1024, dtype=np.float32)}}, large_dir / "source.h5", mode="w")
+
+    counts: dict[Path, int] = {}
+    real_load_h5 = load_h5
+
+    def counting_load_h5(data, filename, mode="r", jax=False):
+        path = Path(filename)
+        counts[path] = counts.get(path, 0) + 1
+        return real_load_h5(data, filename, mode=mode, jax=jax)
+
+    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
+    loader = DataLoader(
+        root=root,
+        datasets={
+            "train": {
+                "source": {
+                    "kind": "source",
+                    "batch_size": 1,
+                    "max_epochs": 2,
+                    "cache_policy": "lru",
+                    "cache_max_bytes": 64,
+                }
+            }
+        },
+    )
+
+    list(loader)
+
+    assert counts[small_dir / "source.h5"] == 1
+    assert counts[large_dir / "source.h5"] == 2
+
+
+def test_data_loader_implicit_epoch_cache_reuses_full_epoch(tmp_path, monkeypatch):
+    _write_implicit_dataset(tmp_path, sample_count=2)
+    counts: dict[Path, int] = {}
+    real_load_h5 = load_h5
+
+    def counting_load_h5(data, filename, mode="r", jax=False):
+        path = Path(filename)
+        counts[path] = counts.get(path, 0) + 1
+        return real_load_h5(data, filename, mode=mode, jax=jax)
+
+    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "toy": {
+                "kind": "implicit",
+                "batch_size": 1,
+                "max_epochs": 2,
+                "load_solution": False,
+                "cache_policy": "epoch",
+            }
+        },
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 4
+    assert counts[tmp_path / "toy" / "seed_0" / "sample_0" / "input.h5"] == 1
+    assert counts[tmp_path / "toy" / "seed_0" / "sample_0" / "seed_0" / "sample_0" / "output.h5"] == 1
+    assert counts[tmp_path / "toy" / "seed_0" / "sample_1" / "input.h5"] == 1
+    assert counts[tmp_path / "toy" / "seed_0" / "sample_1" / "seed_0" / "sample_0" / "output.h5"] == 1
 
 
 def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None:
@@ -295,10 +452,13 @@ def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:
     batches = list(loader)
 
     assert len(batches) == 2
-    assert sum(batch["poisson"]["inputs"]["x"].shape[0] for batch in batches) == 3
-    assert sum(batch["poisson"]["outputs"]["phi"].shape[0] for batch in batches) == 3
-    assert len(np.unique(np.asarray(jnp.concatenate([batch["poisson"]["inputs"]["x"] 
-                                                     for batch in batches]).reshape(-1)))) == 3
+    assert sum(len(batch["poisson"]) for batch in batches) == 3
+    inputs = [
+        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
+        for batch in batches
+        for sample in batch["poisson"]
+    ]
+    assert len(np.unique(np.asarray(inputs))) == 3
 
 
 def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Path) -> None:
@@ -322,15 +482,19 @@ def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Pat
     )
 
     batches = list(loader)
-    inputs = jnp.concatenate([batch["poisson"]["inputs"]["x"] for batch in batches]).reshape(-1)
+    inputs = [
+        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
+        for batch in batches
+        for sample in batch["poisson"]
+    ]
 
-    assert sum(batch["poisson"]["outputs"]["phi"].shape[0] for batch in batches) == 4
+    assert sum(len(batch["poisson"]) for batch in batches) == 4
     assert len(np.unique(np.asarray(inputs))) == 2
     assert all(count <= 2 for count in np.unique(np.asarray(inputs), return_counts=True)[1])
 
 
 def test_loader_selects_epoch_pool_once_per_dataset(tmp_path: Path) -> None:
-    _write_source_dataset(tmp_path, sample_count=6)
+    _write_source_dataset(tmp_path, dataset_name="train/source", sample_count=6)
     source_cfg = _TrackingLoadSource(
         batch_size=2,
         max_samples=3,
@@ -342,7 +506,7 @@ def test_loader_selects_epoch_pool_once_per_dataset(tmp_path: Path) -> None:
     batches = list(loader)
 
     assert source_cfg.select_calls == 1
-    assert sum(batch["source"]["state"]["x"].shape[0] for batch in batches) == 6
+    assert sum(len(batch["source"]) for batch in batches) == 6
 
 
 def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -> None:
@@ -425,9 +589,11 @@ def test_data_loader_supports_nested_dataset_pytree(tmp_path):
     batch = next(loader)
 
     assert set(batch) == {"alpha", "beta"}
-    assert batch["alpha"]["inputs"]["x"].shape == (1, 1)
-    assert batch["alpha"]["outputs"]["y"].shape == (1, 1)
-    assert batch["beta"]["inputs"]["x"].shape == (1, 1)
+    assert len(batch["alpha"]) == 1
+    assert len(batch["beta"]) == 1
+    assert batch["alpha"][0]["inputs"]["x"].shape == (1,)
+    assert batch["alpha"][0]["outputs"]["y"].shape == (1,)
+    assert batch["beta"][0]["inputs"]["x"].shape == (1,)
     with pytest.raises(StopIteration):
         next(loader)
 
@@ -471,11 +637,13 @@ def test_data_loader_mixed_generated_implicit_and_source_datasets(tmp_path):
     batch = next(loader)
 
     assert set(batch) == {"toy", "source"}
-    assert batch["toy"]["inputs"]["x"].shape == (3, 1)
-    assert batch["toy"]["outputs"]["y"].shape == (3, 1)
-    assert batch["toy"]["residuals"]["residual"].shape == (3, 1)
-    assert batch["source"]["state"]["x"].shape == (2,)
-    assert batch["source"]["state"]["meta"].shape == (2, 1)
+    assert len(batch["toy"]) == 3
+    assert len(batch["source"]) == 2
+    assert batch["toy"][0]["inputs"]["x"].shape == (1,)
+    assert batch["toy"][0]["outputs"]["y"].shape == (1,)
+    assert batch["toy"][0]["residuals"]["residual"].shape == (1,)
+    assert jax.device_get(batch["source"][0]["state"]["x"]).shape == ()
+    assert batch["source"][0]["state"]["meta"].shape == (1,)
 
 
 def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
@@ -494,9 +662,9 @@ def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
     assert [sample_kind for _, _, sample_kind in refs] == ["solution", "output"]
 
     batch = LoadImplicitModel(batch_size=4).load_batch(refs)
-    assert batch["inputs"]["x"].shape == (2, 1)
-    assert batch["outputs"]["y"][:, 0].tolist() == [2.0, 3.0]
-    assert batch["residuals"]["r"][:, 0].tolist() == [-1.0, 0.5]
+    assert len(batch) == 2
+    assert [sample["outputs"]["y"][0] for sample in batch] == [2.0, 3.0]
+    assert [sample["residuals"]["r"][0] for sample in batch] == [-1.0, 0.5]
 
 
 def test_load_implicit_model_can_disable_solution_sample_loading(tmp_path):
@@ -531,8 +699,9 @@ def test_load_implicit_model_solution_only_skips_output_samples(tmp_path):
 
     assert [sample_kind for _, _, sample_kind in refs] == ["solution"]
     batch = LoadImplicitModel(batch_size=4, solution_only=True).load_batch(refs)
-    assert batch["outputs"]["y"][:, 0].tolist() == [2.0]
-    assert batch["residuals"]["r"][:, 0].tolist() == [-1.0]
+    assert len(batch) == 1
+    assert [sample["outputs"]["y"][0] for sample in batch] == [2.0]
+    assert [sample["residuals"]["r"][0] for sample in batch] == [-1.0]
 
 
 def test_load_implicit_model_solution_only_requires_solution_loading() -> None:

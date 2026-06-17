@@ -41,6 +41,7 @@ def test_uniform_grid():
     assert grid.spacing == (0.5, 0.5)
     assert grid.coords is not None
     assert grid.coords[0].shape == (2, 4)
+    assert isinstance(grid.coords[0], np.ndarray)
     assert jnp.allclose(grid.coords[0][:, 0], jnp.array([0.25, 0.75]))
     assert jnp.allclose(grid.coords[1][0, :], jnp.array([0.25, 0.75, 1.25, 1.75]))
 
@@ -77,6 +78,19 @@ def test_uniform_grid():
     # 6) Make sure we don't serialize big coords array
     d = grid.model_dump()
     assert 'coords' not in d
+
+
+def test_uniform_grid_accepts_numpy_coords() -> None:
+    x = np.array([0.25, 0.75], dtype=np.float32)
+    y = np.array([0.25, 0.75, 1.25, 1.75], dtype=np.float32)
+
+    grid = UniformGrid(coords=(x, y))
+
+    assert grid.shape == (2, 4)
+    assert grid.spacing == (0.5, 0.5)
+    assert isinstance(grid.coords[0], np.ndarray)
+    assert np.allclose(np.asarray(grid.bounds[0]), np.asarray((0.0, 1.0)))
+    assert np.allclose(np.asarray(grid.bounds[1]), np.asarray((0.0, 2.0)))
 
 
 def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
