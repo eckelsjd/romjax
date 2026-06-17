@@ -59,7 +59,7 @@ loss:
     config_path = search._write_case_config(case_root, (0.3, 0.01))
     loaded = romjax.YamlLoader.load(config_path)
 
-    assert loaded["root"] == str(case_root)
+    assert Path(loaded["root"]) == case_root
     assert loaded["loss"]["terms"][0]["alpha"] == 0.01
     assert loaded["loss"]["terms"][1]["weight"] == 0.3
 
