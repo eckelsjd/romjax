@@ -49,6 +49,7 @@ __all__ = [
 ]
 
 _BAR_TITLE_LEN = 20
+_FAILURE_MARKER = ".romjax_failed"
 
 
 def _get_kwargs(fn: Callable) -> set[str]:
@@ -82,6 +83,31 @@ def _build_batched_sample_outputs(model):
             return jax.vmap(model.sample_outputs)(keys)
 
     return eqx.filter_jit(_sample_outputs)
+
+
+def _is_failed_sample_dir(sample_dir: Path) -> bool:
+    """Return whether a sample directory has been marked as failed."""
+    return (sample_dir / _FAILURE_MARKER).exists()
+
+
+def _log_sample_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
+    """Persist a detailed failure record for one sample directory."""
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / _FAILURE_MARKER).touch(exist_ok=True)
+
+    failure_log = sample_dir / "failure.log"
+    sink_id = logger.add(
+        failure_log,
+        level="DEBUG",
+        mode="a",
+        backtrace=True,
+        diagnose=True,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}\n{exception}",
+    )
+    try:
+        logger.opt(exception=exc).error(message)
+    finally:
+        logger.remove(sink_id)
 
 
 type SUPPORTED_FORMATS = Literal["h5"]
@@ -365,21 +391,31 @@ class GenImplicitModel(GenGraph):
     :ivar outputs_per_input: number of output samples for each input sample
     :ivar input_seed: random seed for inputs
     :ivar output_seed: random seed for outputs
+    :ivar throw: whether solve/evaluate failures should propagate immediately
     """
 
     input_samples: int
     outputs_per_input: int
     input_seed: int
     output_seed: int
+    throw: bool = True
     _required_methods: list[str] = PrivateAttr(default=["sample_inputs"])
 
     def generate_serial(self, path, format, write_policy):
         """Generate data in serial for an ImplicitModel."""
         path = Path(path)
         model = self._edge_from_path(path)
+        failed_dirs: set[Path] = set()
+        failed_cases = 0
+
+        def _record_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
+            nonlocal failed_cases
+            if sample_dir not in failed_dirs:
+                failed_dirs.add(sample_dir)
+                failed_cases += 1
+            _log_sample_failure(sample_dir, message, exc)
 
         with alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
-
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -415,12 +451,28 @@ class GenImplicitModel(GenGraph):
                     one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
                 else:
                     one_input = sample_inputs(input_key)
-                    one_solution = solve(one_input) if solve is not None else None
-                    one_solution_residual = (
-                        evaluate(one_input, one_solution)
-                        if evaluate is not None and one_solution is not None
-                        else None
-                    )
+                    one_solution = None
+                    if solve is not None:
+                        if self.throw:
+                            one_solution = solve(one_input)
+                        else:
+                            try:
+                                one_solution = solve(one_input)
+                            except Exception as exc:  # noqa: BLE001
+                                _record_failure(input_dir, f"Failed to solve sample at {input_dir}", exc)
+                    one_solution_residual = None
+                    if evaluate is not None and one_solution is not None:
+                        if self.throw:
+                            one_solution_residual = evaluate(one_input, one_solution)
+                        else:
+                            try:
+                                one_solution_residual = evaluate(one_input, one_solution)
+                            except Exception as exc:  # noqa: BLE001
+                                _record_failure(
+                                    input_dir,
+                                    f"Failed to evaluate solution sample at {input_dir}",
+                                    exc,
+                                )
 
                     if format == "h5":
                         save_h5(one_input, input_path, mode="w")
@@ -436,7 +488,19 @@ class GenImplicitModel(GenGraph):
                     self.outputs_per_input, self.output_seed, path=input_dir, skip=skip
                 ):
                     one_output = sample_outputs(output_key, one_input, one_solution)
-                    one_residual = evaluate(one_input, one_output) if evaluate is not None else None
+                    one_residual = None
+                    if evaluate is not None:
+                        if self.throw:
+                            one_residual = evaluate(one_input, one_output)
+                        else:
+                            try:
+                                one_residual = evaluate(one_input, one_output)
+                            except Exception as exc:  # noqa: BLE001
+                                _record_failure(
+                                    output_dir,
+                                    f"Failed to evaluate output sample at {output_dir}",
+                                    exc,
+                                )
 
                     if format == "h5":
                         save_h5(one_output, output_dir / "output.h5", mode="w")
@@ -446,9 +510,18 @@ class GenImplicitModel(GenGraph):
                         raise RoutineError(f"Save format '{format}' not recognized")
 
                 bar()
-    
+
+        if failed_cases:
+            logger.debug(f"Implicit generation completed with {failed_cases} failed cases at {path}")
+
     def generate_batch(self, path, format, write_policy):
         """Generate data for an ImplicitModel using batches and vmap."""
+        if not self.throw:
+            logger.warning(
+                "GenImplicitModel.throw=False requires per-sample failure handling, "
+                "so batch generation falls back to serial execution."
+            )
+            return self.generate_serial(path, format, write_policy)
 
         def _save_outputs(
             sample_outputs: Callable,
@@ -664,7 +737,8 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
             for input_sample_dir in sorted(input_seed_dir.iterdir()):
                 if (not input_sample_dir.is_dir() or
                     not input_sample_dir.name.startswith("sample_") or
-                    skip_input(input_sample_dir)):
+                    skip_input(input_sample_dir) or
+                    _is_failed_sample_dir(input_sample_dir)):
                     continue
 
                 if load_solution and (input_sample_dir / "solution.h5").exists():
@@ -680,7 +754,8 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
                     for output_sample_dir in sorted(output_seed_dir.iterdir()):
                         if (not output_sample_dir.is_dir() or
                             not output_sample_dir.name.startswith("sample_") or
-                            skip_output(output_sample_dir)):
+                            skip_output(output_sample_dir) or
+                            _is_failed_sample_dir(output_sample_dir)):
                             continue
 
                         yield input_sample_dir, output_sample_dir, "output"
@@ -771,19 +846,30 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
 class GenSource(GenGraph):
     """
     Sampling configuration for a plain source node in a FunctionGraph.
+
+    :ivar throw: whether sample_source failures should propagate immediately
     """
 
     samples: int
     seed: int
+    throw: bool = True
     _required_methods: list[str] = PrivateAttr(default=["sample_source"])
 
     def generate_serial(self, path, format, write_policy):
         """Generate source node data in serial."""
         path = Path(path)
         model = self._edge_from_path(path)
+        failed_dirs: set[Path] = set()
+        failed_cases = 0
+
+        def _record_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
+            nonlocal failed_cases
+            if sample_dir not in failed_dirs:
+                failed_dirs.add(sample_dir)
+                failed_cases += 1
+            _log_sample_failure(sample_dir, message, exc)
 
         with alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
-
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -804,16 +890,31 @@ class GenSource(GenGraph):
                     bar()
                     continue
 
-                if format == "h5":
+                if format != "h5":
+                    raise RoutineError(f"Save format '{format}' not recognized.")
+
+                if self.throw:
                     save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
                 else:
-                    raise RoutineError(f"Save format '{format}' not recognized.")
-                
+                    try:
+                        save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
+                    except Exception as exc:  # noqa: BLE001
+                        _record_failure(input_dir, f"Failed to sample source at {input_dir}", exc)
+
                 bar()
-    
+
+        if failed_cases:
+            logger.debug(f"Source generation completed with {failed_cases} failed cases at {path}")
+
     def generate_batch(self, path, format, write_policy):
         """Generate source node data in batches using vmap."""
-        
+        if not self.throw:
+            logger.warning(
+                "GenSource.throw=False requires per-sample failure handling, "
+                "so batch generation falls back to serial execution."
+            )
+            return self.generate_serial(path, format, write_policy)
+
         def _process_batch(batch, sample_source, bar):
             if not batch:
                 return
@@ -827,7 +928,7 @@ class GenSource(GenGraph):
                 else:
                     raise RoutineError(f"Save format '{format}' not recognized.")
                 bar()
-            
+        
         path = Path(path)
         model = self._edge_from_path(path)
 
@@ -899,7 +1000,8 @@ class LoadSource(LoadDataConfig[Path]):
             for sample_dir in sorted(seed_dir.iterdir()):
                 if (not sample_dir.is_dir() or
                     not sample_dir.name.startswith("sample_") or
-                    skip_sample(sample_dir)):
+                    skip_sample(sample_dir) or
+                    _is_failed_sample_dir(sample_dir)):
                     continue
 
                 yield sample_dir
@@ -1181,7 +1283,11 @@ class DataLoader(BaseModel):
 
                 if len(seed_dirs) > 0 and all("seed_" in d.name for d in seed_dirs):
                     # Just check the first seed directory
-                    sample_dirs = [d for d in seed_dirs[0].iterdir() if d.is_dir() and not d.name.startswith(".")]
+                    sample_dirs = [
+                        d
+                        for d in seed_dirs[0].iterdir()
+                        if d.is_dir() and not d.name.startswith(".") and not _is_failed_sample_dir(d)
+                    ]
 
                     if len(sample_dirs) > 0 and all("sample_" in d.name for d in sample_dirs):
                         if all((s / "input.h5").exists() and (s / "solution.h5").exists() for s in sample_dirs):

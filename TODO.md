@@ -1,13 +1,8 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
-**Short term**
-- Optimize single run (multi-threaded/jit/caching/overhead, poisson, etc.)
-  - gpu seems slower
-  - cpu is only going up to 100%, sometimes more -- not much multi-threading going on in the jit
-- normalization before/after training
-
 
 ## Critical
+- [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.
 - [ ] Normalization for eqx transforms
 
 ## Needs testing
@@ -17,16 +12,20 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
+- [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
+- [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 
 ## Backburner
 - [ ] Go back and make sure graph loss functions actually give the same result as normal regresion (linear, mlp)
 - [ ] Other data save formats outside of H5
+- [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file
 - [ ] Might be neat for the !include mechanism to work like python import, so we don't have to keep worrying about relative paths
 - [ ] More consistent handling of exceptions in the cli. For example, when to show messages, expected vs unexpected failures, etc.
 - [ ] Would be good to copy the entire resolved yaml config to routine root dirs, (after resolving all the overrides)
+- [ ] Would be nice for !overrides to work inline, so you can just override a few values, rather than create a whole new file
 
 ## Serialization
 - [ ] from_registry items back to string
@@ -43,6 +42,9 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Major design changes
 - [ ] Move heavy pydantic workflow to separate library (custom models, yaml loading, routines, cli, etc.)
 - [ ] Move agents workflow to separate libary or copier-numpy template
+- [ ] Move PDE/models to separate library (poisson, vlasov, euler)
+- [ ] Reorganize module layout and optimize public API (with good defaults, nice validation) for documentation tutorials/demos
+- [ ] Unit tests are getting pretty heavy -- breaking into multiple libraries and condensing may help
 
 ## Documentation
 - [ ] Pretty much everything
@@ -51,8 +53,8 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation
-- [ ] Make sure the expensive part of train is the optimizer update (be on the lookout for big recursive pytree operations) -- within this, make sure we are spending most time computing rather than filtering/flattening/assembling/caching/allocating/etc.
 - [ ] Check performance of poisson and make sure it reasonable for the problem size (lookout for optx)
+- [ ] Check performance of vlasov
 
 ## Optimizations
 - [ ] Prefetching for dataloader

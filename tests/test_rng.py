@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
+from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys, log_uniform
 
 
 def test_distribution() -> None:
@@ -33,6 +33,21 @@ def test_distribution() -> None:
 
     assert normal_samples.shape == (4,)
     assert jnp.allclose(normal_samples, expected)
+
+    key = jax.random.key(3)
+    log_samples = log_uniform(key, minval=-3.0, maxval=3.0, shape=(5,))
+    expected_log10 = jax.random.uniform(key, shape=(5,), minval=-3.0, maxval=3.0)
+
+    assert log_samples.shape == (5,)
+    assert jnp.allclose(jnp.log10(log_samples), expected_log10)
+    assert jnp.all(log_samples >= 10.0 ** -3.0)
+    assert jnp.all(log_samples < 10.0 ** 3.0)
+
+    log_dist = Distribution(callable="log_uniform", minval=-2.0, maxval=1.0, shape=(3,))
+    log_dist_samples = log_dist.sample(jax.random.key(4))
+    assert log_dist_samples.shape == (3,)
+    assert jnp.all(log_dist_samples >= 10.0 ** -2.0)
+    assert jnp.all(log_dist_samples < 10.0 ** 1.0)
 
     def custom_dist(key: jax.Array, shape=(3,), scale=1.0):
         return jax.random.uniform(key, shape=shape) * scale

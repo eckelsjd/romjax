@@ -1,6 +1,8 @@
 artifacts
 dataset
 archive
+outputs
+poisson_subspace_compare
 train
 *.pdf
 *.png

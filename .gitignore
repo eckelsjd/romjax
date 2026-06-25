@@ -3,6 +3,7 @@ darcy-opt/
 scripts/darcy-opt/
 *.mp4
 *.gif
+*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

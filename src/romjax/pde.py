@@ -2,11 +2,17 @@
 from enum import IntEnum
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, cast
 
+import diffrax
+import equinox as eqx
+import equinox.internal as eqxi
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
+from alive_progress import alive_bar
+from diffrax._progress_meter import _progress_meter_manager
 from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import (
     AfterValidator,
@@ -30,7 +36,7 @@ from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registr
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'InitializeCallable', 'ForcingCallable', 'IterativeSolver', 'RegisteredInitialize', 'ConstantInitialize',
-           'LatentSamplerFactory', 'ImplicitIterativeGalerkin']
+           'LatentSamplerFactory', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
@@ -88,6 +94,13 @@ class ForcingCallable(CallableModel):
         )
 
 
+class IdentityInputs(ForcingCallable):
+
+    def callable(self, inputs, outputs):
+        """Simple boundary that uses boundary input params directly (just pass them through)."""
+        return inputs
+
+
 class BoundaryType(IntEnum):
     dirichlet = 1
     neumann = 2
@@ -118,6 +131,36 @@ class GridBoundaryInputs(DictModel):
     Each tuple is the left/right boundary conditions for a given dimension.
     """
     boundary: list[tuple[BoundarySpec, BoundarySpec]]
+
+    @staticmethod
+    def _hashable_value(value: Any) -> Any:
+        """Convert nested boundary data into a deterministic hashable structure."""
+        if isinstance(value, DictModel):
+            value = value.model_dump(mode="python")
+
+        if isinstance(value, dict):
+            return tuple(
+                sorted((key, GridBoundaryInputs._hashable_value(item)) for key, item in value.items())
+            )
+
+        if isinstance(value, list | tuple):
+            return tuple(GridBoundaryInputs._hashable_value(item) for item in value)
+
+        if isinstance(value, np.ndarray | jax.Array):
+            array = np.asarray(value)
+            return ("array", array.dtype.str, array.shape, array.tobytes())
+
+        return value
+
+    def __hash__(self) -> int:
+        return hash(self._hashable_value(self.model_dump(mode="python")))
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, GridBoundaryInputs):
+            self_value = self._hashable_value(self.model_dump(mode="python"))
+            other_value = self._hashable_value(other.model_dump(mode="python"))
+            return self_value == other_value
+        return False
 
     @model_validator(mode='after')
     def _check_periodic(self) -> 'GridBoundaryInputs':
@@ -286,6 +329,8 @@ type AbstractAdjoint = Annotated[
     AfterValidator(partial(require_type, optx.AbstractAdjoint))
 ]
 
+type DiffraxObject = ThirdPartyType(default_modules="diffrax")
+
 
 class IterativeSolver(DictModel):
     """Configuration for optimistix iterative solvers. Only root find supported.
@@ -337,6 +382,214 @@ class IterativeSolver(DictModel):
         )
         return solution if return_sol else solution.value
 
+
+class DiffraxSolver(DictModel):
+    """Configuration wrapper for :mod:`diffrax` ODE solves.
+
+    The `ts` and `num_save` options are for convenience. You can also manually specify any `saveat` config.
+
+    :param solver: diffrax solver instance or module spec, default ``KenCarp4``
+    :param stepsize_controller: diffrax controller, default ``PIDController``
+    :param adjoint: diffrax adjoint, default ``RecursiveCheckpointAdjoint``
+    :param progress_meter: for showing solution progress
+    :param saveat: optional explicit ``diffrax.SaveAt`` object
+    :param t0: initial integration time
+    :param t1: final integration time
+    :param dt0: initial step size. If omitted, Vlasov computes a CFL-limited value.
+    :param ts: saved times. If omitted, ``num_save`` evenly spaced times are used.
+    :param num_save: number of evenly spaced saved times when ``ts`` is omitted
+    :param max_steps: maximum diffrax internal steps
+    :param throw: whether diffrax should raise on solver failure
+    """
+
+    solver: DiffraxObject = Field(default_factory=lambda: {"name": "Tsit5"}, validate_default=True)
+    stepsize_controller: DiffraxObject = Field(
+        default_factory=lambda: {"name": "ConstantStepSize"},
+        validate_default=True,
+    )
+    adjoint: DiffraxObject = Field(
+        default_factory=lambda: {"name": "RecursiveCheckpointAdjoint"},
+        validate_default=True,
+    )
+    progress_meter: DiffraxObject = Field(
+        default_factory=lambda: {"name": "NoProgressMeter"},
+        validate_default=True,
+    )
+    saveat: DiffraxObject | None = None
+    t0: float = 0.0
+    t1: float = 1.0
+    dt0: PositiveFloat | None = None
+    ts: tuple[float, ...] | None = None
+    num_save: PositiveInt = 2
+    max_steps: PositiveInt = 4096
+    throw: bool = True
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def _coerce_ts(cls, value: Any) -> tuple[float, ...] | None:
+        """Coerce saved times to a serializable tuple."""
+        if value is None:
+            return None
+        return tuple(float(t) for t in value)
+
+    def save_times(self) -> jax.Array:
+        """Return the saved-time grid used by ``evaluate`` and default ``SaveAt``.
+
+        :return: one-dimensional JAX array of saved times
+        """
+        if self.saveat is not None:
+            saveat_times = self._saveat_times(self.saveat)
+            if saveat_times is not None:
+                return saveat_times
+        if self.ts is not None:
+            return jnp.asarray(self.ts)
+        return jnp.linspace(self.t0, self.t1, self.num_save)
+
+    def _saveat_times(self, saveat: diffrax.SaveAt) -> jax.Array | None:
+        """Extract statically configured saved times from a ``diffrax.SaveAt`` object.
+
+        ``SaveAt(steps=True)`` and ``SaveAt(dense=True)`` do not define a compact
+        fixed time grid ahead of the solve, so those cases intentionally fall back
+        to ``ts``/``num_save``.
+        """
+
+        def _subsaveat_times(subsaveat: Any) -> list[jax.Array]:
+            if isinstance(subsaveat, dict):
+                return [part for value in subsaveat.values() for part in _subsaveat_times(value)]
+            if isinstance(subsaveat, tuple | list):
+                return [part for value in subsaveat for part in _subsaveat_times(value)]
+            if not hasattr(subsaveat, "ts"):
+                return []
+
+            parts = []
+            if bool(getattr(subsaveat, "t0", False)):
+                parts.append(jnp.asarray([self.t0]))
+            if (ts := getattr(subsaveat, "ts", None)) is not None:
+                parts.append(jnp.ravel(jnp.asarray(ts)))
+            if bool(getattr(subsaveat, "t1", False)):
+                parts.append(jnp.asarray([self.t1]))
+            return parts
+
+        parts = _subsaveat_times(saveat.subs)
+        if not parts:
+            return None
+        return jnp.unique(jnp.concatenate(parts))
+
+    def save_at(self) -> diffrax.SaveAt:
+        """Return the diffrax save configuration.
+
+        :return: configured or default ``diffrax.SaveAt``
+        """
+        if self.saveat is not None:
+            return self.saveat
+        return diffrax.SaveAt(ts=self.save_times())
+    
+    def diffeqsolve(
+        self,
+        terms: PyTree,
+        y0: PyTree,
+        args: Any | None = None,
+        dt0: float | None = None,
+        **kwargs
+    ) -> PyTree | diffrax.Solution:
+        """Small wrapper around diffrax diffeqsolve.
+
+        See Diffrax docs for `diffeqsolve()` method.
+        
+        :param terms: the ODE terms
+        :param y0: the initial conditions
+        :param args: extra arguments for the ode terms
+        :param dt0: the initial time step (overrides default config)
+        :param kwargs: everthing else passed directly to diffeqsolve (basically just event and solver/controller state)
+        :return: the solution object or the result
+        """
+        solution = diffrax.diffeqsolve(
+            terms,
+            solver=self.solver,
+            t0=float(self.t0),
+            t1=float(self.t1),
+            dt0=self.dt0 if dt0 is None else dt0,
+            y0=y0,
+            args=args,
+            saveat=self.save_at(),
+            stepsize_controller=self.stepsize_controller,
+            adjoint=self.adjoint,
+            max_steps=self.max_steps,
+            throw=self.throw,
+            progress_meter=self.progress_meter,
+            **kwargs
+        )
+        return solution 
+
+
+class _AliveProgressMeterState(eqx.Module):
+    """Internal JAX-compatible state for :class:`AliveProgressMeter`."""
+
+    progress: jax.Array
+    meter_idx: Any
+
+
+class AliveProgressMeter(diffrax.AbstractProgressMeter[_AliveProgressMeterState]):
+    """Progress meter for ``diffrax`` solves backed by :func:`alive_progress.alive_bar`."""
+
+    minimum_increase: float = 0.02
+
+    @staticmethod
+    def _init_bar() -> list[Any]:
+        """Initialise and enter an ``alive_bar`` context."""
+        ctx = alive_bar(1, manual=True)
+        bar = ctx.__enter__()
+        bar(0.0)
+        return [ctx, bar, 0.0]
+
+    @staticmethod
+    def _step_bar(bar_state: list[Any], progress: jax.Array | np.ndarray | float) -> None:
+        """Advance the underlying ``alive_bar`` to the supplied solve progress."""
+        if eqx.is_array(progress):
+            # May not be an array when called with `JAX_DISABLE_JIT=1`
+            progress = cast(jax.Array | np.ndarray, progress)
+            progress = cast(float, progress.item())
+        else:
+            progress = cast(float, progress)
+        bar_state[2] = progress
+        bar_state[1](progress)
+
+    @staticmethod
+    def _close_bar(bar_state: list[Any]) -> None:
+        """Close the underlying ``alive_bar`` context."""
+        if bar_state[2] != 1.0:
+            bar_state[1](1.0)
+        bar_state[0].__exit__(None, None, None)
+
+    def init(self) -> _AliveProgressMeterState:
+        """Initialise the progress meter state."""
+        meter_idx = _progress_meter_manager.init(self._init_bar)
+        return _AliveProgressMeterState(progress=jnp.array(0.0), meter_idx=meter_idx)
+
+    def step(
+        self,
+        state: _AliveProgressMeterState,
+        progress: jax.Array | np.ndarray | float,
+    ) -> _AliveProgressMeterState:
+        """Advance the progress bar to the supplied solve progress."""
+        pred = eqxi.unvmap_all((progress - state.progress > self.minimum_increase) | (progress == 1))
+
+        next_progress, meter_idx = jax.lax.cond(
+            eqxi.nonbatchable(pred),
+            lambda _idx: (
+                progress,
+                _progress_meter_manager.step(self._step_bar, progress, _idx),
+            ),
+            lambda _idx: (state.progress, _idx),
+            state.meter_idx,
+        )
+
+        return _AliveProgressMeterState(progress=next_progress, meter_idx=meter_idx)
+
+    def close(self, state: _AliveProgressMeterState) -> None:
+        """Close the underlying ``alive_bar`` context."""
+        _progress_meter_manager.close(self._close_bar, state.meter_idx)
+    
 
 def _default_latent_sampler(
     compression: Compression, 

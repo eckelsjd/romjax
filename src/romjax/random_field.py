@@ -104,8 +104,8 @@ class KLEConfig(DictModel):
     @model_validator(mode="after")
     def _validate_config(self) -> "KLEConfig":
         ndim = len(self.bounds)
-        if ndim not in (1, 2):
-            raise ValueError("KLEConfig currently supports only 1D or 2D bounds.")
+        if ndim not in (1, 2, 3):
+            raise ValueError("KLEConfig currently supports only 1D, 2D, or 3D bounds.")
 
         if len(self.shape) != ndim:
             raise ValueError("shape must match the number of bounds.")
@@ -181,7 +181,7 @@ def _smooth_ramp(
 
 
 def kle(key: Key, **config: KLEConfig) -> ArrayLike:
-    r"""Sample a scalar 1D or 2D random field from a truncated KLE on a uniform grid.
+    r"""Sample a scalar 1D, 2D, or 3D random field from a truncated KLE on a uniform grid.
 
     This callable is designed to be used directly in :class:`romjax.rng.Distribution`,
     for example from YAML via ``distribution: !!python/name:romjax.random_field.kle``.
@@ -233,7 +233,7 @@ def kle(key: Key, **config: KLEConfig) -> ArrayLike:
         coeffs = coeffs * sqrt_cov[jnp.newaxis, :]
         samples = jnp.einsum("ik,bk->bi", phi_x, coeffs)
         coords = (x,)
-    else:
+    elif ndim == 2:
         (x0, x1), (y0, y1) = cfg.bounds
         nx, ny = cfg.shape
         mx, my = cfg.truncation
@@ -262,6 +262,40 @@ def kle(key: Key, **config: KLEConfig) -> ArrayLike:
         coeffs = coeffs * sqrt_cov[jnp.newaxis, :, :]
         samples = jnp.einsum("ik,jl,bkl->bij", phi_x, phi_y, coeffs)
         coords = jnp.meshgrid(x, y, indexing="ij")
+    else:
+        (x0, x1), (y0, y1), (z0, z1) = cfg.bounds
+        nx, ny, nz = cfg.shape
+        mx, my, mz = cfg.truncation
+        ell_x, ell_y, ell_z = cfg.correlation_lengths
+        lx = x1 - x0
+        ly = y1 - y0
+        lz = z1 - z0
+
+        x = _cell_centered_axis(x0, x1, nx)
+        y = _cell_centered_axis(y0, y1, ny)
+        z = _cell_centered_axis(z0, z1, nz)
+        phi_x = _cosine_basis(x, x0, x1, mx)
+        phi_y = _cosine_basis(y, y0, y1, my)
+        phi_z = _cosine_basis(z, z0, z1, mz)
+        kx = jnp.arange(mx)
+        ky = jnp.arange(my)
+        kz = jnp.arange(mz)
+        raw_eigs = (
+            1.0
+            + (jnp.pi * ell_x * kx / lx)[:, None, None] ** 2
+            + (jnp.pi * ell_y * ky / ly)[None, :, None] ** 2
+            + (jnp.pi * ell_z * kz / lz)[None, None, :] ** 2
+        ) ** (-cfg.spectral_decay)
+        pointwise_var = jnp.einsum("ik,jl,mn,kln->ijm", phi_x**2, phi_y**2, phi_z**2, raw_eigs)
+        avg_var = jnp.mean(pointwise_var)
+        scale = jnp.where(avg_var > 0.0, cfg.variance / avg_var, 0.0)
+        sqrt_cov = jnp.sqrt(scale * raw_eigs)
+
+        coeff_shape = (cfg.nsamples, mx, my, mz)
+        coeffs = cfg.random_override if cfg.random_override is not None else jax.random.normal(key, coeff_shape)
+        coeffs = coeffs * sqrt_cov[jnp.newaxis, :, :, :]
+        samples = jnp.einsum("ik,jl,mn,bkln->bijm", phi_x, phi_y, phi_z, coeffs)
+        coords = jnp.meshgrid(x, y, z, indexing="ij")
 
     samples = samples + jnp.asarray(cfg.mean)
 

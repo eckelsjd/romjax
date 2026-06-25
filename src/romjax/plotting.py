@@ -261,6 +261,8 @@ class GridplotConfig(DictModel):
                     merged[key] = GridplotConfig.merge(base_value, value)
                 else:
                     merged[key] = copy.deepcopy(value)
+            elif key == "title":
+                merged[key] = value  # skip copying title which may be an iterable
             else:
                 merged[key] = copy.deepcopy(value)
 

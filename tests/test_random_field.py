@@ -55,6 +55,25 @@ def test_kle_supports_1d_and_2d_shapes_and_determinism() -> None:
     assert np.allclose(np.asarray(sample_2d), np.asarray(batched_2d[0]))
 
 
+def test_kle_supports_3d_shapes_and_determinism() -> None:
+    key = jax.random.key(29)
+    opts = dict(
+        bounds=((0.0, 1.0), (-1.0, 1.0), (0.0, 0.5)),
+        shape=(4, 5, 3),
+        truncation=(3, 2, 2),
+        correlation_lengths=(0.2, 0.3, 0.1),
+        variance=0.25,
+        spectral_decay=2.5,
+        mean=0.5,
+    )
+    sample = kle(key, **opts)
+    batched = kle(key, nsamples=2, **opts)
+
+    assert sample.shape == (4, 5, 3)
+    assert batched.shape == (2, 4, 5, 3)
+    assert np.allclose(np.asarray(sample), np.asarray(batched[0]))
+
+
 def test_kle_variance_scaling() -> None:
     samples = kle(
         jax.random.key(11),

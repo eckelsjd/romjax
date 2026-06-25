@@ -355,6 +355,24 @@ wheels = [
 ]
 
 [[package]]
+name = "diffrax"
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "equinox" },
+    { name = "jax" },
+    { name = "jaxtyping" },
+    { name = "lineax" },
+    { name = "optimistix" },
+    { name = "typing-extensions" },
+    { name = "wadler-lindig" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/ea/a22853377a840d70d1d174d43183f12990c66eecf34ba7e76eec781249d0/diffrax-0.7.2.tar.gz", hash = "sha256:9adc70fe90dba83f7dd839845839b2531a3dd736a3944fe1aa26598507cfb48e", size = 155159, upload-time = "2026-02-18T01:14:04.964Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6c/48/c42f657f3d6b4d9d9674c9bc48e763d024511ea4cc1d6e0c68c7b4380c43/diffrax-0.7.2-py3-none-any.whl", hash = "sha256:1beee2f991cd049962fe3c89da28f933753aa66d80bef857533276c9f23301ed", size = 199673, upload-time = "2026-02-18T01:14:03.38Z" },
+]
+
+[[package]]
 name = "distlib"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1865,6 +1883,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "alive-progress" },
+    { name = "diffrax" },
     { name = "equinox" },
     { name = "h5py" },
     { name = "jax" },
@@ -1904,6 +1923,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "alive-progress", specifier = ">=3.3.0" },
+    { name = "diffrax", specifier = ">=0.7.2" },
     { name = "equinox", specifier = ">=0.13.6" },
     { name = "h5py", specifier = ">=3.14" },
     { name = "jax", specifier = ">=0.9.1" },

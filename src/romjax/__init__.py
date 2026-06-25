@@ -45,8 +45,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
+    "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
     "gridplot": ("romjax.plotting", "gridplot"),
     "Poisson2D": ("romjax.poisson", "Poisson2D"),
+    "Vlasov1D1V": ("romjax.vlasov", "Vlasov1D1V"),
     "gen_keys": ("romjax.rng", "gen_keys"),
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
@@ -87,9 +89,10 @@ if TYPE_CHECKING:
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
-    from .pde import ImplicitIterativeGalerkin
+    from .pde import ImplicitIterativeGalerkin, AliveProgressMeter
     from .plotting import gridplot
     from .poisson import Poisson2D
+    from .vlasov import Vlasov1D1V
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .train import (
