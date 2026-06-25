@@ -99,6 +99,65 @@ class _ToySourceEdge(Edge, SourceSampleable):
         }
 
 
+class _FailingImplicitEdge(Edge, ImplicitSampleable):
+    shift: float = 0.1
+    fail_stage: str = "solve"
+    solve_threshold: float = 0.5
+    evaluate_threshold: float = 1.5
+    output_offset: float = 1.0
+
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def sample_inputs(self, key):
+        return {"x": jnp.asarray([jax.random.uniform(key)], dtype=jnp.float32)}
+
+    def solve(self, inputs):
+        x_value = float(np.asarray(inputs["x"]).reshape(-1)[0])
+        if self.fail_stage == "solve" and x_value > self.solve_threshold:
+            raise RuntimeError("solve failure")
+        return {"y": inputs["x"] + self.shift}
+
+    def evaluate(self, inputs, outputs):
+        output_value = float(np.asarray(outputs["y"]).reshape(-1)[0])
+        if self.fail_stage == "output_evaluate" and output_value > self.evaluate_threshold:
+            raise RuntimeError("evaluate failure")
+        return {"residual": outputs["y"] - (inputs["x"] + self.shift)}
+
+    def sample_outputs(self, key, inputs=None, solution=None):
+        del key
+        if solution is not None:
+            if self.fail_stage == "output_evaluate":
+                return {"y": solution["y"] + jnp.asarray([self.output_offset], dtype=jnp.float32)}
+            return solution
+        assert inputs is not None
+        return {"y": inputs["x"] + self.shift}
+
+
+class _FailingSourceEdge(Edge, SourceSampleable):
+    fail_threshold: float = 0.5
+
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def sample_source(self, key):
+        value = jax.random.uniform(key)
+        if float(np.asarray(value)) > self.fail_threshold:
+            raise RuntimeError("source failure")
+        return {
+            "state": {
+                "x": jnp.asarray(value, dtype=jnp.float32),
+                "meta": jnp.asarray([0.0], dtype=jnp.float32),
+            }
+        }
+
+
 class _DummyCompression(Compression):
     scale: float = 1.0
     rank: int = 1
@@ -161,6 +220,10 @@ def _write_implicit_dataset(
         save_h5({"r": np.asarray([0.0], dtype=np.float32)}, output_dir / "residual.h5", mode="w")
 
 
+def _failed_sample_dirs(root: Path) -> list[Path]:
+    return sorted(path.parent for path in root.rglob(".romjax_failed"))
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_generate_data(tmp_path, batch_size):
     config = DataGeneration(
@@ -218,6 +281,172 @@ def test_generate_data(tmp_path, batch_size):
                 output_dir = sample_dir / "seed_5" if dataset_name == "train" else sample_dir / "seed_11"
                 assert (output_dir / "sample_0" / "output.h5").exists()
                 assert (output_dir / "sample_0" / "residual.h5").exists()
+
+
+def test_generate_implicit_throw_false_serial_marks_failed_input_and_skips_loader(tmp_path, monkeypatch):
+    monkeypatch.setattr("romjax.data_gen.eqx.filter_jit", lambda fn: fn)
+    debug_messages: list[str] = []
+    monkeypatch.setattr("romjax.data_gen.logger.debug", lambda message: debug_messages.append(str(message)))
+
+    graph = FunctionGraph(
+        edges={
+            "low": _FailingImplicitEdge(source="inputs", target="low", fail_stage="solve"),
+        }
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "low": {
+                    "input_samples": 2,
+                    "outputs_per_input": 1,
+                    "input_seed": 0,
+                    "output_seed": 0,
+                    "batch_size": 1,
+                    "throw": False,
+                }
+            }
+        },
+        graph=graph,
+    )
+
+    generation.run()
+
+    edge_dir = tmp_path / "train" / "low"
+    failed_dirs = _failed_sample_dirs(edge_dir)
+    assert len(failed_dirs) == 1
+
+    failed_dir = failed_dirs[0]
+    failure_log = failed_dir / "failure.log"
+    assert failure_log.exists()
+    failure_text = failure_log.read_text(encoding="utf-8")
+    assert "solve failure" in failure_text
+    assert "Traceback" in failure_text
+    assert any("1 failed cases" in message for message in debug_messages)
+
+    assert (failed_dir / "input.h5").exists()
+    assert not (failed_dir / "solution.h5").exists()
+
+    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
+    assert len(refs) == 2
+    assert all(input_path != failed_dir for input_path, _, _ in refs)
+
+
+def test_generate_implicit_throw_true_propagates(tmp_path, monkeypatch):
+    monkeypatch.setattr("romjax.data_gen.eqx.filter_jit", lambda fn: fn)
+
+    graph = FunctionGraph(
+        edges={
+            "low": _FailingImplicitEdge(source="inputs", target="low", fail_stage="solve"),
+        }
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "low": {
+                    "input_samples": 2,
+                    "outputs_per_input": 1,
+                    "input_seed": 0,
+                    "output_seed": 0,
+                    "batch_size": 1,
+                    "throw": True,
+                }
+            }
+        },
+        graph=graph,
+    )
+
+    with pytest.raises(RuntimeError, match="solve failure"):
+        generation.run()
+
+
+def test_generate_implicit_throw_false_batch_marks_failed_output_and_skips_loader(tmp_path, monkeypatch):
+    monkeypatch.setattr("romjax.data_gen.eqx.filter_jit", lambda fn: fn)
+    debug_messages: list[str] = []
+    monkeypatch.setattr("romjax.data_gen.logger.debug", lambda message: debug_messages.append(str(message)))
+
+    graph = FunctionGraph(
+        edges={
+            "low": _FailingImplicitEdge(source="inputs", target="low", fail_stage="output_evaluate"),
+        }
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "low": {
+                    "input_samples": 2,
+                    "outputs_per_input": 1,
+                    "input_seed": 0,
+                    "output_seed": 0,
+                    "batch_size": 2,
+                    "throw": False,
+                }
+            }
+        },
+        graph=graph,
+    )
+
+    generation.run()
+
+    edge_dir = tmp_path / "train" / "low"
+    failed_dirs = _failed_sample_dirs(edge_dir)
+    assert len(failed_dirs) == 1
+
+    failed_dir = failed_dirs[0]
+    failure_log = failed_dir / "failure.log"
+    assert failure_log.exists()
+    failure_text = failure_log.read_text(encoding="utf-8")
+    assert "evaluate failure" in failure_text
+    assert "Traceback" in failure_text
+    assert any("1 failed cases" in message for message in debug_messages)
+
+    assert failed_dir.parent.parent.name.startswith("sample_")
+    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
+    assert len(refs) == 3
+    assert all(output_path != failed_dir for _, output_path, _ in refs)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_source_throw_false_skips_failed_samples(tmp_path, monkeypatch, batch_size):
+    monkeypatch.setattr("romjax.data_gen.eqx.filter_jit", lambda fn: fn)
+    debug_messages: list[str] = []
+    monkeypatch.setattr("romjax.data_gen.logger.debug", lambda message: debug_messages.append(str(message)))
+
+    graph = FunctionGraph(edges={"source": _FailingSourceEdge(source="noise", target="source")})
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "source": {
+                "samples": 2,
+                "seed": 0,
+                "batch_size": batch_size,
+                "throw": False,
+            }
+        },
+        graph=graph,
+    )
+
+    generation.run()
+
+    source_dir = tmp_path / "source"
+    failed_dirs = _failed_sample_dirs(source_dir)
+    assert len(failed_dirs) == 1
+
+    failed_dir = failed_dirs[0]
+    failure_log = failed_dir / "failure.log"
+    assert failure_log.exists()
+    failure_text = failure_log.read_text(encoding="utf-8")
+    assert "source failure" in failure_text
+    assert "Traceback" in failure_text
+    assert any("1 failed cases" in message for message in debug_messages)
+
+    loader = DataLoader(root=tmp_path)
+    assert isinstance(loader.datasets["source"], LoadSource)
+    refs = loader.datasets["source"].discover_sample_refs(source_dir)
+    assert len(refs) == 1
+    assert refs[0] != failed_dir
 
 
 class _CustomDataset(GenDataConfig):

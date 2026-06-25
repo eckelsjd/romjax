@@ -5,5 +5,28 @@
     ],
     "python.testing.unittestEnabled": false,
     "python.testing.pytestEnabled": true,
-    "editor.rulers": [120]
+    "editor.rulers": [120],
+    // "editor.semanticHighlighting.enabled": true,
+    // "editor.semanticTokenColorCustomizations": {
+    //     "rules": {
+    //     // "variable": "#c0c0c0",
+    //     // "parameter": "#c0c0c0",
+    //     // "property": "#c0c0c0"
+    //     }
+    // },
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+        {
+            "scope": [
+            // "variable",
+            // "variable.other",
+            "variable.other.readwrite",
+            // "entity.name.variable"
+            ],
+            "settings": {
+            "foreground": "#c0c0c0"
+            }
+        }
+        ]
+    }
 }

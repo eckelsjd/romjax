@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import diffrax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,7 +9,14 @@ import pytest
 from romjax.compression import SVD
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
-from romjax.pde import BoundaryType, ImplicitIterativeGalerkin, LatentSamplerFactory, UniformGrid, homogeneous_boundary
+from romjax.pde import (
+    AliveProgressMeter,
+    BoundaryType,
+    ImplicitIterativeGalerkin,
+    LatentSamplerFactory,
+    UniformGrid,
+    homogeneous_boundary,
+)
 from romjax.tree import pytree_merge
 
 
@@ -33,6 +41,14 @@ def test_merge_boundary_conditions():
     assert merged["boundary"][0][0]["type"] == BoundaryType.dirichlet
     assert merged["boundary"][1][0]["type"] == BoundaryType.neumann
     assert float(merged["boundary"][0][1]["value"]) == 2.0
+
+
+def test_grid_boundary_inputs_are_hashable():
+    boundary_a = homogeneous_boundary(type="dirichlet", value=0.0, ndim=2)
+    boundary_b = homogeneous_boundary(type="dirichlet", value=0.0, ndim=2)
+
+    assert hash(boundary_a) == hash(boundary_b)
+    assert {boundary_a: "ok"}[boundary_b] == "ok"
 
 
 def test_uniform_grid():
@@ -216,4 +232,27 @@ def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Pat
     assert sample["outputs"].shape == (2,)
     assert jnp.all(sample["outputs"] >= jnp.asarray([-1.0, -2.0]))
     assert jnp.all(sample["outputs"] <= jnp.asarray([1.0, 2.0]))
+
+
+def test_alive_progress_meter_is_jit_compatible() -> None:
+    solver = diffrax.Euler()
+    meter = AliveProgressMeter()
+
+    solution = jax.jit(
+        lambda y0: diffrax.diffeqsolve(
+            diffrax.ODETerm(lambda t, y, args: y),
+            solver=solver,
+            t0=0.0,
+            t1=0.1,
+            dt0=0.05,
+            y0=y0,
+            saveat=diffrax.SaveAt(ts=jnp.asarray([0.0, 0.05, 0.1])),
+            stepsize_controller=diffrax.ConstantStepSize(),
+            max_steps=16,
+            progress_meter=meter,
+        ).ys
+    )(jnp.asarray(1.0))
+
+    assert solution.shape == (3,)
+    assert jnp.isfinite(solution).all()
     

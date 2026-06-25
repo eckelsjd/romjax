@@ -37,6 +37,19 @@ def uniform(key: jaxtyping.Key, shape=(), dtype=None, minval=0.0, maxval=1.0, *,
                               out_sharding=out_sharding)
 
 
+def log_uniform(key: jaxtyping.Key, shape=(), dtype=None, minval=-6.0, maxval=0.0, *, out_sharding=None):
+    """Sample values uniformly in log10 space between ``10**minval`` and ``10**maxval``."""
+    log10_sample = jax.random.uniform(
+        key,
+        shape=shape,
+        dtype=dtype,
+        minval=jnp.asarray(minval),
+        maxval=jnp.asarray(maxval),
+        out_sharding=out_sharding,
+    )
+    return jnp.power(jnp.asarray(10, dtype=log10_sample.dtype), log10_sample)
+
+
 def normal(key: jaxtyping.Key, mean: ArrayLike = 0.0, std: ArrayLike = 1.0, **kwargs) -> ArrayLike:
     """Small wrapper of jax.random.normal to support mean/std args."""
     return jax.random.normal(key, **kwargs) * jnp.asarray(std) + jnp.asarray(mean)
@@ -79,6 +92,7 @@ def random_eqx_module(
 
 _distribution_registry = {
     "uniform": uniform,
+    "log_uniform": log_uniform,
     "normal": normal,
     "darcy": darcy,
     "kle": kle,

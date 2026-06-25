@@ -21,6 +21,7 @@ dependencies = [
     "jax>=0.9.1",
     "orbax-checkpoint>=0.11.39",
     "loguru>=0.7.3",
+    "diffrax>=0.7.2",
 ]
 requires-python = ">=3.12"
 readme = "README.md"

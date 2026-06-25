@@ -17,6 +17,7 @@ from romjax.pde import (
     ConstantInitialize,
     Coordinates,
     ForcingCallable,
+    IdentityInputs,
     IterativeSolver,
     RegisteredInitialize,
     UniformGrid,
@@ -149,13 +150,6 @@ class SinusoidForcing(ForcingCallable):
         :return: the forcing on the grid.
         """
         return -2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
-
-
-class IdentityInputs(ForcingCallable):
-
-    def callable(self, inputs, outputs):
-        """Simple boundary that uses boundary input params directly (just pass them through)."""
-        return inputs
     
 
 _forcing_registry = {

@@ -1,0 +1,65 @@
+!romx:Vlasov1D1V
+grid:
+  shape: [16, 32]
+  bounds: [[0.0, 6.283185307179586], [-6.0, 6.0]]
+solver:
+  solver: {name: KenCarp4}
+  stepsize_controller: {name: PIDController, kwargs: {rtol: 1.0e-4, atol: 1.0e-6}}
+  adjoint: {name: RecursiveCheckpointAdjoint}
+  t0: 0.0
+  t1: 1.0
+  ts: [0.0, 0.25, 0.5, 0.75, 1.0]
+  dt0: 0.001
+  max_steps: 20000
+  throw: false
+fv:
+  flux: upwind
+  reconstruction: none
+  limiter: van_leer
+  cfl: 0.8
+params:
+  knudsen: .inf
+  debye: 1.0
+initial:
+  callable: cosine
+  inputs_default:
+    alpha: 0.01
+    k: 1.0
+    n0: 1.0
+    u0: 0.0
+    T0: 1.0
+boundary:
+  callable: identity
+  inputs_default:
+    vdf:
+      boundary:
+        - [{type: periodic, value: 0.0}, {type: periodic, value: 0.0}]
+        - [{type: neumann, value: 0.0}, {type: neumann, value: 0.0}]
+    potential:
+      boundary:
+        - [{type: dirichlet, value: 0.0}, {type: dirichlet, value: 0.0}]
+inputs_sampler: !romx:PyTreeSampler
+  template:
+    initial:
+      alpha: {callable: normal, mean: 0.01, std: 0.002, shape: []}
+outputs_sampler: !romx:NearSolutionSampler
+  scale:
+    fields:
+      vdf: [max_abs, 0.05]
+      potential: [max_abs, 0.05]
+  template:
+    fields:
+      vdf:
+        callable: kle
+        bounds: [[0.0, 6.283185307179586], [-6.0, 6.0], [0.0, 1.0]]
+        shape: [16, 32, 5]
+        truncation: [4, 4, 3]
+        correlation_lengths: [0.5, 0.5, 0.25]
+        variance: 1.0
+      potential:
+        callable: kle
+        bounds: [[0.0, 6.283185307179586], [0.0, 1.0]]
+        shape: [16, 5]
+        truncation: [4, 3]
+        correlation_lengths: [0.5, 0.25]
+        variance: 1.0
