@@ -13,15 +13,16 @@ import jaxtyping
 from jax.typing import ArrayLike
 from pydantic import AfterValidator, BeforeValidator, Field, TypeAdapter, model_validator
 
+from romjax.operators import UnaryOp
 from romjax.random_field import darcy, kle
-from romjax.tree import UnaryOperator, get_unary_operator, pytree_merge
+from romjax.tree import pytree_merge
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
            'NearSolutionSampler', 'gen_keys']
 
 
-type RelativeScale = tuple[UnaryOperator, float]
+type RelativeScale = tuple[UnaryOp, float]
 
 
 class SamplerCallable(CallableModel):
@@ -195,14 +196,15 @@ class NearSolutionSampler(PyTreeSampler):
         """Scale noise using a reference solution."""
         def _is_relative_scale_spec(value: Any) -> bool:
             """Return True when ``value`` is a ``(reducer, factor)`` relative-scale specification."""
-            return isinstance(value, tuple | list) and len(value) == 2 and (isinstance(value[0], str | UnaryOperator) 
-                                                                            or callable(value[0]))
+            return isinstance(value, tuple | list) and len(value) == 2 and (
+                isinstance(value[0], str | UnaryOp) or callable(value[0])
+            )
 
         def _resolve_scale_leaf(reference: ArrayLike, scale_spec: ArrayLike | RelativeScale) -> ArrayLike:
             """Resolve one scale leaf, supporting both absolute and relative scale specifications."""
             if _is_relative_scale_spec(scale_spec):
                 reducer, factor = scale_spec
-                reducer_fn = get_unary_operator(reducer)
+                reducer_fn = UnaryOp(reducer)
                 return jnp.asarray(reducer_fn(jnp.asarray(reference))) * jnp.asarray(factor)
             return jnp.asarray(scale_spec)
 

@@ -1,15 +1,11 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from romjax import YamlLoader
+from romjax.operators import BinaryOp, UnaryOp
 from romjax.tree import (
-    ErrorOperator,
-    TreeErrorOperator,
-    UnaryOperator,
-    get_error_operator,
-    get_tree_operator,
-    get_unary_operator,
     pytree_at,
     pytree_iter,
     pytree_mean,
@@ -121,13 +117,14 @@ def test_to_pytree_merge_and_jit_grad():
     assert jnp.allclose(grad_val, 2.0)
 
 
-def test_unary_operator():
-    operator = UnaryOperator("max-abs")
-    grad_operator = UnaryOperator("mean-square")
+def test_unary_op_array_and_tree_inputs():
+    operator = UnaryOp("max-abs")
+    grad_operator = UnaryOp("mean-square")
+    tree = {"a": jnp.array([-1.0, 2.0]), "b": ("ignore", jnp.array([-4.0]))}
 
-    assert operator.op_str == "max-abs"
-    assert operator.function is UnaryOperator("max-abs").function
     assert jnp.allclose(operator(jnp.array([-1.0, 2.0, -4.0])), 4.0)
+    assert jnp.allclose(operator(tree), 4.0)
+    assert jnp.allclose(UnaryOp("mean")(tree, ignore=[("b",)]), 0.5)
 
     jit_value = jax.jit(operator)(jnp.array([-1.0, 2.0, -4.0]))
     grad_value = jax.grad(grad_operator)(jnp.array([1.0, 2.0]))
@@ -138,16 +135,22 @@ def test_unary_operator():
     assert jnp.allclose(vmap_value, jnp.array([2.0, 5.0]))
 
 
-def test_error_operator():
-    custom = ErrorOperator(lambda x, xhat: jnp.sum(x - xhat))
-    relative = ErrorOperator(("abs", "norm"))
-    cached = ErrorOperator(("abs", "norm"))
+def test_unary_op_leaf_reduce_config():
+    operator = UnaryOp({"leaf_op": "square", "reduce_op": "mean"})
+    tree = {"a": jnp.array([1.0, 2.0]), "b": jnp.array([3.0])}
+
+    assert jnp.allclose(operator(tree), jnp.mean(jnp.array([1.0, 4.0, 9.0])))
+    assert jnp.allclose(operator(jnp.array([1.0, 2.0])), jnp.mean(jnp.array([1.0, 4.0])))
+
+
+def test_binary_op_array_inputs():
+    custom = BinaryOp(lambda x, xhat: jnp.sum(x - xhat))
+    relative = BinaryOp(("abs", "norm"))
 
     x = jnp.array([3.0, 4.0])
     xhat = jnp.array([1.0, 1.0])
 
     assert jnp.allclose(custom(x, xhat), 5.0)
-    assert relative.function is cached.function
     assert jnp.allclose(relative(x, xhat), jnp.abs(x - xhat) / jnp.linalg.norm(x))
 
     jit_value = jax.jit(relative)(x, xhat)
@@ -157,19 +160,18 @@ def test_error_operator():
     assert grad_value.shape == x.shape
 
 
-def test_tree_error_operator():
+def test_binary_op_tree_inputs_and_aliases():
     tree = {"a": jnp.array([1.0, 3.0]), "b": jnp.array([-2.0])}
     tree_hat = {"a": jnp.array([0.0, 1.0]), "b": jnp.array([1.0])}
 
-    mean_error = TreeErrorOperator("mean")
-    mse = TreeErrorOperator("mse")
-    relative = TreeErrorOperator("relative")
+    mean_error = BinaryOp("mean")
+    mse = BinaryOp("mse")
+    relative = BinaryOp("relative")
 
     expected_mean = jnp.mean(jnp.concatenate([jnp.array([1.0, 2.0]), jnp.array([-3.0])]))
     expected_mse = jnp.mean(jnp.square(jnp.concatenate([jnp.array([1.0, 2.0]), jnp.array([-3.0])])))
     expected_relative = jnp.linalg.norm(jnp.array([1.0, 2.0, -3.0])) / jnp.linalg.norm(jnp.array([1.0, 3.0, -2.0]))
 
-    assert mse.function is TreeErrorOperator("mse").function
     assert jnp.ndim(mean_error(tree, tree_hat)) == 0
     assert jnp.allclose(mean_error(tree, tree_hat), expected_mean)
     assert jnp.allclose(mse(tree, tree_hat), expected_mse)
@@ -179,15 +181,54 @@ def test_tree_error_operator():
     assert jnp.allclose(jit_value, expected_relative)
 
 
+def test_binary_op_common_overlap_ignore_and_strict_errors():
+    tree = {
+        "keep": {"x": jnp.array(3.0), "ignore": {"y": jnp.array(100.0)}, "left_only": jnp.array(9.0)},
+        "shared": jnp.array(1.0),
+        "seq": [jnp.array(10.0), jnp.array(20.0), jnp.array(30.0)],
+    }
+    tree_hat = {
+        "keep": {"x": jnp.array(1.0), "ignore": {"y": jnp.array(-100.0)}, "right_only": jnp.array(4.0)},
+        "shared": jnp.array(4.0),
+        "seq": [jnp.array(13.0), jnp.array(21.0)],
+    }
+
+    operator = BinaryOp("mae", ignore=[("keep", "ignore")])
+
+    assert jnp.allclose(operator(tree, tree_hat), jnp.array(2.25))
+    assert jnp.allclose(BinaryOp("mae")(tree, tree_hat, ignore=[("keep",)]), jnp.array(7.0 / 3.0))
+    with pytest.raises(ValueError, match="keys differ"):
+        BinaryOp({"op": "mae", "overlap": "strict"})(tree, tree_hat)
+    with pytest.raises(ValueError, match="no selected overlapping"):
+        BinaryOp("mae")(tree, tree_hat, ignore=[("keep",), ("shared",), ("seq",)])
+
+
+def test_binary_op_leaf_reduce_config():
+    tree = {"a": jnp.array([3.0, 4.0]), "b": jnp.array([1.0, 1.0])}
+    tree_hat = {"a": jnp.array([1.0, 1.0]), "b": jnp.array([0.0, 1.0])}
+    operator = BinaryOp({"reduce_op": "mean", "leaf_op": ("norm", "norm")})
+
+    expected = jnp.mean(
+        jnp.array(
+            [
+                jnp.linalg.norm(tree["a"] - tree_hat["a"]) / jnp.linalg.norm(tree["a"]),
+                jnp.linalg.norm(tree["b"] - tree_hat["b"]) / jnp.linalg.norm(tree["b"]),
+            ]
+        )
+    )
+
+    assert jnp.allclose(operator(tree, tree_hat), expected)
+
+
 def test_pytree_reduce():
     tree = {"a": jnp.array([1.0, -2.0]), "b": ("ignore", jnp.array([3.0]))}
     flat = jnp.array([1.0, -2.0, 3.0])
 
     mean_value = pytree_mean(tree)
     norm_value = pytree_norm(tree)
-    generic_mean = pytree_reduce(get_unary_operator("mean"), tree)
-    generic_norm = pytree_reduce(get_unary_operator("norm"), tree)
-    generic_max = pytree_reduce(get_unary_operator("max_abs"), tree)
+    generic_mean = pytree_reduce("mean", tree)
+    generic_norm = pytree_reduce(UnaryOp("norm"), tree)
+    generic_max = pytree_reduce("max_abs", tree)
 
     assert jnp.ndim(mean_value) == 0
     assert jnp.ndim(norm_value) == 0
@@ -198,27 +239,12 @@ def test_pytree_reduce():
     assert jnp.allclose(generic_max, 3.0)
 
 
-def test_get_operators_by_alias():
-    unary = get_unary_operator("max_abs")
-    unary_again = get_unary_operator("max-abs")
-    error = get_error_operator("rmse")
-    error_again = get_error_operator("rmse")
-    tree_op = get_tree_operator("relative")
-    tree_op_again = get_tree_operator("relative")
-
-    assert unary is unary_again
-    assert unary.function is unary_again.function
-    assert error is error_again
-    assert error.function is error_again.function
-    assert tree_op is tree_op_again
-    assert tree_op.function is tree_op_again.function
-
-
-def test_unary_operator_yaml_round_trip(tmp_path):
+def test_unary_op_yaml_round_trip(tmp_path):
     path = tmp_path / "unary.yml"
     payload = {
-        "string_op": UnaryOperator("max_abs"),
-        "callable_op": UnaryOperator(unary_shift_sum),
+        "string_op": UnaryOp("max_abs"),
+        "callable_op": UnaryOp(unary_shift_sum),
+        "structured_op": UnaryOp({"leaf_op": "square", "reduce_op": "mean", "ignore": ["skip"]}),
     }
 
     YamlLoader.dump(payload, path)
@@ -226,18 +252,19 @@ def test_unary_operator_yaml_round_trip(tmp_path):
     reloaded = YamlLoader.load(path)
 
     assert "tests.test_tree.unary_shift_sum" in dumped
-    assert reloaded["string_op"].op_str == "max-abs"
-    assert reloaded["callable_op"].op_str is None
     assert jnp.allclose(reloaded["string_op"](jnp.array([-1.0, 3.0])), 3.0)
     assert jnp.allclose(reloaded["callable_op"](jnp.array([1.0, 2.0])), 4.0)
+    assert jnp.allclose(reloaded["structured_op"]({"x": jnp.array([2.0]), "skip": jnp.array([100.0])}), 4.0)
 
 
-def test_error_operator_yaml_round_trip(tmp_path):
+def test_binary_op_yaml_round_trip(tmp_path):
     path = tmp_path / "error.yml"
     payload = {
-        "op_only": ErrorOperator("abs"),
-        "with_norm": ErrorOperator(("abs", "norm")),
-        "callable": ErrorOperator(error_l1),
+        "op_only": BinaryOp("abs"),
+        "with_norm": BinaryOp(("abs", "norm")),
+        "structured": BinaryOp({"reduce_op": "norm", "leaf_op": ("abs", "norm"), "norm": "norm"}),
+        "callable": BinaryOp(error_l1),
+        "tree_callable": BinaryOp(tree_l1),
     }
 
     YamlLoader.dump(payload, path)
@@ -245,38 +272,18 @@ def test_error_operator_yaml_round_trip(tmp_path):
     reloaded = YamlLoader.load(path)
     x = jnp.array([3.0, 4.0])
     xhat = jnp.array([1.0, 1.0])
-
-    assert "tests.test_tree.error_l1" in dumped
-    assert reloaded["op_only"].norm is None
-    assert reloaded["with_norm"].norm is not None
-    assert jnp.allclose(reloaded["op_only"](x, xhat), jnp.abs(x - xhat))
-    assert jnp.allclose(reloaded["with_norm"](x, xhat), jnp.abs(x - xhat) / jnp.linalg.norm(x))
-    assert jnp.allclose(reloaded["callable"](x, xhat), 5.0)
-
-
-def test_tree_error_operator_yaml_round_trip(tmp_path):
-    path = tmp_path / "tree_error.yml"
-    payload = {
-        "reduce_only": TreeErrorOperator("mean"),
-        "full_spec": TreeErrorOperator({"reduce_op": "norm", "leaf_op": ("abs", "norm"), "norm": "norm"}),
-        "callable": TreeErrorOperator(tree_l1),
-    }
-
-    YamlLoader.dump(payload, path)
-    dumped = path.read_text()
-    reloaded = YamlLoader.load(path)
     tree = {"a": jnp.array([3.0, 4.0])}
     tree_hat = {"a": jnp.array([1.0, 1.0])}
 
-    assert "tests.test_tree.tree_l1" in dumped
-    assert reloaded["reduce_only"].leaf_op.spec_key == ("noop", None)
-    assert reloaded["full_spec"].norm is not None
-    assert jnp.allclose(reloaded["reduce_only"](tree, tree_hat), jnp.mean(tree["a"] - tree_hat["a"]))
+    assert "tests.test_tree.error_l1" in dumped
     expected = jnp.linalg.norm(jnp.abs(tree["a"] - tree_hat["a"]) / jnp.linalg.norm(tree["a"])) / jnp.linalg.norm(
         tree["a"]
     )
-    assert jnp.allclose(reloaded["full_spec"](tree, tree_hat), expected)
-    assert jnp.allclose(reloaded["callable"](tree, tree_hat), 5.0)
+    assert jnp.allclose(reloaded["op_only"](x, xhat), jnp.abs(x - xhat))
+    assert jnp.allclose(reloaded["with_norm"](x, xhat), jnp.abs(x - xhat) / jnp.linalg.norm(x))
+    assert jnp.allclose(reloaded["structured"](tree, tree_hat), expected)
+    assert jnp.allclose(reloaded["callable"](x, xhat), 5.0)
+    assert jnp.allclose(reloaded["tree_callable"](tree, tree_hat), 5.0)
 
 
 def test_pytree_iter():

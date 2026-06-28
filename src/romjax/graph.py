@@ -10,7 +10,8 @@ from jaxtyping import PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from romjax.norm import EdgeNormConfig, NormTree
-from romjax.tree import TreeErrorOperator, TreePath, coerce_tree_paths, get_tree_operator, pytree_merge, pytree_union
+from romjax.operators import BinaryOp
+from romjax.tree import TreePath, coerce_tree_paths, pytree_merge
 from romjax.typing import ListModel
 
 type EdgePatch = Mapping[Edge, Mapping[str, PyTree]]  # Maps edge names to extra payload dict data
@@ -31,12 +32,12 @@ class Node(BaseModel, Hashable):
     A Node in a FunctionGraph represents a vector space. This is essentially just a string identifier and
     a way to compute the size of errors in the space.
 
-    Error defaults to `mean-relative`, which averages per-leaf relative error.
+    Error defaults to `sum-square`, which is the squared L2 norm.
 
     Must be hashable to be usable with networkx. Just hashes using the string identifier.
     """
     name: str
-    error_op: TreeErrorOperator = Field(default_factory=lambda: get_tree_operator("mean-relative"))
+    error_op: BinaryOp = Field(default_factory=lambda: BinaryOp("sum-square"))
     ignore: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -49,9 +50,9 @@ class Node(BaseModel, Hashable):
     @field_validator("error_op", mode="before")
     @classmethod
     def _coerce_error_op(cls, value):
-        if isinstance(value, TreeErrorOperator):
+        if isinstance(value, BinaryOp):
             return value
-        return get_tree_operator(value)
+        return BinaryOp(value)
 
     def __hash__(self):
         return hash(self.name)
@@ -74,7 +75,7 @@ class Node(BaseModel, Hashable):
         """
         Compute the pytree error at this node. Only consider shared paths, and optionally ignore paths via `self.ignore`
         """
-        return self.error_op(*pytree_union(value, value_hat, ignore=self.ignore))
+        return self.error_op(value, value_hat, ignore=self.ignore)
 
 
 class Edge(BaseModel, Hashable, ABC):
@@ -753,7 +754,7 @@ class FunctionGraph(BaseModel):
         aux_a: EdgePatch | None = None,
         aux_b: EdgePatch | None = None,
         edge_payload_patches: EdgePatch | None = None,
-        error_op: TreeErrorOperator | None = None,
+        error_op: BinaryOp | None = None,
         ignore: set | None = None,
     ) -> jax.Array:
         """
@@ -785,8 +786,10 @@ class FunctionGraph(BaseModel):
             aux=aux_b,
             edge_payload_patches=edge_payload_patches,
         )
-        error_fn = end_a.error if error_op is None else (
-            lambda a, b: get_tree_operator(error_op)(*pytree_union(a, b, ignore=ignore or end_a.ignore))
+        error_fn = (
+            end_a.error
+            if error_op is None
+            else lambda a, b: BinaryOp(error_op)(a, b, ignore=ignore or end_a.ignore)
         )
         return error_fn(out_a, out_b)
 
@@ -798,7 +801,7 @@ class FunctionGraph(BaseModel):
         start: Node | str | None = None,
         aux: EdgePatch | None = None,
         edge_payload_patches: EdgePatch | None = None,
-        error_op: TreeErrorOperator | None = None,
+        error_op: BinaryOp | None = None,
         ignore: set | None = None,
     ) -> jax.Array:
         """
@@ -824,7 +827,9 @@ class FunctionGraph(BaseModel):
             aux=aux_cache,
             edge_payload_patches=edge_payload_patches,
         )
-        error_fn = start_node.error if error_op is None else (
-            lambda a, b: get_tree_operator(error_op)(*pytree_union(a, b, ignore=ignore or start_node.ignore))
+        error_fn = (
+            start_node.error
+            if error_op is None
+            else lambda a, b: BinaryOp(error_op)(a, b, ignore=ignore or start_node.ignore)
         )
         return error_fn(payload, reconstructed)

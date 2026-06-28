@@ -53,9 +53,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
     "GraphRef": ("romjax.typing", "GraphRef"),
-    "get_unary_operator": ("romjax.tree", "get_unary_operator"),
-    "get_error_operator": ("romjax.tree", "get_error_operator"),
-    "get_tree_operator": ("romjax.tree", "get_tree_operator"),
+    "UnaryOp": ("romjax.operators", "UnaryOp"),
+    "BinaryOp": ("romjax.operators", "BinaryOp"),
     "DictModel": ("romjax.typing", "DictModel"),
     "ListModel": ("romjax.typing", "ListModel"),
     "CallableModel": ("romjax.typing", "CallableModel"),
@@ -95,13 +94,13 @@ if TYPE_CHECKING:
     from .vlasov import Vlasov1D1V
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
+    from .operators import BinaryOp, UnaryOp
     from .train import (
         BatchLoader,
         GraphLoss,
         GraphTest,
         Train,
     )
-    from .tree import get_error_operator, get_tree_operator, get_unary_operator
     from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType
     from .utils import load_h5, save_h5
 

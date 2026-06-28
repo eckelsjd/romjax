@@ -1,6 +1,6 @@
 import copy
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterable, Iterator, Literal, Mapping
+from typing import Annotated, Any, Callable, Iterable, Literal, Mapping
 
 import equinox as eqx
 import jax
@@ -20,11 +20,12 @@ from pydantic import (
     model_validator,
 )
 
-from romjax.data_gen import LoadDataConfig, DataLoader
+from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
+from romjax.operators import UnaryOp
 from romjax.routine import Routine
 from romjax.train import GraphLoss
-from romjax.tree import UnaryOperator, get_unary_operator, pytree_path_iter
+from romjax.tree import pytree_path_iter
 from romjax.typing import from_yaml, resolve_graph_refs
 from romjax.utils import _NullProgress
 
@@ -135,7 +136,7 @@ class CompareTable(CompareOrbax):
     dataloaders: SkipValidation[Mapping[str, Iterable[Any]]]
     metrics: Mapping[str, Callable[[PyTree, Any], float]]
 
-    stats: Mapping[str, UnaryOperator] = Field(default_factory=lambda: ["mean", "std"])
+    stats: Mapping[str, UnaryOp] = Field(default_factory=lambda: ["mean", "std"])
     latex_template: str | None = None
     col_format: Mapping[str, str] = r"{mean:5.3f} ({std:5.3f})"
     filename: str = "compare_table.yml"
@@ -152,7 +153,7 @@ class CompareTable(CompareOrbax):
                 value = {str(v): v for v in value}
         
         if isinstance(value, Mapping):
-            value = {k: get_unary_operator(v) for k, v in value.items()}
+            value = {k: UnaryOp(v) for k, v in value.items()}
 
         return value
     
