@@ -1,15 +1,22 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
+- finish objectives and poisson
+- get Galerkin ODE working (small problem, then Vlasov)
+- repeat galerkin training on Vlasov
+- implement Euler (conservative values, handle heat flux and stress terms)
+- Figure out coord/res transforms for Vlasov->Euler
+- possibly CNN/FNO autoencoder 
+- Train Vlasov/Euler graph
+- Routine for sampling knudsen, training surrogate for E(v)
 
 ## Critical
 - [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.
-- [ ] Normalization for eqx transforms
+- [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
 
 ## Needs testing
 - [ ] Training on param references
 
 ## Blind spots
-- [ ] Support raw arrays and lists/tuples in HDF5 loader
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
 - [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
@@ -17,8 +24,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Backburner
 - [ ] Go back and make sure graph loss functions actually give the same result as normal regresion (linear, mlp)
-- [ ] Other data save formats outside of H5
-- [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
+- [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm)
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file
@@ -50,6 +56,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Pretty much everything
 - [ ] Some simple train and gen data examples would be good
 - [ ] How to use filter model with eqx_evaluate for projection, neural nets, etc.
+- [ ] Composite functions for unary operators, normalizations, error/tree operators, etc.
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation
@@ -71,3 +78,11 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Future projects
 - Building surrogate for graph comm as a model error indicator (scalar or field)
 - Online adaptive time-stepping for time-based simulations
+- Public release:
+    - Move pydantic/agents/models out
+    - Clean tests, CI/CD, demos
+    - Refactor to nice internal/public layout (modules, exports, defaults, param/var names)
+    - Module/class/function docstrings throughout
+    - Readme, quickstart, citations
+    - Mkdocs website with tutorial, examples
+    - Version, pip, github, bump

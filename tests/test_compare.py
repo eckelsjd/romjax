@@ -26,7 +26,13 @@ def absolute_error(params: dict[str, jax.Array], single_data: dict[str, jax.Arra
 
 def graph_single_squared_error(params: dict, single_data: dict, graph: object) -> jax.Array:
     del graph
-    return jnp.square(params["toy"]["weight"] - single_data["toy"]["inputs"]["x"])
+    sample = single_data["toy"] if "toy" in single_data else single_data
+    return jnp.square(params["toy"]["weight"] - sample["inputs"]["x"])
+
+
+def mapped_batch_metric(params: dict[str, jax.Array], batch: dict[str, list[dict[str, jax.Array]]]) -> jax.Array:
+    del params
+    return sum(item["x"] for item in batch["train"]) + sum(item["x"] for item in batch["test"])
 
 
 class FiniteLoader:
@@ -124,9 +130,37 @@ def test_compare_basic_callables_params_templates_and_multiple_dataloaders(tmp_p
     assert "orbax & 1.67/4.00 & 1.00/1.00 & 1.00/2.00 & 1.00/1.00" in tex
 
 
+def test_compare_table_iterates_dataloader_style_batch_mappings(tmp_path: Path) -> None:
+    compare = CompareTable(
+        root=tmp_path / "compare",
+        show_table=False,
+        show_progress=False,
+        cases={"case": {"w": jnp.array(0.0)}},
+        params_template={"w": jnp.array(0.0)},
+        dataloaders={
+            "validation": FiniteLoader(
+                [
+                    {
+                        "train": [{"x": jnp.array(1.0)}, {"x": jnp.array(2.0)}],
+                        "test": [{"x": jnp.array(10.0)}, {"x": jnp.array(20.0)}],
+                    }
+                ]
+            ),
+        },
+        metrics={"sum": mapped_batch_metric},
+        stats=["mean"],
+        col_format="{mean:.1f}",
+    )
+
+    assert compare.run() == 0
+
+    results = yaml.safe_load((tmp_path / "compare" / "compare_table.yml").read_text(encoding="utf-8"))
+    assert results["case"]["sum"]["validation"]["mean"] == pytest.approx(33.0)
+
+
 def test_compare_graph_loss_with_file_backed_dataloader(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    _write_graph_dataset(data_root, "toy", n_inputs=2, n_outputs=1)
+    _write_graph_dataset(data_root, "toy", n_inputs=4, n_outputs=1)
 
     graph = {"edges": {"toy": ToyLinearReconstructionEdge()}}
     compare = CompareTable(
@@ -141,10 +175,10 @@ def test_compare_graph_loss_with_file_backed_dataloader(tmp_path: Path) -> None:
         dataloaders={
             "validation": DataLoader(
                 root=data_root,
-                datasets={"toy": {"kind": "implicit", "batch_size": 1, "shuffle_seed": 0}},
+                datasets={"toy": {"kind": "implicit", "batch_size": 2, "max_epochs": 1, "shuffle_seed": 0}},
             ),
         },
-        metrics={"loss": GraphLoss(terms=[{"function": graph_single_squared_error, "batch_reduce": None}])},
+        metrics={"loss": GraphLoss(terms=[{"function": graph_single_squared_error}])},
         stats=["mean", "max"],
         col_format="{mean:.1f}/{max:.1f}",
     )
@@ -152,11 +186,11 @@ def test_compare_graph_loss_with_file_backed_dataloader(tmp_path: Path) -> None:
     assert compare.run() == 0
 
     results = yaml.safe_load((tmp_path / "compare" / "compare_table.yml").read_text(encoding="utf-8"))
-    assert results["zero"]["loss"]["validation"]["mean"] == pytest.approx(np.mean([1.0, 1.0, 121.0, 121.0]))
-    assert results["zero"]["loss"]["validation"]["max"] == pytest.approx(121.0)
-    assert results["one"]["loss"]["validation"]["mean"] == pytest.approx(np.mean([0.0, 0.0, 100.0, 100.0]))
-    assert results["one"]["loss"]["validation"]["max"] == pytest.approx(100.0)
+    assert results["zero"]["loss"]["validation"]["mean"] == pytest.approx(np.mean([221.0, 541.0]))
+    assert results["zero"]["loss"]["validation"]["max"] == pytest.approx(701.0)
+    assert results["one"]["loss"]["validation"]["mean"] == pytest.approx(np.mean([200.0, 500.0]))
+    assert results["one"]["loss"]["validation"]["max"] == pytest.approx(650.0)
 
     tex = (tmp_path / "compare" / "compare_table.tex").read_text(encoding="utf-8")
-    assert "zero & 61.0/121.0" in tex
-    assert "one & 50.0/100.0" in tex
+    assert "zero & 381.0/701.0" in tex
+    assert "one & 350.0/650.0" in tex

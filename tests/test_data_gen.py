@@ -12,12 +12,14 @@ from romjax.data_gen import (
     DataLoader,
     GenDataConfig,
     GenLatent,
+    GenNorm,
     GenSource,
     LoadImplicitModel,
     LoadSource,
 )
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
+from romjax.norm import NormTree
 from romjax.utils import load_h5, save_h5
 
 
@@ -788,6 +790,237 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
     reconstructed = compression.reconstruct(compression.compress(compression.template))
     assert reconstructed["poisson"]["outputs"]["phi"].shape == (2,)
     assert reconstructed["poisson"]["outputs"]["psi"].shape == (2,)
+
+
+def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> None:
+    _write_implicit_dataset(tmp_path, dataset_name="train/toy", sample_count=2, output_width=1)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={"train": {"toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1}}},
+    )
+    artifact_path = tmp_path / "train" / "compression" / "normalized_compression.npz"
+    generator = GenLatent(
+        loader=loader,
+        gather_paths=[("toy", "outputs", "y")],
+        norm=NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 2.0}}}),
+        compression=_DummyCompression(),
+        filename="normalized_compression.npz",
+    )
+
+    generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
+    compression = Compression.load(artifact_path)
+
+    assert jnp.allclose(compression.template["toy"]["outputs"]["y"], jnp.asarray([-0.5]))
+
+
+def test_generate_latent_uses_dataset_specific_norms(tmp_path: Path) -> None:
+    _write_implicit_dataset(tmp_path, dataset_name="train/toy", sample_count=1, output_width=1)
+    _write_implicit_dataset(tmp_path, dataset_name="train/alt", sample_count=1, output_width=1)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1},
+                "alt": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1},
+            }
+        },
+    )
+    generator = GenLatent(
+        loader=loader,
+        norm={
+            "toy": NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 1.0}}}),
+            "alt": NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 0.0, "std": 1.0}}}),
+        },
+        compression=_DummyCompression(),
+    )
+
+    samples = list(generator._iter_samples(progress=False))
+
+    assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
+    assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([0.0]))
+
+
+def test_generate_latent_reuses_single_norm_for_all_datasets(tmp_path: Path) -> None:
+    _write_implicit_dataset(tmp_path, dataset_name="train/toy", sample_count=1, output_width=1)
+    _write_implicit_dataset(tmp_path, dataset_name="train/alt", sample_count=1, output_width=1)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1},
+                "alt": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1},
+            }
+        },
+    )
+    generator = GenLatent(
+        loader=loader,
+        norm=NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 1.0}}}),
+        compression=_DummyCompression(),
+    )
+
+    samples = list(generator._iter_samples(progress=False))
+
+    assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
+    assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([-1.0]))
+
+
+def test_data_generation_config_keeps_normalized_genlatent_as_latent(tmp_path: Path) -> None:
+    _write_implicit_dataset(tmp_path, dataset_name="data/toy", sample_count=2, output_width=1)
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "artifacts": {
+                "compression": {
+                    "loader": {
+                        "root": tmp_path,
+                        "datasets": {
+                            "data": {
+                                "toy": {
+                                    "kind": "implicit",
+                                    "batch_size": 1,
+                                    "load_solution": False,
+                                    "max_epochs": 1,
+                                }
+                            }
+                        },
+                    },
+                    "gather_paths": [("toy", "outputs", "y")],
+                    "norm": {"toy": {"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 2.0}}}},
+                    "compression": _DummyCompression(),
+                    "filename": "normalized_compression.npz",
+                }
+            }
+        },
+        write_policy="overwrite",
+    )
+
+    assert isinstance(generation.datasets["artifacts"]["compression"], GenLatent)
+    generation.run()
+
+    expected_artifact = tmp_path / "artifacts" / "compression" / "normalized_compression.npz"
+    unexpected_artifact = tmp_path / "artifacts" / "compression" / "toy_normalized_compression.npz"
+    assert expected_artifact.exists()
+    assert not unexpected_artifact.exists()
+
+
+def test_generate_zscore_norm_artifact_from_loaded_data(tmp_path: Path) -> None:
+    _write_implicit_dataset(tmp_path, dataset_name="train/toy", sample_count=2, output_width=2)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={"train": {"toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1}}},
+    )
+    generator = GenNorm(
+        loader=loader,
+        norm={"toy": {"outputs": {"y": {"callable": "zscore"}}}},
+        filename="toy_norm.h5",
+    )
+
+    generator.generate(tmp_path / "train" / "norm", format="h5", write_policy="overwrite")
+
+    artifact = tmp_path / "train" / "norm" / "toy_toy_norm.h5"
+    norm = NormTree(root=str(artifact))
+    out = norm({"outputs": {"y": jnp.asarray([0.0, 1.0], dtype=jnp.float32)}})
+
+    assert artifact.exists()
+    assert jnp.allclose(out["outputs"]["y"], jnp.asarray([-1.4142135, 0.0]))
+
+
+def test_generate_minmax_norm_artifact_with_leaf_axes_and_opts(tmp_path: Path) -> None:
+    for sample_idx in range(2):
+        sample_dir = tmp_path / "source" / "seed_0" / f"sample_{sample_idx}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        values = np.asarray([[sample_idx, sample_idx + 10], [sample_idx + 1, sample_idx + 11]], dtype=np.float32)
+        save_h5({"state": {"x": values}}, sample_dir / "source.h5", mode="w")
+
+    loader = DataLoader(root=tmp_path, datasets={"source": {"kind": "source", "batch_size": 1, "max_epochs": 1}})
+    generator = GenNorm(
+        loader=loader,
+        norm={"source": {"state": {"x": {"callable": "minmax", "axes": -1, "ymin": -1.0, "ymax": 1.0}}}},
+        filename="source_norm.h5",
+    )
+
+    generator.generate(tmp_path / "norm", format="h5", write_policy="overwrite")
+
+    constants = load_h5({}, tmp_path / "norm" / "source_source_norm.h5", jax=False)
+    x_constants = constants["tree"]["state"]["x"]
+    norm = NormTree(root=str(tmp_path / "norm" / "source_source_norm.h5"))
+    out = norm({"state": {"x": jnp.asarray([[0.0, 10.0], [2.0, 12.0]])}})
+
+    assert x_constants["xmin"].shape == (2, 1)
+    assert x_constants["xmax"].shape == (2, 1)
+    assert jnp.allclose(out["state"]["x"], jnp.asarray([[-1.0, 0.8181819], [-0.8181818, 1.0]]))
+
+
+def test_generate_norm_outlier_filter_limits_minmax_range(tmp_path: Path) -> None:
+    values = [0.0, 1.0, 2.0, 1000.0]
+    for sample_idx, value in enumerate(values):
+        sample_dir = tmp_path / "source" / "seed_0" / f"sample_{sample_idx}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        save_h5({"state": {"x": np.asarray([value], dtype=np.float32)}}, sample_dir / "source.h5", mode="w")
+
+    loader = DataLoader(root=tmp_path, datasets={"source": {"kind": "source", "batch_size": 1, "max_epochs": 1}})
+    generator = GenNorm(
+        loader=loader,
+        norm={"source": {"state": {"x": {"callable": "minmax"}}}},
+        outlier_filter={"threshold": 2.0, "warmup_samples": 3},
+    )
+
+    generator.generate(tmp_path / "norm", format="h5", write_policy="overwrite")
+
+    constants = load_h5({}, tmp_path / "norm" / "source_norm.h5", jax=False)
+    assert np.allclose(constants["tree"]["state"]["x"]["xmax"], np.asarray([2.0]))
+
+
+def test_generate_norm_write_policy_reuse_and_error(tmp_path: Path) -> None:
+    _write_source_dataset(tmp_path, dataset_name="source", sample_count=2)
+    loader = DataLoader(root=tmp_path, datasets={"source": {"kind": "source", "batch_size": 1, "max_epochs": 1}})
+    generator = GenNorm(loader=loader, norm={"source": {"state": {"x": "zscore"}}})
+
+    generator.generate(tmp_path / "norm", format="h5", write_policy="overwrite")
+    artifact = tmp_path / "norm" / "source_norm.h5"
+    original_mtime = artifact.stat().st_mtime_ns
+    generator.generate(tmp_path / "norm", format="h5", write_policy="reuse")
+    assert artifact.stat().st_mtime_ns == original_mtime
+
+    with pytest.raises(Exception, match="policy='error'"):
+        generator.generate(tmp_path / "norm", format="h5", write_policy="error")
+
+
+def test_generate_norm_writes_one_artifact_per_dataset(tmp_path: Path) -> None:
+    _write_source_dataset(tmp_path, dataset_name="source", sample_count=2)
+    _write_implicit_dataset(tmp_path, dataset_name="toy", sample_count=2, output_width=1)
+    loader = DataLoader(
+        root=tmp_path,
+        datasets={
+            "source": {"kind": "source", "batch_size": 1, "max_epochs": 1},
+            "toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1},
+        },
+    )
+    generator = GenNorm(
+        loader=loader,
+        norm={
+            "source": {"state": {"x": "zscore"}},
+            "toy": {"outputs": {"y": "minmax"}},
+        },
+    )
+
+    generator.generate(tmp_path / "norm", format="h5", write_policy="overwrite")
+
+    source_artifact = tmp_path / "norm" / "source_norm.h5"
+    toy_artifact = tmp_path / "norm" / "toy_norm.h5"
+    source_norm = NormTree(root=str(source_artifact))
+    toy_norm = NormTree(root=str(toy_artifact))
+    source_tree = load_h5({}, source_artifact, jax=False)["tree"]
+    toy_tree = load_h5({}, toy_artifact, jax=False)["tree"]
+
+    assert source_artifact.exists()
+    assert toy_artifact.exists()
+    assert "source" not in source_tree
+    assert "toy" not in toy_tree
+    assert "state" in source_tree
+    assert "outputs" in toy_tree
+    assert "state" in source_norm.resolve_root()
+    assert "outputs" in toy_norm.resolve_root()
 
 
 def test_data_loader_supports_nested_dataset_pytree(tmp_path):
