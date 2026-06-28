@@ -9,7 +9,16 @@ import matplotlib
 import matplotlib.pyplot as plt
 from alive_progress import config_handler
 from loguru import logger
-from pydantic import BaseModel, BeforeValidator, ConfigDict, PrivateAttr, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    BaseModel, 
+    BeforeValidator, 
+    ConfigDict, 
+    Field,
+    PrivateAttr, 
+    TypeAdapter, 
+    field_validator, 
+    model_validator,
+)
 
 from romjax.plotting import GridplotConfig
 from romjax.typing import DictModel, WriteStream, from_yaml
@@ -115,6 +124,7 @@ class RoutineConfig(BaseModel):
     :ivar gridplot: gridplot style
     :ivar logger: loguru configuration
     :ivar progress_bar: alive_bar configuration
+    :ivar ignore: anything you want to write/reuse in yaml but don't want to exist on its own
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="forbid")
@@ -124,6 +134,7 @@ class RoutineConfig(BaseModel):
     gridplot: GridplotConfig | None = None
     logger: LoggerConfig | None = None
     progress_bar: ProgressBarConfig | None = None
+    ignore: Any | None = Field(exclude=True, default=None)
 
     @model_validator(mode="after")
     def configure(self):

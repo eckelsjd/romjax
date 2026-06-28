@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from contextvars import ContextVar
+from inspect import Parameter, signature
 from typing import Annotated, Any, Hashable, Literal, Sequence
 
 import jax
@@ -7,6 +9,7 @@ import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from romjax.norm import EdgeNormConfig, NormTree
 from romjax.tree import TreeErrorOperator, TreePath, coerce_tree_paths, get_tree_operator, pytree_merge, pytree_union
 from romjax.typing import ListModel
 
@@ -15,6 +18,12 @@ type EdgePyTree = Mapping[Edge, PyTree]               # Maps edge names to more 
 
 
 __all__ = ['FunctionGraph', 'Node', 'Edge', 'CompositeEdge']
+
+
+_EDGE_NORM_CONTEXT: ContextVar[tuple[tuple[int, str], ...]] = ContextVar(
+    "romjax_edge_norm_context",
+    default=(),
+)
     
 
 class Node(BaseModel, Hashable):
@@ -81,6 +90,68 @@ class Edge(BaseModel, Hashable, ABC):
     source: Node
     target: Node
     name: str = ""
+    norm: EdgeNormConfig = Field(default_factory=EdgeNormConfig)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for direction in ("forward", "backward"):
+            cls._wrap_norm_map(direction)
+            cls._wrap_norm_aux_map(direction)
+
+    @classmethod
+    def _wrap_norm_map(cls, direction: Literal["forward", "backward"]) -> None:
+        method = getattr(cls, direction, None)
+        if method is None:
+            return
+        raw_method = getattr(method, "_romjax_norm_raw", method)
+
+        def wrapped(self: "Edge", x: PyTree) -> PyTree:
+            if self._norm_context_active(direction):
+                return raw_method(self, x)
+            x_norm = self._apply_norm_stage(direction, "pre", x, aux=None)
+            token = self._enter_norm_context(direction)
+            try:
+                y = raw_method(self, x_norm)
+            finally:
+                _EDGE_NORM_CONTEXT.reset(token)
+            return self._apply_norm_stage(direction, "post", y, aux=None)
+
+        wrapped.__name__ = getattr(method, "__name__", direction)
+        wrapped.__qualname__ = getattr(method, "__qualname__", wrapped.__qualname__)
+        wrapped.__doc__ = getattr(method, "__doc__", None)
+        wrapped.__isabstractmethod__ = getattr(method, "__isabstractmethod__", False)
+        wrapped._romjax_norm_wrapped = True
+        wrapped._romjax_norm_raw = raw_method
+        setattr(cls, direction, wrapped)
+
+    @classmethod
+    def _wrap_norm_aux_map(cls, direction: Literal["forward", "backward"]) -> None:
+        method_name = f"{direction}_aux"
+        method = getattr(cls, method_name, None)
+        if method is None:
+            return
+        raw_method = getattr(method, "_romjax_norm_raw", method)
+
+        def wrapped(self: "Edge", x: PyTree, aux: PyTree | None = None, *args: Any, **kwargs: Any):
+            if self._norm_context_active(direction):
+                return raw_method(self, x, aux, *args, **kwargs)
+            norm_aux, edge_aux = self._split_norm_aux(aux)
+            x_norm = self._apply_norm_stage(direction, "pre", x, aux=self._stage_norm_aux(norm_aux, direction, "pre"))
+            token = self._enter_norm_context(direction)
+            try:
+                y, aux_out = raw_method(self, x_norm, edge_aux, *args, **kwargs)
+            finally:
+                _EDGE_NORM_CONTEXT.reset(token)
+            y_norm = self._apply_norm_stage(direction, "post", y, aux=self._stage_norm_aux(norm_aux, direction, "post"))
+            return y_norm, aux_out
+
+        wrapped.__name__ = getattr(method, "__name__", method_name)
+        wrapped.__qualname__ = getattr(method, "__qualname__", wrapped.__qualname__)
+        wrapped.__doc__ = getattr(method, "__doc__", None)
+        wrapped.__isabstractmethod__ = getattr(method, "__isabstractmethod__", False)
+        wrapped._romjax_norm_wrapped = True
+        wrapped._romjax_norm_raw = raw_method
+        setattr(cls, method_name, wrapped)
 
     @model_validator(mode="before")
     @classmethod
@@ -98,6 +169,119 @@ class Edge(BaseModel, Hashable, ABC):
         if self.name == "" or self.name is None:
             self.name = f"{self.source}->{self.target}"
         return self
+
+    def _norm_context_active(self, direction: Literal["forward", "backward"]) -> bool:
+        """Return whether this edge direction is already inside a normalization wrapper."""
+        return (id(self), direction) in _EDGE_NORM_CONTEXT.get()
+
+    def _enter_norm_context(self, direction: Literal["forward", "backward"]):
+        """Mark an edge direction as active while the raw implementation runs."""
+        current = _EDGE_NORM_CONTEXT.get()
+        return _EDGE_NORM_CONTEXT.set(current + ((id(self), direction),))
+
+    @staticmethod
+    def _split_norm_aux(aux: PyTree | None) -> tuple[PyTree | None, PyTree | None]:
+        """Split reserved normalization aux overrides from edge-specific auxiliary state."""
+        if not isinstance(aux, Mapping) or "norm" not in aux:
+            return None, aux
+        edge_aux = dict(aux)
+        norm_aux = edge_aux.pop("norm")
+        if len(edge_aux) == 0:
+            return norm_aux, None
+        return norm_aux, edge_aux
+
+    @staticmethod
+    def _stage_norm_aux(
+        norm_aux: PyTree | None,
+        direction: Literal["forward", "backward"],
+        stage: Literal["pre", "post"],
+    ) -> PyTree | None:
+        """Return runtime normalization overrides for one direction/stage."""
+        if not isinstance(norm_aux, Mapping):
+            return None
+        direction_aux = norm_aux.get(direction)
+        if isinstance(direction_aux, Mapping):
+            return direction_aux.get(stage)
+        return None
+
+    def _apply_norm_stage(
+        self,
+        direction: Literal["forward", "backward"],
+        stage: Literal["pre", "post"],
+        x: PyTree,
+        aux: PyTree | None = None,
+    ) -> PyTree:
+        """Apply one configured normalization stage."""
+        hook = getattr(self, f"_{direction}_{stage}_norm")
+        try:
+            hook_signature = signature(hook)
+        except (TypeError, ValueError):
+            return hook(x, aux=aux)
+
+        aux_param = hook_signature.parameters.get("aux")
+        accepts_aux = aux_param is not None and aux_param.kind in {
+            Parameter.POSITIONAL_OR_KEYWORD,
+            Parameter.KEYWORD_ONLY,
+        }
+        if accepts_aux:
+            return hook(x, aux=aux)
+        return hook(x)
+
+    def resolve_norms(self) -> None:
+        """
+        Resolve and cache any artifact-backed normalization trees configured on this edge.
+
+        Call this before entering ``jax.jit``/``jax.grad`` regions when a norm stage references an HDF5 artifact.
+        Runtime edge evaluation also resolves lazily if this method was not called explicitly.
+        """
+        for direction in (self.norm.forward, self.norm.backward):
+            for norm in (direction.pre, direction.post):
+                if isinstance(norm, NormTree):
+                    norm.resolve_root()
+
+    def _forward_pre_norm(self, x: PyTree, aux: PyTree | None = None) -> PyTree:
+        """
+        Apply configured forward pre-normalization.
+
+        :param x: edge input payload
+        :param aux: optional runtime norm-constant overrides
+        :return: normalized payload
+        """
+        norm = self.norm.forward.pre
+        return x if norm is None else norm(x, aux=aux)
+
+    def _forward_post_norm(self, x: PyTree, aux: PyTree | None = None) -> PyTree:
+        """
+        Apply configured forward post-normalization.
+
+        :param x: edge output payload
+        :param aux: optional runtime norm-constant overrides
+        :return: normalized payload
+        """
+        norm = self.norm.forward.post
+        return x if norm is None else norm(x, aux=aux)
+
+    def _backward_pre_norm(self, x: PyTree, aux: PyTree | None = None) -> PyTree:
+        """
+        Apply configured backward pre-normalization.
+
+        :param x: edge input payload
+        :param aux: optional runtime norm-constant overrides
+        :return: normalized payload
+        """
+        norm = self.norm.backward.pre
+        return x if norm is None else norm(x, aux=aux)
+
+    def _backward_post_norm(self, x: PyTree, aux: PyTree | None = None) -> PyTree:
+        """
+        Apply configured backward post-normalization.
+
+        :param x: edge output payload
+        :param aux: optional runtime norm-constant overrides
+        :return: normalized payload
+        """
+        norm = self.norm.backward.post
+        return x if norm is None else norm(x, aux=aux)
 
     def __hash__(self):
         return hash(self.name)
@@ -548,6 +732,16 @@ class FunctionGraph(BaseModel):
             edge_payload_patches=edge_payload_patches,
             return_aux=return_aux,
         )
+
+    def resolve_norms(self) -> None:
+        """
+        Resolve and cache artifact-backed normalization trees for all graph edges.
+
+        This is useful before tracing graph computations with ``jax.jit`` or ``jax.grad`` so file IO does not happen
+        during tracing.
+        """
+        for edge in self.edges.values():
+            edge.resolve_norms()
 
     def path_error(
         self,

@@ -618,6 +618,9 @@ class Train(Routine):
         # If init params implements a 'sample' function, then initialize the parameter pytree.
         # Pass graph object to loss, test, and dataloader if requested
         if self.graph is not None:
+            
+            self.graph.resolve_norms()
+
             for attr in ["loss", "test", "dataloader"]:
                 if hasattr(ele := getattr(self, attr), "graph"):
                     if ele.graph is None:

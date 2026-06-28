@@ -20,11 +20,11 @@ from pydantic import (
     model_validator,
 )
 
-from romjax.data_gen import DataLoader
+from romjax.data_gen import LoadDataConfig, DataLoader
 from romjax.graph import FunctionGraph
 from romjax.routine import Routine
 from romjax.train import GraphLoss
-from romjax.tree import UnaryOperator, get_unary_operator
+from romjax.tree import UnaryOperator, get_unary_operator, pytree_path_iter
 from romjax.typing import from_yaml, resolve_graph_refs
 from romjax.utils import _NullProgress
 
@@ -96,6 +96,7 @@ class CompareOrbax(Routine):
             self.params_template[case] = from_yaml(self.params_template[case])  # validate from yaml (optional)
 
         if self.graph is not None:
+            self.graph.resolve_norms()
             for case in self.cases:
                 self.params_template[case] = resolve_graph_refs(self.params_template[case], self.graph)
         
@@ -175,6 +176,12 @@ class CompareTable(CompareOrbax):
             else:
                 self.metrics[name] = eqx.filter_jit(metric_fn)
         
+        # Enforce max_epochs=1
+        for _, dl in self.dataloaders.items():
+            if isinstance(dl, DataLoader):
+                for _, ds_cfg in pytree_path_iter(dl.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+                    ds_cfg.max_epochs = 1
+
         return self
 
     def _format_table(self, data: Mapping) -> list[list[str]]:
@@ -200,30 +207,6 @@ class CompareTable(CompareOrbax):
     def _table_columns(self) -> list[tuple[str, str]]:
         """Return metric/dataset column labels in table order."""
         return [(metric_name, ds_name) for metric_name in self.metrics for ds_name in self.dataloaders]
-
-    @staticmethod
-    def _iter_sample_payloads(batch: Any) -> Iterator[Any]:
-        """Yield sample-level payloads from a loader batch when possible.
-
-        ``DataLoader`` yields per-dataset batches, but file-backed datasets commonly return a list of individual
-        sample pytrees. In that case, CompareTable should score each sample independently rather than handing the
-        whole list to a metric that expects a single sample.
-        """
-        if isinstance(batch, Mapping) and batch:
-            values = list(batch.values())
-            if all(isinstance(value, (list, tuple)) for value in values):
-                lengths = {len(value) for value in values}
-                if len(lengths) == 1:
-                    batch_size = lengths.pop()
-                    for index in range(batch_size):
-                        yield {key: value[index] for key, value in batch.items()}
-                    return
-
-        if isinstance(batch, (list, tuple)):
-            yield from batch
-            return
-
-        yield batch
 
     def print_table(self, data: Mapping):
         """Print a fixed-width comparison table to stdout."""
@@ -290,12 +273,6 @@ class CompareTable(CompareOrbax):
         path.write_text(text, encoding="utf-8")
 
     def run(self):
-        def _iter_loader_once(loader: Iterable[Any]) -> Iterator[Any]:
-            """Iterate a loader once, using one epoch for file-backed ``DataLoader`` instances."""
-            if isinstance(loader, DataLoader):
-                return loader._iter_datasets(max_epochs=1)
-            return iter(loader)
-        
         if self.root is not None:
             self.root = Path(self.root)
             self.root.mkdir(exist_ok=True, parents=True)
@@ -331,12 +308,9 @@ class CompareTable(CompareOrbax):
                                             f"and write_policy='error'")
                         if has_stats and self.write_policy == "reuse":
                             continue
+                        
+                        values = [metric_fn(params, data) for data in loader]
 
-                        values = [
-                            metric_fn(params, single_data)
-                            for batch in _iter_loader_once(loader)
-                            for single_data in self._iter_sample_payloads(batch)
-                        ]
                         if not values:
                             raise ValueError(f"No data loaded for dataset '{ds_name}'")
                         results = jnp.asarray(values)

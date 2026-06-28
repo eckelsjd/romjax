@@ -32,6 +32,7 @@ Use YAML-friendly configuration for public, file-loaded objects. Prefer `romjax.
 * Prefer `import jax.numpy as jnp`.
 * Avoid Python side effects, mutation inside jitted functions, and non-JAX-compatible libraries in differentiable code.
 * Run targeted unit tests with `uv run pytest ...` for specific small file changes. Run all tests with `uv run rr test` only for significant repo changes. Read the failures and fix them before continuing.
+* Prefer an object-oriented approach and keep private helper methods consolidated within the classes that use them. Only move private methods outside of classes when they are reused and common to multiple classes.
 
 ## Project structure
 
@@ -78,6 +79,7 @@ Success means both lint and test pass without issues. You usually do not need to
 ### Do
 - Preserve existing architecture
 - Prefer small, composable functions
+- Prefer pydantic validation once and for all upon object init rather than at runtime when methods are called
 - Follow the software design philosophy and contribution guidelines in this document
 - Write code that is similar in spirit and style to existing code in the repo
 - Provide clean documentation and type-hints on all public APIs
@@ -97,3 +99,5 @@ Success means both lint and test pass without issues. You usually do not need to
 - Break existing tests or APIs without fixing them
 - Break `jax` compatibility
 - Show large code diffs in prompt outputs or CLI responses
+- Create an excessive number of standalone private functions if they are only used once
+- Run the full test suite unless it is absolutely necessary. Prefer small focused tests.

@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import inspect
 import json
+import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
 
 import equinox as eqx
+import h5py
 import jax
 import numpy as np
 from alive_progress import alive_bar
@@ -27,6 +29,7 @@ from pydantic import (
 
 from romjax.compression import SVD, Compression
 from romjax.graph import Edge, FunctionGraph
+from romjax.norm import NormOperator, NormTree
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
@@ -38,7 +41,7 @@ from romjax.tree import (
     pytree_stack,
     set_subtree,
 )
-from romjax.typing import from_yaml
+from romjax.typing import CallableModel, from_yaml
 from romjax.utils import _NullProgress, load_h5, required_fields, save_h5
 
 __all__ = [
@@ -1033,6 +1036,520 @@ class LoadSource(LoadDataConfig[Path]):
         return load_h5({}, ref / "source.h5", jax=False)
 
 
+type NormAxes = int | Sequence[int] | None
+
+
+class NormOutlierFilter(BaseModel):
+    """
+    Streaming outlier filter for normalization-stat accumulation.
+
+    :param method: filtering method
+    :param threshold: number of standard deviations used by sigma clipping
+    :param warmup_samples: number of initial samples used before filtering begins
+    """
+
+    method: Literal["sigma"] = "sigma"
+    threshold: float = 5.0
+    warmup_samples: NonNegativeInt = 32
+
+
+class GenNormLeaf(BaseModel):
+    """
+    Generation-time normalization config for one pytree leaf.
+
+    Extra fields are preserved as runtime normalization options in the saved artifact.
+
+    :param callable: runtime normalization callable or registered name
+    :param axes: axes to reduce over within each single-sample leaf
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    callable: str | Callable[..., Any] = "zscore"
+    axes: NormAxes = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_spec(cls, value: Any) -> Any:
+        if isinstance(value, GenNormLeaf):
+            return value
+        if isinstance(value, str) or callable(value):
+            return {"callable": value}
+        return value
+
+    @property
+    def opts(self) -> dict[str, Any]:
+        """Return static runtime normalization options."""
+        return dict(self.model_extra or {})
+
+    @property
+    def callable_name(self) -> str:
+        """Return an importable or registered callable name for artifact persistence."""
+        if isinstance(self.callable, str):
+            return self.callable
+        return f"{self.callable.__module__}.{self.callable.__qualname__}"
+
+
+def _is_gennorm_leaf_spec(value: Any) -> bool:
+    return isinstance(value, GenNormLeaf) or isinstance(value, str) or callable(value) or (
+        isinstance(value, Mapping) and "callable" in value
+    )
+
+
+def _validate_gennorm_spec(value: Any) -> Any:
+    if isinstance(value, GenNormTree):
+        return value.root
+    if _is_gennorm_leaf_spec(value):
+        return GenNormLeaf.model_validate(value)
+    if isinstance(value, Mapping):
+        return {key: _validate_gennorm_spec(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_validate_gennorm_spec(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_validate_gennorm_spec(item) for item in value)
+    return value
+
+
+class GenNormTree(BaseModel):
+    """
+    Pytree of generation-time normalization leaf configs.
+
+    :param root: one broadcast leaf config or a pytree of per-leaf configs
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    root: Any
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_spec(cls, value: Any) -> Any:
+        if isinstance(value, GenNormTree):
+            return {"root": value.root}
+        if isinstance(value, Mapping) and set(value.keys()) == {"root"}:
+            return value
+        return {"root": value}
+
+    @model_validator(mode="after")
+    def _validate_root(self) -> "GenNormTree":
+        self.root = _validate_gennorm_spec(self.root)
+        return self
+
+
+class NormStatsCallable(CallableModel):
+    """
+    Custom streaming normalization-stat callable.
+
+    The configured callable should provide ``init(sample_leaf, axes, **opts)``,
+    ``update(state, sample_leaf)``, and ``finalize(state)`` methods.
+    """
+
+    callable: Callable[..., Any]
+
+    def init(self, sample_leaf: Any, axes: tuple[int, ...], **opts: Any) -> Any:
+        return self.callable.init(sample_leaf, axes=axes, **opts)
+
+    def update(self, state: Any, sample_leaf: Any) -> Any:
+        return self.callable.update(state, sample_leaf)
+
+    def finalize(self, state: Any) -> dict[str, Any]:
+        return self.callable.finalize(state)
+
+
+def _normalize_norm_axes(axes: NormAxes, ndim: int) -> tuple[int, ...]:
+    """Normalize reduction axes against a leaf rank."""
+    if axes is None:
+        return tuple(range(ndim))
+    axes_tuple = (axes,) if isinstance(axes, int) else tuple(axes)
+    normalized: list[int] = []
+    for axis in axes_tuple:
+        axis_int = int(axis)
+        if axis_int < 0:
+            axis_int += ndim
+        if axis_int < 0 or axis_int >= ndim:
+            raise ValueError(f"Normalization axis {axis!r} is out of range for leaf rank {ndim}.")
+        if axis_int in normalized:
+            raise ValueError(f"Duplicate normalization axis {axis!r}.")
+        normalized.append(axis_int)
+    return tuple(normalized)
+
+
+def _finite_group_stats(arr: np.ndarray, axes: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return finite count, mean, and M2 over axes with keepdims."""
+    arr = np.asarray(arr, dtype=np.float64)
+    finite = np.isfinite(arr)
+    count = np.sum(finite, axis=axes, keepdims=True, dtype=np.float64) if axes else finite.astype(np.float64)
+    total = np.sum(np.where(finite, arr, 0.0), axis=axes, keepdims=True) if axes else np.where(finite, arr, 0.0)
+    mean = np.divide(total, count, out=np.zeros_like(total, dtype=np.float64), where=count > 0)
+    delta = np.where(finite, arr - mean, 0.0)
+    m2 = np.sum(np.square(delta), axis=axes, keepdims=True) if axes else np.square(delta)
+    return count, mean, m2
+
+
+def _combine_moments(
+    count_a: np.ndarray,
+    mean_a: np.ndarray,
+    m2_a: np.ndarray,
+    count_b: np.ndarray,
+    mean_b: np.ndarray,
+    m2_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Combine two sets of streaming moments (Welford/Chan algorithm)."""
+    total = count_a + count_b
+    delta = mean_b - mean_a
+    mean = np.divide(
+        mean_a * count_a + mean_b * count_b,
+        total,
+        out=np.zeros_like(mean_a, dtype=np.float64),
+        where=total > 0,
+    )
+    correction = np.divide(
+        np.square(delta) * count_a * count_b,
+        total,
+        out=np.zeros_like(m2_a, dtype=np.float64),
+        where=total > 0,
+    )
+    return total, mean, m2_a + m2_b + correction
+
+
+class _BuiltinNormAccumulator:
+    """Streaming per-leaf accumulator for built-in norm constants."""
+
+    def __init__(self, leaf: GenNormLeaf, sample_leaf: Any, outlier_filter: NormOutlierFilter | None):
+        self.leaf = leaf
+        self.callable_name = leaf.callable_name
+        self.input_shape = tuple(np.asarray(sample_leaf).shape)
+        self.axes = _normalize_norm_axes(leaf.axes, len(self.input_shape))
+        self.outlier_filter = outlier_filter
+        self.samples_seen = 0
+        self.count: np.ndarray | None = None
+        self.mean: np.ndarray | None = None
+        self.m2: np.ndarray | None = None
+        self.xmin: np.ndarray | None = None
+        self.xmax: np.ndarray | None = None
+        self.update(sample_leaf)
+
+    def _check_shape(self, sample_leaf: Any) -> np.ndarray:
+        arr = np.asarray(sample_leaf, dtype=np.float64)
+        if tuple(arr.shape) != self.input_shape:
+            raise ValueError(
+                f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}."
+            )
+        return arr
+
+    def _filter_array(self, arr: np.ndarray) -> np.ndarray:
+        if (
+            self.outlier_filter is None
+            or self.samples_seen < self.outlier_filter.warmup_samples
+            or self.mean is None
+            or self.m2 is None
+            or self.count is None
+        ):
+            return arr
+
+        std = np.sqrt(np.divide(self.m2, self.count, out=np.zeros_like(self.m2), where=self.count > 0))
+        lower = self.mean - self.outlier_filter.threshold * std
+        upper = self.mean + self.outlier_filter.threshold * std
+        return np.where((arr >= lower) & (arr <= upper), arr, np.nan)
+
+    def _update_moments(self, arr: np.ndarray) -> None:
+        count_b, mean_b, m2_b = _finite_group_stats(arr, self.axes)
+        if self.count is None or self.mean is None or self.m2 is None:
+            self.count, self.mean, self.m2 = count_b, mean_b, m2_b
+            return
+        self.count, self.mean, self.m2 = _combine_moments(self.count, self.mean, self.m2, count_b, mean_b, m2_b)
+
+    def _update_minmax(self, arr: np.ndarray) -> None:
+        if len(self.axes) == 0:
+            xmin_b = arr
+            xmax_b = arr
+        else:
+            if not np.isfinite(arr).any():
+                return
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                xmin_b = np.nanmin(arr, axis=self.axes, keepdims=True)
+                xmax_b = np.nanmax(arr, axis=self.axes, keepdims=True)
+        if self.xmin is None or self.xmax is None:
+            self.xmin, self.xmax = xmin_b, xmax_b
+            return
+        self.xmin = np.fmin(self.xmin, xmin_b)
+        self.xmax = np.fmax(self.xmax, xmax_b)
+
+    def update(self, sample_leaf: Any) -> None:
+        """Update the accumulator with one sample leaf."""
+        raw = self._check_shape(sample_leaf)
+        filtered = self._filter_array(raw)
+        if self.callable_name == "zscore":
+            self._update_moments(filtered)
+        elif self.callable_name == "minmax":
+            self._update_minmax(filtered)
+            self._update_moments(raw)
+        else:
+            raise ValueError(f"Built-in GenNorm does not know how to compute constants for {self.callable_name!r}.")
+        self.samples_seen += 1
+
+    def finalize(self) -> dict[str, Any]:
+        """Return runtime norm config for the accumulated leaf."""
+        payload: dict[str, Any] = {
+            "callable": self.callable_name,
+            "axes": self.axes,
+            "input_shape": self.input_shape,
+            **self.leaf.opts,
+        }
+        if self.callable_name == "zscore":
+            assert self.count is not None and self.mean is not None and self.m2 is not None
+            variance = np.divide(self.m2, self.count, out=np.zeros_like(self.m2), where=self.count > 0)
+            payload.update({"mean": self.mean, "std": np.sqrt(variance)})
+        elif self.callable_name == "minmax":
+            assert self.xmin is not None and self.xmax is not None
+            payload.update({"xmin": self.xmin, "xmax": self.xmax})
+        return payload
+
+
+class _CustomNormAccumulator:
+    """Adapter for custom streaming normalization-stat callables."""
+
+    def __init__(self, leaf: GenNormLeaf, sample_leaf: Any):
+        if not callable(leaf.callable):
+            raise TypeError("Custom GenNorm stats require a callable object.")
+        stats = NormStatsCallable(callable=leaf.callable)
+        input_shape = tuple(np.asarray(sample_leaf).shape)
+        axes = _normalize_norm_axes(leaf.axes, len(input_shape))
+        self.leaf = leaf
+        self.stats = stats
+        self.input_shape = input_shape
+        self.axes = axes
+        self.state = stats.init(sample_leaf, axes=axes, **leaf.opts)
+
+    def update(self, sample_leaf: Any) -> None:
+        arr = np.asarray(sample_leaf)
+        if tuple(arr.shape) != self.input_shape:
+            raise ValueError(
+                f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}."
+            )
+        self.state = self.stats.update(self.state, sample_leaf)
+
+    def finalize(self) -> dict[str, Any]:
+        payload = {
+            "callable": self.leaf.callable_name,
+            "axes": self.axes,
+            "input_shape": self.input_shape,
+            **self.leaf.opts,
+        }
+        payload.update(self.stats.finalize(self.state))
+        return payload
+
+
+def _make_norm_accumulator(
+    leaf: GenNormLeaf,
+    sample_leaf: Any,
+    outlier_filter: NormOutlierFilter | None,
+) -> _BuiltinNormAccumulator | _CustomNormAccumulator:
+    if isinstance(leaf.callable, str):
+        if leaf.callable not in {"zscore", "minmax"}:
+            NormOperator(callable=leaf.callable, **leaf.opts)
+            raise ValueError(f"GenNorm cannot infer constants for registered norm {leaf.callable!r}.")
+        return _BuiltinNormAccumulator(leaf, sample_leaf, outlier_filter)
+    return _CustomNormAccumulator(leaf, sample_leaf)
+
+
+def _iter_gennorm_configured_leaves(
+    spec: Any,
+    sample: PyTree,
+    path: TreePath = (),
+) -> Generator[tuple[TreePath, GenNormLeaf, Any], None, None]:
+    """Yield configured sample leaves from a GenNorm tree."""
+    if isinstance(spec, GenNormLeaf):
+        for leaf_path, sample_leaf in pytree_path_iter(sample, is_leaf=lambda leaf: eqx.is_array_like(leaf)):
+            if eqx.is_array_like(sample_leaf):
+                yield path + leaf_path, spec, sample_leaf
+        return
+    if isinstance(spec, Mapping):
+        if not isinstance(sample, Mapping):
+            raise TypeError(f"GenNorm spec at {path!r} expects a mapping sample.")
+        for key, child_spec in spec.items():
+            if key not in sample:
+                raise KeyError(f"GenNorm sample is missing configured path {path + (key,)!r}.")
+            yield from _iter_gennorm_configured_leaves(child_spec, sample[key], path + (key,))
+        return
+    if isinstance(spec, list | tuple):
+        if not isinstance(sample, Sequence) or isinstance(sample, str | bytes):
+            raise TypeError(f"GenNorm spec at {path!r} expects a sequence sample.")
+        for index, child_spec in enumerate(spec):
+            if index >= len(sample):
+                raise IndexError(f"GenNorm sample is missing configured index {path + (index,)!r}.")
+            yield from _iter_gennorm_configured_leaves(child_spec, sample[index], path + (index,))
+
+
+def _set_nested_mapping(tree: dict[str, Any], path: TreePath, value: Any) -> None:
+    """Set a nested dictionary path."""
+    cursor = tree
+    for token in path[:-1]:
+        cursor = cursor.setdefault(str(token), {})
+    cursor[str(path[-1])] = value
+
+
+def _write_norm_value(group: h5py.Group, key: str, value: Any) -> None:
+    """Persist one normalization option as an HDF5 attribute or dataset."""
+    if isinstance(value, tuple | list):
+        group.attrs[key] = json.dumps(list(value), separators=(",", ":"))
+        return
+    if isinstance(value, str | int | float | bool) or value is None:
+        group.attrs[key] = "null" if value is None else value
+        return
+    group.create_dataset(key, data=np.asarray(value))
+
+
+def _write_norm_tree_group(group: h5py.Group, tree: Any) -> None:
+    """Write a finalized norm tree to an HDF5 group."""
+    if isinstance(tree, Mapping) and "callable" in tree:
+        group.attrs["callable"] = tree["callable"]
+        for key, value in tree.items():
+            if key == "callable":
+                continue
+            _write_norm_value(group, key, value)
+        return
+    if isinstance(tree, Mapping):
+        for key, value in tree.items():
+            _write_norm_tree_group(group.create_group(str(key), track_order=True), value)
+        return
+    raise TypeError("Finalized GenNorm tree must contain mapping containers and leaf norm configs.")
+
+
+class GenNorm(GenDataConfig):
+    """Compute and save normalization constants from loaded datasets."""
+
+    loader: DataLoader
+    filename: str | Path = "norm.h5"
+    norm: GenNormTree
+    outlier_filter: NormOutlierFilter | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_loader(cls, value: Any) -> Any:
+        if isinstance(value, str | Path | DataLoader):
+            return {"loader": value}
+        return value
+
+    @model_validator(mode="after")
+    def _set_max_epochs(self) -> "GenNorm":
+        """Only load data once."""
+        for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
+            ds_cfg.max_epochs = 1
+        return self
+
+    @staticmethod
+    def _iter_loaded_samples(loaded: PyTree) -> Generator[PyTree, None, None]:
+        """Yield individual samples from either a stacked pytree or a plain sample list."""
+        if isinstance(loaded, (list, tuple)):
+            yield from loaded
+            return
+        yield from pytree_iter(loaded)
+
+    def _iter_samples(self, progress: bool = True) -> Generator[tuple[str, PyTree], None, None]:
+        ctxt = (
+            alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN)
+            if progress
+            else _NullProgress()
+        )
+
+        with ctxt as bar:
+            bar.text("Loading normalization samples...")
+            for batch in self.loader:
+                for dataset_name, loaded in batch.items():
+                    for sample in self._iter_loaded_samples(loaded):
+                        yield dataset_name, sample
+                bar()
+
+    def _finalize_tree(self, accumulators: Mapping[TreePath, Any]) -> dict[str, Any]:
+        tree: dict[str, Any] = {}
+        for path, accumulator in accumulators.items():
+            _set_nested_mapping(tree, path, accumulator.finalize())
+        return tree
+
+    def _dataset_norm_spec(self, dataset_name: str) -> Any:
+        """Return the sample-relative norm spec for one loaded dataset."""
+        root = self.norm.root
+        if isinstance(root, Mapping) and dataset_name in root:
+            return root[dataset_name]
+        return root
+
+    def _artifact_path(self, root: Path, dataset_name: str) -> Path:
+        """Return the dataset-specific norm artifact path."""
+        filename = Path(self.filename)
+        suffix = filename.suffix or ".h5"
+        return root / f"{dataset_name}_{filename.stem}{suffix}"
+
+    def generate(self, path, format=None, write_policy=None):
+        """Compute normalization constants from loaded data and emit one HDF5 norm artifact per dataset."""
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
+        if format != "h5":
+            raise RoutineError(f"Save format '{format}' not recognized.")
+
+        root_path = Path(path)
+        dataset_names = [
+            dataset_path[-1]
+            for dataset_path, _ in pytree_path_iter(
+                self.loader.datasets,
+                is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig),
+            )
+        ]
+        artifact_paths = {
+            dataset_name: self._artifact_path(root_path, str(dataset_name))
+            for dataset_name in dataset_names
+        }
+        existing_paths = [artifact_path for artifact_path in artifact_paths.values() if artifact_path.exists()]
+        if write_policy == "error" and existing_paths:
+            raise RoutineError(
+                f"Normalization artifact already exists at {existing_paths[0]} and policy='error'"
+            )
+        if write_policy == "reuse" and existing_paths and len(existing_paths) == len(artifact_paths):
+            return
+
+        accumulators: dict[str, dict[TreePath, _BuiltinNormAccumulator | _CustomNormAccumulator]] = {}
+        sample_counts: dict[str, int] = {}
+        for dataset_name, sample in self._iter_samples():
+            artifact_path = self._artifact_path(root_path, dataset_name)
+            if write_policy == "reuse" and artifact_path.exists():
+                continue
+
+            sample_counts[dataset_name] = sample_counts.get(dataset_name, 0) + 1
+            dataset_accumulators = accumulators.setdefault(dataset_name, {})
+            norm_spec = self._dataset_norm_spec(dataset_name)
+            for leaf_path, leaf_spec, sample_leaf in _iter_gennorm_configured_leaves(norm_spec, sample):
+                if leaf_path not in dataset_accumulators:
+                    dataset_accumulators[leaf_path] = _make_norm_accumulator(
+                        leaf_spec,
+                        sample_leaf,
+                        self.outlier_filter,
+                    )
+                else:
+                    dataset_accumulators[leaf_path].update(sample_leaf)
+
+        if not accumulators:
+            raise ValueError("GenNorm did not find any configured array leaves to normalize.")
+
+        root_path.mkdir(parents=True, exist_ok=True)
+        for dataset_name, dataset_accumulators in accumulators.items():
+            artifact_path = self._artifact_path(root_path, dataset_name)
+            finalized = self._finalize_tree(dataset_accumulators)
+            with h5py.File(artifact_path, "w", track_order=True) as h5:
+                h5.attrs["romjax_type"] = "norm_tree"
+                h5.attrs["version"] = 1
+                h5.attrs["dataset"] = dataset_name
+                _write_norm_tree_group(h5.create_group("tree", track_order=True), finalized)
+
+            manifest = {
+                "dataset": dataset_name,
+                "sample_count": sample_counts.get(dataset_name, 0),
+                "leaf_count": len(dataset_accumulators),
+                "leaf_paths": [list(path) for path in dataset_accumulators],
+                "outlier_filter": None if self.outlier_filter is None else self.outlier_filter.model_dump(),
+            }
+            artifact_path.with_suffix(".manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
+
+
 class GenLatent(GenDataConfig):
     """Fit a latent-space compressor and emit the compression artifact."""
 
@@ -1040,6 +1557,7 @@ class GenLatent(GenDataConfig):
     filename: str | Path = "compression.npz"
     gather_paths: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
     gather_template: Any | None = None
+    norm: Any | None = None
     compression: Compression = Field(default_factory=lambda: SVD(energy_tol=0.999))
 
     @staticmethod
@@ -1063,6 +1581,12 @@ class GenLatent(GenDataConfig):
         """Only load data once"""
         for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
             ds_cfg.max_epochs = 1
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_norm_config(self) -> "GenLatent":
+        """Canonicalize the latent normalization config."""
+        self.norm = self._coerce_norm_config(self.norm)
         return self
 
     def _selected_paths(self) -> list[TreePath]:
@@ -1101,17 +1625,59 @@ class GenLatent(GenDataConfig):
             merged = set_subtree(merged, path, get_subtree(sample, path))
         return merged if merged is not None else sample
 
+    def _coerce_norm_config(self, value: Any) -> NormTree | Mapping[str, NormTree] | None:
+        """Return a canonical latent norm config.
+
+        A single :class:`NormTree` is used for every dataset. A mapping is treated as dataset-specific only when
+        every value is already a :class:`NormTree`, keeping bare tree specs compatible with the single-tree form.
+        """
+        if value is None or isinstance(value, NormTree):
+            return value
+        if isinstance(value, Mapping) and value and all(isinstance(item, NormTree) for item in value.values()):
+            return dict(value)
+        return NormTree.model_validate(value)
+
+    def _dataset_norm(self, dataset_name: str) -> NormTree | None:
+        """Return the normalization tree for one dataset, if configured."""
+        if self.norm is None:
+            return None
+        if isinstance(self.norm, NormTree):
+            return self.norm
+        if dataset_name not in self.norm:
+            raise ValueError(f"No latent normalization configured for dataset {dataset_name!r}.")
+        return self.norm[dataset_name]
+
+    def _apply_dataset_norm(self, sample: PyTree, dataset_name: str, norm: NormTree) -> PyTree:
+        """Apply one dataset's norm to either the wrapped payload or the nested dataset sample."""
+        resolved_root = norm.resolve_root()
+        if isinstance(sample, Mapping) and dataset_name in sample and isinstance(resolved_root, Mapping):
+            if dataset_name in resolved_root:
+                return norm(sample)
+
+            normalized = dict(sample)
+            normalized[dataset_name] = norm(sample[dataset_name])
+            return normalized
+        return norm(sample)
+
     def _iter_samples(self, progress: bool = True) -> Generator[PyTree, None, None]:
-        
-        ctxt = (alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN) 
-                if progress else _NullProgress())
+        ctxt = (
+            alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN)
+            if progress
+            else _NullProgress()
+        )
 
         with ctxt as bar:
             bar.text("Loading compression samples...")
             for batch in self.loader:
                 for dataset_name, loaded in batch.items():
+                    dataset_norm = self._dataset_norm(dataset_name)
+                    if dataset_norm is not None:
+                        dataset_norm.resolve_root()
                     for sample in self._iter_loaded_samples(loaded):
-                        yield self._merge_selected_sample({dataset_name: sample})
+                        selected = self._merge_selected_sample({dataset_name: sample})
+                        if dataset_norm is not None:
+                            selected = self._apply_dataset_norm(selected, dataset_name, dataset_norm)
+                        yield selected
                 bar()
 
     def generate(self, path, format=None, write_policy=None):
@@ -1126,7 +1692,6 @@ class GenLatent(GenDataConfig):
         
         samples = list(self._iter_samples())
         
-        logger.debug("Fitting compression...")
         compression = self.compression.fit(samples)
         logger.debug(f"Compression finished. Latent space: {compression.latent_size()}")
 
@@ -1153,6 +1718,15 @@ class GenLatent(GenDataConfig):
 def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
     """Validate every leaf in a pytree-like template as a :class:`GenDataConfig`. Leave anything else untouched."""
     if isinstance(template, Mapping):
+        latent_fields = {"compression", "gather_paths", "gather_template"}
+        filename = template.get("filename")
+        latent_filename = isinstance(filename, str | Path) and Path(filename).suffix == ".npz"
+        if (any(field in template for field in latent_fields) or latent_filename) and all(
+            field in template for field in required_fields(GenLatent)
+        ):
+            return GenLatent(**template)
+        if all(field in template for field in required_fields(GenNorm)):
+            return GenNorm(**template)
         if all(field in template for field in required_fields(GenLatent)):
             return GenLatent(**template)
         if all(field in template for field in required_fields(GenImplicitModel)):
