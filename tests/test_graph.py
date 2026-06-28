@@ -66,7 +66,7 @@ def test_node_error_operator_on_graph_node() -> None:
 
     error = node.error(value, value_hat)
 
-    assert node.error_op.reduce_op.op_str == "norm"
+    assert node.error_op.op == "norm"
     assert jnp.allclose(error, jnp.array(1.0))
 
 

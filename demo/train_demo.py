@@ -105,8 +105,8 @@ def run(method="linear"):
     ytest_true = true_model(xtest[idx_test])
     ytest_pred = approx_model(xtest[idx_test], approx_params)
 
-    print(f"Train relative error: {romx.tree.get_error_operator("relative")(ytrain_true, ytrain_pred):.5f}")
-    print(f"Validation relative error: {romx.tree.get_error_operator("relative")(ytest_true, ytest_pred)}")
+    print(f"Train relative error: {romx.BinaryOp('relative')(ytrain_true, ytrain_pred):.5f}")
+    print(f"Validation relative error: {romx.BinaryOp('relative')(ytest_true, ytest_pred)}")
 
     fig, ax = plt.subplots(figsize=(6, 5), layout='tight')
     ax.plot(xtrain, ytrain, "or", label="Training data")

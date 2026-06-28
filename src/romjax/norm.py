@@ -328,7 +328,7 @@ class NormOperator(CallableModel):
     A configured leaf-wise normalization callable.
 
     String callables may be composite specs separated by ``"-"``. Composite order matches
-    :class:`romjax.tree.UnaryOperator`: ``"log-minmax"`` applies ``minmax`` first, then ``log``.
+    :class:`romjax.operators.UnaryOp`: ``"log-minmax"`` applies ``minmax`` first, then ``log``.
 
     :param callable: callable object or registered string spec
     """

@@ -37,14 +37,12 @@ from pydantic import (
 from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
+from romjax.operators import BinaryOp, UnaryOp
 from romjax.plotting import PlotSpec, gridplot
 from romjax.profiling import profile_annotation, profile_step, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
-    TreeErrorOperator,
-    UnaryOperator,
     get_subtree,
-    get_unary_operator,
     pytree_norm,
     pytree_path_iter,
     pytree_resolve_refs,
@@ -218,10 +216,11 @@ def reconstruction_loss(
     params: PyTree, 
     single_data: PyTree, 
     graph: FunctionGraph, 
-    path: list[str] = None,
-    error_op: TreeErrorOperator | None = None,
+    path: list[str] | None = None,
+    error_op: BinaryOp | None = None,
     ignore: set | None = None,
 ):
+    """State reconstruction objective. Minimize reconstruction error along a given path."""
     return graph.reconstruction_error(single_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore)
 
 
@@ -280,13 +279,13 @@ class GraphLossTerm(BaseModel):
     function: GraphLossFunction
     dataset: str | None = None
     weight: float = 1.0
-    batch_reduce: UnaryOperator | None = "mean"
+    batch_reduce: UnaryOp | None = "mean"
 
     @field_validator("batch_reduce", mode="before")
     @classmethod
-    def _get_unary_operator(cls, value):
+    def _get_unary_op(cls, value):
         if value is not None:
-            return get_unary_operator(value)
+            return UnaryOp(value)
         return value
 
     @model_validator(mode="before")
@@ -382,14 +381,14 @@ class GraphTest(GraphLoss):
     """
 
     loader: DataLoader
-    reduce: UnaryOperator | None = "mean"
+    reduce: UnaryOp | None = "mean"
     _batch_loss: Callable[[PyTree, PyTree], ArrayLike] = PrivateAttr()
     
     @field_validator("reduce", mode="before")
     @classmethod
-    def _get_unary_operator(cls, value):
+    def _get_unary_op(cls, value):
         if value is not None:
-            return get_unary_operator(value)
+            return UnaryOp(value)
         return value
     
     @model_validator(mode="after")

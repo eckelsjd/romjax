@@ -10,13 +10,13 @@ import matplotlib.pyplot as plt
 from alive_progress import config_handler
 from loguru import logger
 from pydantic import (
-    BaseModel, 
-    BeforeValidator, 
-    ConfigDict, 
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
     Field,
-    PrivateAttr, 
-    TypeAdapter, 
-    field_validator, 
+    PrivateAttr,
+    TypeAdapter,
+    field_validator,
     model_validator,
 )
 
