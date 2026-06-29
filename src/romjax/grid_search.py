@@ -605,8 +605,8 @@ def _yaml_path_text(path: str | Path | PathLike[str]) -> str:
     return str(path).replace("\\", "/")
 
 
-def orbax_metric(case_root: Path) -> float:
-    """Return the best loss recorded for a training case.
+def orbax_metric(case_root: Path, window: int = 10) -> float:
+    """Return the best loss recorded for a training case (only near the end of training).
 
     The fast path reads ``loss.csv`` written by :class:`romjax.train.Train`. If no loss history is present, the
     function attempts to inspect the latest Orbax checkpoint metrics.
@@ -619,7 +619,7 @@ def orbax_metric(case_root: Path) -> float:
     if loss_path.exists():
         values = np.atleast_2d(np.loadtxt(loss_path, delimiter=",", skiprows=1))
         if values.size and values.shape[1] >= 2:
-            return float(np.nanmin(values[:, 1]))
+            return float(np.nanmean(values[-window:, 1]))
 
     try:
         from orbax.checkpoint import v1 as ocp

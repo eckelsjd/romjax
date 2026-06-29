@@ -124,7 +124,7 @@ class RoutineConfig(BaseModel):
     :ivar gridplot: gridplot style
     :ivar logger: loguru configuration
     :ivar progress_bar: alive_bar configuration
-    :ivar ignore: anything you want to write/reuse in yaml but don't want to exist on its own
+    :ivar extra: anything you want to write/reuse in yaml but don't want to exist on its own
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="forbid")
@@ -134,7 +134,7 @@ class RoutineConfig(BaseModel):
     gridplot: GridplotConfig | None = None
     logger: LoggerConfig | None = None
     progress_bar: ProgressBarConfig | None = None
-    ignore: Any | None = Field(exclude=True, default=None)
+    extra: Any | None = Field(exclude=True, default=None)
 
     @model_validator(mode="after")
     def configure(self):
