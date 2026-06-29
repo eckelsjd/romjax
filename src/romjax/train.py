@@ -224,6 +224,31 @@ def reconstruction_loss(
     return graph.reconstruction_error(single_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore)
 
 
+def residual_loss(
+    params: PyTree,
+    single_data: PyTree,
+    graph: FunctionGraph,
+    path: list[str] = None,
+    reduce_op: UnaryOp | None = None,
+    ignore: set | None = None,
+):
+    """Residual minimization objective. Minimize the result of a single forward path."""
+    if path is None:
+        raise ValueError("Residual loss must specify a path")
+    
+    end_node = graph._path_end_node(path)
+
+    if reduce_op is None:
+        reduce_op = UnaryOp(end_node.error_op.op or end_node.error_op.reduce_op)
+
+    if ignore is None:
+        ignore = end_node.ignore
+
+    res = graph.push_path(single_data, path, edge_payload_patches=params)
+
+    return reduce_op(res, ignore=ignore)
+
+
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
     del single_data, graph
     return pytree_square_norm(params)
@@ -241,27 +266,16 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
 
 _LOSS_REGISTRY = {
     "reconstruction": reconstruction_loss,
+    "residual": residual_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
 }
 
 
-type GraphLossFunctionCallable = Annotated[
-    Callable[[PyTree, PyTree, FunctionGraph], ArrayLike],
-    BeforeValidator(functools.partial(from_registry, _LOSS_REGISTRY))
-]
-
-class GraphLossFunction(CallableModel):
+class GraphLossCallable(CallableModel):
     """Loss function for a single data sample."""
 
-    callable: GraphLossFunctionCallable
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_str(cls, value):
-        if isinstance(value, str):
-            return {"callable": value}
-        return value
+    callable: Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]
 
 
 class GraphLossTerm(BaseModel):
@@ -276,7 +290,11 @@ class GraphLossTerm(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
-    function: GraphLossFunction
+    term: Annotated[
+        GraphLossCallable,
+        BeforeValidator(lambda v: {"callable": v} if isinstance(v, str) else v),
+        BeforeValidator(functools.partial(from_registry, _LOSS_REGISTRY))
+    ]
     dataset: str | None = None
     weight: float = 1.0
     batch_reduce: UnaryOp | None = "mean"
@@ -292,7 +310,7 @@ class GraphLossTerm(BaseModel):
     @classmethod
     def _from_plain_function(cls, value):
         if callable(value) or isinstance(value, str) or (isinstance(value, Mapping) and "callable" in value):
-            return {"function": value}
+            return {"term": value}
         return value
 
     def __call__(
@@ -309,16 +327,16 @@ class GraphLossTerm(BaseModel):
             if isinstance(term_batch, (list, tuple)):
                 if len(term_batch) == 0:
                     return jnp.asarray(0.0)
-                losses = jnp.asarray([self.function(params, single_data, graph) for single_data in term_batch])
+                losses = jnp.asarray([self.term(params, single_data, graph) for single_data in term_batch])
             else:
                 def body(carry, single_data):
-                    return carry, self.function(params, single_data, graph)
+                    return carry, self.term(params, single_data, graph)
 
                 _, losses = jax.lax.scan(body, None, term_batch)
             return jnp.asarray(self.weight) * self.batch_reduce(losses)
     
         else:
-            return jnp.asarray(self.weight) * self.function(params, batch_data, graph)
+            return jnp.asarray(self.weight) * self.term(params, batch_data, graph)
 
 
 class GraphLoss(BaseModel):
