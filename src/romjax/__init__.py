@@ -30,7 +30,22 @@ import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
 from pydantic.fields import PydanticUndefined as _PydanticUndefined
 
-type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any]]
+
+class YamlSource:
+    """In-memory YAML source produced by nested ``!overrides:`` tags.
+
+    :param node: raw YAML node to construct when the source is loaded
+    :param source_path: path of the YAML file that declared this source, when known
+    :param label: optional diagnostic label for the source
+    """
+
+    def __init__(self, node: _yaml.Node | None, source_path: _Path | None, label: str | None = None) -> None:
+        self.node = node
+        self.source_path = source_path
+        self.label = label
+
+
+type _Stream = _Union[str, bytes, bytearray, _PathLike[str], _IO[_Any], YamlSource]
 
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
@@ -231,10 +246,20 @@ class YamlLoader(ConfigLoader):
 
             return cls_obj.model_validate(data)
 
+        def _construct_overrides(loader: _yaml.SafeLoader, tag_suffix: str, node: _yaml.Node) -> YamlSource:
+            """Construct a nested override as a loadable in-memory YAML source."""
+            source_path = cls.current_source_path()
+            override_path = cls._resolve_override_path(tag_suffix, source_path)
+            base_node, _ = cls._compose_resolved_node(override_path)
+            override_node = cls._copy_with_tag(node, cls._default_node_tag(node))
+            merged_node = cls._merge_nodes(base_node, override_node)
+            return YamlSource(merged_node, source_path, tag_suffix)
+
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
         _Loader.add_multi_constructor(cls.PYDANTIC_TAG, _construct_base_model)
         _Loader.add_multi_constructor(cls.ROMX_TAG, _partial(_construct_base_model, default_module="romjax"))
+        _Loader.add_multi_constructor(cls.OVERRIDES_TAG, _construct_overrides)
         return _Loader
 
     @classmethod
@@ -260,8 +285,12 @@ class YamlLoader(ConfigLoader):
                 return dumper.represent_scalar(tag, str(payload) if payload is not None else "null")
             return dumper.represent_mapping(tag, payload)
 
+        def _represent_yaml_source(dumper: _yaml.SafeDumper, data: YamlSource) -> _yaml.Node:
+            return _deepcopy(data.node) if data.node is not None else dumper.represent_none(None)
+
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
+        _Dumper.add_representer(YamlSource, _represent_yaml_source)
         _Dumper.add_multi_representer(_BaseModel, _represent_base_model)
         return _Dumper
 
@@ -309,6 +338,19 @@ class YamlLoader(ConfigLoader):
                 raise ValueError("The __parent__ override path requires loading from a file path.")
             return source_path.parent / normalized[len(prefix):]
         return _Path(normalized)
+
+    @classmethod
+    def _resolve_parent_scalar(cls, value: str, source_path: _Path | None) -> str:
+        """Resolve a scalar that may use the ``__parent__/`` prefix.
+
+        :param value: scalar text
+        :param source_path: path of the YAML file that declared the scalar
+        :return: resolved scalar text
+        """
+        normalized = value.replace("\\", "/")
+        if not normalized.startswith("__parent__/"):
+            return value
+        return cls._resolve_override_path(value, source_path).resolve().as_posix()
 
     @classmethod
     def current_source_path(cls) -> _Path | None:
@@ -433,6 +475,39 @@ class YamlLoader(ConfigLoader):
         return _deepcopy(override)
 
     @classmethod
+    def _resolve_parent_refs(cls, node: _yaml.Node | None, source_path: _Path | None) -> _yaml.Node | None:
+        """Return a node copy with ``__parent__/`` scalar and override-tag references resolved.
+
+        :param node: raw YAML node to rewrite
+        :param source_path: path used to resolve parent-relative references
+        :return: copied node with parent-relative references rewritten
+        """
+        if node is None:
+            return None
+
+        copied = _deepcopy(node)
+        if copied.tag.startswith(cls.OVERRIDES_TAG):
+            suffix = copied.tag[len(cls.OVERRIDES_TAG):]
+            copied.tag = f"{cls.OVERRIDES_TAG}{cls._resolve_parent_scalar(suffix, source_path)}"
+
+        if isinstance(copied, _yaml.ScalarNode):
+            copied.value = cls._resolve_parent_scalar(copied.value, source_path)
+            return copied
+        if isinstance(copied, _yaml.SequenceNode):
+            copied.value = [cls._resolve_parent_refs(item, source_path) for item in copied.value]
+            return copied
+        if isinstance(copied, _yaml.MappingNode):
+            copied.value = [
+                (
+                    cls._resolve_parent_refs(key_node, source_path),
+                    cls._resolve_parent_refs(value_node, source_path),
+                )
+                for key_node, value_node in copied.value
+            ]
+            return copied
+        return copied
+
+    @classmethod
     def _compose_resolved_node(cls, stream: _Stream) -> tuple[_yaml.Node | None, _Path | None]:
         """Compose YAML into a raw node after resolving any root-level overrides.
 
@@ -474,7 +549,10 @@ class YamlLoader(ConfigLoader):
         if "Loader" not in kwargs:
             kwargs["Loader"] = cls.get_loader()
 
-        node, source_path = cls._compose_resolved_node(stream)
+        if isinstance(stream, YamlSource):
+            node, source_path = stream.node, stream.source_path
+        else:
+            node, source_path = cls._compose_resolved_node(stream)
         token = cls._SOURCE_PATH.set(source_path)
         try:
             return _yaml.load(cls._node_to_yaml(node), **kwargs)

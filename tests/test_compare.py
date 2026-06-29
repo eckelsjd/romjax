@@ -178,7 +178,7 @@ def test_compare_graph_loss_with_file_backed_dataloader(tmp_path: Path) -> None:
                 datasets={"toy": {"kind": "implicit", "batch_size": 2, "max_epochs": 1, "shuffle_seed": 0}},
             ),
         },
-        metrics={"loss": GraphLoss(terms=[{"function": graph_single_squared_error}])},
+        metrics={"loss": GraphLoss(terms=[{"callable": graph_single_squared_error}])},
         stats=["mean", "max"],
         col_format="{mean:.1f}/{max:.1f}",
     )

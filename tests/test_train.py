@@ -575,11 +575,11 @@ def test_data_loader_config_types(tmp_path: Path) -> None:
 def test_graph_loss(toy_graph: FunctionGraph) -> None:
     batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
 
-    squared = GraphLoss(terms=[{"function": graph_batch_squared_error, "dataset": "toy"}], graph=toy_graph)
+    squared = GraphLoss(terms=[{"term": graph_batch_squared_error, "dataset": "toy"}], graph=toy_graph)
     params = {"toy": {"weight": jnp.array(0.5)}}
     assert squared(params, batch) == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
 
-    reference = GraphLoss(terms=[{"function": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
+    reference = GraphLoss(terms=[{"term": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
     ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
     resolved_params = pytree_resolve_refs(ref_params)
     assert reference(ref_params, batch) == pytest.approx(squared(params, batch))
@@ -595,8 +595,8 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
 
     weighted = GraphLoss(
         terms=[
-            {"function": graph_batch_squared_error, "dataset": "toy", "weight": 2.0},
-            {"function": graph_batch_absolute_error, "dataset": "toy", "weight": 0.5},
+            {"term": graph_batch_squared_error, "dataset": "toy", "weight": 2.0},
+            {"term": graph_batch_absolute_error, "dataset": "toy", "weight": 0.5},
         ],
         graph=toy_graph,
     )
@@ -609,7 +609,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     reconstructed = GraphLoss(
         terms=[
             {"callable": "reconstruction", "path": ["toy"]},
-            {"function": "tikhonov", "weight": 0.1, "batch_reduce": None},
+            {"term": "tikhonov", "weight": 0.1, "batch_reduce": None},
         ],
         graph=toy_graph,
     )
@@ -627,7 +627,7 @@ def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         datasets={"toy": {"kind": "implicit", "batch_size": 1, "max_epochs": 2}},
     )
     test = GraphTest(
-        terms=[{"function": graph_batch_squared_error, "dataset": "toy"}],
+        terms=[{"term": graph_batch_squared_error, "dataset": "toy"}],
         graph=toy_graph,
         loader=dataloader,
         reduce="mean",
@@ -654,7 +654,7 @@ train: !romx:Train
   loss: !romx:GraphLoss
     terms:
       - reconstruction
-      - function: !!python/name:tests.test_train.graph_batch_squared_error
+      - term: !!python/name:tests.test_train.graph_batch_squared_error
         weight: 0.5
         dataset: toy
   test: !romx:GraphTest
@@ -777,7 +777,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         return jnp.square(x - (params["toy"]["weight"] * x + params["toy"]["bias"]))
 
     test = GraphTest(
-        terms=[{"function": validation_error}],
+        terms=[{"callable": validation_error}],
         loader=validation_loader,
     )
 

@@ -95,6 +95,89 @@ executor: serial
     assert search.case_root_path == (("root",),)
 
 
+def test_grid_search_writes_case_from_inline_base_override(tmp_path: Path) -> None:
+    train_path = tmp_path / "train.yml"
+    config_path = tmp_path / "grid.yml"
+    train_path.write_text(
+        """
+root: original
+value: train
+artifact: __parent__/artifact.txt
+""",
+        encoding="utf-8",
+    )
+    config_path.write_text(
+        f"""
+!romx:GridSearch
+root: {tmp_path / "grid"}
+base: !overrides:__parent__/train.yml
+  value: inline
+override:
+  - path: [value]
+    cases: [case]
+executor: serial
+""",
+        encoding="utf-8",
+    )
+
+    search = romjax.load(config_path)
+    case_root = search.root / "cases" / "case_0000"
+    case_config = search._write_case_config(case_root, ("case",))
+    loaded = romjax.YamlLoader.load(case_config)
+
+    assert isinstance(search.base, romjax.YamlSource)
+    assert Path(loaded["root"]) == case_root
+    assert loaded["value"] == "case"
+    assert loaded["artifact"] == (tmp_path / "artifact.txt").resolve().as_posix()
+
+
+def test_grid_search_loads_inline_override(tmp_path: Path) -> None:
+    grid_path = tmp_path / "grid.yml"
+    train_path = tmp_path / "train.yml"
+    parent_path = tmp_path / "all-feat.yml"
+    grid_path.write_text(
+        """
+!romx:GridSearch
+root: grid
+base: __parent__/train.yml
+override:
+  - path: [loss, 0, callable]
+    cases: [default]
+executor: serial
+""",
+        encoding="utf-8",
+    )
+    train_path.write_text(
+        """
+root: train
+loss:
+  - {callable: default, path: [original]}
+""",
+        encoding="utf-8",
+    )
+    parent_path.write_text(
+        f"""
+!romx:CompositeRoutine
+- !overrides:__parent__/grid.yml
+  root: {tmp_path / "cases" / "grid-sr"}
+  base: !overrides:__parent__/train.yml
+    loss:
+      - {{callable: reconstruction, path: [coordinate transform]}}
+""",
+        encoding="utf-8",
+    )
+
+    composite = romjax.load(parent_path)
+    search = composite._validate_routine(composite.routines[0])
+    case_root = search.root / "cases" / "case_0000"
+    case_config = search._write_case_config(case_root, ("residual",))
+    loaded = romjax.YamlLoader.load(case_config)
+
+    assert isinstance(search, GridSearch)
+    assert isinstance(search.base, romjax.YamlSource)
+    assert loaded["loss"] == [{"callable": "residual", "path": ["coordinate transform"]}]
+
+
 def test_grid_search_loads_hybrid_executor_from_yaml(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yml"
     base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
