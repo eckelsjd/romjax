@@ -31,7 +31,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Might be neat for the !include mechanism to work like python import, so we don't have to keep worrying about relative paths
 - [ ] More consistent handling of exceptions in the cli. For example, when to show messages, expected vs unexpected failures, etc.
 - [ ] Would be good to copy the entire resolved yaml config to routine root dirs, (after resolving all the overrides)
-- [ ] Would be nice for !overrides to work inline, so you can just override a few values, rather than create a whole new file
 
 ## Serialization
 - [ ] from_registry items back to string
@@ -57,6 +56,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Some simple train and gen data examples would be good
 - [ ] How to use filter model with eqx_evaluate for projection, neural nets, etc.
 - [ ] Composite functions for unary operators, normalizations, error/tree operators, etc.
+- [ ] Pydantic workflow, !romx, !pd, !overrides, __parent__, etc..
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation

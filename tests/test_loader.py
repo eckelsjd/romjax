@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from romjax import YamlLoader
+from romjax import YamlLoader, YamlSource
 from romjax.model import ImplicitModel
 from romjax.poisson import GaussianForcing, Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler
@@ -295,6 +295,30 @@ def test_yaml_overrides_parent_path_resolves_from_declaring_file(tmp_path: Path)
     override_path.write_text("!overrides:__parent__/../base.yml\nsettings: {two: override}\n", encoding="utf-8")
 
     assert YamlLoader.load(override_path) == {"settings": {"one": "base", "two": "override"}}
+
+
+def test_yaml_nested_overrides_construct_loadable_sources(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    parent_path = tmp_path / "parent.yml"
+    base_path.write_text("settings: {one: base, two: base, three: base}\n", encoding="utf-8")
+    parent_path.write_text(
+        """
+child: !overrides:__parent__/base.yml
+  settings: {two: child}
+items:
+  - !overrides:__parent__/base.yml
+    settings: {three: item}
+""",
+        encoding="utf-8",
+    )
+
+    data = YamlLoader.load(parent_path)
+
+    assert isinstance(data["child"], YamlSource)
+    assert isinstance(data["items"][0], YamlSource)
+    assert data["child"].source_path == parent_path
+    assert YamlLoader.load(data["child"]) == {"settings": {"one": "base", "two": "child", "three": "base"}}
+    assert YamlLoader.load(data["items"][0]) == {"settings": {"one": "base", "two": "base", "three": "item"}}
 
 
 

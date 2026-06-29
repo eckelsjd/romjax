@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import ClassVar
 
 import matplotlib
@@ -164,6 +165,38 @@ def test_composite_routine_loads_mixed_yaml_and_inline_children(tmp_path, monkey
     assert isinstance(composite, CompositeRoutine)
     assert composite.run() == 0
     assert DemoRoutine.observed == ["file", "inline"]
+
+
+def test_composite_routine_loads_inline_override_child(tmp_path: Path) -> None:
+    DemoRoutine.observed = []
+    child_path = tmp_path / "child.yml"
+    parent_path = tmp_path / "parent.yml"
+    child_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.DemoRoutine",
+                "name: file",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    parent_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "routines:",
+                "  - !overrides:__parent__/child.yml",
+                "    name: inline-override",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    composite = romjax.load(parent_path)
+
+    assert isinstance(composite, CompositeRoutine)
+    assert composite.run() == 0
+    assert DemoRoutine.observed == ["inline-override"]
 
 
 def test_composite_routine_parent_relative_child_path(tmp_path) -> None:

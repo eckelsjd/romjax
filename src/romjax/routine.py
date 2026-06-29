@@ -246,9 +246,11 @@ class CompositeRoutine(Routine):
         if isinstance(value, Routine):
             return value
 
-        if isinstance(value, str | Path | bytes):
-            import romjax
+        import romjax
 
+        if isinstance(value, romjax.YamlSource):
+            value = romjax.load(value)
+        elif isinstance(value, str | Path | bytes):
             if isinstance(value, str | Path):
                 source_path = self._source_path
                 if source_path is not None:

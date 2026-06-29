@@ -118,8 +118,11 @@ def resolve_graph_refs(value: Any, graph) -> Any:
 
 def from_yaml(value: str | Path | bytes | Any) -> Any:
     """Try to load from yaml. Useful as a pydantic validator."""
+    import romjax
+
+    if isinstance(value, romjax.YamlSource):
+        return romjax.load(value)
     if isinstance(value, str | Path | bytes):
-        import romjax
         stream = romjax.YamlLoader.resolve_parent_path(value) if isinstance(value, str | Path) else value
         return romjax.load(stream)
     return value

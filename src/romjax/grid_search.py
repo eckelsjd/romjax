@@ -684,7 +684,7 @@ class GridSearch(Routine):
     """Run a Cartesian-product grid search by generating override YAML files and dispatching ``romx run`` cases.
 
     :param root: directory containing generated cases, best-copy outputs, and manifest
-    :param base: base routine YAML file to override
+    :param base: base routine YAML file or inline override source to override
     :param override: hyperparameter override specifications
     :param write_policy: behavior when root or case artifacts already exist
     :param save_policy: which completed cases to retain after ranking
@@ -697,7 +697,7 @@ class GridSearch(Routine):
     """
 
     root: Path
-    base: Path
+    base: Path | romjax.YamlSource
     override: list[GridOverride]
     write_policy: WritePolicy = "reuse"
     save_policy: _SavePolicy = Field(default_factory=_SavePolicy)
@@ -738,9 +738,10 @@ class GridSearch(Routine):
     @model_validator(mode="after")
     def _validate_paths(self) -> "GridSearch":
         self.root = self.root.resolve()
-        self.base = self.base.resolve()
-        if not self.base.exists():
-            raise RoutineError(f"GridSearch base config does not exist: {self.base}")
+        if isinstance(self.base, Path):
+            self.base = self.base.resolve()
+            if not self.base.exists():
+                raise RoutineError(f"GridSearch base config does not exist: {self.base}")
         self.executor.validate_child_env(self.child_env)
         
         if self.root.exists() and any(self.root.iterdir()):
@@ -786,13 +787,22 @@ class GridSearch(Routine):
         for root_path in self.case_root_path:
             tree = _set_override_path(tree, root_path, _yaml_path_text(case_root))
 
+        config_path = case_root / "case.yml"
+        yaml_body = romjax.YamlLoader.dump(tree, sort_keys=False)
+        if isinstance(self.base, romjax.YamlSource):
+            override_node = yaml.compose(yaml_body, Loader=yaml.SafeLoader)
+            if override_node is None:
+                raise RoutineError("GridSearch generated an empty override tree.")
+            merged_node = romjax.YamlLoader._merge_nodes(self.base.node, override_node)
+            merged_node = romjax.YamlLoader._resolve_parent_refs(merged_node, self.base.source_path)
+            config_path.write_text(romjax.YamlLoader._node_to_yaml(merged_node), encoding="utf-8")
+            return config_path
+
         try:
             base_ref = _yaml_path_text(os.path.relpath(self.base, start=case_root))
             override_tag = f"!overrides:__parent__/{base_ref}"
         except ValueError:
             override_tag = f"!overrides:{_yaml_path_text(self.base)}"
-        config_path = case_root / "case.yml"
-        yaml_body = romjax.YamlLoader.dump(tree, sort_keys=False)
         config_path.write_text(f"{override_tag}\n{yaml_body}", encoding="utf-8")
         return config_path
 
