@@ -70,6 +70,49 @@ def test_node_error_operator_on_graph_node() -> None:
     assert jnp.allclose(error, jnp.array(1.0))
 
 
+def test_function_graph_preserves_list_node_ignore_python() -> None:
+    graph = FunctionGraph(
+        nodes=[
+            {"name": "hello", "ignore": "inputs"},
+            {"name": "out", "ignore": "skip"},
+        ],
+        edges={"hello_out": IdentityEdge(source="hello", target="out", name="hello_out")},
+    )
+
+    assert "hello" in graph.nodes
+    assert graph.nodes["hello"].ignore == [("inputs",)]
+    assert graph.nodes["out"].ignore == [("skip",)]
+    assert graph.edges["hello_out"].source is graph.nodes["hello"]
+    assert graph.edges["hello_out"].target is graph.nodes["out"]
+    assert graph._resolve_start_node(["hello_out"], None) is graph.nodes["hello"]
+    assert graph._path_end_node(["hello_out"], start="hello") is graph.nodes["out"]
+
+
+def test_function_graph_preserves_list_node_ignore_yaml() -> None:
+    yaml_text = """
+!romx:romjax.graph.FunctionGraph
+nodes:
+  - name: hello
+    ignore: inputs
+  - name: out
+    ignore: skip
+edges:
+  - !romx:romjax.graph.IdentityEdge
+    source: hello
+    target: out
+    name: hello_out
+"""
+    graph = YamlLoader.load(yaml_text)
+
+    assert "hello" in graph.nodes
+    assert graph.nodes["hello"].ignore == [("inputs",)]
+    assert graph.nodes["out"].ignore == [("skip",)]
+    assert graph.edges["hello_out"].source is graph.nodes["hello"]
+    assert graph.edges["hello_out"].target is graph.nodes["out"]
+    assert graph._resolve_start_node(["hello_out"], None) is graph.nodes["hello"]
+    assert graph._path_end_node(["hello_out"], start="hello") is graph.nodes["out"]
+
+
 def test_node_error_ignore():
     """Make sure node error works for non-overlapping and ignored subtrees."""
     node = Node(name="state", error_op="mae", ignore=[("keep", "ignore")])

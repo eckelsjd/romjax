@@ -285,6 +285,14 @@ class ListModel[T: BaseModel](DictModel):
     def __init__(self, data: Mapping | list | tuple | None = None, **kwargs):
         super().__init__()
         self.update(data, **kwargs)  # Triggers validation of all elements
+
+    @staticmethod
+    def _item_key(raw_value: Any, value: BaseModel) -> str:
+        """Return the storage key for a validated list item."""
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        return str(raw_value)
     
     def __setitem__(self, key: str | int, value: Any) -> None:
         if isinstance(key, int):
@@ -322,7 +330,8 @@ class ListModel[T: BaseModel](DictModel):
             else:
                 data = [data] if not isinstance(data, list | tuple) else data
                 for ele in data:
-                    self.__setitem__(str(ele), ele)
+                    value = self._get_adapter().validate_python(ele)
+                    self.__setitem__(self._item_key(ele, value), value)
         if kwargs:
             super().update(kwargs)
     

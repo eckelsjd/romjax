@@ -1,5 +1,6 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
+- restart from POD matrix
 - finish objectives and poisson
 - get Galerkin ODE working (small problem, then Vlasov)
 - repeat galerkin training on Vlasov
