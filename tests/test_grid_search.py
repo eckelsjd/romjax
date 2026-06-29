@@ -315,7 +315,7 @@ def test_build_hybrid_slots_allows_cpu_only() -> None:
 def test_default_orbax_metric_reads_loss_csv(tmp_path: Path) -> None:
     (tmp_path / "loss.csv").write_text("Iteration,Value\n0,3.0\n1,1.5\n2,2.0\n", encoding="utf-8")
 
-    assert orbax_metric(tmp_path) == 1.5
+    assert orbax_metric(tmp_path) == (3.0 + 1.5 + 2.0) / 3
 
 
 def test_grid_search_run_writes_manifest_and_copies_best(tmp_path: Path, monkeypatch) -> None:

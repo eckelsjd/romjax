@@ -501,6 +501,14 @@ class FunctionGraph(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _bind_edge_nodes_to_graph_nodes(self):
+        """Point edge endpoints at the canonical graph nodes when they are configured."""
+        for edge in self.edges.values():
+            edge.source = self._resolve_node(edge.source)
+            edge.target = self._resolve_node(edge.target)
+        return self
+
+    @model_validator(mode="after")
     def _bind_and_validate_composite_edges(self):
         for edge in self.edges.values():
             if isinstance(edge, CompositeEdge):
