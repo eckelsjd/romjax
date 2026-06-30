@@ -84,6 +84,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "DataLoader": ("romjax.data_gen", "DataLoader"),
     "CompareOrbax": ("romjax.compare", "CompareOrbax"),
     "CompareTable": ("romjax.compare", "CompareTable"),
+    "OrbaxParams": ("romjax.train", "OrbaxParams"),
     "Train": ("romjax.train", "Train"),
     "GraphLoss": ("romjax.train", "GraphLoss"),
     "GraphTest": ("romjax.train", "GraphTest"),
@@ -114,6 +115,7 @@ if TYPE_CHECKING:
         BatchLoader,
         GraphLoss,
         GraphTest,
+        OrbaxParams,
         Train,
     )
     from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType

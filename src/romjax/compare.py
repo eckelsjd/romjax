@@ -8,13 +8,9 @@ import jax.numpy as jnp
 import yaml
 from alive_progress import alive_bar
 from jaxtyping import PyTree
-from orbax.checkpoint import v1 as ocp
 from pydantic import (
-    BaseModel,
     BeforeValidator,
-    ConfigDict,
     Field,
-    PrivateAttr,
     SkipValidation,
     field_validator,
     model_validator,
@@ -24,7 +20,7 @@ from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.operators import UnaryOp
 from romjax.routine import Routine
-from romjax.train import GraphLoss
+from romjax.train import GraphLoss, OrbaxParams
 from romjax.tree import pytree_path_iter
 from romjax.typing import from_yaml, resolve_graph_refs
 from romjax.utils import _NullProgress
@@ -32,47 +28,6 @@ from romjax.utils import _NullProgress
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 
 __all__ = ["CompareOrbax", "CompareTable", "OrbaxParams"]
-
-
-class OrbaxParams(BaseModel):
-    """Utility for loading params from orbax checkpoints."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    params: PyTree | str | Path
-    _resolved_params: PyTree | None = PrivateAttr(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_plain_params(cls, value):
-        if not isinstance(value, OrbaxParams):
-            if isinstance(value, Mapping) and "params" in value:
-                return value
-            return {"params": value}
-        return value
-
-    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
-        """Load parameters from orbax using a template."""
-        if self._resolved_params is not None:
-            return self._resolved_params
-        
-        if isinstance(self.params, str | Path):
-            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
-                if ckptr.latest is not None:
-                    if template is not None:
-                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
-                        _loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
-                        params = eqx.combine(_loaded["params"], static_params)
-                    else:
-                        params = ckptr.load_checkpointables()["params"]
-
-                    self._resolved_params = params
-                    return params
-            
-            return None
-
-        else:
-            return self.params
 
 
 class CompareOrbax(Routine):

@@ -26,6 +26,7 @@ from romjax.train import (
     DiagnosticsConfig,
     GraphLoss,
     GraphTest,
+    OrbaxParams,
     TerminationConfig,
     Train,
 )
@@ -416,6 +417,64 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     assert isinstance(resumed.init_params, eqx.nn.MLP)
     assert isinstance(loaded["params"], eqx.nn.MLP)
     assert hasattr(loaded["opt_state"][0], "mu")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path.resolve() / "source"
+    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+        ckptr.save_checkpointables(
+            step=0,
+            checkpointables={"params": {"w": jnp.array(3.0)}},
+            force=True,
+        )
+
+    root = tmp_path.resolve() / "warm_start"
+    train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.1),
+        termination=TerminationConfig(max_steps=1),
+        root=root,
+        load_orbax=checkpoint_root,
+    )
+
+    assert isinstance(train.load_orbax, OrbaxParams)
+    assert train.run() == 0
+    assert _history_csv(root / "loss.csv")[1].tolist() == pytest.approx([4.0])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_train_load_orbax_uses_eqx_static_template(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path.resolve() / "mlp_source"
+    source_params = eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(0))
+    init_params = eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(999))
+
+    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+        ckptr.save_checkpointables(
+            step=0,
+            checkpointables={"params": eqx.filter(source_params, eqx.is_array)},
+            force=True,
+        )
+
+    train = Train(
+        loss=mlp_quadratic_loss,
+        init_params=init_params,
+        optimizer=optax.sgd(0.0),
+        termination=TerminationConfig(max_steps=1),
+        load_orbax={"params": checkpoint_root},
+    )
+    loaded_params = train()
+
+    assert isinstance(loaded_params, eqx.nn.MLP)
+    np.testing.assert_allclose(loaded_params.layers[0].weight, source_params.layers[0].weight)
+    np.testing.assert_allclose(loaded_params.layers[0].bias, source_params.layers[0].bias)
+
+
+def test_orbax_params_compare_import_compatibility() -> None:
+    from romjax.compare import OrbaxParams as CompareOrbaxParams
+
+    assert CompareOrbaxParams is OrbaxParams
 
 
 def test_basic_batch_loader():
