@@ -1,6 +1,5 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
-- restart from POD matrix
 - finish objectives and poisson
 - get Galerkin ODE working (small problem, then Vlasov)
 - repeat galerkin training on Vlasov
@@ -18,7 +17,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Training on param references
 
 ## Bugs
-- [ ] Training live plot hangs at beginning -- might need to include progress of loading data
+- [ ] Training live plot hangs at beginning -- might need to include progress of loading data / compiling
 
 ## Blind spots
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
@@ -35,6 +34,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Might be neat for the !include mechanism to work like python import, so we don't have to keep worrying about relative paths
 - [ ] More consistent handling of exceptions in the cli. For example, when to show messages, expected vs unexpected failures, etc.
 - [ ] Would be good to copy the entire resolved yaml config to routine root dirs, (after resolving all the overrides)
+- [ ] All the annoying `resolve` methods you need to call on a graph after construction (norms, refs, compression, etc.)
 
 ## Serialization
 - [ ] from_registry items back to string

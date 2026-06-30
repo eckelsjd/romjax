@@ -191,12 +191,27 @@ def test_diagnostics(tmp_path: Path) -> None:
     loss_steps, loss_values = _history_csv(root / "loss.csv")
     test_steps, test_values = _history_csv(root / "test.csv")
     assert root.joinpath("history.pdf").exists()
-    assert loss_steps.tolist() == [0, 1, 2]
-    assert test_steps.tolist() == [0, 1, 2]
+    assert loss_steps.tolist() == [0, 1, 2, 3]
+    assert test_steps.tolist() == [0, 1, 2, 3]
     assert loss_values[0] > loss_values[-1]
     assert test_values[0] > test_values[-1]
-    assert len(callback_calls) == 3
+    assert len(callback_calls) == 4
     assert all(call_root == root for _, call_root in callback_calls)
+
+    final_test_root = tmp_path.resolve() / "final_test"
+    final_test_train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=scalar_quadratic_test,
+        termination=3,
+        diagnostics=DiagnosticsConfig(test_interval=10),
+        root=final_test_root,
+    )
+    assert final_test_train.run() == 0
+    assert _history_csv(final_test_root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+    assert _history_csv(final_test_root / "test.csv")[0].tolist() == [0, 3]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
@@ -273,7 +288,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
     assert checkpoint_names[:2] == ["train_000", "train_001"]
     with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
-        assert ckptr.latest.step == 1
+        assert ckptr.latest.step == 2
 
     resumed = Train(
         loss=scalar_quadratic_loss,
@@ -285,10 +300,10 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
         checkpointer=checkpointer,
     )
     assert resumed.run() == 0
-    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
     with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
-        assert ckptr.latest.step == 3
+        assert ckptr.latest.step == 4
 
     overwrite_root = tmp_path.resolve() / "overwrite"
     overwrite_root.mkdir(parents=True, exist_ok=True)
@@ -358,11 +373,11 @@ def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
         checkpointer=checkpointer,
     )
     assert resumed.run() == 0
-    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
 
     with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
-        assert ckptr.latest.step == 3
+        assert ckptr.latest.step == 4
         loaded = ckptr.load_checkpointables(
             abstract_checkpointables={
                 "params": {"w": jnp.array(0.0)},
@@ -403,7 +418,7 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
         checkpointer=checkpointer,
     )
     assert resumed.run() == 0
-    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
 
     with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
@@ -441,7 +456,7 @@ def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
 
     assert isinstance(train.load_orbax, OrbaxParams)
     assert train.run() == 0
-    assert _history_csv(root / "loss.csv")[1].tolist() == pytest.approx([4.0])
+    assert _history_csv(root / "loss.csv")[1].tolist() == pytest.approx([4.0, 2.56])
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
@@ -860,14 +875,14 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
 
     loss_steps, loss_values = _history_csv(root / "loss.csv")
     test_steps, test_values = _history_csv(root / "test.csv")
-    assert loss_steps.tolist() == list(range(max_steps))
-    assert test_steps.tolist() == list(range(max_steps))
+    assert loss_steps.tolist() == list(range(max_steps + 1))
+    assert test_steps.tolist() == list(range(max_steps + 1))
     assert loss_values[-1] < 0.1 * loss_values[0]
     assert test_values[-1] < test_values[0]
 
     with ocp.training.Checkpointer(root) as ckptr:
         assert ckptr.latest is not None
-        assert ckptr.latest.step == max_steps - 1
+        assert ckptr.latest.step == max_steps
         params = ckptr.load_checkpointables(
             abstract_checkpointables={
                 "params": {"toy": {"weight": jnp.array(0.0), "bias": jnp.array(0.0)}}
