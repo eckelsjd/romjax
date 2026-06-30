@@ -17,6 +17,9 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Needs testing
 - [ ] Training on param references
 
+## Bugs
+- [ ] Training live plot hangs at beginning -- might need to include progress of loading data
+
 ## Blind spots
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction

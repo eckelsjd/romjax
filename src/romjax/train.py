@@ -51,7 +51,7 @@ from romjax.tree import (
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type, resolve_graph_refs
 from romjax.utils import _NullProgress
 
-__all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader"]
+__all__ = ["Train", "GraphLoss", "GraphTest", "BatchLoader", "OrbaxParams"]
 
 
 def _prettify_timedelta(delta: float) -> str:
@@ -229,7 +229,7 @@ def residual_loss(
     single_data: PyTree,
     graph: FunctionGraph,
     path: list[str] = None,
-    reduce_op: UnaryOp | None = None,
+    error_op: UnaryOp | None = None,
     ignore: set | None = None,
 ):
     """Residual minimization objective. Minimize the result of a single forward path."""
@@ -238,15 +238,15 @@ def residual_loss(
     
     end_node = graph._path_end_node(path)
 
-    if reduce_op is None:
-        reduce_op = UnaryOp(end_node.error_op.op or end_node.error_op.reduce_op)
+    if error_op is None:
+        error_op = end_node.error_op.op or end_node.error_op.reduce_op
 
     if ignore is None:
         ignore = end_node.ignore
 
     res = graph.push_path(single_data, path, edge_payload_patches=params)
 
-    return reduce_op(res, ignore=ignore)
+    return UnaryOp(error_op)(res, ignore=ignore)
 
 
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
@@ -436,6 +436,56 @@ type GradientTransformation = Annotated[
 ]
 
 
+class OrbaxParams(BaseModel):
+    """
+    Utility for loading parameter PyTrees from Orbax checkpoints.
+
+    :param params: direct parameter PyTree or path to a checkpoint directory containing a ``params`` checkpointable
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    params: PyTree | str | Path
+    _resolved_params: PyTree | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_plain_params(cls, value: PyTree | str | Path | Mapping[str, PyTree]) -> dict[str, PyTree] | PyTree:
+        if not isinstance(value, OrbaxParams):
+            if isinstance(value, Mapping) and "params" in value:
+                return value
+            return {"params": value}
+        return value
+
+    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
+        """
+        Load parameters from Orbax using a template for static leaves.
+
+        :param template: optional full parameter PyTree template
+        :returns: resolved parameters, or ``None`` if a checkpoint path has no latest checkpoint
+        """
+        if self._resolved_params is not None:
+            return self._resolved_params
+
+        if isinstance(self.params, str | Path):
+            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
+                if ckptr.latest is not None:
+                    if template is not None:
+                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
+                        loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
+                        params = eqx.combine(loaded["params"], static_params)
+                    else:
+                        params = ckptr.load_checkpointables()["params"]
+
+                    self._resolved_params = params
+                    return params
+
+            return None
+
+        self._resolved_params = self.params
+        return self._resolved_params
+
+
 class CheckpointerConfig(BaseModel):
     """
     Orbax-policy checkpoint configuration for :class:`GraphTrain`.
@@ -601,6 +651,7 @@ class Train(Routine):
     :param root: run directory for checkpoints, logs, and history (optional)
     :param write_policy: ``reuse`` restores checkpoints, ``overwrite`` replaces artifacts, ``error`` fails
     :param checkpointer: Orbax policy checkpoint options
+    :param load_orbax: optional params-only Orbax warm start used when no ``root`` checkpoint is resumed
 
     :param init_seed: random seed for initializing parameters (if init_params is callable)
     :param graph: graph object or YAML path (optional, for graph-related losses and dataloaders)
@@ -621,6 +672,7 @@ class Train(Routine):
     root: Path | None = None
     write_policy: Literal["reuse", "overwrite", "error"] = "reuse"
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
+    load_orbax: OrbaxParams | None = None
 
     # Other
     init_seed: int = 0
@@ -742,19 +794,23 @@ class Train(Routine):
         with profile_trace("train", self.root):
             with checkpointer_context as ckptr:
                 ## INITIALIZE/LOAD
-                abstract_checkpointables = {
-                    "params": _checkpoint_params(self.init_params),
-                    "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
-                }
+                params, opt_state, curr_step, total_steps = None, None, None, None
 
                 if ckptr.latest is None:
                     params = self.init_params
-                    opt_state = abstract_checkpointables["opt_state"]
+                    if self.load_orbax is not None:
+                        params = self.load_orbax.resolve_params(self.init_params)
+                    opt_state = self.optimizer.init(eqx.filter(params, eqx.is_array))
                     curr_step = 0
                     total_steps = self.termination.max_steps
                     logger.debug("Initialized train")
                 else:
-                    _loaded = ckptr.load_checkpointables(abstract_checkpointables=abstract_checkpointables)
+                    _loaded = ckptr.load_checkpointables(
+                        abstract_checkpointables={
+                            "params": _checkpoint_params(self.init_params),
+                            "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
+                        }
+                    )
                     params = _restore_params(_loaded["params"])
                     opt_state = _loaded["opt_state"]
                     curr_step = ckptr.latest.step + 1  # starting on next iteration
