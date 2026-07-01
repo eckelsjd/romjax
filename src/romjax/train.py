@@ -229,24 +229,18 @@ def residual_loss(
     single_data: PyTree,
     graph: FunctionGraph,
     path: list[str] = None,
-    error_op: UnaryOp | None = None,
+    error_op: BinaryOp | None = None,
     ignore: set | None = None,
 ):
     """Residual minimization objective. Minimize the result of a single forward path."""
-    if path is None:
-        raise ValueError("Residual loss must specify a path")
-    
-    end_node = graph._path_end_node(path)
-
-    if error_op is None:
-        error_op = end_node.error_op.op or end_node.error_op.reduce_op
-
-    if ignore is None:
-        ignore = end_node.ignore
-
-    res = graph.push_path(single_data, path, edge_payload_patches=params)
-
-    return UnaryOp(error_op)(res, ignore=ignore)
+    return graph.path_error(
+        single_data,
+        path_a=path,
+        path_b=None,
+        edge_payload_patches=params,
+        error_op=error_op,
+        ignore=ignore
+    )
 
 
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):

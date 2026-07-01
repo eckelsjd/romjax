@@ -5,6 +5,7 @@ from inspect import Parameter, signature
 from typing import Annotated, Any, Hashable, Literal, Sequence
 
 import jax
+import jax.numpy as jnp
 import networkx as nx
 from jaxtyping import PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -756,7 +757,7 @@ class FunctionGraph(BaseModel):
         self,
         payload: PyTree,
         path_a: list[str | Edge] | tuple[str | Edge, ...],
-        path_b: list[str | Edge] | tuple[str | Edge, ...],
+        path_b: list[str | Edge] | tuple[str | Edge, ...] | None,
         *,
         start: Node | str | None = None,
         aux_a: EdgePatch | None = None,
@@ -766,16 +767,17 @@ class FunctionGraph(BaseModel):
         ignore: set | None = None,
     ) -> jax.Array:
         """
-        Propagate one payload along two paths and compare the results at the common destination node.
+        Propagate one payload along two paths and compare the results at the common destination node. If path_b is 
+        None, then only propagate along path_a and compare to 0.
 
         Empty paths are treated as loopbacks and require an explicit ``start`` node.
         """
         normalized_a = self._normalize_path(path_a)
-        normalized_b = self._normalize_path(path_b)
+        normalized_b = self._normalize_path(path_b) if path_b is not None else None
         start_node = self._resolve_start_node(normalized_a if normalized_a else normalized_b, start)
         end_a = self._path_end_node(normalized_a, start=start_node)
-        end_b = self._path_end_node(normalized_b, start=start_node)
-        if end_a != end_b:
+        end_b = self._path_end_node(normalized_b, start=start_node) if normalized_b is not None else None
+        if end_b is not None and end_a != end_b:
             raise ValueError(
                 f"Path error requires matching destinations, but got {end_a!r} and {end_b!r}."
             )
@@ -787,13 +789,19 @@ class FunctionGraph(BaseModel):
             aux=aux_a,
             edge_payload_patches=edge_payload_patches,
         )
-        out_b = self.push_path(
-            payload,
-            normalized_b,
-            start=start_node,
-            aux=aux_b,
-            edge_payload_patches=edge_payload_patches,
-        )
+        if normalized_b is not None:
+            out_b = self.push_path(
+                payload,
+                normalized_b,
+                start=start_node,
+                aux=aux_b,
+                edge_payload_patches=edge_payload_patches,
+            )
+        else:
+            out_b = jax.tree_util.tree_map(
+                lambda leaf: jnp.zeros_like(jnp.asarray(leaf)) if eqx.is_array(leaf) else leaf,
+                out_a,
+            )
         error_fn = (
             end_a.error
             if error_op is None

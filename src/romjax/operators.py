@@ -43,9 +43,12 @@ _binary_aliases: dict[str, dict[str, Any]] = {
     "max-abs": {"op": "max-abs"},
     "rmse": {"op": "sqrt-mean-square"},
     "relative": {"op": "norm", "norm": "norm"},
+    "square-relative": {"op": "sum-square", "norm": "sum-square"},
     "pointwise-relative": {"op": "abs", "norm": "abs"},
     "mean-relative": {"reduce_op": "mean", "leaf_op": ("norm", "norm")},
+    "mean-square-relative": {"reduce_op": "mean", "leaf_op": ("sum-square", "sum-square")},
     "mean-norm": {"reduce_op": "mean", "leaf_op": "norm"},
+    "mean-max-square": {"reduce_op": "mean", "leaf_op": ("sum-square", "max-square")}  # norm each leaf by max square
 }
 
 
