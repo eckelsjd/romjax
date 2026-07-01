@@ -97,6 +97,7 @@ class AxisOptions(DictModel):
     :ivar title: the axis title
     :ivar xscale: scale for x-axis
     :ivar yscale: scale for y-axis
+    :ivar cscale: scale for colorbar axis normalization
     :ivar xlim: limits for x-axis (defaults to autoscale if None)
     :ivar ylim: limits for y-axis (defaults to autoscale if None)
     :ivar clim: limits for colorbar (if None, will not show a colorbar), can also set to 'auto'
@@ -111,6 +112,7 @@ class AxisOptions(DictModel):
     title: str | None = None
     xscale: str | None = None
     yscale: str | None = None
+    cscale: str | None = None
     xlim: tuple[float, float] | None = None
     ylim: tuple[float, float] | None = None
     clim: tuple[float, float] | Literal['auto'] | None = None
@@ -356,7 +358,8 @@ def gridplot(
             ax = axs[i, j]
 
             if spec.opts.clim is not None:
-                sm = ScalarMappable(norm=spec.kwargs.pop("norm", "linear"), cmap=spec.kwargs.pop("cmap", "viridis"))
+                norm = spec.kwargs.pop("norm", spec.opts.cscale or "linear")
+                sm = ScalarMappable(norm=norm, cmap=spec.kwargs.pop("cmap", "viridis"))
                 sm.set_array([])
 
                 if spec.opts.clim != 'auto':
