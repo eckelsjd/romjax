@@ -33,7 +33,6 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
     "Train": ("romjax.train", "Train"),

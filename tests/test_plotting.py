@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import matplotlib
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
@@ -34,6 +35,27 @@ def test_basic_gridplot(tmp_path):
     )
 
     assert (Path(tmp_path) / "sine.gif").exists()
+    plt.close(fig)
+
+
+def test_gridplot_cscale_sets_colorbar_normalization():
+    x, y = np.meshgrid(np.linspace(0.0, 1.0, 3), np.linspace(0.0, 1.0, 3))
+    z = np.asarray([[1.0, 10.0, 100.0], [2.0, 20.0, 200.0], [3.0, 30.0, 300.0]])
+
+    spec = PlotSpec(
+        kind="pcolor",
+        data=(x, y, z),
+        opts=AxisOptions(clim=(1.0, 300.0), cscale="log"),
+    )
+
+    fig, axs = gridplot(spec)
+    mesh = axs[0, 0].collections[0]
+
+    assert isinstance(mesh.norm, mcolors.LogNorm)
+    assert mesh.norm.vmin == pytest.approx(1.0)
+    assert mesh.norm.vmax == pytest.approx(300.0)
+    assert fig.axes[1].get_yscale() == "log"
+
     plt.close(fig)
 
 
