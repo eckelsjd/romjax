@@ -74,6 +74,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ListModel": ("romjax.typing", "ListModel"),
     "CallableModel": ("romjax.typing", "CallableModel"),
     "ThirdPartyType": ("romjax.typing", "ThirdPartyType"),
+    "from_yaml": ("romjax.typing", "from_yaml"),
+    "resolve_graph_refs": ("romjax.typing", "resolve_graph_refs"),
     "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "Routine": ("romjax.routine", "Routine"),
     "RoutineConfig": ("romjax.routine", "RoutineConfig"),
@@ -118,7 +120,7 @@ if TYPE_CHECKING:
         OrbaxParams,
         Train,
     )
-    from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType
+    from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType, resolve_graph_refs, from_yaml
     from .utils import load_h5, save_h5
 
 def __getattr__(name: str) -> _Any:
