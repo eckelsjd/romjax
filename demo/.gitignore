@@ -4,6 +4,7 @@ archive
 outputs
 poisson_subspace_compare
 train
+ema_balancing
 *.pdf
 *.png
 *.npz

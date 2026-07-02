@@ -73,6 +73,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Stacked h5 datasets (many samples per file)
 - [ ] Something with pre-compiling (globally) jax loss functions to avoid jit cache misses
 - [ ] Seems to be some recompiling when using cached data versus disk data -- keep an eye on this
+- [ ] All the jax jit stuff I have not been paying attention to (static args, recompilation, host/device transfer, python logic)
 
 ## Training
 - [ ] EvolutionSearch or similar instead of grid search (still dispatch in parallel)
