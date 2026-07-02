@@ -38,7 +38,7 @@ from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.operators import BinaryOp, UnaryOp
-from romjax.plotting import PlotSpec, gridplot
+from romjax.plotting import GridplotConfig, PlotSpec, gridplot
 from romjax.profiling import profile_annotation, profile_step, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
@@ -272,10 +272,103 @@ class GraphLossCallable(CallableModel):
     callable: Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]
 
 
+class GraphLossBalancing(BaseModel):
+    """
+    Optional adaptive scaling policy for :class:`GraphLoss` terms.
+
+    :param kind: balancing strategy; ``"none"`` preserves static term weights and ``"ema"`` enables EMA scaling
+    :param decay: exponential decay factor for raw term magnitudes: ema = decay*last + (1-decay)*new
+    :param eps: positive denominator floor for scale computation
+    :param target: target scaled magnitude for each term before clipping (default is 1)
+    :param min_scale: lower bound for the adaptive scale
+    :param max_scale: upper bound for the adaptive scale
+    :param bootstrap: initialize EMA scales from the first batch before the first optimizer update
+    :param normalize: normalize adaptive scales to control the global learning-rate scale
+    :param update_interval: number of optimizer steps between EMA updates
+    """
+
+    kind: Literal["none", "ema"] = "none"
+    decay: float = 0.95
+    eps: float = 1e-8
+    target: float = 1.0
+    min_scale: float = 1e-8
+    max_scale: float = 1e8
+    bootstrap: bool = True
+    normalize: Literal["mean", "sum", "none"] = "mean"
+    update_interval: PositiveInt = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_bool_or_str(cls, value):
+        if isinstance(value, str):
+            return {"kind": value}
+        elif isinstance(value, bool):
+            return {"kind": "ema" if value else "none"}
+        return value
+
+    @model_validator(mode="after")
+    def _check_values(self):
+        if not 0.0 <= self.decay < 1.0:
+            raise ValueError("decay must satisfy 0 <= decay < 1")
+        if self.eps <= 0.0:
+            raise ValueError("eps must be positive")
+        if self.target <= 0.0:
+            raise ValueError("target must be positive")
+        if self.min_scale <= 0.0 or self.max_scale <= 0.0:
+            raise ValueError("scale bounds must be positive")
+        if self.min_scale > self.max_scale:
+            raise ValueError("min_scale must be less than or equal to max_scale")
+        return self
+
+
+class _GraphLossEmaState(BaseModel):
+    """Mutable Python-side EMA state for adaptive :class:`GraphLoss` scaling.
+    
+    :ivar step: current optimizer step
+    :ivar ema: current exponential moving average of each loss term: (1-decay)*curr + decay*last
+    :ivar scales: clip(1/ema), this is what actually multiples each loss, e.g. w(t)
+    :ivar initialized: whether each term's ema has been started
+    """
+
+    step: int = 0
+    ema: dict[str, float]
+    scales: dict[str, float]
+    initialized: dict[str, bool]
+
+    @classmethod
+    def initialize(cls, names: Sequence[str]) -> "_GraphLossEmaState":
+        """Create an all-ones EMA state for a fixed list of term names."""
+        return cls(
+            ema={name: 0.0 for name in names},
+            scales={name: 1.0 for name in names},
+            initialized={name: False for name in names},
+        )
+
+    @classmethod
+    def from_checkpoint(cls, tree: Mapping[str, Any]) -> "_GraphLossEmaState":
+        """Restore EMA state from a scalar-array checkpoint tree."""
+        return cls(
+            step=int(np.asarray(tree["step"])),
+            ema={name: float(np.asarray(value)) for name, value in tree["ema"].items()},
+            scales={name: float(np.asarray(value)) for name, value in tree["scales"].items()},
+            initialized={name: bool(np.asarray(value)) for name, value in tree["initialized"].items()},
+        )
+
+    def checkpoint_tree(self) -> dict[str, PyTree]:
+        """Return a checkpointable scalar-array representation."""
+        return {
+            "step": jnp.asarray(self.step, dtype=jnp.int32),
+            "ema": {name: jnp.asarray(value, dtype=jnp.float32) for name, value in self.ema.items()},
+            "scales": {name: jnp.asarray(value, dtype=jnp.float32) for name, value in self.scales.items()},
+            "initialized": {name: jnp.asarray(value) for name, value in self.initialized.items()},
+        }
+
+
 class GraphLossTerm(BaseModel):
     """
     One weighted term in a :class:`GraphLoss`. Aggregates a loss function over batch data.
 
+    :param name: stable term name used for adaptive balancing, diagnostics, and plotting
     :param function: function to apply to a single sample of data
     :param dataset: which dataset name to read data from
     :param weight: scalar term weight
@@ -289,9 +382,21 @@ class GraphLossTerm(BaseModel):
         BeforeValidator(lambda v: {"callable": v} if isinstance(v, str) else v),
         BeforeValidator(functools.partial(from_registry, _LOSS_REGISTRY))
     ]
+    name: str | None = None
     dataset: str | None = None
     weight: float = 1.0
     batch_reduce: UnaryOp | None = "mean"
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("GraphLossTerm name must not be empty")
+        if "," in value:
+            raise ValueError("GraphLossTerm name must not contain ','")
+        return value
 
     @field_validator("batch_reduce", mode="before")
     @classmethod
@@ -307,12 +412,13 @@ class GraphLossTerm(BaseModel):
             return {"term": value}
         return value
 
-    def __call__(
+    def raw_value(
         self, 
         params: Mapping[str, PyTree], 
         batch_data: Mapping[str, PyTree], 
         graph: FunctionGraph
     ) -> jax.Array:
+        """Evaluate the unweighted, batch-reduced term value."""
         if self.batch_reduce is not None:
             if self.dataset is not None and self.dataset not in batch_data:
                 return jnp.asarray(0.0)  # if a dataset runs out during iteration
@@ -327,10 +433,19 @@ class GraphLossTerm(BaseModel):
                     return carry, self.term(params, single_data, graph)
 
                 _, losses = jax.lax.scan(body, None, term_batch)
-            return jnp.asarray(self.weight) * self.batch_reduce(losses)
+            return self.batch_reduce(losses)
     
         else:
-            return jnp.asarray(self.weight) * self.term(params, batch_data, graph)
+            return self.term(params, batch_data, graph)
+
+    def __call__(
+        self, 
+        params: Mapping[str, PyTree], 
+        batch_data: Mapping[str, PyTree], 
+        graph: FunctionGraph
+    ) -> jax.Array:
+        """Evaluate the weighted term value."""
+        return jnp.asarray(self.weight) * self.raw_value(params, batch_data, graph)
 
 
 class GraphLoss(BaseModel):
@@ -338,12 +453,14 @@ class GraphLoss(BaseModel):
     Loss function for a `FunctionGraph`.
 
     :param terms: loss terms combined by weighted summation
+    :param balancing: optional adaptive term scaling policy
     :param graph: the FunctionGraph, leave as None to defer to `Train.graph`
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
     terms: Sequence[GraphLossTerm]
+    balancing: GraphLossBalancing = Field(default_factory=GraphLossBalancing)
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
 
     __hash__ = object.__hash__
@@ -357,9 +474,20 @@ class GraphLoss(BaseModel):
 
     @model_validator(mode="after")
     def _bind_default_datasets(self):
+        self._set_default_term_names()
         if self.graph is not None:
             self._set_default_datasets()
         return self
+
+    def _set_default_term_names(self) -> None:
+        """Assign deterministic names to unnamed loss terms and require uniqueness."""
+        names = []
+        for idx, term in enumerate(self.terms):
+            if term.name is None:
+                term.name = f"term_{idx}"
+            if term.name in names:
+                raise ValueError(f"Duplicate GraphLoss term name: {term.name}")
+            names.append(term.name)
     
     def _set_default_datasets(self):
         """Grab the first sampleable edge as the default dataset, i.e. typically there is only one."""
@@ -374,17 +502,54 @@ class GraphLoss(BaseModel):
                 if term.dataset is None:
                     term.dataset = _default_edge
 
+    @property
+    def term_names(self) -> tuple[str, ...]:
+        """Stable names for all terms in order."""
+        return tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
+
+    def term_values(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> dict[str, jax.Array]:
+        """Return raw, unweighted term values keyed by term name.
+
+        :param params: edge-payload parameter patches
+        :param batch: batch data passed to graph loss terms
+        :return: raw scalar loss value for each term
+        """
+        params = pytree_resolve_refs(params)
+        return {
+            term.name or f"term_{idx}": term.raw_value(params, batch, self.graph)
+            for idx, term in enumerate(self.terms)
+        }
+
+    def scaled_term_values(
+        self,
+        raw_terms: Mapping[str, jax.Array],
+        scales: Mapping[str, ArrayLike] | None = None,
+    ) -> dict[str, jax.Array]:
+        """Apply static weights and optional adaptive scales to raw term values.
+
+        :param raw_terms: raw values returned by :meth:`term_values`
+        :param scales: optional adaptive scale for each term; missing scales default to one
+        :return: effective contribution of each term to the total loss
+        """
+        scales = scales or {}
+        scaled = {}
+        for idx, term in enumerate(self.terms):
+            name = term.name or f"term_{idx}"
+            scale = scales.get(name, 1.0)
+            scaled[name] = jnp.asarray(term.weight) * jnp.asarray(scale) * raw_terms[name]
+        return scaled
+
+    def total_from_terms(self, terms: Mapping[str, jax.Array]) -> jax.Array:
+        """Sum a mapping of scalar term values into one scalar loss."""
+        total = jnp.asarray(0.0)
+        for name in self.term_names:
+            total = total + terms[name]
+        return total
+
     def __call__(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
         """Parameters are specified on a per-edge basis. Data batches will also be passed per-edge."""
-        if self.graph is None:
-            raise ValueError("Must specify a FunctionGraph to evaluate GraphLoss")
-        
-        params = pytree_resolve_refs(params)
-
-        total = 0.0
-        for term in self.terms:
-            total = total + term(params, batch, self.graph)
-        return total
+        raw_terms = self.term_values(params, batch)
+        return self.total_from_terms(self.scaled_term_values(raw_terms))
 
 
 class GraphTest(GraphLoss):
@@ -534,6 +699,60 @@ class CheckpointerConfig(BaseModel):
         return value
 
 
+def _merge_plot_spec(base: PlotSpec, override: Mapping | PlotSpec | None) -> PlotSpec:
+    """Merge a partial plot spec override into a default spec."""
+    if override is None:
+        return base
+    if isinstance(override, PlotSpec):
+        return override
+    if not isinstance(override, Mapping):
+        raise ValueError("plot spec override must be a Mapping or PlotSpec")
+
+    spec = {
+        "kind": override.get("kind", base.kind),
+        "data": override.get("data", base.data),
+        "name": override.get("name", base.name),
+        "opts": GridplotConfig.merge(base.opts, override.get("opts", {})),
+        "kwargs": GridplotConfig.merge(base.kwargs, override.get("kwargs", {})),
+    }
+    return PlotSpec(**spec)
+
+
+def _default_plot_spec(name: str = "Loss", color: str | None = None) -> PlotSpec:
+    """Default plot spec for training."""
+    return PlotSpec(
+        kind="line",
+        data=([], []),
+        name=name,
+        opts={"xlabel": "Iteration", "ylabel": name, "yscale": "log", "grid": True},
+        kwargs={"color": color} if color is not None else {}
+    )
+
+
+class TermPlotConfig(BaseModel):
+    """
+    Online plotting options for per-term :class:`GraphLoss` diagnostics.
+
+    :param enabled: whether to include this term subplot in the training figure
+    :param include: term names to plot; ``None`` means all terms not excluded
+    :param exclude: term names to hide
+    :param spec: base subplot style, matching :class:`romjax.plotting.PlotSpec`
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    enabled: bool = False
+    include: Sequence[str] | None = None
+    exclude: Sequence[str] = ()
+    spec: PlotSpec = Field(default_factory=_default_plot_spec)
+
+    def selected_terms(self, names: Sequence[str]) -> tuple[str, ...]:
+        """Return visible term names in their original order."""
+        included = set(names) if self.include is None else set(self.include)
+        excluded = set(self.exclude)
+        return tuple(name for name in names if name in included and name not in excluded)
+
+
 class DiagnosticsConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
@@ -546,20 +765,12 @@ class DiagnosticsConfig(BaseModel):
     progress_callback: Callable[[PyTree, FunctionGraph, Path], None] | None = None
     live_plot: bool = False
     save_plot: dict = Field(default_factory=lambda: dict(fname="loss.pdf", bbox_inches="tight"))
-    train_plot: PlotSpec = Field(
-        default_factory=lambda: dict(
-            kind="line", data=([], []), name="train",
-            opts={"xlabel": "Iteration", "ylabel": "Training loss", "yscale": "log", "grid": True},
-            kwargs={"color": "green"}
-        )
+    raw_terms_plot: TermPlotConfig = Field(default_factory=lambda: TermPlotConfig(spec=_default_plot_spec("Raw terms")))
+    scaled_terms_plot: TermPlotConfig = Field(
+        default_factory=lambda: TermPlotConfig(spec=_default_plot_spec("Scaled terms"))
     )
-    validation_plot: PlotSpec = Field(
-        default_factory=lambda: dict(
-            kind="line", data=([], []), name="validation",
-            opts={"xlabel": "Iteration", "ylabel": "Validation loss", "yscale": "log", "grid": True},
-            kwargs={"color": "orange"}
-        )
-    )
+    loss_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Loss", "g"))
+    test_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Test", "orange"))
 
     @field_validator("save_plot", mode="before")
     @classmethod
@@ -568,24 +779,39 @@ class DiagnosticsConfig(BaseModel):
         if isinstance(value, str | Path):
             return {"fname": value}
         return value
+
+    @field_validator("raw_terms_plot", "scaled_terms_plot", mode="before")
+    @classmethod
+    def _fill_term_plot_config(cls, value, info):
+        """Fill term plot configs from partial mappings while preserving subplot-specific defaults."""
+        default_spec = (
+            _default_plot_spec("Raw terms") if info.field_name == "raw_terms_plot" else 
+            _default_plot_spec("Scaled terms")
+        )
+
+        if value is None:
+            return TermPlotConfig(spec=default_spec)
+        if isinstance(value, bool):
+            return TermPlotConfig(enabled=value, spec=default_spec)
+        if isinstance(value, TermPlotConfig):
+            value.spec = _merge_plot_spec(default_spec, value.spec)
+            return value
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{info.field_name} must be a Mapping, bool, or TermPlotConfig")
+        
+        cfg = dict(value)
+        cfg["spec"] = _merge_plot_spec(default_spec, cfg.get("spec"))
+        return TermPlotConfig(**cfg)
     
-    @field_validator("train_plot", "validation_plot", mode="before")
+    @field_validator("loss_plot", "test_plot", mode="before")
     @classmethod
     def _fill_plot_spec_data(cls, value, info):
         """Ensure we are only doing line plots, and initialize empty data param."""
-        spec = PlotSpec(kind="line", data=([], []))
-
-        if value is None:
-            return spec
-        
-        if not isinstance(value, Mapping):
-            raise ValueError(f"{info.field_name} must be a Mapping")
-        
-        for key in ["opts", "kwargs", "name"]:
-            if (ele := value.get(key, None)) is not None and len(ele) > 0:
-                spec[key] = ele
-        
-        return spec
+        spec = (
+            _default_plot_spec("Loss", "g") if info.field_name == "loss_plot" else 
+            _default_plot_spec("Test", "orange")
+        )
+        return _merge_plot_spec(spec, value)
 
 
 class TerminationConfig(BaseModel):
@@ -631,6 +857,137 @@ class _NullCheckpointer:
     
     def save_checkpointables(*args, **kwargs):
         pass
+
+
+class _ScalarHistory:
+    """Scalar metric history with O(1) step replacement."""
+
+    def __init__(self, steps: Sequence[int] | None = None, values: Sequence[float] | None = None):
+        self.steps = list(steps or [])
+        self.values = list(values or [])
+        self._step_index = {step: idx for idx, step in enumerate(self.steps)}
+
+    @classmethod
+    def load(cls, path: Path) -> "_ScalarHistory":
+        """Load a scalar CSV history."""
+        if not path.exists():
+            return cls()
+
+        arr = np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+        if arr.size == 0:
+            return cls()
+        return cls(arr[:, 0].astype(int).tolist(), arr[:, 1].tolist())
+
+    def has_step(self, step: int) -> bool:
+        """Return whether a row exists for ``step``."""
+        return step in self._step_index
+
+    def record(self, step: int, value: float) -> None:
+        """Append or replace a scalar value for an optimizer step."""
+        idx = self._step_index.get(step)
+        if idx is None:
+            self._step_index[step] = len(self.steps)
+            self.steps.append(step)
+            self.values.append(value)
+        else:
+            self.values[idx] = value
+
+    def series(self) -> tuple[list[int], list[float]]:
+        """Return data in ``matplotlib`` line format."""
+        return self.steps, self.values
+
+    def save(self, path: Path) -> None:
+        """Write this scalar history as CSV."""
+        if self.steps:
+            arr = np.column_stack((
+                np.asarray(self.steps, dtype=int),
+                np.asarray(self.values, dtype=float),
+            ))
+        else:
+            arr = np.empty((0, 2))
+        np.savetxt(
+            path,
+            arr,
+            fmt="%d,%.6e",
+            header="Iteration,Value",
+            comments="",
+        )
+
+
+class _TermHistory:
+    """Multi-term metric history with O(1) step replacement."""
+
+    def __init__(
+        self,
+        term_names: Sequence[str],
+        steps: Sequence[int] | None = None,
+        values: Mapping[str, Sequence[float]] | None = None,
+    ):
+        self.term_names = tuple(term_names)
+        self.steps = list(steps or [])
+        values = values or {}
+        self.values = {name: list(values.get(name, [])) for name in self.term_names}
+        for name in self.term_names:
+            missing = len(self.steps) - len(self.values[name])
+            if missing > 0:
+                self.values[name].extend([np.nan] * missing)
+        self._step_index = {step: idx for idx, step in enumerate(self.steps)}
+
+    @classmethod
+    def load(cls, path: Path, term_names: Sequence[str]) -> "_TermHistory":
+        """Load a multi-term CSV history."""
+        if not path.exists():
+            return cls(term_names)
+
+        with path.open("r", encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+        arr = np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+        if arr.size == 0:
+            return cls(term_names)
+
+        steps = arr[:, 0].astype(int).tolist()
+        values = {name: [] for name in term_names}
+        for col_idx, name in enumerate(header[1:], start=1):
+            if name in values:
+                values[name] = arr[:, col_idx].tolist()
+        return cls(term_names, steps, values)
+
+    def record(self, step: int, values: Mapping[str, float]) -> None:
+        """Append or replace a row in a multi-term history."""
+        idx = self._step_index.get(step)
+        if idx is None:
+            idx = len(self.steps)
+            self._step_index[step] = idx
+            self.steps.append(step)
+            for name in self.term_names:
+                self.values[name].append(np.nan)
+
+        for name in self.term_names:
+            value = values.get(name, np.nan)
+            self.values[name][idx] = value
+
+    def term_series(self, name: str) -> tuple[list[int], list[float]]:
+        """Return one term's data in ``matplotlib`` line format."""
+        return self.steps, self.values.get(name, [])
+
+    def save(self, path: Path) -> None:
+        """Write this multi-term history as CSV."""
+        if self.steps:
+            columns = [np.asarray(self.steps, dtype=int)]
+            columns.extend(np.asarray(self.values[name], dtype=float) for name in self.term_names)
+            arr = np.column_stack(columns)
+        else:
+            arr = np.empty((0, 1 + len(self.term_names)))
+
+        fmt = ["%d"] + ["%.6e"] * len(self.term_names)
+        np.savetxt(
+            path,
+            arr,
+            fmt=fmt,
+            delimiter=",",
+            header="Iteration," + ",".join(self.term_names),
+            comments="",
+        )
 
 
 class Train(Routine):
@@ -738,6 +1095,16 @@ class Train(Routine):
 
         test_fn = self.test if self.test is not None else None
         _, static_params = eqx.partition(self.init_params, eqx.is_array)
+        graph_loss = self.loss if isinstance(self.loss, GraphLoss) else None
+        ema_enabled = graph_loss is not None and graph_loss.balancing.kind == "ema"
+        term_names = graph_loss.term_names if graph_loss is not None else ()
+        term_diagnostics_enabled = graph_loss is not None and (
+            ema_enabled
+            or self.diagnostics.raw_terms_plot.enabled
+            or self.diagnostics.scaled_terms_plot.enabled
+        )
+        loss_state = _GraphLossEmaState.initialize(term_names) if ema_enabled else None
+        ema_bootstrapped = False
 
         def _checkpoint_params(params: PyTree) -> PyTree:
             """Persist only array-valued leaves so Orbax never sees static callables/modules."""
@@ -752,10 +1119,116 @@ class Train(Routine):
             return eqx.filter_value_and_grad(self.loss)(params, batch)
 
         @eqx.filter_jit
+        def _graph_raw_terms(params: PyTree, batch: PyTree):
+            return graph_loss.term_values(params, batch)
+
+        @eqx.filter_jit
+        def _graph_loss_and_grad(params: PyTree, batch: PyTree, scales: Mapping[str, ArrayLike]):
+            def _loss(params: PyTree, batch: PyTree):
+                raw_terms = _graph_raw_terms(params, batch)
+                scaled_terms = graph_loss.scaled_term_values(raw_terms, scales)
+                return graph_loss.total_from_terms(scaled_terms), (raw_terms, scaled_terms)
+
+            return eqx.filter_value_and_grad(_loss, has_aux=True)(params, batch)
+
+        @eqx.filter_jit
         def _optimizer_update(params: PyTree, opt_state: optax.OptState, grads: PyTree):
             updates, opt_state = self.optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
             params = eqx.apply_updates(params, updates)
             return params, opt_state
+
+        def _checkpointables(params: PyTree, opt_state: optax.OptState) -> dict[str, PyTree]:
+            """Build the checkpointable training state."""
+            checkpointables = {"params": _checkpoint_params(params), "opt_state": opt_state}
+            if loss_state is not None:
+                checkpointables["loss_state"] = loss_state.checkpoint_tree()
+            return checkpointables
+
+        def _current_scales() -> dict[str, float]:
+            """Return the current adaptive scales as host floats for diagnostics and checkpointing."""
+            if loss_state is None:
+                return {name: 1.0 for name in term_names}
+            return dict(loss_state.scales)
+
+        def _current_scale_arrays() -> dict[str, jax.Array]:
+            """Return current adaptive scales as dynamic JAX leaves for jitted loss evaluation."""
+            return {name: jnp.asarray(value, dtype=jnp.float32) for name, value in _current_scales().items()}
+
+        def _host_float_terms(terms: Mapping[str, ArrayLike] | None) -> dict[str, float] | None:
+            """Convert a ready term-value mapping to host floats."""
+            if terms is None:
+                return None
+            return {name: float(np.asarray(value)) for name, value in terms.items()}
+
+        def _compute_ema_scales() -> dict[str, float]:
+            """Compute clipped and normalized adaptive scales from current EMA values."""
+            if loss_state is None:
+                return {}
+
+            scales = {}
+            for name in term_names:
+                if loss_state.initialized[name]:
+                    scale = graph_loss.balancing.target / (loss_state.ema[name] + graph_loss.balancing.eps)
+                    scales[name] = float(np.clip(scale, graph_loss.balancing.min_scale, graph_loss.balancing.max_scale))
+                else:
+                    scales[name] = loss_state.scales[name]
+
+            if graph_loss.balancing.normalize == "none" or len(scales) == 0:
+                return scales
+
+            values = np.asarray(list(scales.values()), dtype=float)
+            denom = float(np.mean(values) if graph_loss.balancing.normalize == "mean" else np.sum(values))
+            if not np.isfinite(denom) or denom <= 0.0:
+                logger.warning("Skipping GraphLoss EMA scale normalization due to non-positive scale denominator.")
+                return scales
+
+            factor = graph_loss.balancing.target / denom
+            return {name: scale * factor for name, scale in scales.items()}
+
+        def _bootstrap_ema_state(raw_terms: Mapping[str, float]) -> None:
+            """Initialize EMA state from the first batch before optimizer gradients are computed."""
+            if loss_state is None:
+                return
+
+            for name in term_names:
+                raw_value = raw_terms[name]
+                if not np.isfinite(raw_value):
+                    logger.warning(f"Skipping EMA bootstrap for non-finite GraphLoss term '{name}': {raw_value}")
+                    continue
+                if raw_value < 0.0:
+                    logger.warning(f"EMA GraphLoss balancing assumes non-negative terms; got {name}={raw_value:.3e}")
+                loss_state.ema[name] = raw_value
+                loss_state.initialized[name] = True
+            loss_state.scales = _compute_ema_scales()
+
+        def _update_ema_state(raw_terms: Mapping[str, float]) -> None:
+            """Update EMA state from raw term values outside the differentiable path."""
+            if loss_state is None:
+                return
+            if loss_state.step % graph_loss.balancing.update_interval != 0:
+                loss_state.step += 1
+                return
+
+            new_step = loss_state.step + 1
+            for name in term_names:
+                raw_value = raw_terms[name]
+                if not np.isfinite(raw_value):
+                    logger.warning(f"Skipping EMA update for non-finite GraphLoss term '{name}': {raw_value}")
+                    continue
+                if raw_value < 0.0:
+                    logger.warning(f"EMA GraphLoss balancing assumes non-negative terms; got {name}={raw_value:.3e}")
+                
+                if loss_state.initialized[name]:
+                    ema = graph_loss.balancing.decay * loss_state.ema[name]
+                    ema += (1.0 - graph_loss.balancing.decay) * raw_value
+                else:
+                    ema = raw_value
+                    loss_state.initialized[name] = True
+                
+                loss_state.ema[name] = ema
+            
+            loss_state.scales = _compute_ema_scales()
+            loss_state.step = new_step
 
         def _save_plot(fig):
             if fig is not None and self.root is not None:
@@ -763,38 +1236,30 @@ class Train(Routine):
                 fname = save_opts.pop("fname", "loss.pdf")
                 fig.savefig(self.root / fname, **save_opts)
         
-        def _load_history_csv(fname: str) -> tuple[list[int], list[float]]:
-            if self.root:
-                p = self.root / fname
-                if not p.exists():
-                    return [], []
-                arr = np.atleast_2d(np.loadtxt(p, delimiter=",", skiprows=1))
-                return arr[:, 0].astype(int).tolist(), arr[:, 1].tolist()
-            else:
-                return [], []
-    
-        def _save_history_csv(fname: str, iterations: list[int], values: list[float]):
-            if self.root:
-                arr = np.column_stack((
-                    np.asarray(iterations, dtype=int),
-                    np.asarray(values, dtype=float),
-                ))
-                np.savetxt(
-                    self.root / fname, 
-                    arr,
-                    fmt="%d,%.6e",
-                    header="Iteration,Value",
-                    comments="",
-                )
+        def _load_scalar_history(fname: str) -> _ScalarHistory:
+            if self.root is None:
+                return _ScalarHistory()
+            return _ScalarHistory.load(self.root / fname)
 
-        def _record_history(hist: tuple[list[int], list[float]], step: int, value: float):
-            """Append or replace a scalar history value for an optimizer-step index."""
-            if step in hist[0]:
-                idx = hist[0].index(step)
-                hist[1][idx] = value
-            else:
-                hist[0].append(step)
-                hist[1].append(value)
+        def _load_term_history(fname: str) -> _TermHistory:
+            if self.root is None:
+                return _TermHistory(term_names)
+            return _TermHistory.load(self.root / fname, term_names)
+
+        def _save_histories() -> None:
+            """Persist CSV histories independently of plot refresh cadence."""
+            if self.root is None:
+                return
+
+            loss_hist.save(self.root / "loss.csv")
+            if test_fn is not None:
+                test_hist.save(self.root / "test.csv")
+            if raw_terms_hist is not None:
+                raw_terms_hist.save(self.root / "loss_terms_raw.csv")
+            if scaled_terms_hist is not None:
+                scaled_terms_hist.save(self.root / "loss_terms_scaled.csv")
+            if term_scales_hist is not None:
+                term_scales_hist.save(self.root / "loss_term_scales.csv")
         
         if self.root is not None:
             checkpointer_context = ocp.training.Checkpointer(self.root, **dict(self.checkpointer))
@@ -815,12 +1280,32 @@ class Train(Routine):
                     total_steps = self.termination.max_steps
                     logger.debug("Initialized train")
                 else:
-                    _loaded = ckptr.load_checkpointables(
-                        abstract_checkpointables={
-                            "params": _checkpoint_params(self.init_params),
-                            "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
-                        }
-                    )
+                    abstract_checkpointables = {
+                        "params": _checkpoint_params(self.init_params),
+                        "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
+                    }
+                    if loss_state is not None:
+                        abstract_checkpointables["loss_state"] = loss_state.checkpoint_tree()
+                    
+                    try:
+                        _loaded = ckptr.load_checkpointables(abstract_checkpointables=abstract_checkpointables)
+                    except Exception:
+                        if loss_state is None:
+                            raise
+                        logger.warning(
+                            "Could not restore GraphLoss EMA state from checkpoint; initializing fresh state."
+                        )
+                        _loaded = ckptr.load_checkpointables(
+                            abstract_checkpointables={
+                                "params": abstract_checkpointables["params"],
+                                "opt_state": abstract_checkpointables["opt_state"],
+                            }
+                        )
+                    else:
+                        if loss_state is not None and "loss_state" in _loaded:
+                            loss_state = _GraphLossEmaState.from_checkpoint(_loaded["loss_state"])
+                            ema_bootstrapped = True
+                    
                     params = _restore_params(_loaded["params"])
                     opt_state = _loaded["opt_state"]
                     curr_step = ckptr.latest.step  # checkpoint step is the number of completed optimizer updates
@@ -839,26 +1324,79 @@ class Train(Routine):
                 plot_interval = self.diagnostics.plot_interval or float('inf')
                 callback_interval = self.diagnostics.callback_interval or float('inf')
                 
-                loss_hist = _load_history_csv("loss.csv")
-                test_hist = _load_history_csv("test.csv")
+                loss_hist = _load_scalar_history("loss.csv")
+                test_hist = _load_scalar_history("test.csv")
+                raw_terms_hist = _load_term_history("loss_terms_raw.csv") if term_diagnostics_enabled else None
+                scaled_terms_hist = _load_term_history("loss_terms_scaled.csv") if term_diagnostics_enabled else None
+                term_scales_hist = _load_term_history("loss_term_scales.csv") if ema_enabled else None
                 existing_checkpoint_steps = {checkpoint.step for checkpoint in ckptr.checkpoints}
                 fig, axs, lines = None, None, None
+                raw_term_lines, scaled_term_lines = {}, {}
 
                 if 0 < plot_interval < float('inf'):
                     if self.diagnostics.live_plot:
                         plt.ion()
 
-                    plot_specs = [self.diagnostics.train_plot]
+                    plot_specs = [self.diagnostics.loss_plot]
 
                     if test_fn is not None:
-                        plot_specs.append(self.diagnostics.validation_plot)
+                        plot_specs.append(self.diagnostics.test_plot)
+
+                    raw_plot_terms = ()
+                    scaled_plot_terms = ()
+                    if graph_loss is not None:
+                        raw_plot_terms = self.diagnostics.raw_terms_plot.selected_terms(term_names)
+                        scaled_plot_terms = self.diagnostics.scaled_terms_plot.selected_terms(term_names)
+                    
+                    if self.diagnostics.raw_terms_plot.enabled and raw_plot_terms:
+                        plot_specs.append(tuple(
+                            _merge_plot_spec(
+                                self.diagnostics.raw_terms_plot.spec,
+                                {
+                                    "data": ([], []),
+                                    "name": f"raw_terms_{name}",
+                                    "opts": {"leg_label": name},
+                                },
+                            )
+                            for name in raw_plot_terms
+                        ))
+                    
+                    if self.diagnostics.scaled_terms_plot.enabled and scaled_plot_terms:
+                        plot_specs.append(tuple(
+                            _merge_plot_spec(
+                                self.diagnostics.scaled_terms_plot.spec,
+                                {
+                                    "data": ([], []),
+                                    "name": f"scaled_terms_{name}",
+                                    "opts": {"leg_label": name},
+                                },
+                            )
+                            for name in scaled_plot_terms
+                        ))
                     
                     fig, axs = gridplot(plot_specs)
-                    lines = [ax.lines[0] for ax in axs.ravel()]
-                    lines[0].set_data(*loss_hist)
+                    active_axes = axs.ravel()[:len(plot_specs)]
+                    lines = [ax.lines[0] for ax in active_axes]
+                    lines[0].set_data(*loss_hist.series())
 
                     if test_fn is not None:
-                        lines[1].set_data(*test_hist)
+                        lines[1].set_data(*test_hist.series())
+                    
+                    plot_axis_idx = 1 + int(test_fn is not None)
+                    if self.diagnostics.raw_terms_plot.enabled and raw_plot_terms:
+                        ax = active_axes[plot_axis_idx]
+                        raw_term_lines = dict(zip(raw_plot_terms, ax.lines))
+                        if raw_terms_hist is not None:
+                            for name, line in raw_term_lines.items():
+                                line.set_data(*raw_terms_hist.term_series(name))
+                        plot_axis_idx += 1
+                    
+                    if self.diagnostics.scaled_terms_plot.enabled and scaled_plot_terms:
+                        ax = active_axes[plot_axis_idx]
+                        scaled_term_lines = dict(zip(scaled_plot_terms, ax.lines))
+                        if scaled_terms_hist is not None:
+                            for name, line in scaled_term_lines.items():
+                                line.set_data(*scaled_terms_hist.term_series(name))
                 
                 def _save_final(metrics=None):
                     if 0 < plot_interval < float('inf') and self.diagnostics.live_plot:
@@ -866,16 +1404,14 @@ class Train(Routine):
                     with profile_annotation("checkpoint_save", env=os.environ):
                         ckptr.save_checkpointables(
                             step=curr_step,
-                            checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
+                            checkpointables=_checkpointables(params, opt_state),
                             metrics=metrics,
                             force=True,
                             overwrite=True,
                         )
                     with profile_annotation("plot_save", env=os.environ):
                         _save_plot(fig)
-                    _save_history_csv("loss.csv", *loss_hist)
-                    if test_fn is not None:
-                        _save_history_csv("test.csv", *test_hist)
+                    _save_histories()
 
                 t_start = time.time()
                 metrics = None
@@ -889,7 +1425,7 @@ class Train(Routine):
                         try:
                             batch = next(self.dataloader)
                         except StopIteration:
-                            if last_batch is None or curr_step in loss_hist[0]:
+                            if last_batch is None or loss_hist.has_step(curr_step):
                                 logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
                                 break
                             logger.info(
@@ -901,11 +1437,47 @@ class Train(Routine):
                             last_batch = batch
                         
                         try:
+                            if (
+                                ema_enabled
+                                and graph_loss.balancing.bootstrap
+                                and not ema_bootstrapped
+                                and loss_state is not None
+                            ):
+                                bootstrap_terms = jax.block_until_ready(_graph_raw_terms(params, batch))
+                                bootstrap_terms = _host_float_terms(bootstrap_terms)
+                                _bootstrap_ema_state(bootstrap_terms)
+                                ema_bootstrapped = True
+
                             with profile_step("train", step_num=curr_step, env=os.environ):
                                 with profile_annotation("loss_and_grad", env=os.environ):
-                                    loss, grads = _loss_and_grad(params, batch)
-                            loss = jax.block_until_ready(loss)
-                            _record_history(loss_hist, curr_step, float(loss))
+                                    if term_diagnostics_enabled:
+                                        (loss, (raw_terms, scaled_terms)), grads = _graph_loss_and_grad(
+                                            params,
+                                            batch,
+                                            _current_scale_arrays(),
+                                        )
+                                    else:
+                                        loss, grads = _loss_and_grad(params, batch)
+                                        raw_terms, scaled_terms = None, None
+                            if raw_terms is not None and scaled_terms is not None:
+                                loss, raw_terms, scaled_terms = jax.block_until_ready((
+                                    loss,
+                                    raw_terms,
+                                    scaled_terms,
+                                ))
+                                raw_terms = _host_float_terms(raw_terms)
+                                scaled_terms = _host_float_terms(scaled_terms)
+                            else:
+                                loss = jax.block_until_ready(loss)
+                            loss_hist.record(curr_step, float(loss))
+                            if raw_terms_hist is not None and raw_terms is not None:
+                                raw_terms_hist.record(curr_step, raw_terms)
+                            if scaled_terms_hist is not None and scaled_terms is not None:
+                                scaled_terms_hist.record(curr_step, scaled_terms)
+                            if term_scales_hist is not None:
+                                term_scales_hist.record(curr_step, _current_scales())
+                            if raw_terms is not None:
+                                _update_ema_state(raw_terms)
                         except Exception as exc:
                             logger.exception(
                                 f"Exception encountered during train loss evaluation at step {curr_step}. "
@@ -928,7 +1500,7 @@ class Train(Routine):
                         ):
                             with profile_annotation("validation", env=os.environ):
                                 test_score = float(test_fn(params))
-                            _record_history(test_hist, curr_step, test_score)
+                            test_hist.record(curr_step, test_score)
                             metrics["test_score"] = test_score
 
                         if self.termination.grad_tol:
@@ -941,12 +1513,14 @@ class Train(Routine):
                                 self.checkpointer.save_decision_policy is not None
                                 and curr_step not in existing_checkpoint_steps
                             ):
-                                ckptr.save_checkpointables(
+                                saved_checkpoint = ckptr.save_checkpointables(
                                     step=curr_step,
-                                    checkpointables={"params": _checkpoint_params(params), "opt_state": opt_state},
+                                    checkpointables=_checkpointables(params, opt_state),
                                     metrics=metrics,
                                 )
-                                existing_checkpoint_steps.add(curr_step)
+                                if saved_checkpoint:
+                                    _save_histories()
+                                    existing_checkpoint_steps.add(curr_step)
 
                         ## DIAGNOSTICS
                         stats_str = f"loss={float(loss):.2e}"
@@ -966,12 +1540,16 @@ class Train(Routine):
                             and (curr_step % plot_interval == 0 or curr_step >= self.termination.max_steps)
                         ):
                             with profile_annotation("plot_update", env=os.environ):
-                                lines[0].set_data(*loss_hist)
-                                _save_history_csv("loss.csv", *loss_hist)
+                                lines[0].set_data(*loss_hist.series())
 
                                 if test_fn is not None:
-                                    lines[1].set_data(*test_hist)
-                                    _save_history_csv("test.csv", *test_hist)
+                                    lines[1].set_data(*test_hist.series())
+                                if raw_terms_hist is not None:
+                                    for name, line in raw_term_lines.items():
+                                        line.set_data(*raw_terms_hist.term_series(name))
+                                if scaled_terms_hist is not None:
+                                    for name, line in scaled_term_lines.items():
+                                        line.set_data(*scaled_terms_hist.term_series(name))
                                 
                                 for ax in axs.ravel():
                                     ax.relim()

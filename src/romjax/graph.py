@@ -4,6 +4,7 @@ from contextvars import ContextVar
 from inspect import Parameter, signature
 from typing import Annotated, Any, Hashable, Literal, Sequence
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import networkx as nx

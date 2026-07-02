@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from orbax.checkpoint import v1 as ocp
+from pydantic import ValidationError
 
 from romjax import YamlLoader
 from romjax.compression import SVD
@@ -68,6 +69,10 @@ def graph_batch_absolute_error(params: dict, single_data: dict, graph: FunctionG
     return jnp.abs(params["toy"]["weight"] - x)
 
 
+def graph_batch_large_squared_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+    return 100.0 * graph_batch_squared_error(params, single_data, graph)
+
+
 def graph_reference_loss(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
     del graph
     weight = params["toy"]["weight"]
@@ -117,6 +122,11 @@ def _history_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return arr[:, 0].astype(int), arr[:, 1]
 
 
+def _table_csv(path: Path) -> tuple[list[str], np.ndarray]:
+    header = path.read_text(encoding="utf-8").splitlines()[0].split(",")
+    return header, np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+
+
 def _tree_allclose(lhs, rhs) -> bool:
     return bool(
         jax.tree.reduce(
@@ -161,10 +171,18 @@ def toy_graph() -> FunctionGraph:
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_diagnostics(tmp_path: Path) -> None:
     callback_calls: list[tuple[float, Path | None]] = []
+    checkpoint_history_steps: list[int] = []
 
     def progress_callback(params, graph, root):
         del graph
         callback_calls.append((float(params["w"]), root))
+
+    def checkpoint_history_callback(params, graph, root):
+        del params, graph
+        assert root is not None
+        loss_csv = root / "loss.csv"
+        assert loss_csv.exists()
+        checkpoint_history_steps.append(int(_history_csv(loss_csv)[0][-1]))
 
     root = tmp_path.resolve() / "diagnostics"
     train = Train(
@@ -212,6 +230,24 @@ def test_diagnostics(tmp_path: Path) -> None:
     assert final_test_train.run() == 0
     assert _history_csv(final_test_root / "loss.csv")[0].tolist() == [0, 1, 2, 3]
     assert _history_csv(final_test_root / "test.csv")[0].tolist() == [0, 3]
+
+    checkpoint_history_root = tmp_path.resolve() / "checkpoint_history"
+    checkpoint_history_train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        termination=2,
+        diagnostics=DiagnosticsConfig(
+            plot_interval=None,
+            callback_interval=1,
+            progress_callback=checkpoint_history_callback,
+        ),
+        root=checkpoint_history_root,
+        checkpointer=CheckpointerConfig(save_decision_policy=2, preservation_policy=1, step_name_format="step"),
+    )
+    assert checkpoint_history_train.run() == 0
+    assert checkpoint_history_steps == [0, 0, 2]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
@@ -652,6 +688,10 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     squared = GraphLoss(terms=[{"term": graph_batch_squared_error, "dataset": "toy"}], graph=toy_graph)
     params = {"toy": {"weight": jnp.array(0.5)}}
     assert squared(params, batch) == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
+    assert squared.term_names == ("term_0",)
+    assert squared.term_values(params, batch)["term_0"] == pytest.approx(
+        np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2)
+    )
 
     reference = GraphLoss(terms=[{"term": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
     ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
@@ -691,6 +731,81 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     expected_reconstruction = np.mean((np.array([1.0, 2.0, 3.0]) - (0.5 * np.array([1.0, 2.0, 3.0]) + 0.2)) ** 2)
     expected_regularization = 0.1 * float(pytree_norm(recon_params)**2)
     assert reconstructed(recon_params, batch) == pytest.approx(expected_reconstruction + expected_regularization)
+
+
+def test_graph_loss_balancing_config_and_term_names(toy_graph: FunctionGraph) -> None:
+    loss = GraphLoss(
+        terms=[
+            {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+            {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+        ],
+        balancing={"kind": "ema", "decay": 0.5, "min_scale": 1e-4},
+        graph=toy_graph,
+    )
+
+    assert loss.balancing.kind == "ema"
+    assert loss.balancing.decay == pytest.approx(0.5)
+    assert loss.balancing.bootstrap is True
+    assert loss.balancing.normalize == "mean"
+    assert loss.term_names == ("small", "large")
+
+    with pytest.raises(ValidationError):
+        GraphLoss(
+            terms=[
+                {"name": "duplicate", "term": graph_batch_squared_error, "dataset": "toy"},
+                {"name": "duplicate", "term": graph_batch_absolute_error, "dataset": "toy"},
+            ],
+            graph=toy_graph,
+        )
+
+    with pytest.raises(ValidationError):
+        GraphLoss(
+            terms=[{"term": graph_batch_squared_error, "dataset": "toy"}],
+            balancing={"kind": "ema", "decay": 1.0},
+            graph=toy_graph,
+        )
+
+    with pytest.raises(ValidationError):
+        GraphLoss(
+            terms=[{"term": graph_batch_squared_error, "dataset": "toy"}],
+            balancing={"kind": "ema", "normalize": "median"},
+            graph=toy_graph,
+        )
+
+
+def test_graph_loss_scale_arrays_do_not_retrace_on_value_changes(toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.asarray([1.0], dtype=jnp.float32)}]}
+    params = {"toy": {"weight": jnp.asarray(0.0, dtype=jnp.float32)}}
+    loss = GraphLoss(
+        terms=[
+            {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+            {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+        ],
+        graph=toy_graph,
+    )
+    trace_count = 0
+
+    @eqx.filter_jit
+    def loss_and_grad(params, batch, scales):
+        nonlocal trace_count
+        trace_count += 1
+
+        def _loss(params, batch):
+            raw_terms = loss.term_values(params, batch)
+            scaled_terms = loss.scaled_term_values(raw_terms, scales)
+            return loss.total_from_terms(scaled_terms)
+
+        return eqx.filter_value_and_grad(_loss)(params, batch)
+
+    scales_a = {"small": jnp.asarray(1.0, dtype=jnp.float32), "large": jnp.asarray(0.01, dtype=jnp.float32)}
+    scales_b = {"small": jnp.asarray(0.5, dtype=jnp.float32), "large": jnp.asarray(0.02, dtype=jnp.float32)}
+
+    value_a, _ = loss_and_grad(params, batch, scales_a)
+    value_b, _ = loss_and_grad(params, batch, scales_b)
+    jax.block_until_ready((value_a, value_b))
+
+    assert trace_count == 1
+    assert value_a != value_b
 
 
 def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
@@ -890,3 +1005,99 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         )["params"]
     assert float(params["toy"]["weight"]) == pytest.approx(1.0, abs=0.2)
     assert abs(float(params["toy"]["bias"])) < 0.2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
+    root = tmp_path.resolve() / "graph_loss_ema"
+    train = Train(
+        loss=GraphLoss(
+            terms=[
+                {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+                {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+            ],
+            balancing={
+                "kind": "ema",
+                "decay": 0.0,
+                "target": 1.0,
+                "min_scale": 1e-6,
+                "max_scale": 1e6,
+            },
+            graph=toy_graph,
+        ),
+        init_params={"toy": {"weight": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.0),
+        dataloader=RepeatBatchLoader(batch),
+        termination=TerminationConfig(max_steps=1),
+        diagnostics=DiagnosticsConfig(
+            plot_interval=1,
+            raw_terms_plot={"enabled": True, "include": ["small"]},
+            scaled_terms_plot={"enabled": True, "exclude": ["small"]},
+        ),
+        root=root,
+    )
+
+    assert train.run() == 0
+
+    raw_header, raw_values = _table_csv(root / "loss_terms_raw.csv")
+    scaled_header, scaled_values = _table_csv(root / "loss_terms_scaled.csv")
+    scale_header, scale_values = _table_csv(root / "loss_term_scales.csv")
+
+    assert raw_header == ["Iteration", "small", "large"]
+    assert scaled_header == ["Iteration", "small", "large"]
+    assert scale_header == ["Iteration", "small", "large"]
+    assert raw_values[:, 0].tolist() == [0.0, 1.0]
+    assert raw_values[0, 1] == pytest.approx(np.mean(np.array([1.0, 2.0, 3.0]) ** 2))
+    assert raw_values[0, 2] == pytest.approx(100.0 * raw_values[0, 1])
+    inverse_scales = np.array([1.0 / raw_values[0, 1], 1.0 / raw_values[0, 2]])
+    expected_scales = inverse_scales / np.mean(inverse_scales)
+    assert scale_values[0, 1] == pytest.approx(expected_scales[0])
+    assert scale_values[0, 2] == pytest.approx(expected_scales[1])
+    assert scale_values[1, 1] == pytest.approx(expected_scales[0])
+    assert scale_values[1, 2] == pytest.approx(expected_scales[1])
+    assert scaled_values[0, 1] == pytest.approx(expected_scales[0] * raw_values[0, 1])
+    assert scaled_values[0, 2] == pytest.approx(expected_scales[1] * raw_values[0, 2])
+    assert (root / "loss.pdf").exists()
+
+    with ocp.training.Checkpointer(root) as ckptr:
+        assert ckptr.latest is not None
+        loaded = ckptr.load_checkpointables(
+            abstract_checkpointables={
+                "loss_state": {
+                    "step": jnp.asarray(0, dtype=jnp.int32),
+                    "ema": {"small": jnp.asarray(0.0), "large": jnp.asarray(0.0)},
+                    "scales": {"small": jnp.asarray(1.0), "large": jnp.asarray(1.0)},
+                    "initialized": {"small": jnp.asarray(False), "large": jnp.asarray(False)},
+                }
+            }
+        )
+    assert int(np.asarray(loaded["loss_state"]["step"])) >= 2
+
+
+def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
+    train = Train(
+        loss=GraphLoss(
+            terms=[
+                {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+                {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+            ],
+            balancing={"kind": "ema", "decay": 0.0, "eps": 1e-12},
+            graph=toy_graph,
+        ),
+        init_params={"toy": {"weight": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.001),
+        dataloader=RepeatBatchLoader(batch),
+        termination=TerminationConfig(max_steps=1),
+        diagnostics=DiagnosticsConfig(show_progress=False),
+    )
+
+    params = train()
+
+    raw_small = np.mean(np.array([1.0, 2.0, 3.0]) ** 2)
+    raw_large = 100.0 * raw_small
+    inverse_scales = np.array([1.0 / raw_small, 1.0 / raw_large])
+    scales = inverse_scales / np.mean(inverse_scales)
+    expected_grad = scales[0] * -4.0 + scales[1] * -400.0
+    assert float(params["toy"]["weight"]) == pytest.approx(-0.001 * expected_grad, rel=1e-5)
