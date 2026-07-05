@@ -276,25 +276,33 @@ class GraphLossBalancing(BaseModel):
     """
     Optional adaptive scaling policy for :class:`GraphLoss` terms.
 
-    :param kind: balancing strategy; ``"none"`` preserves static term weights and ``"ema"`` enables EMA scaling
-    :param decay: exponential decay factor for raw term magnitudes: ema = decay*last + (1-decay)*new
+    Recommended: 
+    - If loss varies on log-scale, then use ema_log
+    - Set update_interval = 1-2 epochs
+    - Decrease decay~0.9 for faster control
+    - Don't use normalize
+
+    :param kind: balancing strategy; ``"none"`` preserves static term weights, ``"ema"`` tracks raw magnitudes,
+        and ``"ema_log"`` tracks log magnitudes for multiplicative scale adaptation
+    :param decay: exponential decay factor for term magnitudes; for ``"ema_log"`` this is applied to log magnitudes
     :param eps: positive denominator floor for scale computation
     :param target: target scaled magnitude for each term before clipping (default is 1)
     :param min_scale: lower bound for the adaptive scale
     :param max_scale: upper bound for the adaptive scale
     :param bootstrap: initialize EMA scales from the first batch before the first optimizer update
-    :param normalize: normalize adaptive scales to control the global learning-rate scale
+    :param normalize: normalize adaptive scales to control the global learning-rate scale. For ``"ema"``, uses
+        arithmetic mean. For ``"ema_log"``, uses geometric mean
     :param update_interval: number of optimizer steps between EMA updates
     """
 
-    kind: Literal["none", "ema"] = "none"
-    decay: float = 0.95
+    kind: Literal["none", "ema", "ema_log"] = "none"
+    decay: float = 0.99
     eps: float = 1e-8
     target: float = 1.0
     min_scale: float = 1e-8
     max_scale: float = 1e8
     bootstrap: bool = True
-    normalize: Literal["mean", "sum", "none"] = "mean"
+    normalize: bool = False
     update_interval: PositiveInt = 1
 
     @model_validator(mode="before")
@@ -325,7 +333,7 @@ class _GraphLossEmaState(BaseModel):
     """Mutable Python-side EMA state for adaptive :class:`GraphLoss` scaling.
     
     :ivar step: current optimizer step
-    :ivar ema: current exponential moving average of each loss term: (1-decay)*curr + decay*last
+    :ivar ema: current exponential moving average of each loss term, either in raw space or log space
     :ivar scales: clip(1/ema), this is what actually multiples each loss, e.g. w(t)
     :ivar initialized: whether each term's ema has been started
     """
@@ -1096,7 +1104,7 @@ class Train(Routine):
         test_fn = self.test if self.test is not None else None
         _, static_params = eqx.partition(self.init_params, eqx.is_array)
         graph_loss = self.loss if isinstance(self.loss, GraphLoss) else None
-        ema_enabled = graph_loss is not None and graph_loss.balancing.kind == "ema"
+        ema_enabled = graph_loss is not None and graph_loss.balancing.kind in {"ema", "ema_log"}
         term_names = graph_loss.term_names if graph_loss is not None else ()
         term_diagnostics_enabled = graph_loss is not None and (
             ema_enabled
@@ -1168,22 +1176,48 @@ class Train(Routine):
             scales = {}
             for name in term_names:
                 if loss_state.initialized[name]:
-                    scale = graph_loss.balancing.target / (loss_state.ema[name] + graph_loss.balancing.eps)
+                    if graph_loss.balancing.kind == "ema_log":
+                        scale = (
+                            graph_loss.balancing.target / (
+                                np.exp(np.clip(loss_state.ema[name], np.log(graph_loss.balancing.min_scale), 
+                                               np.log(graph_loss.balancing.max_scale)))
+                                + graph_loss.balancing.eps
+                            )
+                        )
+                    else:
+                        scale = graph_loss.balancing.target / (loss_state.ema[name] + graph_loss.balancing.eps)
                     scales[name] = float(np.clip(scale, graph_loss.balancing.min_scale, graph_loss.balancing.max_scale))
                 else:
                     scales[name] = loss_state.scales[name]
 
-            if graph_loss.balancing.normalize == "none" or len(scales) == 0:
+            if not graph_loss.balancing.normalize or len(scales) == 0:
                 return scales
 
             values = np.asarray(list(scales.values()), dtype=float)
-            denom = float(np.mean(values) if graph_loss.balancing.normalize == "mean" else np.sum(values))
+            if graph_loss.balancing.kind == "ema":
+                # Arithmetic mean
+                denom = float(np.mean(values))
+            elif graph_loss.balancing.kind == "ema_log":
+                # Geometric mean
+                if np.any(values <= 0.0):
+                    logger.warning("Skipping GraphLoss log EMA scale normalization due to non-positive scale values.")
+                    return scales
+                denom = float(np.exp(np.mean(np.log(values))))
+            else:
+                raise ValueError(f"EMA kind '{graph_loss.balancing.kind}' not recognized.")
+                                 
             if not np.isfinite(denom) or denom <= 0.0:
                 logger.warning("Skipping GraphLoss EMA scale normalization due to non-positive scale denominator.")
                 return scales
 
             factor = graph_loss.balancing.target / denom
             return {name: scale * factor for name, scale in scales.items()}
+
+        def _ema_space_value(raw_value: float) -> float:
+            """Map a raw loss magnitude into the space tracked by the EMA state."""
+            if graph_loss.balancing.kind == "ema_log":
+                return float(np.log(raw_value))
+            return raw_value
 
         def _bootstrap_ema_state(raw_terms: Mapping[str, float]) -> None:
             """Initialize EMA state from the first batch before optimizer gradients are computed."""
@@ -1197,7 +1231,7 @@ class Train(Routine):
                     continue
                 if raw_value < 0.0:
                     logger.warning(f"EMA GraphLoss balancing assumes non-negative terms; got {name}={raw_value:.3e}")
-                loss_state.ema[name] = raw_value
+                loss_state.ema[name] = _ema_space_value(raw_value)
                 loss_state.initialized[name] = True
             loss_state.scales = _compute_ema_scales()
 
@@ -1220,9 +1254,9 @@ class Train(Routine):
                 
                 if loss_state.initialized[name]:
                     ema = graph_loss.balancing.decay * loss_state.ema[name]
-                    ema += (1.0 - graph_loss.balancing.decay) * raw_value
+                    ema += (1.0 - graph_loss.balancing.decay) * _ema_space_value(raw_value)
                 else:
-                    ema = raw_value
+                    ema = _ema_space_value(raw_value)
                     loss_state.initialized[name] = True
                 
                 loss_state.ema[name] = ema
@@ -1401,6 +1435,7 @@ class Train(Routine):
                 def _save_final(metrics=None):
                     if 0 < plot_interval < float('inf') and self.diagnostics.live_plot:
                         plt.ioff()
+                        plt.show()
                     with profile_annotation("checkpoint_save", env=os.environ):
                         ckptr.save_checkpointables(
                             step=curr_step,

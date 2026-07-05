@@ -79,10 +79,12 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] EvolutionSearch or similar instead of grid search (still dispatch in parallel)
 - [ ] Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding
 - [ ] Get this all to work on Mac OS
+- [ ] Early validation-based stopping criteria (and keeping best performing checkpoint)
 
 ## Future projects
 - Building surrogate for graph comm as a model error indicator (scalar or field)
 - Online adaptive time-stepping for time-based simulations
+- Can reformulate loss scaling as a PID controller
 - Public release:
     - Move pydantic/agents/models out
     - Clean tests, CI/CD, demos
