@@ -746,7 +746,6 @@ def test_graph_loss_balancing_config_and_term_names(toy_graph: FunctionGraph) ->
     assert loss.balancing.kind == "ema"
     assert loss.balancing.decay == pytest.approx(0.5)
     assert loss.balancing.bootstrap is True
-    assert loss.balancing.normalize == "mean"
     assert loss.term_names == ("small", "large")
 
     with pytest.raises(ValidationError):
@@ -771,6 +770,14 @@ def test_graph_loss_balancing_config_and_term_names(toy_graph: FunctionGraph) ->
             balancing={"kind": "ema", "normalize": "median"},
             graph=toy_graph,
         )
+
+    log_loss = GraphLoss(
+        terms=[{"term": graph_batch_squared_error, "dataset": "toy"}],
+        balancing={"kind": "ema_log", "normalize": True},
+        graph=toy_graph,
+    )
+    assert log_loss.balancing.kind == "ema_log"
+    assert log_loss.balancing.normalize
 
 
 def test_graph_loss_scale_arrays_do_not_retrace_on_value_changes(toy_graph: FunctionGraph) -> None:
@@ -1023,6 +1030,7 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
                 "target": 1.0,
                 "min_scale": 1e-6,
                 "max_scale": 1e6,
+                "normalize": True
             },
             graph=toy_graph,
         ),
@@ -1075,6 +1083,46 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
     assert int(np.asarray(loaded["loss_state"]["step"])) >= 2
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_graph_loss_ema_log_balancing_uses_geometric_normalization(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
+    root = tmp_path.resolve() / "graph_loss_ema_log"
+    train = Train(
+        loss=GraphLoss(
+            terms=[
+                {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+                {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+            ],
+            balancing={
+                "kind": "ema_log",
+                "decay": 0.0,
+                "target": 1.0,
+                "min_scale": 1e-6,
+                "max_scale": 1e6,
+                "normalize": True,
+            },
+            graph=toy_graph,
+        ),
+        init_params={"toy": {"weight": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.0),
+        dataloader=RepeatBatchLoader(batch),
+        termination=TerminationConfig(max_steps=1),
+        diagnostics=DiagnosticsConfig(show_progress=False),
+        root=root,
+    )
+
+    assert train.run() == 0
+
+    scale_header, scale_values = _table_csv(root / "loss_term_scales.csv")
+    assert scale_header == ["Iteration", "small", "large"]
+    raw_small = np.mean(np.array([1.0, 2.0, 3.0]) ** 2)
+    raw_large = 100.0 * raw_small
+    expected_scales = np.array([np.sqrt(raw_large / raw_small), np.sqrt(raw_small / raw_large)])
+    assert scale_values[0, 1] == pytest.approx(expected_scales[0])
+    assert scale_values[0, 2] == pytest.approx(expected_scales[1])
+    assert np.sqrt(scale_values[0, 1] * scale_values[0, 2]) == pytest.approx(1.0)
+
+
 def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: FunctionGraph) -> None:
     batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
     train = Train(
@@ -1083,7 +1131,7 @@ def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: Funct
                 {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
                 {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
             ],
-            balancing={"kind": "ema", "decay": 0.0, "eps": 1e-12},
+            balancing={"kind": "ema", "decay": 0.0, "eps": 1e-12, "normalize": True},
             graph=toy_graph,
         ),
         init_params={"toy": {"weight": jnp.array(0.0)}},
