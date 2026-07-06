@@ -23,6 +23,7 @@ __all__ = [
     "build_profile_env",
     "profile_enabled",
     "profile_label",
+    "profile_options",
     "profile_step",
     "profile_trace",
     "profile_trace_dir",
@@ -50,6 +51,16 @@ def _sanitize_label(value: str) -> str:
 def _trace_run_id() -> str:
     """Return a timestamped run identifier suitable for a trace directory name."""
     return datetime.now().astimezone().strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+
+
+def _env_int(value: str | None, name: str) -> int | None:
+    """Parse an optional integer environment value."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
 
 
 def profile_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -114,6 +125,30 @@ def build_profile_env(
     }
 
 
+def profile_options(env: Mapping[str, str] | None = None) -> jax.profiler.ProfileOptions | None:
+    """Return JAX profiler options configured by ROMJAX profile environment variables.
+
+    :param env: environment mapping to read; defaults to :data:`os.environ`
+    :return: configured JAX profiler options, or ``None`` when no option override is set
+    """
+    source = os.environ if env is None else env
+    host_level = _env_int(source.get("ROMJAX_PROFILE_HOST_TRACER_LEVEL"), "ROMJAX_PROFILE_HOST_TRACER_LEVEL")
+    device_level = _env_int(source.get("ROMJAX_PROFILE_DEVICE_TRACER_LEVEL"), "ROMJAX_PROFILE_DEVICE_TRACER_LEVEL")
+    python_level = _env_int(source.get("ROMJAX_PROFILE_PYTHON_TRACER_LEVEL"), "ROMJAX_PROFILE_PYTHON_TRACER_LEVEL")
+
+    if host_level is None and device_level is None and python_level is None:
+        return None
+
+    options = jax.profiler.ProfileOptions()
+    if host_level is not None:
+        options.host_tracer_level = host_level
+    if device_level is not None:
+        options.device_tracer_level = device_level
+    if python_level is not None:
+        options.python_tracer_level = python_level
+    return options
+
+
 @contextmanager
 def profile_trace(
     default_label: str,
@@ -128,7 +163,7 @@ def profile_trace(
         return
 
     trace_dir.mkdir(parents=True, exist_ok=True)
-    with jax.profiler.trace(trace_dir):
+    with jax.profiler.trace(trace_dir, profiler_options=profile_options(env)):
         yield
 
 

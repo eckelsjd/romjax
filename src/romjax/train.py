@@ -466,6 +466,22 @@ class GraphLossTerm(BaseModel):
             return {"term": value}
         return value
 
+    @staticmethod
+    def _stack_sequence_batch(term_batch: Sequence[PyTree]) -> PyTree:
+        """Convert a sequence of single-sample PyTrees into one batched PyTree."""
+        def stack_leaf(*leaves: PyTree) -> PyTree:
+            try:
+                return jnp.stack(leaves)
+            except (TypeError, ValueError):
+                return leaves[0]
+
+        return jax.tree.map(stack_leaf, *term_batch)
+
+    @staticmethod
+    def _vmap_in_axes(term_batch: PyTree) -> PyTree:
+        """Return vmap axes for batched array leaves while preserving static leaves."""
+        return jax.tree.map(lambda leaf: 0 if eqx.is_array(leaf) else None, term_batch)
+
     def raw_value(
         self, 
         params: Mapping[str, PyTree], 
@@ -481,12 +497,12 @@ class GraphLossTerm(BaseModel):
             if isinstance(term_batch, (list, tuple)):
                 if len(term_batch) == 0:
                     return jnp.asarray(0.0)
-                losses = jnp.asarray([self.term(params, single_data, graph) for single_data in term_batch])
-            else:
-                def body(carry, single_data):
-                    return carry, self.term(params, single_data, graph)
+                term_batch = self._stack_sequence_batch(term_batch)
 
-                _, losses = jax.lax.scan(body, None, term_batch)
+            losses = jax.vmap(
+                lambda single_data: self.term(params, single_data, graph),
+                in_axes=(self._vmap_in_axes(term_batch),),
+            )(term_batch)
             return self.batch_reduce(losses)
     
         else:
@@ -516,6 +532,11 @@ class GraphLoss(BaseModel):
     terms: Sequence[GraphLossTerm]
     balancing: GraphLossBalancing = Field(default_factory=GraphLossBalancing)
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+    _term_names: tuple[str, ...] = PrivateAttr(default=())
+    _term_weights: jax.Array = PrivateAttr(default_factory=lambda: jnp.asarray([], dtype=jnp.float32))
+    _term_value_branches: tuple[Callable[[Mapping[str, PyTree], Mapping[str, PyTree]], jax.Array], ...] = PrivateAttr(
+        default=()
+    )
 
     __hash__ = object.__hash__
 
@@ -531,6 +552,7 @@ class GraphLoss(BaseModel):
         self._set_default_term_names()
         if self.graph is not None:
             self._set_default_datasets()
+        self._refresh_term_cache()
         return self
 
     def _set_default_term_names(self) -> None:
@@ -555,55 +577,66 @@ class GraphLoss(BaseModel):
             for term in self.terms:
                 if term.dataset is None:
                     term.dataset = _default_edge
+            self._refresh_term_cache()
+
+    def _refresh_term_cache(self) -> None:
+        """Cache term metadata and JAX branch callables used during loss evaluation."""
+        self._term_names = tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
+        self._term_weights = jnp.asarray([term.weight for term in self.terms])
+        self._term_value_branches = tuple(
+            (lambda params, batch, term=term: term.raw_value(params, batch, self.graph))
+            for term in self.terms
+        )
 
     @property
     def term_names(self) -> tuple[str, ...]:
         """Stable names for all terms in order."""
-        return tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
+        return self._term_names
 
-    def term_values(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> dict[str, jax.Array]:
-        """Return raw, unweighted term values keyed by term name.
+    def _raw_term_array(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
+        """Evaluate raw term values as an ordered JAX array."""
+        if len(self._term_value_branches) == 0:
+            return jnp.asarray([])
+
+        def body(carry: None, idx: jax.Array) -> tuple[None, jax.Array]:
+            value = jax.lax.switch(idx, self._term_value_branches, params, batch)
+            return carry, value
+
+        _, values = jax.lax.scan(body, None, jnp.arange(len(self._term_value_branches)))
+        return values
+
+    def _scale_array(self, scales: Mapping[str, ArrayLike] | None = None) -> jax.Array:
+        """Return ordered adaptive scale values."""
+        scales = scales or {}
+        return jnp.asarray([scales.get(name, 1.0) for name in self._term_names])
+
+    def _array_to_term_dict(self, values: jax.Array) -> dict[str, jax.Array]:
+        """Convert ordered term values into the public term-name mapping."""
+        return {name: values[idx] for idx, name in enumerate(self._term_names)}
+
+    def __call__(
+        self,
+        params: Mapping[str, PyTree],
+        batch: Mapping[str, PyTree],
+        scales: Mapping[str, ArrayLike] | None = None,
+        return_aux: bool = False,
+    ) -> jax.Array | tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+        """Evaluate the total graph loss.
 
         :param params: edge-payload parameter patches
         :param batch: batch data passed to graph loss terms
-        :return: raw scalar loss value for each term
+        :param scales: optional adaptive scale for each term; missing scales default to one
+        :param return_aux: if True, return ``(total, (raw_terms, scaled_terms))``
+        :return: scalar total loss, optionally with raw and scaled term values keyed by term name
         """
         params = pytree_resolve_refs(params)
-        return {
-            term.name or f"term_{idx}": term.raw_value(params, batch, self.graph)
-            for idx, term in enumerate(self.terms)
-        }
+        raw_values = self._raw_term_array(params, batch)
+        scaled_values = self._term_weights * self._scale_array(scales) * raw_values
+        total = jnp.sum(scaled_values)
 
-    def scaled_term_values(
-        self,
-        raw_terms: Mapping[str, jax.Array],
-        scales: Mapping[str, ArrayLike] | None = None,
-    ) -> dict[str, jax.Array]:
-        """Apply static weights and optional adaptive scales to raw term values.
-
-        :param raw_terms: raw values returned by :meth:`term_values`
-        :param scales: optional adaptive scale for each term; missing scales default to one
-        :return: effective contribution of each term to the total loss
-        """
-        scales = scales or {}
-        scaled = {}
-        for idx, term in enumerate(self.terms):
-            name = term.name or f"term_{idx}"
-            scale = scales.get(name, 1.0)
-            scaled[name] = jnp.asarray(term.weight) * jnp.asarray(scale) * raw_terms[name]
-        return scaled
-
-    def total_from_terms(self, terms: Mapping[str, jax.Array]) -> jax.Array:
-        """Sum a mapping of scalar term values into one scalar loss."""
-        total = jnp.asarray(0.0)
-        for name in self.term_names:
-            total = total + terms[name]
+        if return_aux:
+            return total, (self._array_to_term_dict(raw_values), self._array_to_term_dict(scaled_values))
         return total
-
-    def __call__(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
-        """Parameters are specified on a per-edge basis. Data batches will also be passed per-edge."""
-        raw_terms = self.term_values(params, batch)
-        return self.total_from_terms(self.scaled_term_values(raw_terms))
 
 
 class GraphTest(GraphLoss):
@@ -1176,15 +1209,9 @@ class Train(Routine):
             return eqx.filter_value_and_grad(self.loss)(params, batch)
 
         @eqx.filter_jit
-        def _graph_raw_terms(params: PyTree, batch: PyTree):
-            return graph_loss.term_values(params, batch)
-
-        @eqx.filter_jit
         def _graph_loss_and_grad(params: PyTree, batch: PyTree, scales: Mapping[str, ArrayLike]):
             def _loss(params: PyTree, batch: PyTree):
-                raw_terms = _graph_raw_terms(params, batch)
-                scaled_terms = graph_loss.scaled_term_values(raw_terms, scales)
-                return graph_loss.total_from_terms(scaled_terms), (raw_terms, scaled_terms)
+                return graph_loss(params, batch, scales=scales, return_aux=True)
 
             return eqx.filter_value_and_grad(_loss, has_aux=True)(params, batch)
 
@@ -1527,7 +1554,9 @@ class Train(Routine):
                                 and not ema_bootstrapped
                                 and loss_state is not None
                             ):
-                                bootstrap_terms = jax.block_until_ready(_graph_raw_terms(params, batch))
+                                (_, (bootstrap_terms, _)), _ = jax.block_until_ready(
+                                    _graph_loss_and_grad(params, batch, _current_scale_arrays())
+                                )
                                 bootstrap_terms = _host_float_terms(bootstrap_terms)
                                 _bootstrap_ema_state(bootstrap_terms)
                                 ema_bootstrapped = True
