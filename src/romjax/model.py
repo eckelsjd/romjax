@@ -10,7 +10,14 @@ from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from romjax.graph import Edge, Node
-from romjax.tree import TreePath, coerce_tree_path, pytree_merge, set_subtree
+from romjax.tree import (
+    TreePath,
+    coerce_tree_path,
+    is_shape_dtype_template_leaf,
+    pytree_merge,
+    set_subtree,
+    shape_dtype_template_like,
+)
 
 __all__ = ['eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel',
            'ImplicitSampleable', 'SourceSampleable']
@@ -217,7 +224,7 @@ def eqx_evaluate(
     """
     aux_out: dict[str, Any] = {}
     if capture_template:
-        aux_out["template"] = _shape_template_like(x, leaf_filter=leaf_filter)
+        aux_out["template"] = shape_dtype_template_like(x, leaf_filter=leaf_filter)
 
     if gather is None:
         x_eval = x
@@ -435,10 +442,15 @@ class FilterModel(Edge):
         if not isinstance(cached_states, (list, tuple)):
             raise ValueError("FilterModel auxiliary 'cached_states' must be a list or tuple aligned with the filters.")
         cached_state_list = list(cached_states)
+
+        for _ in range(len(self.filters) - len(cached_state_list)):
+            cached_state_list.append(None)
+
         if len(cached_state_list) != len(self.filters):
             raise ValueError(
                 f"Received {len(cached_state_list)} cached states but model has {len(self.filters)} filter specs."
             )
+        
         return cached_state_list
 
     def _package_cached_states(self, cached_states: list[Any] | None) -> dict[str, list[Any]] | None:
@@ -614,14 +626,6 @@ def _call_direction_callable(
     return result, None
 
 
-def _shape_template_like(tree: PyTree, leaf_filter: Callable[[Any], bool]) -> PyTree:
-    """Create a lightweight template preserving array leaf shapes and dtypes."""
-    return jax.tree_util.tree_map(
-        lambda leaf: jnp.zeros_like(jnp.asarray(leaf)) if leaf_filter(leaf) else leaf,
-        tree,
-    )
-
-
 def _gather_tree_array(
     tree: PyTree,
     mode: Literal["flat", "stack"],
@@ -652,7 +656,11 @@ def _scatter_tree_array(
 ) -> PyTree:
     """Reconstruct/scatter selected template leaves from one array output."""
     leaves, treedef = jax.tree_util.tree_flatten(template)
-    selected = [(idx, jnp.asarray(leaf)) for idx, leaf in enumerate(leaves) if leaf_filter(leaf)]
+    selected = [
+        (idx, leaf)
+        for idx, leaf in enumerate(leaves)
+        if is_shape_dtype_template_leaf(leaf) or leaf_filter(leaf)
+    ]
     if not selected:
         return template
 

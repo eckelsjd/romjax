@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import optimistix as optx
 import pytest
 from orbax.checkpoint import v1 as ocp
 from pydantic import ValidationError
@@ -30,8 +31,9 @@ from romjax.train import (
     OrbaxParams,
     TerminationConfig,
     Train,
+    solution_loss,
 )
-from romjax.tree import pytree_norm, pytree_resolve_refs
+from romjax.tree import is_shape_dtype_template_leaf, pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
 from romjax.utils import save_h5
 
@@ -104,6 +106,58 @@ class ToyLinearReconstructionEdge(Edge, ImplicitSampleable):
         del key, solution
         assert inputs is not None
         return self.forward(inputs)
+
+
+class TemplateAuxEdge(Edge):
+    source: Node = Node(name="template_source")
+    target: Node = Node(name="template_target")
+    name: str = "template"
+
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def forward_aux(self, x, aux=None):
+        del x
+        if aux is None:
+            raise ValueError("TemplateAuxEdge requires forward aux data.")
+        return jax.tree.map(self._zeros_from_template, aux), None
+
+    @staticmethod
+    def _zeros_from_template(leaf):
+        if is_shape_dtype_template_leaf(leaf):
+            return jnp.zeros(leaf.shape, leaf.dtype)
+        if eqx.is_array(leaf):
+            raise AssertionError("Template aux should carry shape/dtype metadata, not arrays.")
+        return leaf
+
+
+class OptimistixRootFindEdge(Edge):
+    source: Node = Node(name="root_source")
+    target: Node = Node(name="root_target")
+    name: str = "root"
+
+    def forward(self, x):
+        def residual(y, target):
+            return y - target
+
+        x_value = jnp.asarray(x["x"])
+        target = jnp.asarray(x["weight"]) * x_value
+        solution = optx.root_find(
+            residual,
+            solver=optx.Newton(rtol=1e-6, atol=1e-6),
+            y0=jnp.zeros_like(target),
+            args=target,
+            max_steps=8,
+            adjoint=optx.ImplicitAdjoint(),
+            throw=False,
+        )
+        return {"x": x_value, "u": solution.value}
+
+    def backward(self, x):
+        return x
 
 
 class RepeatBatchLoader:
@@ -526,6 +580,26 @@ def test_orbax_params_compare_import_compatibility() -> None:
     from romjax.compare import OrbaxParams as CompareOrbaxParams
 
     assert CompareOrbaxParams is OrbaxParams
+
+
+@pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_orbax_params_resolve_params_accepts_shape_dtype_template(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path.resolve() / "shape_dtype_template"
+    source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
+    template = {
+        "w": jax.ShapeDtypeStruct(source_params["w"].shape, source_params["w"].dtype),
+        "b": jax.ShapeDtypeStruct(source_params["b"].shape, source_params["b"].dtype),
+    }
+
+    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+        ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
+
+    loaded_params = OrbaxParams(params=checkpoint_root).resolve_params(template)
+
+    assert loaded_params is not None
+    np.testing.assert_allclose(loaded_params["w"], source_params["w"])
+    np.testing.assert_allclose(loaded_params["b"], source_params["b"])
 
 
 def test_basic_batch_loader():
@@ -1012,6 +1086,47 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         )["params"]
     assert float(params["toy"]["weight"]) == pytest.approx(1.0, abs=0.2)
     assert abs(float(params["toy"]["bias"])) < 0.2
+
+
+def test_solution_loss_template_paths_adds_edge_aux_template() -> None:
+    graph = FunctionGraph(
+        edges={
+            "pass": IdentityEdge(source="state", target="template_source", name="pass"),
+            "template": TemplateAuxEdge(),
+        }
+    )
+    single_data = {"x": jnp.array([2.0, -3.0]), "nested": {"y": jnp.array(4.0)}}
+
+    loss = solution_loss(
+        {},
+        single_data,
+        graph,
+        path=["pass", "template"],
+        template_paths=[("nested", "y")],
+        aux_paths=[("template", "forward")],
+    )
+
+    assert float(loss) == pytest.approx(4.0**2)
+
+
+def test_solution_loss_trains_through_optimistix_root_find_edge() -> None:
+    graph = FunctionGraph(edges={"root": OptimistixRootFindEdge()})
+    batch = {"root": [{"x": jnp.array(2.0), "u": jnp.array(6.0)}]}
+    train = Train(
+        loss=GraphLoss(
+            terms=[{"term": {"callable": "solution", "path": "root"}, "dataset": "root"}],
+            graph=graph,
+        ),
+        init_params={"root": {"weight": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.05),
+        dataloader=RepeatBatchLoader(batch),
+        termination=TerminationConfig(max_steps=10),
+        diagnostics=DiagnosticsConfig(show_progress=False),
+    )
+
+    params = train()
+
+    assert float(params["root"]["weight"]) == pytest.approx(3.0, abs=0.03)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")

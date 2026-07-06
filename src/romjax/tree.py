@@ -25,6 +25,8 @@ __all__ = [
     "to_pytree",
     "get_subtree",
     "set_subtree",
+    "shape_dtype_template_like",
+    "is_shape_dtype_template_leaf",
     "TreePath",
     "coerce_tree_path",
     "coerce_tree_paths",
@@ -62,6 +64,28 @@ def coerce_tree_paths(value: Any) -> list[TreePath]:
 
 def _array_tree(tree: PyTree) -> PyTree:
     return eqx.filter(tree, eqx.is_array_like)
+
+
+def is_shape_dtype_template_leaf(value: Any) -> bool:
+    """Return whether ``value`` is JAX shape/dtype metadata used as a static template leaf."""
+    return isinstance(value, jax.ShapeDtypeStruct)
+
+
+def shape_dtype_template_like(
+    tree: PyTree,
+    leaf_filter: Callable[[Any], bool] = eqx.is_array,
+) -> PyTree:
+    """
+    Create a lightweight template preserving selected array leaf shapes and dtypes.
+
+    :param tree: source pytree
+    :param leaf_filter: predicate selecting leaves to replace with shape/dtype metadata
+    :return: pytree with selected leaves replaced by :class:`jax.ShapeDtypeStruct`
+    """
+    return jax.tree_util.tree_map(
+        lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.asarray(leaf).dtype) if leaf_filter(leaf) else leaf,
+        tree,
+    )
 
 
 @eqx.filter_jit
