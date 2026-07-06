@@ -6,7 +6,7 @@ import jax
 import pytest
 
 from romjax.grid_search import GridSearch
-from romjax.profiling import build_profile_env, profile_enabled, profile_trace
+from romjax.profiling import build_profile_env, profile_enabled, profile_options, profile_trace
 
 
 def test_profile_enabled_respects_truthy_and_falsey_flags() -> None:
@@ -42,6 +42,51 @@ def test_profile_trace_uses_jax_profiler_trace(tmp_path: Path, monkeypatch: pyte
     assert seen["entered"] is True
     assert seen["exited"] is True
     assert seen["log_dir"] == (tmp_path.resolve() / "profiles" / "train-20260616-120000-pid123")
+    assert seen["kwargs"] == {"profiler_options": None}
+
+
+def test_profile_options_reads_tracer_levels() -> None:
+    options = profile_options(
+        {
+            "ROMJAX_PROFILE_HOST_TRACER_LEVEL": "3",
+            "ROMJAX_PROFILE_DEVICE_TRACER_LEVEL": "1",
+            "ROMJAX_PROFILE_PYTHON_TRACER_LEVEL": "1",
+        }
+    )
+
+    assert options is not None
+    assert options.host_tracer_level == 3
+    assert options.device_tracer_level == 1
+    assert options.python_tracer_level == 1
+
+
+def test_profile_trace_passes_configured_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    class DummyTrace:
+        def __init__(self, log_dir, **kwargs):
+            seen["log_dir"] = Path(log_dir)
+            seen["kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setenv("ROMJAX_PROFILE", "1")
+    monkeypatch.setenv("ROMJAX_PROFILE_HOST_TRACER_LEVEL", "3")
+    monkeypatch.setenv("ROMJAX_PROFILE_DEVICE_TRACER_LEVEL", "1")
+    monkeypatch.setenv("ROMJAX_PROFILE_PYTHON_TRACER_LEVEL", "1")
+    monkeypatch.setattr(jax.profiler, "trace", lambda log_dir, **kwargs: DummyTrace(log_dir, **kwargs))
+
+    with profile_trace("train", tmp_path):
+        pass
+
+    options = seen["kwargs"]["profiler_options"]
+    assert options.host_tracer_level == 3
+    assert options.device_tracer_level == 1
+    assert options.python_tracer_level == 1
 
 
 def test_build_profile_env_is_case_specific(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -763,9 +763,10 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     params = {"toy": {"weight": jnp.array(0.5)}}
     assert squared(params, batch) == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
     assert squared.term_names == ("term_0",)
-    assert squared.term_values(params, batch)["term_0"] == pytest.approx(
-        np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2)
-    )
+    loss_value, (raw_terms, scaled_terms) = squared(params, batch, return_aux=True)
+    assert loss_value == pytest.approx(squared(params, batch))
+    assert raw_terms["term_0"] == pytest.approx(np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2))
+    assert scaled_terms["term_0"] == pytest.approx(loss_value)
 
     reference = GraphLoss(terms=[{"term": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
     ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
@@ -793,6 +794,15 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
         + 0.5 * np.mean(np.abs(0.5 - np.array([1.0, 2.0, 3.0])))
     )
     assert weighted(params, batch) == pytest.approx(expected_weighted)
+    scaled_loss, (raw_terms, scaled_terms) = weighted(
+        params,
+        batch,
+        scales={"term_0": jnp.asarray(0.25), "term_1": jnp.asarray(4.0)},
+        return_aux=True,
+    )
+    assert scaled_terms["term_0"] == pytest.approx(2.0 * 0.25 * raw_terms["term_0"])
+    assert scaled_terms["term_1"] == pytest.approx(0.5 * 4.0 * raw_terms["term_1"])
+    assert scaled_loss == pytest.approx(scaled_terms["term_0"] + scaled_terms["term_1"])
 
     reconstructed = GraphLoss(
         terms=[
@@ -872,9 +882,7 @@ def test_graph_loss_scale_arrays_do_not_retrace_on_value_changes(toy_graph: Func
         trace_count += 1
 
         def _loss(params, batch):
-            raw_terms = loss.term_values(params, batch)
-            scaled_terms = loss.scaled_term_values(raw_terms, scales)
-            return loss.total_from_terms(scaled_terms)
+            return loss(params, batch, scales=scales)
 
         return eqx.filter_value_and_grad(_loss)(params, batch)
 
