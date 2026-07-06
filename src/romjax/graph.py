@@ -803,12 +803,11 @@ class FunctionGraph(BaseModel):
                 lambda leaf: jnp.zeros_like(jnp.asarray(leaf)) if eqx.is_array(leaf) else leaf,
                 out_a,
             )
-        error_fn = (
-            end_a.error
-            if error_op is None
-            else lambda a, b: BinaryOp(error_op)(a, b, ignore=ignore or end_a.ignore)
-        )
-        return error_fn(out_a, out_b)
+        
+        op = end_a.error_op if error_op is None else BinaryOp(error_op)
+        ignore = ignore or end_a.ignore
+        
+        return op(out_a, out_b, ignore=ignore)
 
     def reconstruction_error(
         self,
@@ -844,9 +843,8 @@ class FunctionGraph(BaseModel):
             aux=aux_cache,
             edge_payload_patches=edge_payload_patches,
         )
-        error_fn = (
-            start_node.error
-            if error_op is None
-            else lambda a, b: BinaryOp(error_op)(a, b, ignore=ignore or start_node.ignore)
-        )
-        return error_fn(payload, reconstructed)
+
+        op = start_node.error_op if error_op is None else BinaryOp(error_op)
+        ignore = ignore or start_node.ignore
+
+        return op(payload, reconstructed, ignore=ignore)

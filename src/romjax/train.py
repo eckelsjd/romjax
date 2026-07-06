@@ -42,11 +42,16 @@ from romjax.plotting import GridplotConfig, PlotSpec, gridplot
 from romjax.profiling import profile_annotation, profile_step, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
+    TreePath,
+    coerce_tree_paths,
     get_subtree,
+    is_shape_dtype_template_leaf,
     pytree_norm,
     pytree_path_iter,
     pytree_resolve_refs,
     pytree_square_norm,
+    set_subtree,
+    shape_dtype_template_like,
 )
 from romjax.typing import CallableModel, ThirdPartyType, from_registry, from_yaml, require_type, resolve_graph_refs
 from romjax.utils import _NullProgress
@@ -243,6 +248,46 @@ def residual_loss(
     )
 
 
+def solution_loss(
+    params: PyTree,
+    single_data: PyTree,
+    graph: FunctionGraph,
+    path: list[str] = None,
+    template_paths: Sequence[TreePath] | None = None,
+    aux_paths: Sequence[TreePath] | None = None,
+    error_op: BinaryOp | None = None,
+    ignore: set | None = None,
+):
+    """
+    Solution error objective. Minimize difference between a single solution path and the data. Assumes solution data
+    is precomputed and passed in. 
+    """
+    template_paths = coerce_tree_paths(template_paths)
+    aux_paths = coerce_tree_paths(aux_paths)
+    aux = None
+
+    if aux_paths:
+        if len(template_paths) == 0:
+            selected = single_data
+        else:
+            selected = None
+            for p in template_paths:
+                selected = set_subtree(selected, p, get_subtree(single_data, p))
+        
+        template = shape_dtype_template_like(selected)
+        
+        for p in aux_paths:
+            aux = set_subtree(aux, p, template)
+    
+    sol = graph.push_path(single_data, path, edge_payload_patches=params, aux=aux)
+
+    end_node = graph._path_end_node(path)
+    op = end_node.error_op if error_op is None else BinaryOp(error_op)
+    ignore = ignore or end_node.ignore
+
+    return op(single_data, sol, ignore=ignore)
+
+
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
     del single_data, graph
     return pytree_square_norm(params)
@@ -261,6 +306,7 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
 _LOSS_REGISTRY = {
     "reconstruction": reconstruction_loss,
     "residual": residual_loss,
+    "solution": solution_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
 }
@@ -638,7 +684,10 @@ class OrbaxParams(BaseModel):
             with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
                 if ckptr.latest is not None:
                     if template is not None:
-                        dynamic_params, static_params = eqx.partition(template, eqx.is_array)
+                        dynamic_params, static_params = eqx.partition(
+                            template,
+                            lambda leaf: eqx.is_array(leaf) or is_shape_dtype_template_leaf(leaf),
+                        )
                         loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
                         params = eqx.combine(loaded["params"], static_params)
                     else:

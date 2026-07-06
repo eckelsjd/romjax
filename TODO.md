@@ -26,7 +26,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 
 ## Backburner
-- [ ] Go back and make sure graph loss functions actually give the same result as normal regresion (linear, mlp)
 - [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm)
 
 ## Ergonomics
