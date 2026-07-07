@@ -59,15 +59,12 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation
-- [ ] Check performance of poisson and make sure it reasonable for the problem size (lookout for optx)
 - [ ] Check performance of vlasov
 
 ## Optimizations
-- [ ] Prefetching for dataloader
 - [ ] Caching data globally across training runs (train data and graph/models to avoid repeated pydantic validation)
 - [ ] Stacked h5 datasets (many samples per file)
 - [ ] Something with pre-compiling (globally) jax loss functions to avoid jit cache misses
-- [ ] All the jax jit stuff I have not been paying attention to (static args, recompilation, host/device transfer, python logic)
 
 ## Training
 - [ ] EvolutionSearch or similar instead of grid search (still dispatch in parallel)

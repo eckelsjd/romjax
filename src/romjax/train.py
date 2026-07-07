@@ -427,7 +427,8 @@ class GraphLossTerm(BaseModel):
     :param dataset: which dataset name to read data from
     :param weight: scalar term weight
     :param batch_reduce: reduce the loss over batch data; skip batch reduce if none
-    :param batch_size: optional, passed to jax.lax.map for balancing memory with vmap, use batch_size=0 for vmap-like behavior
+    :param batch_size: optional, passed to jax.lax.map for balancing memory with vmap; use batch_size=0 for vmap-like
+        behavior
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
@@ -1088,6 +1089,8 @@ class Train(Routine):
     :param dataloader: Optionally load extra data for the loss function
     :param termination: stopping criteria
     :param diagnostics: configs for plotting and logging
+    :param host_interval: global host synchronization interval; ``None`` synchronizes only at the final iteration
+    :param checkpoint_interval: outer checkpoint check interval; ``None`` checks only at the final iteration
 
     :param root: run directory for checkpoints, logs, and history (optional)
     :param write_policy: ``reuse`` restores checkpoints, ``overwrite`` replaces artifacts, ``error`` fails
@@ -1108,6 +1111,8 @@ class Train(Routine):
     dataloader: Iterator[Any] = Field(default_factory=BatchLoader)  # empty loading by default
     termination: TerminationConfig = Field(default_factory=TerminationConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
+    host_interval: PositiveInt | None = 1
+    checkpoint_interval: PositiveInt | None = 1
 
     # Persistence
     root: Path | None = None
@@ -1118,6 +1123,15 @@ class Train(Routine):
     # Other
     init_seed: int = 0
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+
+    @model_validator(mode="after")
+    def _infer_train_intervals(self):
+        """Infer cheap outer checkpoint cadence from a fixed-interval Orbax policy when possible."""
+        if "checkpoint_interval" not in self.model_fields_set:
+            interval = getattr(self.checkpointer.save_decision_policy, "interval", None)
+            if isinstance(interval, int) and interval > 0:
+                self.checkpoint_interval = interval
+        return self
 
     @model_validator(mode="after")
     def _setup_extra_train_configs(self):
@@ -1200,22 +1214,31 @@ class Train(Routine):
             """Rebuild the full parameter pytree from checkpointed arrays and the init template."""
             return eqx.combine(dynamic_params, static_params)
 
-        @eqx.filter_jit
-        def _loss_and_grad(params: PyTree, batch: PyTree):
-            return eqx.filter_value_and_grad(self.loss)(params, batch)
+        def _apply_optimizer_update(params: PyTree, opt_state: optax.OptState, grads: PyTree):
+            updates, opt_state = self.optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
+            params = eqx.apply_updates(params, updates)
+            grad_norm = pytree_norm(grads) if self.termination.grad_tol else None
+            return params, opt_state, grad_norm
 
         @eqx.filter_jit
-        def _graph_loss_and_grad(params: PyTree, batch: PyTree, scales: Mapping[str, ArrayLike]):
+        def _train_step(params: PyTree, opt_state: optax.OptState, batch: PyTree):
+            loss, grads = eqx.filter_value_and_grad(self.loss)(params, batch)
+            params, opt_state, grad_norm = _apply_optimizer_update(params, opt_state, grads)
+            return params, opt_state, loss, grad_norm
+
+        @eqx.filter_jit
+        def _graph_train_step(
+            params: PyTree,
+            opt_state: optax.OptState,
+            batch: PyTree,
+            scales: Mapping[str, ArrayLike],
+        ):
             def _loss(params: PyTree, batch: PyTree):
                 return graph_loss(params, batch, scales=scales, return_aux=True)
 
-            return eqx.filter_value_and_grad(_loss, has_aux=True)(params, batch)
-
-        @eqx.filter_jit
-        def _optimizer_update(params: PyTree, opt_state: optax.OptState, grads: PyTree):
-            updates, opt_state = self.optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
-            params = eqx.apply_updates(params, updates)
-            return params, opt_state
+            (loss, (raw_terms, scaled_terms)), grads = eqx.filter_value_and_grad(_loss, has_aux=True)(params, batch)
+            params, opt_state, grad_norm = _apply_optimizer_update(params, opt_state, grads)
+            return params, opt_state, loss, raw_terms, scaled_terms, grad_norm
 
         def _checkpointables(params: PyTree, opt_state: optax.OptState) -> dict[str, PyTree]:
             """Build the checkpointable training state."""
@@ -1523,62 +1546,97 @@ class Train(Routine):
                 t_start = time.time()
                 metrics = None
 
+                def _interval_active(interval: int | None, step: int) -> bool:
+                    """Return whether host work for an interval should run at this optimizer step."""
+                    final_step = step >= self.termination.max_steps
+                    if interval is None:
+                        return final_step
+                    return step % interval == 0 or final_step
+
                 ctxt = alive_bar(total_steps) if self.diagnostics.show_progress else _NullProgress()
                     
                 with ctxt as bar:
-                    last_batch = None
+                    try:
+                        batch = next(self.dataloader)
+                    except StopIteration:
+                        logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
+                        batch = None
+                    last_batch = batch
+
                     while True:
+                        if batch is None:
+                            break
+
                         ## LOSS/VALIDATION EVALUATION
-                        try:
-                            batch = next(self.dataloader)
-                        except StopIteration:
-                            if last_batch is None or loss_hist.has_step(curr_step):
-                                logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
-                                break
-                            logger.info(
-                                f"Train dataloader has stopped at step {curr_step}. "
-                                "Reusing the last batch for final metric evaluation..."
-                            )
-                            batch = last_batch
-                        else:
-                            last_batch = batch
-                        
+                        host_active = _interval_active(self.host_interval, curr_step)
+                        next_batch = None
+                        dataloader_stopped = False
+
                         try:
                             if (
+                                host_active
+                                and
                                 ema_enabled
                                 and graph_loss.balancing.bootstrap
                                 and not ema_bootstrapped
                                 and loss_state is not None
                             ):
-                                (_, (bootstrap_terms, _)), _ = jax.block_until_ready(
-                                    _graph_loss_and_grad(params, batch, _current_scale_arrays())
+                                _, _, _, bootstrap_terms, _, _ = jax.block_until_ready(
+                                    _graph_train_step(params, opt_state, batch, _current_scale_arrays())
                                 )
                                 bootstrap_terms = _host_float_terms(bootstrap_terms)
                                 _bootstrap_ema_state(bootstrap_terms)
                                 ema_bootstrapped = True
 
                             with profile_step("train", step_num=curr_step, env=os.environ):
-                                with profile_annotation("loss_and_grad", env=os.environ):
+                                with profile_annotation("train_step", env=os.environ):
                                     if term_diagnostics_enabled:
-                                        (loss, (raw_terms, scaled_terms)), grads = _graph_loss_and_grad(
+                                        train_result = _graph_train_step(
                                             params,
+                                            opt_state,
                                             batch,
                                             _current_scale_arrays(),
                                         )
                                     else:
-                                        loss, grads = _loss_and_grad(params, batch)
-                                        raw_terms, scaled_terms = None, None
-                            if raw_terms is not None and scaled_terms is not None:
-                                loss, raw_terms, scaled_terms = jax.block_until_ready((
-                                    loss,
-                                    raw_terms,
-                                    scaled_terms,
-                                ))
-                                raw_terms = _host_float_terms(raw_terms)
-                                scaled_terms = _host_float_terms(scaled_terms)
+                                        train_result = _train_step(params, opt_state, batch)
+
+                            if curr_step < self.termination.max_steps:
+                                try:
+                                    next_batch = next(self.dataloader)
+                                except StopIteration:
+                                    dataloader_stopped = True
+                                else:
+                                    last_batch = next_batch
+
+                            train_result = jax.block_until_ready(train_result)
+                            if term_diagnostics_enabled:
+                                next_params, next_opt_state, loss, raw_terms, scaled_terms, grad_norm_device = (
+                                    train_result
+                                )
                             else:
-                                loss = jax.block_until_ready(loss)
-                            loss_hist.record(curr_step, float(loss))
+                                next_params, next_opt_state, loss, grad_norm_device = train_result
+                                raw_terms, scaled_terms = None, None
+                        except Exception as exc:
+                            logger.exception(
+                                f"Exception encountered during train step at step {curr_step}. "
+                                "Saving checkpoint..."
+                            )
+                            _save_final()
+                            raise RoutineError("Train step failure") from exc
+                        
+                        ## METRICS AND CHECKPOINT
+                        t_diff = time.time() - t_start
+                        runtime_reached = t_diff >= self.termination.max_runtime.total_seconds()
+                        host_active = host_active or runtime_reached
+                        test_score, grad_norm = None, None
+                        loss_value = None
+                        stats_str = f"step={curr_step}"
+
+                        if host_active:
+                            loss_value = float(loss)
+                            raw_terms = _host_float_terms(raw_terms)
+                            scaled_terms = _host_float_terms(scaled_terms)
+                            loss_hist.record(curr_step, loss_value)
                             if raw_terms_hist is not None and raw_terms is not None:
                                 raw_terms_hist.record(curr_step, raw_terms)
                             if scaled_terms_hist is not None and scaled_terms is not None:
@@ -1587,64 +1645,55 @@ class Train(Routine):
                                 term_scales_hist.record(curr_step, _current_scales())
                             if raw_terms is not None:
                                 _update_ema_state(raw_terms)
-                        except Exception as exc:
-                            logger.exception(
-                                f"Exception encountered during train loss evaluation at step {curr_step}. "
-                                "Saving checkpoint..."
-                            )
-                            _save_final()
-                            raise RoutineError("Train loss evaluation failure") from exc
-                        
-                        ## METRICS AND CHECKPOINT
-                        metrics = {"loss": float(loss)}
-                        test_score, grad_norm = None, None
 
-                        if (
-                            test_fn is not None
-                            and 0 < test_interval < float('inf')
-                            and (
-                                curr_step % test_interval == 0
-                                or curr_step >= self.termination.max_steps
-                            )
-                        ):
-                            with profile_annotation("validation", env=os.environ):
-                                test_score = float(test_fn(params))
-                            test_hist.record(curr_step, test_score)
-                            metrics["test_score"] = test_score
+                            metrics = {"loss": loss_value}
 
-                        if self.termination.grad_tol:
-                            with profile_annotation("grad_norm", env=os.environ):
-                                grad_norm = pytree_norm(grads)
-                            metrics["grad_norm"] = float(grad_norm)
-                        
-                        with profile_annotation("checkpoint_save", env=os.environ):
                             if (
-                                self.checkpointer.save_decision_policy is not None
-                                and curr_step not in existing_checkpoint_steps
-                            ):
-                                saved_checkpoint = ckptr.save_checkpointables(
-                                    step=curr_step,
-                                    checkpointables=_checkpointables(params, opt_state),
-                                    metrics=metrics,
+                                test_fn is not None
+                                and 0 < test_interval < float('inf')
+                                and (
+                                    curr_step % test_interval == 0
+                                    or curr_step >= self.termination.max_steps
                                 )
-                                if saved_checkpoint:
-                                    _save_histories()
-                                    existing_checkpoint_steps.add(curr_step)
+                            ):
+                                with profile_annotation("validation", env=os.environ):
+                                    test_score = float(test_fn(params))
+                                test_hist.record(curr_step, test_score)
+                                metrics["test_score"] = test_score
 
-                        ## DIAGNOSTICS
-                        stats_str = f"loss={float(loss):.2e}"
-                        if test_score is not None:
-                            stats_str += f" test={test_score:.2e}"
-                        if grad_norm is not None:
-                            stats_str += f" grad={grad_norm:.2e}"
+                            if self.termination.grad_tol and grad_norm_device is not None:
+                                grad_norm = float(grad_norm_device)
+                                metrics["grad_norm"] = grad_norm
+
+                            with profile_annotation("checkpoint_save", env=os.environ):
+                                if (
+                                    _interval_active(self.checkpoint_interval, curr_step)
+                                    and self.checkpointer.save_decision_policy is not None
+                                    and curr_step not in existing_checkpoint_steps
+                                ):
+                                    saved_checkpoint = ckptr.save_checkpointables(
+                                        step=curr_step,
+                                        checkpointables=_checkpointables(params, opt_state),
+                                        metrics=metrics,
+                                    )
+                                    if saved_checkpoint:
+                                        _save_histories()
+                                        existing_checkpoint_steps.add(curr_step)
+
+                            ## DIAGNOSTICS
+                            stats_str = f"loss={loss_value:.2e}"
+                            if test_score is not None:
+                                stats_str += f" test={test_score:.2e}"
+                            if grad_norm is not None:
+                                stats_str += f" grad={grad_norm:.2e}"
                         
                         bar.text = stats_str
 
-                        if curr_step % log_interval == 0:
+                        if host_active and curr_step % log_interval == 0:
                             logger.debug(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
                                         f"| step={curr_step} {stats_str}")
                         
-                        if (
+                        if host_active and (
                             0 < plot_interval < float('inf')
                             and (curr_step % plot_interval == 0 or curr_step >= self.termination.max_steps)
                         ):
@@ -1668,7 +1717,8 @@ class Train(Routine):
                                 
                                 _save_plot(fig)
                         
-                        if (self.diagnostics.progress_callback is not None
+                        if (host_active
+                            and self.diagnostics.progress_callback is not None
                             and 0 < callback_interval < float('inf')
                             and curr_step % callback_interval == 0):
                             with profile_annotation("progress_callback", env=os.environ):
@@ -1676,6 +1726,8 @@ class Train(Routine):
                         
                         ## END CONDITIONS
                         if (
+                            host_active
+                            and
                             self.termination.test_tol
                             and test_score is not None
                             and test_score < self.termination.test_tol
@@ -1684,7 +1736,7 @@ class Train(Routine):
                                         f"{test_score:.2e} < {self.termination.test_tol:.2e}")
                             break
                             
-                        if self.termination.grad_tol and grad_norm is not None:
+                        if host_active and self.termination.grad_tol and grad_norm is not None:
                             if not jnp.isfinite(grad_norm):
                                 logger.warning("Grad norm is not finite. Terminating...")
                                 break
@@ -1694,9 +1746,9 @@ class Train(Routine):
                                             f"{grad_norm:.2e} < {self.termination.grad_tol:.2e}")
                                 break
                         
-                        if self.termination.loss_tol and float(loss) < self.termination.loss_tol:
+                        if host_active and self.termination.loss_tol and loss_value < self.termination.loss_tol:
                             logger.info(f"Termination criteria reached: loss "
-                                        f"{float(loss):.2e} < {self.termination.loss_tol:.2e}")
+                                        f"{loss_value:.2e} < {self.termination.loss_tol:.2e}")
                             break
 
                         if curr_step >= self.termination.max_steps:
@@ -1704,28 +1756,27 @@ class Train(Routine):
                                         f"{curr_step} / {self.termination.max_steps} optimizer steps")
                             break
 
-                        if (t_diff := time.time() - t_start) >= self.termination.max_runtime.total_seconds():
+                        if runtime_reached:
                             logger.info(f"Termination criteria reached: max runtime "
                                         f"{_prettify_timedelta(t_diff)} / "
                                         f"{_prettify_timedelta(self.termination.max_runtime.total_seconds())}")
                             break
 
-                        ## OPTIMIZER UPDATE
-                        try:
-                            with profile_step("train", step_num=curr_step, env=os.environ):
-                                with profile_annotation("optimizer_step", env=os.environ):
-                                    params, opt_state = _optimizer_update(params, opt_state, grads)
-                            params = jax.block_until_ready(params)
-                        except Exception as exc:
-                            logger.exception(
-                                f"Exception encountered during optimizer update at step {curr_step}. "
-                                "Saving checkpoint..."
-                            )
-                            _save_final(metrics)
-                            raise RoutineError("Optimizer update failure") from exc
-
+                        params, opt_state = next_params, next_opt_state
                         curr_step += 1
                         bar()
+
+                        if dataloader_stopped:
+                            if loss_hist.has_step(curr_step):
+                                logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
+                                break
+                            logger.info(
+                                f"Train dataloader has stopped at step {curr_step}. "
+                                "Reusing the last batch for final metric evaluation..."
+                            )
+                            batch = last_batch
+                        else:
+                            batch = next_batch
                 
                 logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
                 _save_final(metrics)
