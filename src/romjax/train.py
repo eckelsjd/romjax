@@ -423,10 +423,11 @@ class GraphLossTerm(BaseModel):
     One weighted term in a :class:`GraphLoss`. Aggregates a loss function over batch data.
 
     :param name: stable term name used for adaptive balancing, diagnostics, and plotting
-    :param function: function to apply to a single sample of data
+    :param term: callable to apply to a single sample of data
     :param dataset: which dataset name to read data from
     :param weight: scalar term weight
     :param batch_reduce: reduce the loss over batch data; skip batch reduce if none
+    :param batch_size: optional, passed to jax.lax.map for balancing memory with vmap, use batch_size=0 for vmap-like behavior
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
@@ -440,6 +441,7 @@ class GraphLossTerm(BaseModel):
     dataset: str | None = None
     weight: float = 1.0
     batch_reduce: UnaryOp | None = "mean"
+    batch_size: int | None = None
 
     @field_validator("name", mode="after")
     @classmethod
@@ -477,11 +479,6 @@ class GraphLossTerm(BaseModel):
 
         return jax.tree.map(stack_leaf, *term_batch)
 
-    @staticmethod
-    def _vmap_in_axes(term_batch: PyTree) -> PyTree:
-        """Return vmap axes for batched array leaves while preserving static leaves."""
-        return jax.tree.map(lambda leaf: 0 if eqx.is_array(leaf) else None, term_batch)
-
     def raw_value(
         self, 
         params: Mapping[str, PyTree], 
@@ -499,10 +496,9 @@ class GraphLossTerm(BaseModel):
                     return jnp.asarray(0.0)
                 term_batch = self._stack_sequence_batch(term_batch)
 
-            losses = jax.vmap(
-                lambda single_data: self.term(params, single_data, graph),
-                in_axes=(self._vmap_in_axes(term_batch),),
-            )(term_batch)
+            losses = jax.lax.map(
+                lambda single_data: self.term(params, single_data, graph), term_batch, batch_size=self.batch_size
+            )
             return self.batch_reduce(losses)
     
         else:
