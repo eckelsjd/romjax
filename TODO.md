@@ -13,9 +13,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.
 - [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
 
-## Needs testing
-- [ ] Training on param references
-
 ## Bugs
 - [ ] Training live plot hangs at beginning -- might need to include progress of loading data / compiling
 
