@@ -53,6 +53,22 @@ def test_third_party_type_constructs_and_round_trips_nested_optax_specs():
     assert dumped == data
 
 
+def test_third_party_type_preserves_default_modules_for_nested_specs():
+    data = {
+        "name": "chain",
+        "args": [
+            {"name": "adam", "args": [0.1]},
+        ],
+    }
+
+    adapter = TypeAdapter(ThirdPartyType(default_modules="optax"))
+    transform = adapter.validate_python(data)
+    dumped = adapter.dump_python(transform)
+
+    assert isinstance(transform, optax.GradientTransformation)
+    assert dumped == data
+
+
 def test_third_party_type_accepts_partially_validated_nested_objects():
     adapter = TypeAdapter(ThirdPartyType(default_modules="optax"))
     clip = adapter.validate_python({"name": "optax.clip_by_global_norm", "args": [1.0]})
