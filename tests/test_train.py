@@ -305,6 +305,98 @@ def test_diagnostics(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_train_host_interval_gates_host_diagnostics(tmp_path: Path) -> None:
+    callback_values: list[float] = []
+    root = tmp_path.resolve() / "host_interval"
+
+    def progress_callback(params, graph, root):
+        del graph
+        assert root is not None
+        callback_values.append(float(params["w"]))
+
+    train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=scalar_quadratic_test,
+        termination=5,
+        diagnostics=DiagnosticsConfig(
+            test_interval=1,
+            callback_interval=1,
+            progress_callback=progress_callback,
+        ),
+        host_interval=2,
+        root=root,
+    )
+
+    assert train.run() == 0
+    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 2, 4, 5]
+    assert _history_csv(root / "test.csv")[0].tolist() == [0, 2, 4, 5]
+    assert len(callback_values) == 4
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_train_host_interval_none_syncs_only_at_final_step(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "host_interval_none"
+    train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=scalar_quadratic_test,
+        termination=4,
+        diagnostics=DiagnosticsConfig(test_interval=1),
+        host_interval=None,
+        root=root,
+    )
+
+    assert train.run() == 0
+    assert _history_csv(root / "loss.csv")[0].tolist() == [4]
+    assert _history_csv(root / "test.csv")[0].tolist() == [4]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_train_checkpoint_interval_gates_orbax_save_checks(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "checkpoint_interval"
+    checkpointer = CheckpointerConfig(save_decision_policy=1, preservation_policy=1, step_name_format="step")
+    train = Train(
+        routine_config=dict(progress_bar={"disable": True}),
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        termination=5,
+        checkpoint_interval=2,
+        root=root,
+        checkpointer=checkpointer,
+    )
+
+    assert train.run() == 0
+    checkpoint_names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    assert checkpoint_names == ["step_0", "step_2", "step_4", "step_5"]
+
+
+def test_train_checkpoint_interval_infers_fixed_orbax_save_policy() -> None:
+    train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        checkpointer=CheckpointerConfig(save_decision_policy=3),
+    )
+
+    explicit = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        checkpoint_interval=2,
+        checkpointer=CheckpointerConfig(save_decision_policy=3),
+    )
+
+    assert train.checkpoint_interval == 3
+    assert explicit.checkpoint_interval == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_termination(tmp_path: Path) -> None:
     loss_tol_root = tmp_path.resolve() / "loss_tol"
     loss_tol_train = Train(
