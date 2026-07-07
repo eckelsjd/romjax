@@ -21,7 +21,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Blind spots
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
-- [ ] Might be necessary (and nice) to allow jax dtype structs for filter model templates during reconstruction
 - [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
 - [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 
@@ -71,7 +70,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Caching data globally across training runs (train data and graph/models to avoid repeated pydantic validation)
 - [ ] Stacked h5 datasets (many samples per file)
 - [ ] Something with pre-compiling (globally) jax loss functions to avoid jit cache misses
-- [ ] Seems to be some recompiling when using cached data versus disk data -- keep an eye on this
 - [ ] All the jax jit stuff I have not been paying attention to (static args, recompilation, host/device transfer, python logic)
 
 ## Training

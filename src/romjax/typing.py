@@ -428,6 +428,15 @@ def _normalize_default_modules(default_modules: _DefaultModules = None) -> tuple
     return tuple(modules)
 
 
+def _nested_default_modules(target: Any, default_modules: _DefaultModules = None) -> tuple[str | ModuleType, ...]:
+    """Return default modules for nested specs without dropping parent fallbacks."""
+    target_module = getattr(target, "__module__", None)
+    parent_modules = _normalize_default_modules(default_modules)
+    if target_module is None:
+        return parent_modules
+    return (target_module, *parent_modules)
+
+
 def _resolve_name(name: str, *, default_modules: _DefaultModules = None) -> Any:
     """Resolve an import path, optionally using a parent module as context."""
     if "." in name:
@@ -499,14 +508,14 @@ def _normalize_spec_data(data: str | Mapping[str, Any], *, default_modules: _Def
         raise ValueError("Third-party spec mappings must include a 'name' field.")
 
     target = _resolve_name(str(data["name"]), default_modules=default_modules)
-    nested_default_module = getattr(target, "__module__", None)
+    nested_default_modules = _nested_default_modules(target, default_modules)
 
     spec: dict[str, Any] = {"name": str(data["name"])}
     if "args" in data:
-        spec["args"] = [_normalize_value(arg, default_modules=nested_default_module) for arg in data.get("args", ())]
+        spec["args"] = [_normalize_value(arg, default_modules=nested_default_modules) for arg in data.get("args", ())]
     if "kwargs" in data:
         spec["kwargs"] = {
-            str(key): _normalize_value(val, default_modules=nested_default_module)
+            str(key): _normalize_value(val, default_modules=nested_default_modules)
             for key, val in data.get("kwargs", {}).items()
         }
     return spec
@@ -546,10 +555,10 @@ def _construct_value(value: Any, *, default_modules: _DefaultModules = None) -> 
 def _construct_spec(spec: dict[str, Any], *, default_modules: _DefaultModules = None) -> Any:
     """Construct an object from a normalized spec and cache its serialized form."""
     target = _resolve_name(spec["name"], default_modules=default_modules)
-    target_module = getattr(target, "__module__", None)
-    args = [_construct_value(arg, default_modules=target_module) for arg in spec.get("args", ())]
+    nested_default_modules = _nested_default_modules(target, default_modules)
+    args = [_construct_value(arg, default_modules=nested_default_modules) for arg in spec.get("args", ())]
     kwargs = {
-        key: _construct_value(val, default_modules=target_module)
+        key: _construct_value(val, default_modules=nested_default_modules)
         for key, val in spec.get("kwargs", {}).items()
     }
     value = target(*args, **kwargs)
