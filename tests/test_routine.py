@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import pytest
 from alive_progress import config_handler
 from loguru import logger
+from pydantic import field_validator
 
 import romjax
 from romjax import plotting
@@ -76,6 +77,16 @@ def test_progress_bar_config(monkeypatch):
     assert captured["file"] is sys.stdout
 
 
+def test_routine_config_updates_jax_platforms_early(monkeypatch):
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr("jax.config.update", lambda key, value: calls.append((key, value)))
+
+    RoutineConfig(device="cpu")
+
+    assert calls == [("jax_platforms", "cpu")]
+
+
 def test_routine_config(monkeypatch):
     calls: dict[str, list[object]] = {"gridplot": [], "logger": [], "bar": [], "style": [], "rc": []}
 
@@ -125,6 +136,30 @@ def test_routine_config(monkeypatch):
     assert len(calls["bar"]) == 2
     assert calls["rc"][0] == {"axes.facecolor": "white"}
     assert calls["style"] == ["dark_background"]
+
+
+def test_routine_config_extras_apply_before_field_validation(monkeypatch):
+    updates: list[dict[str, object]] = []
+
+    monkeypatch.setattr(matplotlib.rcParams, "update", lambda settings: updates.append(dict(settings)))
+
+    class StyledRoutine(Routine):
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def _check_style(cls, value):
+            assert updates == [{"axes.facecolor": "white"}]
+            return value
+
+        def run(self) -> int:
+            return 0
+
+    routine = StyledRoutine(name="demo", mplstyle={"axes.facecolor": "white"})
+
+    assert routine.name == "demo"
+    assert routine.routine_config is not None
+    assert routine.routine_config.mplstyle == {"axes.facecolor": "white"}
 
 
 def test_composite_routine_validates_from_plain_list() -> None:

@@ -530,7 +530,7 @@ class GraphLoss(BaseModel):
     balancing: GraphLossBalancing = Field(default_factory=GraphLossBalancing)
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
     _term_names: tuple[str, ...] = PrivateAttr(default=())
-    _term_weights: jax.Array = PrivateAttr(default_factory=lambda: jnp.asarray([], dtype=jnp.float32))
+    _term_weights: list[float] = PrivateAttr(default_factory=lambda: [])
     _term_value_branches: tuple[Callable[[Mapping[str, PyTree], Mapping[str, PyTree]], jax.Array], ...] = PrivateAttr(
         default=()
     )
@@ -579,7 +579,7 @@ class GraphLoss(BaseModel):
     def _refresh_term_cache(self) -> None:
         """Cache term metadata and JAX branch callables used during loss evaluation."""
         self._term_names = tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
-        self._term_weights = jnp.asarray([term.weight for term in self.terms])
+        self._term_weights = [term.weight for term in self.terms]
         self._term_value_branches = tuple(
             (lambda params, batch, term=term: term.raw_value(params, batch, self.graph))
             for term in self.terms
@@ -628,7 +628,7 @@ class GraphLoss(BaseModel):
         """
         params = pytree_resolve_refs(params)
         raw_values = self._raw_term_array(params, batch)
-        scaled_values = self._term_weights * self._scale_array(scales) * raw_values
+        scaled_values = jnp.asarray(self._term_weights) * self._scale_array(scales) * raw_values
         total = jnp.sum(scaled_values)
 
         if return_aux:

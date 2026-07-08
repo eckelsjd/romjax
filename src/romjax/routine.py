@@ -135,12 +135,22 @@ class RoutineConfig(BaseModel):
     progress_bar: ProgressBarConfig | None = None
     extra: Any | None = Field(exclude=True, default=None)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _configure_device(cls, value):
+        if isinstance(value, Mapping):
+            device = value.get("device")
+        else:
+            device = getattr(value, "device", None)
+
+        if device is not None:
+            import jax
+
+            jax.config.update("jax_platforms", device)
+        return value
+
     @model_validator(mode="after")
     def configure(self):
-        if (device := self.device) is not None:
-            import jax
-            jax.config.update('jax_platforms', device)
-
         if (style := self.mplstyle) is not None:    # plt style
             if isinstance(style, str | Path):
                 plt.style.use(style)
@@ -167,25 +177,42 @@ class Routine(BaseModel, ABC):
     
     routine_config: Annotated[RoutineConfig | None, BeforeValidator(from_yaml)] = None
 
-    @model_validator(mode="after")
-    def _get_routine_configs_from_extra(self):
+    @model_validator(mode="wrap")
+    @classmethod
+    def _get_routine_configs_from_extra(cls, value, handler):
+        validated_extra = None
+
+        if isinstance(value, Mapping):
+            value = dict(value)
+            config_data = {
+                key: value[key]
+                for key in RoutineConfig.model_fields
+                if key != "routine_config" and key in value and key not in cls.model_fields
+            }
+            if config_data:
+                validated_extra = RoutineConfig.model_validate(config_data)
+
+        self = handler(value)
+
         if self.model_extra is None or len(self.model_extra) == 0:
             return self
-        
-        for k in self.model_extra:
-            if k not in RoutineConfig.model_fields:
-                raise ValueError(f"Extra Routine argument '{k}' not recognized. Only global configs: "
-                                 f"{RoutineConfig.model_fields} allowed.")
-        
-        validated_extra = RoutineConfig.model_validate(self.model_extra)  # updates globals
 
-        # Update the instance config just for consistency
+        for key in self.model_extra:
+            if key not in RoutineConfig.model_fields:
+                raise ValueError(
+                    f"Extra Routine argument '{key}' not recognized. Only global configs: "
+                    f"{RoutineConfig.model_fields} allowed."
+                )
+
+        if validated_extra is None:
+            return self
+
         if self.routine_config is None:
             object.__setattr__(self, "routine_config", validated_extra)
         else:
             for attr in RoutineConfig.model_fields:
                 if (ele := getattr(validated_extra, attr, None)) is not None:
-                    # Merge gridplot configs, all others will override completely
+                    # Merge gridplot configs, all others will override completely.
                     if attr == "gridplot" and (curr_ele := self.routine_config.gridplot) is not None:
                         GridplotConfig.merge(curr_ele, ele, in_place=True)
                     else:
