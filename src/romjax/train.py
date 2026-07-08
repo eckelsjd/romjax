@@ -217,16 +217,77 @@ class BatchLoader[T: Any](BaseModel, Iterator):
         return self
 
 
+def _aux_from_template(
+    data: PyTree,
+    template_paths: Sequence[TreePath] | None = None,
+    aux_paths: Sequence[TreePath] | None = None
+) -> PyTree | None:
+    """Form graph aux data by templating from the input data.
+    
+    :param data: the input pytree containing array-like data
+    :param template_paths: Target paths in data to form a template from
+    :param aux_paths: Destination paths in aux graph input to place the formed template (e.g. for reconstruction)
+    """
+    template_paths = coerce_tree_paths(template_paths)
+    aux_paths = coerce_tree_paths(aux_paths)
+    aux = None
+
+    if aux_paths:
+        if len(template_paths) == 0:
+            selected = data
+        else:
+            selected = None
+            for p in template_paths:
+                selected = set_subtree(selected, p, get_subtree(data, p))
+        
+        template = shape_dtype_template_like(selected)
+        
+        for p in aux_paths:
+            aux = set_subtree(aux, p, template)
+    
+    return aux
+
+
 def reconstruction_loss(
     params: PyTree, 
     single_data: PyTree, 
     graph: FunctionGraph, 
     path: list[str] | None = None,
+    start: str | None = None,
+    initial_path: list[str] | None = None,
+    template_paths: Sequence[TreePath] | None = None,
+    aux_paths: Sequence[TreePath] | None = None,
     error_op: BinaryOp | None = None,
     ignore: set | None = None,
 ):
-    """State reconstruction objective. Minimize reconstruction error along a given path."""
-    return graph.reconstruction_error(single_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore)
+    """State reconstruction objective. Minimize reconstruction error along a given path.
+
+    Note that templates are generally handled internally by the graph, but sometimes you may need to pass it in
+    a priori depending on which paths are being traversed, e.g. trying to reconstruct before compressing.
+    
+    :param params: optimization params
+    :param single_data: single pytree sample payload
+    :param graph: graph containing function/model definitions along edges
+    :param path: the reconstruction path
+    :param start: the starting node for the reconstruction path (defaults initial in the path)
+    :param initial_path: optional transform for the input data before reconstruction (default uses raw data)
+    :param template_paths: gather template from the input data
+    :param aux_paths: insert template in the aux tree 
+    :param error_op: optional override for node error
+    :param ignore: optional override for node ignore paths
+    """
+    aux = _aux_from_template(single_data, template_paths, aux_paths)
+
+    if initial_path is None:
+        initial_data = single_data
+    else:
+        initial_data, aux = graph.push_path(
+            single_data, initial_path, aux=aux, edge_payload_patches=params, return_aux=True
+        )
+
+    return graph.reconstruction_error(
+        initial_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore, aux=aux, start=start
+    )
 
 
 def residual_loss(
@@ -234,21 +295,26 @@ def residual_loss(
     single_data: PyTree,
     graph: FunctionGraph,
     path: list[str] = None,
+    template_paths: Sequence[TreePath] | None = None,
+    aux_paths: Sequence[TreePath] | None = None,
     error_op: BinaryOp | None = None,
     ignore: set | None = None,
 ):
     """Residual minimization objective. Minimize the result of a single forward path."""
+    aux = _aux_from_template(single_data, template_paths, aux_paths)
     return graph.path_error(
         single_data,
         path_a=path,
         path_b=None,
         edge_payload_patches=params,
         error_op=error_op,
-        ignore=ignore
+        ignore=ignore,
+        aux_a=aux,
+        aux_b=aux
     )
 
 
-def solution_loss(
+def similarity_loss(
     params: PyTree,
     single_data: PyTree,
     graph: FunctionGraph,
@@ -259,26 +325,10 @@ def solution_loss(
     ignore: set | None = None,
 ):
     """
-    Solution error objective. Minimize difference between a single solution path and the data. Assumes solution data
-    is precomputed and passed in. 
+    Similarity error objective. Minimize difference between a single similarity path and the data. Assumes data contains
+    all inputs, outputs, and residuals (e.g. data from both sides of an implicit model edge).
     """
-    template_paths = coerce_tree_paths(template_paths)
-    aux_paths = coerce_tree_paths(aux_paths)
-    aux = None
-
-    if aux_paths:
-        if len(template_paths) == 0:
-            selected = single_data
-        else:
-            selected = None
-            for p in template_paths:
-                selected = set_subtree(selected, p, get_subtree(single_data, p))
-        
-        template = shape_dtype_template_like(selected)
-        
-        for p in aux_paths:
-            aux = set_subtree(aux, p, template)
-    
+    aux = _aux_from_template(single_data, template_paths, aux_paths)
     sol = graph.push_path(single_data, path, edge_payload_patches=params, aux=aux)
 
     end_node = graph._path_end_node(path)
@@ -306,7 +356,7 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
 _LOSS_REGISTRY = {
     "reconstruction": reconstruction_loss,
     "residual": residual_loss,
-    "solution": solution_loss,
+    "similarity": similarity_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
 }

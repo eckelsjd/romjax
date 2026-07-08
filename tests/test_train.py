@@ -31,7 +31,7 @@ from romjax.train import (
     OrbaxParams,
     TerminationConfig,
     Train,
-    solution_loss,
+    similarity_loss,
 )
 from romjax.tree import is_shape_dtype_template_leaf, pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
@@ -1188,7 +1188,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     assert abs(float(params["toy"]["bias"])) < 0.2
 
 
-def test_solution_loss_template_paths_adds_edge_aux_template() -> None:
+def test_similarity_loss_template_paths_adds_edge_aux_template() -> None:
     graph = FunctionGraph(
         edges={
             "pass": IdentityEdge(source="state", target="template_source", name="pass"),
@@ -1197,7 +1197,7 @@ def test_solution_loss_template_paths_adds_edge_aux_template() -> None:
     )
     single_data = {"x": jnp.array([2.0, -3.0]), "nested": {"y": jnp.array(4.0)}}
 
-    loss = solution_loss(
+    loss = similarity_loss(
         {},
         single_data,
         graph,
@@ -1209,12 +1209,12 @@ def test_solution_loss_template_paths_adds_edge_aux_template() -> None:
     assert float(loss) == pytest.approx(4.0**2)
 
 
-def test_solution_loss_trains_through_optimistix_root_find_edge() -> None:
+def test_similarity_loss_trains_through_optimistix_root_find_edge() -> None:
     graph = FunctionGraph(edges={"root": OptimistixRootFindEdge()})
     batch = {"root": [{"x": jnp.array(2.0), "u": jnp.array(6.0)}]}
     train = Train(
         loss=GraphLoss(
-            terms=[{"term": {"callable": "solution", "path": "root"}, "dataset": "root"}],
+            terms=[{"term": {"callable": "similarity", "path": "root"}, "dataset": "root"}],
             graph=graph,
         ),
         init_params={"root": {"weight": jnp.array(0.0)}},
