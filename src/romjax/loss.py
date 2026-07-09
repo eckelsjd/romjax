@@ -1,5 +1,6 @@
 """Loss functions for graphs."""
 import functools
+from inspect import Parameter, signature
 from typing import Annotated, Any, Callable, Literal, Mapping, Sequence
 
 import equinox as eqx
@@ -185,7 +186,7 @@ _LOSS_REGISTRY = {
 class GraphLossCallable(CallableModel):
     """Loss function for a single data sample."""
 
-    callable: Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]
+    callable: Callable[..., ArrayLike | tuple[ArrayLike, PyTree]]
 
 
 class GraphLossBalancing(BaseModel):
@@ -314,6 +315,16 @@ class GraphLossTerm(BaseModel):
     batch_reduce: UnaryOp | None = "mean"
     batch_size: int | None = None
 
+    @property
+    def accepts_aux(self) -> bool:
+        """Whether the wrapped callable accepts the optional GraphLoss aux payload."""
+        try:
+            params = signature(self.term.callable).parameters.values()
+        except (TypeError, ValueError):
+            return False
+
+        return any(param.name == "aux" or param.kind == Parameter.VAR_KEYWORD for param in params)
+
     @field_validator("name", mode="after")
     @classmethod
     def _check_name(cls, value: str | None) -> str | None:
@@ -351,29 +362,58 @@ class GraphLossTerm(BaseModel):
         return jax.tree.map(stack_leaf, *term_batch)
 
     def raw_value(
-        self, 
-        params: Mapping[str, PyTree], 
-        batch_data: Mapping[str, PyTree], 
-        graph: FunctionGraph
-    ) -> jax.Array:
+        self,
+        params: Mapping[str, PyTree],
+        batch_data: Mapping[str, PyTree],
+        graph: FunctionGraph,
+        aux: PyTree | None = None,
+        return_aux: bool = False,
+    ) -> jax.Array | tuple[jax.Array, PyTree | None]:
         """Evaluate the unweighted, batch-reduced term value."""
         if self.batch_reduce is not None:
             if self.dataset is not None and self.dataset not in batch_data:
-                return jnp.asarray(0.0)  # if a dataset runs out during iteration
+                value = jnp.asarray(0.0)  # if a dataset runs out during iteration
+                return (value, aux) if return_aux else value
 
             term_batch = batch_data[self.dataset] if self.dataset is not None else batch_data
             if isinstance(term_batch, (list, tuple)):
                 if len(term_batch) == 0:
-                    return jnp.asarray(0.0)
+                    value = jnp.asarray(0.0)
+                    return (value, aux) if return_aux else value
                 term_batch = self._stack_sequence_batch(term_batch)
 
-            losses = jax.lax.map(
-                lambda single_data: self.term(params, single_data, graph), term_batch, batch_size=self.batch_size
+            term_result = jax.lax.map(
+                lambda single_data: self._call_term(params, single_data, graph, aux), term_batch,
+                batch_size=self.batch_size
             )
-            return self.batch_reduce(losses)
-    
-        else:
-            return self.term(params, batch_data, graph)
+            losses, aux = self._split_term_result(term_result, aux)
+            value = self.batch_reduce(losses)
+            return (value, aux) if return_aux else value
+
+        value, aux = self._split_term_result(self._call_term(params, batch_data, graph, aux), aux)
+        return (value, aux) if return_aux else value
+
+    def _call_term(
+        self,
+        params: Mapping[str, PyTree],
+        single_data: Mapping[str, PyTree],
+        graph: FunctionGraph,
+        aux: PyTree | None,
+    ) -> jax.Array | tuple[jax.Array, PyTree]:
+        """Call a scalar loss term with aux only when the callable declares support for it."""
+        if self.accepts_aux:
+            return self.term(params, single_data, graph, aux=aux)
+        return self.term(params, single_data, graph)
+
+    @staticmethod
+    def _split_term_result(
+        result: jax.Array | tuple[jax.Array, PyTree],
+        aux: PyTree | None,
+    ) -> tuple[jax.Array, PyTree | None]:
+        """Split a term result into a scalar value and next aux carry."""
+        if isinstance(result, tuple) and len(result) == 2:
+            return result
+        return result, aux
 
     def __call__(
         self, 
@@ -401,9 +441,6 @@ class GraphLoss(BaseModel):
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
     _term_names: tuple[str, ...] = PrivateAttr(default=())
     _term_weights: list[float] = PrivateAttr(default_factory=lambda: [])
-    _term_value_branches: tuple[Callable[[Mapping[str, PyTree], Mapping[str, PyTree]], jax.Array], ...] = PrivateAttr(
-        default=()
-    )
 
     __hash__ = object.__hash__
 
@@ -447,13 +484,9 @@ class GraphLoss(BaseModel):
             self._refresh_term_cache()
 
     def _refresh_term_cache(self) -> None:
-        """Cache term metadata and JAX branch callables used during loss evaluation."""
+        """Cache term metadata used during loss evaluation."""
         self._term_names = tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
         self._term_weights = [term.weight for term in self.terms]
-        self._term_value_branches = tuple(
-            (lambda params, batch, term=term: term.raw_value(params, batch, self.graph))
-            for term in self.terms
-        )
 
     @property
     def term_names(self) -> tuple[str, ...]:
@@ -462,15 +495,16 @@ class GraphLoss(BaseModel):
 
     def _raw_term_array(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
         """Evaluate raw term values as an ordered JAX array."""
-        if len(self._term_value_branches) == 0:
+        if len(self.terms) == 0:
             return jnp.asarray([])
 
-        def body(carry: None, idx: jax.Array) -> tuple[None, jax.Array]:
-            value = jax.lax.switch(idx, self._term_value_branches, params, batch)
-            return carry, value
+        values = []
+        aux = None
+        for term in self.terms:
+            value, aux = term.raw_value(params, batch, self.graph, aux=aux, return_aux=True)
+            values.append(value)
 
-        _, values = jax.lax.scan(body, None, jnp.arange(len(self._term_value_branches)))
-        return values
+        return jnp.asarray(values)
 
     def _scale_array(self, scales: Mapping[str, ArrayLike] | None = None) -> jax.Array:
         """Return ordered adaptive scale values."""
@@ -533,4 +567,3 @@ class GraphTest(GraphLoss):
     def __call__(self, params: Mapping[str, PyTree]) -> jax.Array:
         values = jnp.asarray([self._batch_loss(params, batch) for batch in self.loader])
         return self.reduce(values)
-    
