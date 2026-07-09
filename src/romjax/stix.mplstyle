@@ -2,8 +2,8 @@ font.size : 18
 font.family : STIXGeneral
 mathtext.fontset : stix
 text.usetex : False
-xtick.labelsize : x-small
-ytick.labelsize : x-small
+xtick.labelsize : small
+ytick.labelsize : small
 xtick.major.size : 6
 xtick.major.width : 1
 xtick.major.pad: 5
@@ -20,4 +20,4 @@ ytick.minor.width : 0.8
 ytick.minor.visible : True
 legend.framealpha : 0.5
 legend.fancybox : true
-legend.fontsize : x-small
+legend.fontsize : small
