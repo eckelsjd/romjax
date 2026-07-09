@@ -59,6 +59,56 @@ def test_gridplot_cscale_sets_colorbar_normalization():
     plt.close(fig)
 
 
+def test_gridplot_hist_uses_log_bins_for_log_xscale():
+    spec = PlotSpec(
+        kind="hist",
+        data=np.asarray([1.0, 10.0, 100.0, 1000.0]),
+        opts=AxisOptions(xscale="log"),
+        kwargs={"bins": 3},
+    )
+
+    fig, axs = gridplot(spec)
+    patches = axs[0, 0].patches
+    edges = np.asarray([patches[0].get_x(), *(patch.get_x() + patch.get_width() for patch in patches)])
+
+    np.testing.assert_allclose(edges, np.geomspace(1.0, 1000.0, 4))
+    assert axs[0, 0].get_xscale() == "log"
+
+    plt.close(fig)
+
+
+def test_gridplot_hist_auto_bins_are_inferred_in_log_space_for_log_xscale():
+    spec = PlotSpec(
+        kind="hist",
+        data=np.geomspace(1.0, 1000.0, 16),
+        opts=AxisOptions(xscale="log"),
+        kwargs={"bins": "auto"},
+    )
+
+    fig, axs = gridplot(spec)
+    patches = axs[0, 0].patches
+    edges = np.asarray([patches[0].get_x(), *(patch.get_x() + patch.get_width() for patch in patches)])
+
+    np.testing.assert_allclose(np.diff(np.log10(edges)), np.diff(np.log10(edges))[0])
+    assert axs[0, 0].get_xscale() == "log"
+
+    plt.close(fig)
+
+
+def test_gridplot_hist_stepfilled_handles_list_artists():
+    spec = PlotSpec(
+        kind="hist",
+        data=np.asarray([0.0, 1.0, 2.0, 3.0]),
+        kwargs={"bins": 2, "histtype": "stepfilled"},
+    )
+
+    fig, axs = gridplot(spec)
+
+    assert len(axs[0, 0].patches) == 1
+
+    plt.close(fig)
+
+
 def test_global_override(monkeypatch):
     monkeypatch.setattr(
         plotting,

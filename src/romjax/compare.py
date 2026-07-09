@@ -1,13 +1,15 @@
 import copy
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterable, Literal, Mapping
+from typing import Annotated, Any, Callable, Iterable, Literal, Mapping, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import yaml
 from alive_progress import alive_bar
 from jaxtyping import PyTree
+from matplotlib import rcParams
 from pydantic import (
     BeforeValidator,
     Field,
@@ -19,11 +21,12 @@ from pydantic import (
 from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
 from romjax.operators import UnaryOp
+from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine
 from romjax.train import GraphLoss, OrbaxParams
 from romjax.tree import pytree_path_iter
-from romjax.typing import from_yaml, resolve_graph_refs
-from romjax.utils import _NullProgress
+from romjax.typing import DictModel, from_yaml, resolve_graph_refs
+from romjax.utils import _NullProgress, load_h5, save_h5
 
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 
@@ -65,6 +68,32 @@ class CompareOrbax(Routine):
         return self
 
 
+class CompareHistogram(DictModel):
+    """
+    Histogram plotting options for :class:`CompareTable` error distributions.
+
+    :param case_labels: optional display labels keyed by case name
+    :param dataset_labels: optional y-axis labels keyed by dataset name
+    :param metric_labels: optional x-axis labels keyed by metric name
+    :param bins: histogram bin specification passed to matplotlib
+    :param density: whether to normalize histograms to probability densities
+    :param alpha: histogram transparency
+    :param histtype: histogram rendering style
+    :param scale: the scale for the x-axis (linear or log)
+    :param leg_anchor: bbox anchor for legend
+    """
+
+    case_labels: Mapping[str, str] | None = None
+    dataset_labels: Mapping[str, str] | None = None
+    metric_labels: Mapping[str, str] | None = None
+    bins: int | str | Sequence[float] = "auto"
+    density: bool = False
+    alpha: float = 0.45
+    histtype: str = "stepfilled"
+    scale: str | None = None
+    leg_anchor: tuple[float, float] = (0.5, 1.1)
+
+
 class CompareTable(CompareOrbax):
     """
     Construct a table of the form: case (row) -> metric (col) -> dataset -> stat.
@@ -95,6 +124,7 @@ class CompareTable(CompareOrbax):
     latex_template: str | None = None
     col_format: Mapping[str, str] = r"{mean:5.3f} ({std:5.3f})"
     filename: str = "compare_table.yml"
+    hist: CompareHistogram | None = None
     show_table: bool = True
     show_progress: bool = True
 
@@ -119,6 +149,20 @@ class CompareTable(CompareOrbax):
             value = {metric_name: value for metric_name in info.data["metrics"]}
 
         return value
+
+    @field_validator("hist", mode="before")
+    @classmethod
+    def _from_bool_or_mapping(cls, value):
+        """Allow simple YAML-friendly histogram plot configuration."""
+        if value is None or value is False:
+            return None
+        if value is True:
+            return CompareHistogram()
+        if isinstance(value, CompareHistogram):
+            return value
+        if isinstance(value, Mapping):
+            return CompareHistogram(**value)
+        raise ValueError("histogram_plot must be a bool, mapping, CompareHistogramConfig, or None")
 
     @model_validator(mode="after")
     def _bind_graph_and_jit_metrics(self):
@@ -163,6 +207,76 @@ class CompareTable(CompareOrbax):
     def _table_columns(self) -> list[tuple[str, str]]:
         """Return metric/dataset column labels in table order."""
         return [(metric_name, ds_name) for metric_name in self.metrics for ds_name in self.dataloaders]
+
+    def _plot_histograms(self, distributions: Mapping[str, Mapping], path: str | Path) -> None:
+        """Save a histogram grid of all cached error distributions."""
+        cfg = self.hist
+        dataset_labels = cfg.dataset_labels or {}
+        metric_labels = cfg.metric_labels or {}
+        case_labels = cfg.case_labels or {}
+        dataset_names = list(self.dataloaders)
+        metric_names = list(self.metrics)
+        case_names = list(self.cases)
+        prop_cycle = rcParams["axes.prop_cycle"].by_key()
+        colors = prop_cycle.get("color", [])
+
+        plots = []
+        for row_idx, dataset_name in enumerate(dataset_names):
+            row = []
+            for col_idx, metric_name in enumerate(metric_names):
+                specs = []
+                for case_idx, case_name in enumerate(case_names):
+                    try:
+                        values = distributions[case_name][metric_name][dataset_name]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Missing distribution for {case_name}->{metric_name}->{dataset_name}"
+                        ) from exc
+
+                    specs.append(
+                        PlotSpec(
+                            kind="hist",
+                            name=f"{dataset_name}_{metric_name}",
+                            data=np.ravel(np.asarray(values)),
+                            opts={
+                                "ylabel": dataset_labels.get(dataset_name, dataset_name) if col_idx == 0 else None,
+                                "xlabel": metric_labels.get(metric_name, metric_name)
+                                if row_idx == len(dataset_names) - 1 else None,
+                                "leg_label": case_labels.get(case_name, case_name),
+                                "xscale": cfg.scale
+                            },
+                            kwargs={
+                                "bins": cfg.bins,
+                                "density": cfg.density,
+                                "alpha": cfg.alpha,
+                                "histtype": cfg.histtype,
+                                **({"color": colors[case_idx % len(colors)]} if colors else {}),
+                            },
+                        )
+                    )
+                row.append(tuple(specs))
+            plots.append(row)
+
+        def adjust(fig, axs, artists, cbars):
+            """Replace per-axis legends with one compact figure legend."""
+            for ax in axs.flat:
+                legend = ax.get_legend()
+                if legend is not None:
+                    legend.remove()
+                ax.set_yticks([])
+                ax.tick_params(axis="y", left=False, labelleft=False)
+
+            handles, labels = axs[0, 0].get_legend_handles_labels()
+            fig.legend(
+                handles,
+                labels,
+                loc="upper center",
+                bbox_to_anchor=cfg.leg_anchor,
+                ncols=len(metric_names),
+                frameon=True,
+            )
+
+        gridplot(plots, shape=(len(dataset_names), len(metric_names)), save=path, adjust=adjust)
 
     def print_table(self, data: Mapping):
         """Print a fixed-width comparison table to stdout."""
@@ -235,11 +349,15 @@ class CompareTable(CompareOrbax):
 
         # Construct a table with cases in rows and metrics in columns
         tab_results = {}
+        distributions = {}
         if self.root is not None:
             tab_file = self.root / self.filename
             if tab_file.exists():
                 with tab_file.open("r", encoding="utf-8") as fh:
-                    tab_results = yaml.safe_load(fh)
+                    tab_results = yaml.safe_load(fh) or {}
+            dist_file = tab_file.with_suffix(".h5")
+            if dist_file.exists():
+                distributions = load_h5({}, dist_file, jax=False)
         
         num_items = len(self.cases) * len(self.metrics)
         ctxt = alive_bar(num_items) if self.show_progress else _NullProgress()
@@ -248,28 +366,36 @@ class CompareTable(CompareOrbax):
             for case_name, case in self.cases.items():
                 bar.text(f"Comparing case: {case_name}")
                 case_results = tab_results.setdefault(case_name, {})
+                case_distributions = distributions.setdefault(case_name, {})
 
                 params = case.resolve_params(self.params_template[case_name])
 
                 for metric_name, metric_fn in self.metrics.items():
                     metric_results = case_results.setdefault(metric_name, {})
+                    metric_distributions = case_distributions.setdefault(metric_name, {})
                 
                     for ds_name, loader in self.dataloaders.items():
                         ds_results = metric_results.setdefault(ds_name, {})
 
                         has_stats = all(stat_name in ds_results for stat_name in self.stats)
+                        has_distribution = ds_name in metric_distributions
 
-                        if has_stats and self.write_policy == "error":
-                            raise ValueError(f"Stats already computed for {case_name}->{metric_name}->{ds_name} "
-                                            f"and write_policy='error'")
-                        if has_stats and self.write_policy == "reuse":
+                        if (has_stats or has_distribution) and self.write_policy == "error":
+                            raise ValueError(
+                                f"Results already computed for {case_name}->{metric_name}->{ds_name} "
+                                f"and write_policy='error'"
+                            )
+                        if has_stats and has_distribution and self.write_policy == "reuse":
                             continue
-                        
-                        values = [metric_fn(params, data) for data in loader]
 
-                        if not values:
-                            raise ValueError(f"No data loaded for dataset '{ds_name}'")
-                        results = jnp.asarray(values)
+                        if has_distribution and self.write_policy == "reuse":
+                            results = jnp.ravel(jnp.asarray(metric_distributions[ds_name]))
+                        else:
+                            results = [metric_fn(params, data) for data in loader]
+                            if not results:
+                                raise ValueError(f"No data loaded for dataset '{ds_name}'")
+                            results = jnp.ravel(jnp.asarray(results))
+                            metric_distributions[ds_name] = np.asarray(jax.device_get(results))
 
                         for stat_name, stat_fn in self.stats.items():
                             ds_results[stat_name] = float(stat_fn(results))
@@ -281,7 +407,11 @@ class CompareTable(CompareOrbax):
             with tab_file.open("w", encoding="utf-8") as fh:
                 yaml.dump(tab_results, fh, sort_keys=False)
             
+            save_h5(distributions, tab_file.with_suffix(".h5"), mode="w")
             self.write_table(tab_results, tab_file.with_suffix(".tex"))
+
+            if self.hist:
+                self._plot_histograms(distributions, tab_file.with_suffix(".pdf"))
         
         if self.show_table:
             self.print_table(tab_results)

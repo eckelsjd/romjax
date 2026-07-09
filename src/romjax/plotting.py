@@ -434,6 +434,42 @@ def gridplot(
 
     animate, cbars, legends = _setup_plotting_area()
 
+    def _set_hist_bins(artist, bins) -> None:
+        """Store histogram bins when the matplotlib artist type supports attributes."""
+        try:
+            artist._hist_bins = bins
+        except AttributeError:
+            if isinstance(artist, list | tuple):
+                for item in artist:
+                    _set_hist_bins(item, bins)
+
+    def _get_hist_bins(artist, default):
+        """Return cached histogram bins, handling list-valued artists from step histograms."""
+        if hasattr(artist, "_hist_bins"):
+            return artist._hist_bins
+        if isinstance(artist, list | tuple):
+            for item in artist:
+                bins = _get_hist_bins(item, None)
+                if bins is not None:
+                    return bins
+        return default
+
+    def _hist_artists(artist) -> list[Artist]:
+        """Flatten matplotlib histogram return values into removable/updateable artists."""
+        if hasattr(artist, "patches"):
+            return list(artist.patches)
+        if isinstance(artist, list | tuple):
+            artists = []
+            for item in artist:
+                artists.extend(_hist_artists(item))
+            return artists
+        return [artist]
+
+    def _remove_hist_artists(artist) -> None:
+        """Remove all artists produced by a histogram call."""
+        for hist_artist in _hist_artists(artist):
+            hist_artist.remove()
+
     def _draw_empty_plots():
         """Initialize plots and gather all artists."""
         artists = []
@@ -470,7 +506,7 @@ def gridplot(
                     if "bins" not in kwargs:
                         kwargs["bins"] = 10
                     _, bin_edges, container = ax.hist([0.0, 1.0], label=spec.opts.leg_label, **kwargs)
-                    container._hist_bins = bin_edges  # monkey-patch for some reason
+                    _set_hist_bins(container, bin_edges)
                     p = container
                 case "hist2d":
                     kwargs = _get_kwargs()
@@ -529,6 +565,43 @@ def gridplot(
                     kwargs["norm"] = copy.deepcopy(cbar.norm)
                     kwargs["cmap"] = cbar.cmap
                 return kwargs
+
+            def _hist_bins(x, bins, range_):
+                """Return log-spaced histogram bins for log-x histograms when bins are inferred."""
+                if spec.opts.xscale != "log" or not isinstance(bins, int | str):
+                    return bins
+
+                if range_ is None:
+                    if isinstance(x, list | tuple) and len(x) > 0 and not np.isscalar(x[0]):
+                        x_arr = np.concatenate([np.ravel(np.asarray(item, dtype=float)) for item in x])
+                    else:
+                        x_arr = np.ravel(np.asarray(x, dtype=float))
+                    positive = x_arr[np.isfinite(x_arr) & (x_arr > 0.0)]
+                    if positive.size == 0:
+                        raise ValueError("Log-scaled histograms require positive finite data.")
+                    log_values = np.log10(positive)
+                    log_range = None
+                else:
+                    vmin, vmax = range_
+                    if vmin <= 0.0 or vmax <= 0.0:
+                        raise ValueError("Log-scaled histogram ranges must be positive.")
+                    log_values = None
+                    log_range = (np.log10(vmin), np.log10(vmax))
+
+                if isinstance(bins, str):
+                    sample = log_values if log_values is not None else np.asarray(log_range)
+                    log_edges = np.histogram_bin_edges(sample, bins=bins, range=log_range)
+                    return np.power(10.0, log_edges)
+
+                if range_ is None:
+                    vmin = np.nanmin(positive)
+                    vmax = np.nanmax(positive)
+                if vmin == vmax:
+                    factor = np.sqrt(10.0)
+                    vmin /= factor
+                    vmax *= factor
+
+                return np.geomspace(vmin, vmax, bins + 1)
 
             match spec.kind.lower():
                 case "line":
@@ -593,37 +666,39 @@ def gridplot(
                         # Fallback to re-plot for stacked/multi-dataset histograms.
                         if bins_override is not None:
                             kwargs["bins"] = bins_override
+                        kwargs["bins"] = _hist_bins(x, kwargs.get("bins", _get_hist_bins(artist, 10)),
+                                                    kwargs.get("range"))
                         if weights_override is not None:
                             kwargs["weights"] = weights_override
-                        for patch in artist.patches:
-                            patch.remove()
+                        _remove_hist_artists(artist)
                         n, bin_edges, new_container = ax.hist(x, **kwargs)
-                        new_container._hist_bins = bin_edges
+                        _set_hist_bins(new_container, bin_edges)
                         all_artists[flat_idx] = new_container
-                        updated_artists.extend(new_container.patches)
+                        updated_artists.extend(_hist_artists(new_container))
                     else:
                         bins = bins_override if bins_override is not None else kwargs.get("bins")
                         if bins is None:
-                            bins = getattr(artist, "_hist_bins", 10)
+                            bins = _get_hist_bins(artist, 10)
                         weights = weights_override if weights_override is not None else kwargs.get("weights")
                         range_ = kwargs.get("range")
                         density = kwargs.get("density", False)
+                        bins = _hist_bins(x, bins, range_)
 
                         hist, bin_edges = np.histogram(x, bins=bins, range=range_, density=density, weights=weights)
 
-                        if len(artist.patches) != len(hist):
+                        if not hasattr(artist, "patches") or len(artist.patches) != len(hist):
                             if bins_override is not None:
                                 kwargs["bins"] = bins_override
+                            kwargs["bins"] = bin_edges
                             if weights_override is not None:
                                 kwargs["weights"] = weights_override
-                            for patch in artist.patches:
-                                patch.remove()
+                            _remove_hist_artists(artist)
                             n, bin_edges, new_container = ax.hist(x, **kwargs)
-                            new_container._hist_bins = bin_edges
+                            _set_hist_bins(new_container, bin_edges)
                             all_artists[flat_idx] = new_container
-                            updated_artists.extend(new_container.patches)
+                            updated_artists.extend(_hist_artists(new_container))
                         else:
-                            artist._hist_bins = bin_edges
+                            _set_hist_bins(artist, bin_edges)
                             bottom = kwargs.get("bottom", 0.0)
                             if np.ndim(bottom) == 0:
                                 bottom_vals = np.full_like(hist, float(bottom), dtype=float)
