@@ -17,22 +17,13 @@ from romjax import YamlLoader
 from romjax.compression import SVD
 from romjax.data_gen import DataLoader, LoadImplicitModel, LoadSource
 from romjax.graph import Edge, FunctionGraph, IdentityEdge, Node
+from romjax.loss import GraphLoss, GraphTest, similarity_loss
 from romjax.model import ImplicitSampleable
 from romjax.nn import LinearProjection
 from romjax.pde import ImplicitIterativeGalerkin
 from romjax.rng import PyTreeSampler
 from romjax.routine import RoutineError
-from romjax.train import (
-    BatchLoader,
-    CheckpointerConfig,
-    DiagnosticsConfig,
-    GraphLoss,
-    GraphTest,
-    OrbaxParams,
-    TerminationConfig,
-    Train,
-    similarity_loss,
-)
+from romjax.train import BatchLoader, CheckpointerConfig, DiagnosticsConfig, OrbaxParams, TerminationConfig, Train
 from romjax.tree import is_shape_dtype_template_leaf, pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
 from romjax.utils import save_h5

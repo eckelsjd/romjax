@@ -20,10 +20,11 @@ from pydantic import (
 
 from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
+from romjax.loss import GraphLoss
 from romjax.operators import UnaryOp
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine
-from romjax.train import GraphLoss, OrbaxParams
+from romjax.train import OrbaxParams
 from romjax.tree import pytree_path_iter
 from romjax.typing import DictModel, from_yaml, resolve_graph_refs
 from romjax.utils import _NullProgress, load_h5, save_h5

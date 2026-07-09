@@ -15,7 +15,7 @@ from orbax.checkpoint import v1 as ocp
 import romjax.compare as compare_module
 from romjax.compare import CompareTable
 from romjax.data_gen import DataLoader
-from romjax.train import GraphLoss
+from romjax.loss import GraphLoss
 from romjax.utils import load_h5, save_h5
 from tests.test_train import ToyLinearReconstructionEdge, _write_graph_dataset
 

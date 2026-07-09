@@ -88,9 +88,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CompareTable": ("romjax.compare", "CompareTable"),
     "OrbaxParams": ("romjax.train", "OrbaxParams"),
     "Train": ("romjax.train", "Train"),
-    "GraphLoss": ("romjax.train", "GraphLoss"),
-    "GraphTest": ("romjax.train", "GraphTest"),
     "BatchLoader": ("romjax.train", "BatchLoader"),
+    "GraphLoss": ("romjax.loss", "GraphLoss"),
+    "GraphTest": ("romjax.loss", "GraphTest"),
 }
 
 __all__ = list(_LAZY_EXPORTS.keys())
@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
+    from .loss import GraphLoss, GraphTest
     from .pde import ImplicitIterativeGalerkin, AliveProgressMeter
     from .plotting import gridplot
     from .poisson import Poisson2D
@@ -113,13 +114,7 @@ if TYPE_CHECKING:
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .operators import BinaryOp, UnaryOp
-    from .train import (
-        BatchLoader,
-        GraphLoss,
-        GraphTest,
-        OrbaxParams,
-        Train,
-    )
+    from .train import BatchLoader, OrbaxParams, Train
     from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType, resolve_graph_refs, from_yaml
     from .utils import load_h5, save_h5
 
