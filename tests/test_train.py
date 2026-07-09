@@ -73,6 +73,47 @@ def graph_reference_loss(params: dict, single_data: dict, graph: FunctionGraph) 
     return jnp.square(weight - single_data["x"]) + jnp.square(alias - weight)
 
 
+def graph_aux_producer(
+    params: dict,
+    batch_data: dict,
+    graph: FunctionGraph,
+    aux: dict | None = None,
+) -> tuple[jax.Array, dict]:
+    del batch_data, graph, aux
+    weight = params["toy"]["weight"]
+    return jnp.square(weight), {"shared": weight + 1.0}
+
+
+def graph_aux_consumer(params: dict, batch_data: dict, graph: FunctionGraph, aux: dict | None = None) -> jax.Array:
+    del params, batch_data, graph
+    return aux["shared"]
+
+
+def graph_aux_kwargs_consumer(params: dict, batch_data: dict, graph: FunctionGraph, **kwargs: dict) -> jax.Array:
+    del params, batch_data, graph
+    return 2.0 * kwargs["aux"]["shared"]
+
+
+def graph_batched_aux_producer(
+    params: dict,
+    single_data: dict,
+    graph: FunctionGraph,
+    aux: dict | None = None,
+) -> tuple[jax.Array, dict]:
+    del params, graph, aux
+    return single_data["x"], {"double": 2.0 * single_data["x"]}
+
+
+def graph_stacked_aux_consumer(
+    params: dict,
+    batch_data: dict,
+    graph: FunctionGraph,
+    aux: dict | None = None,
+) -> jax.Array:
+    del params, batch_data, graph
+    return jnp.sum(aux["double"])
+
+
 class ToyLinearReconstructionEdge(Edge, ImplicitSampleable):
     source: Node = Node(name="state", error_op="mse")
     target: Node = Node(name="latent")
@@ -898,6 +939,50 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     expected_reconstruction = np.mean((np.array([1.0, 2.0, 3.0]) - (0.5 * np.array([1.0, 2.0, 3.0]) + 0.2)) ** 2)
     expected_regularization = 0.1 * float(pytree_norm(recon_params)**2)
     assert reconstructed(recon_params, batch) == pytest.approx(expected_reconstruction + expected_regularization)
+
+
+def test_graph_loss_passes_aux_between_terms(toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.array([1.0])}]}
+    params = {"toy": {"weight": jnp.array(2.0)}}
+    loss = GraphLoss(
+        terms=[
+            {"term": graph_aux_producer, "batch_reduce": None},
+            {"term": graph_aux_consumer, "batch_reduce": None},
+            {"term": graph_aux_kwargs_consumer, "batch_reduce": None},
+        ],
+        graph=toy_graph,
+    )
+
+    value, (raw_terms, scaled_terms) = loss(params, batch, return_aux=True)
+
+    assert value == pytest.approx(13.0)
+    assert raw_terms["term_0"] == pytest.approx(4.0)
+    assert raw_terms["term_1"] == pytest.approx(3.0)
+    assert raw_terms["term_2"] == pytest.approx(6.0)
+    assert scaled_terms["term_0"] == pytest.approx(4.0)
+    assert eqx.filter_jit(loss)(params, batch) == pytest.approx(13.0)
+
+    grad = jax.grad(lambda weight: loss({"toy": {"weight": weight}}, batch))(jnp.array(2.0))
+    assert grad == pytest.approx(7.0)
+
+
+def test_graph_loss_stacks_batched_aux_for_downstream_terms(toy_graph: FunctionGraph) -> None:
+    batch = {"toy": [{"x": jnp.array(1.0)}, {"x": jnp.array(2.0)}, {"x": jnp.array(3.0)}]}
+    params = {"toy": {"weight": jnp.array(0.0)}}
+    loss = GraphLoss(
+        terms=[
+            {"term": graph_batched_aux_producer, "dataset": "toy"},
+            {"term": graph_stacked_aux_consumer, "batch_reduce": None},
+        ],
+        graph=toy_graph,
+    )
+
+    value, (raw_terms, scaled_terms) = loss(params, batch, return_aux=True)
+
+    assert raw_terms["term_0"] == pytest.approx(2.0)
+    assert raw_terms["term_1"] == pytest.approx(12.0)
+    assert scaled_terms["term_1"] == pytest.approx(12.0)
+    assert value == pytest.approx(14.0)
 
 
 def test_graph_loss_balancing_config_and_term_names(toy_graph: FunctionGraph) -> None:
