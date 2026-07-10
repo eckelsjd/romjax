@@ -39,7 +39,8 @@ from romjax.plotting import GridplotConfig, PlotSpec, gridplot
 from romjax.profiling import profile_annotation, profile_step, profile_trace
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
-    is_shape_dtype_template_leaf,
+    as_shape_dtype_pytree,
+    is_shape_dtype,
     pytree_norm,
 )
 from romjax.typing import ThirdPartyType, from_yaml, require_type, resolve_graph_refs
@@ -255,9 +256,10 @@ class OrbaxParams(BaseModel):
             with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
                 if ckptr.latest is not None:
                     if template is not None:
+                        template = as_shape_dtype_pytree(template)
                         dynamic_params, static_params = eqx.partition(
                             template,
-                            lambda leaf: eqx.is_array(leaf) or is_shape_dtype_template_leaf(leaf),
+                            lambda leaf: eqx.is_array(leaf) or is_shape_dtype(leaf),
                         )
                         loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
                         params = eqx.combine(loaded["params"], static_params)

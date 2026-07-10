@@ -2,10 +2,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from pydantic import TypeAdapter
 
 from romjax import YamlLoader
 from romjax.operators import BinaryOp, UnaryOp
 from romjax.tree import (
+    ShapeDtypePyTree,
+    as_shape_dtype_pytree,
     pytree_at,
     pytree_iter,
     pytree_mean,
@@ -29,6 +32,30 @@ def error_l1(x, xhat):
 
 def tree_l1(tree, tree_hat):
     return jnp.sum(jnp.abs(tree["a"] - tree_hat["a"]))
+
+
+def test_shape_dtype_template_pytree_validator() -> None:
+    static_fn = lambda value: value
+    template = {
+        "array": jnp.ones((2, 3), dtype=jnp.float32),
+        "yaml": {"shape": [4], "dtype": "int32"},
+        "default_dtype": {"shape": [1, 2]},
+        "nested": ["static", static_fn, {"array": np.zeros(2)}],
+        "not_a_template": {"shape": [3], "label": "static metadata"},
+    }
+
+    validated = TypeAdapter(ShapeDtypePyTree).validate_python(template)
+
+    assert validated == as_shape_dtype_pytree(template)
+    assert isinstance(validated["array"], jax.ShapeDtypeStruct)
+    assert validated["array"].shape == (2, 3)
+    assert validated["array"].dtype == jnp.float32
+    assert validated["yaml"] == jax.ShapeDtypeStruct((4,), jnp.int32)
+    assert validated["default_dtype"].dtype == jnp.asarray(0.0).dtype
+    assert isinstance(validated["nested"][2]["array"], jax.ShapeDtypeStruct)
+    assert validated["nested"][0] == "static"
+    assert validated["nested"][1] is static_fn
+    assert validated["not_a_template"] == template["not_a_template"]
 
 
 def test_to_pytree():

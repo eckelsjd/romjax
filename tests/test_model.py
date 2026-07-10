@@ -15,7 +15,7 @@ from romjax.model import (
     eqx_evaluate,
 )
 from romjax.nn import LinearProjection
-from romjax.tree import is_shape_dtype_template_leaf
+from romjax.tree import is_shape_dtype
 
 
 def _tree_input() -> dict:
@@ -209,7 +209,7 @@ def test_eqx_evaluate():
     encoded_flat, aux_flat = eqx_evaluate(flat_tree, module, gather="flat", method="reduce", return_aux=True)
     decoded_flat = eqx_evaluate(encoded_flat, module, method="reconstruct", scatter="flat", aux=aux_flat)
     assert encoded_flat.ndim == 1
-    assert is_shape_dtype_template_leaf(aux_flat["template"]["left"])
+    assert is_shape_dtype(aux_flat["template"]["left"])
     assert jnp.allclose(decoded_flat["left"], flat_tree["left"])
     assert jnp.allclose(decoded_flat["right"]["v"], flat_tree["right"]["v"])
 
@@ -220,7 +220,7 @@ def test_eqx_evaluate():
     encoded_stack, aux_stack = eqx_evaluate(stack_tree, module, gather="stack", method="reduce", return_aux=True)
     decoded_stack = eqx_evaluate(encoded_stack, module, method="reconstruct", scatter="stack", aux=aux_stack)
     assert encoded_stack.shape == (2, 3)
-    assert is_shape_dtype_template_leaf(aux_stack["template"]["a"])
+    assert is_shape_dtype(aux_stack["template"]["a"])
     assert jnp.allclose(decoded_stack["a"], stack_tree["a"])
     assert jnp.allclose(decoded_stack["b"], stack_tree["b"])
 
@@ -235,7 +235,7 @@ def test_eqx_evaluate():
     encoded, aux = eqx_evaluate(tree, lambda x: x, gather="flat", return_aux=True)
     decoded = eqx_evaluate(encoded, lambda x: x, scatter="flat", aux=aux)
 
-    assert is_shape_dtype_template_leaf(aux["template"]["nested"]["scalar"])
+    assert is_shape_dtype(aux["template"]["nested"]["scalar"])
     assert jnp.allclose(decoded["nested"]["scalar"], tree["nested"]["scalar"])
     assert jnp.allclose(decoded["nested"]["vector"], tree["nested"]["vector"])
     assert jnp.allclose(decoded["tail"][0], tree["tail"][0])
@@ -245,7 +245,19 @@ def test_eqx_evaluate():
         return eqx_evaluate(x, lambda value: value, gather="flat", return_aux=True)
 
     _, jit_aux = jit_capture_template(tree)
-    assert is_shape_dtype_template_leaf(jit_aux["template"]["nested"]["vector"])
+    assert is_shape_dtype(jit_aux["template"]["nested"]["vector"])
+
+
+def test_eqx_evaluate_validates_yaml_template_before_scatter() -> None:
+    decoded = eqx_evaluate(
+        jnp.arange(3.0),
+        lambda x: x,
+        scatter="flat",
+        template={"state": {"shape": [3]}, "label": "static"},
+    )
+
+    assert jnp.allclose(decoded["state"], jnp.arange(3.0))
+    assert decoded["label"] == "static"
 
 
 def test_filter_model_yaml_round_trip_and_routing() -> None:
@@ -491,7 +503,7 @@ def test_filter_model_in_graph() -> None:
         return_aux=True,
     )
     field1_template = aux_cache["filter"]["backward"]["cached_states"][0]["template"]["field1"]
-    assert is_shape_dtype_template_leaf(field1_template)
+    assert is_shape_dtype(field1_template)
     assert field1_template.shape == field1.shape
     assert field1_template.dtype == field1.dtype
     decoded = graph.push_path(

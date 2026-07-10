@@ -24,7 +24,7 @@ from romjax.pde import ImplicitIterativeGalerkin
 from romjax.rng import PyTreeSampler
 from romjax.routine import RoutineError
 from romjax.train import BatchLoader, CheckpointerConfig, DiagnosticsConfig, OrbaxParams, TerminationConfig, Train
-from romjax.tree import is_shape_dtype_template_leaf, pytree_norm, pytree_resolve_refs
+from romjax.tree import is_shape_dtype, pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
 from romjax.utils import save_h5
 
@@ -159,7 +159,7 @@ class TemplateAuxEdge(Edge):
 
     @staticmethod
     def _zeros_from_template(leaf):
-        if is_shape_dtype_template_leaf(leaf):
+        if is_shape_dtype(leaf):
             return jnp.zeros(leaf.shape, leaf.dtype)
         if eqx.is_array(leaf):
             raise AssertionError("Template aux should carry shape/dtype metadata, not arrays.")
@@ -648,6 +648,7 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     assert hasattr(loaded["opt_state"][0], "mu")
 
 
+@pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "source"
@@ -715,6 +716,23 @@ def test_orbax_params_resolve_params_accepts_shape_dtype_template(tmp_path: Path
         "w": jax.ShapeDtypeStruct(source_params["w"].shape, source_params["w"].dtype),
         "b": jax.ShapeDtypeStruct(source_params["b"].shape, source_params["b"].dtype),
     }
+
+    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+        ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
+
+    loaded_params = OrbaxParams(params=checkpoint_root).resolve_params(template)
+
+    assert loaded_params is not None
+    np.testing.assert_allclose(loaded_params["w"], source_params["w"])
+    np.testing.assert_allclose(loaded_params["b"], source_params["b"])
+
+
+@pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_orbax_params_resolve_params_accepts_yaml_shape_dtype_template(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path.resolve() / "yaml_shape_dtype_template"
+    source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
+    template = {"w": {"shape": [2], "dtype": "float32"}, "b": {"shape": []}}
 
     with ocp.training.Checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)

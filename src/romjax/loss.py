@@ -31,7 +31,7 @@ from romjax.tree import (
     pytree_resolve_refs,
     pytree_square_norm,
     set_subtree,
-    shape_dtype_template_like,
+    shape_dtype_like,
 )
 from romjax.typing import CallableModel, from_registry, from_yaml
 
@@ -79,7 +79,7 @@ def _aux_from_template(
             for p in template_paths:
                 selected = set_subtree(selected, p, get_subtree(data, p))
         
-        template = shape_dtype_template_like(selected)
+        template = shape_dtype_like(selected)
         
         for p in aux_paths:
             aux = set_subtree(aux, p, template)
