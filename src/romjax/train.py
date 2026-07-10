@@ -689,10 +689,10 @@ class Train(Routine):
             for attr in ["loss", "test", "dataloader"]:
                 if hasattr(ele := getattr(self, attr), "graph"):
                     if ele.graph is None:
-                        ele.graph = self.graph
-                
                         if isinstance(ele, GraphLoss):
-                            ele._set_default_datasets()
+                            ele.bind_graph(self.graph)
+                        else:
+                            ele.graph = self.graph
 
             self.init_params = resolve_graph_refs(self.init_params, self.graph)
 

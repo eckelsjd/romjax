@@ -90,6 +90,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "Train": ("romjax.train", "Train"),
     "BatchLoader": ("romjax.train", "BatchLoader"),
     "GraphLoss": ("romjax.loss", "GraphLoss"),
+    "GraphLossTerm": ("romjax.loss", "GraphLossTerm"),
+    "GraphLossTermGenerator": ("romjax.loss", "GraphLossTermGenerator"),
     "GraphTest": ("romjax.loss", "GraphTest"),
 }
 
@@ -106,7 +108,7 @@ if TYPE_CHECKING:
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
-    from .loss import GraphLoss, GraphTest
+    from .loss import GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
     from .pde import ImplicitIterativeGalerkin, AliveProgressMeter
     from .plotting import gridplot
     from .poisson import Poisson2D

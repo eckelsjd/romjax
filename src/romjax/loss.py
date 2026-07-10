@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from romjax.data_gen import DataLoader, LoadDataConfig
-from romjax.graph import FunctionGraph
+from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.operators import BinaryOp, UnaryOp
 from romjax.tree import (
@@ -35,7 +35,25 @@ from romjax.tree import (
 )
 from romjax.typing import CallableModel, from_registry, from_yaml
 
-__all__ = ["GraphLoss", "GraphLossTerm", "GraphTest"]
+__all__ = ["GraphLoss", "GraphLossTerm", "GraphLossTermGenerator", "GraphTest", "cyclic_path_error_terms"]
+
+
+_GRAPH_PATH_PAYLOAD_CACHE = "graph_path_payloads"
+_LOSS_TERM_GENERATOR_REGISTRY: dict[str, Callable[..., Sequence["GraphLossTerm"]]] = {}
+_LOSS_REGISTRY: dict[str, Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]] = {}
+
+
+type _PathPayloadCacheKey = tuple[str, str, tuple[str, ...]]
+
+
+def _default_dataset_edge(graph: FunctionGraph | None) -> str | None:
+    """Return the first sampleable edge key in graph order."""
+    if graph is None:
+        return None
+    for edge_name, edge in graph.edges.items():
+        if isinstance(edge, ImplicitSampleable | SourceSampleable):
+            return edge_name
+    return None
 
 
 def _aux_from_template(
@@ -174,19 +192,186 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
     return pytree_square_norm(gram - jnp.eye(gram.shape[0]))
 
 
-_LOSS_REGISTRY = {
+_LOSS_REGISTRY.update({
     "reconstruction": reconstruction_loss,
     "residual": residual_loss,
     "similarity": similarity_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
-}
+})
 
 
 class GraphLossCallable(CallableModel):
     """Loss function for a single data sample."""
 
     callable: Callable[..., ArrayLike | tuple[ArrayLike, PyTree]]
+
+
+class GraphLossTermGenerator(CallableModel):
+    """
+    Configurable factory for one or more :class:`GraphLossTerm` objects.
+
+    The wrapped callable is invoked with the active :class:`FunctionGraph` as its first argument. This allows
+    YAML-configured loss terms to be generated after :class:`Train` binds a graph to a :class:`GraphLoss`.
+
+    :param callable: callable returning one or more graph loss terms
+    """
+
+    callable: Callable[..., Sequence["GraphLossTerm"]]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_generator_config(cls, value):
+        if callable(value) or isinstance(value, str):
+            return {"callable": value}
+        if isinstance(value, Mapping) and "generator" in value:
+            opts = {key: item for key, item in value.items() if key != "generator"}
+            return {"callable": value["generator"], **opts}
+        return value
+
+    @field_validator("callable", mode="before")
+    @classmethod
+    def _resolve_generator_callable(cls, value):
+        if isinstance(value, str) and value in _LOSS_TERM_GENERATOR_REGISTRY:
+            return _LOSS_TERM_GENERATOR_REGISTRY[value]
+        return value
+
+
+class _CyclicPathSpec(BaseModel):
+    """Static path metadata for one generated cyclic path-error term.
+    
+    :ivar name: the generated name of the graph loss term
+    :ivar start: the nominal start node of the path
+    :ivar dest: the final node of the path
+    :ivar logical_start: the dataset node to actually start from (seeded from data node->start node initially)
+    :ivar path_a: the clockwise path from start->dest (including initial seeding)
+    :ivar path_b: the counter-clockwise path from start->dest (including initial seeding)
+    :ivar cache_keys: all the partial paths this graph loss term will encounter
+    :ivar index: the global index in all generated cyclic path error terms
+    :ivar last_use: the index of the last term that uses each partial cached path, use for cleaning the cache 
+    """
+
+    name: str
+    start: str
+    dest: str
+    logical_start: str
+    path_a: tuple[str, ...]
+    path_b: tuple[str, ...]
+    cache_keys: tuple[_PathPayloadCacheKey, ...] = ()
+    index: int = 0
+    last_use: dict[_PathPayloadCacheKey, int] = Field(default_factory=dict)
+
+
+class _CyclicPathErrorCallable(BaseModel):
+    """Single-sample callable used by generated cyclic path-error terms."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    spec: _CyclicPathSpec
+    dataset: str
+    dataset_edge: str
+    template_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
+    aux_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
+    cache_payloads: bool = False
+
+    def __call__(
+        self,
+        params: PyTree,
+        single_data: PyTree,
+        graph: FunctionGraph,
+        aux: PyTree | None = None,
+    ) -> jax.Array | tuple[jax.Array, PyTree]:
+        """Evaluate one generated cyclic path-error term for a single sample."""
+        graph_aux = _aux_from_template(single_data, self.template_paths, self.aux_paths)
+
+        aux_out = {} if aux is None else dict(aux)
+        payload_cache = dict(aux_out.get(_GRAPH_PATH_PAYLOAD_CACHE, {}))
+
+        out_a, graph_aux, payload_cache = self._push_cached_path(
+            single_data, self.spec.path_a, graph, params, graph_aux, payload_cache
+        )
+        out_b, graph_aux, payload_cache = self._push_cached_path(
+            single_data, self.spec.path_b, graph, params, graph_aux, payload_cache
+        )
+
+        dest_node = graph._resolve_node(self.spec.dest)
+        if not self.cache_payloads:
+            return dest_node.error_op(out_a, out_b, ignore=dest_node.ignore)
+
+        for key, last_index in self.spec.last_use.items():
+            if last_index <= self.spec.index:
+                payload_cache.pop(key, None)
+
+        aux_out[_GRAPH_PATH_PAYLOAD_CACHE] = payload_cache
+        return dest_node.error_op(out_a, out_b, ignore=dest_node.ignore), aux_out
+
+    def _push_cached_path(
+        self,
+        single_data: PyTree,
+        logical_path: tuple[str, ...],
+        graph: FunctionGraph,
+        params: PyTree,
+        graph_aux: PyTree | None,
+        payload_cache: dict[_PathPayloadCacheKey, PyTree],
+    ) -> tuple[PyTree, PyTree | None, dict[_PathPayloadCacheKey, PyTree]]:
+        """Push one logical path, reusing and appending path-prefix payloads."""
+        prefix_len = self._longest_cached_prefix(logical_path, payload_cache)
+        if prefix_len == 0:
+            payload = single_data
+            curr_node = graph._resolve_node(self.spec.logical_start)
+        else:
+            prefix = logical_path[:prefix_len]
+            payload = payload_cache[self._cache_key(prefix)]
+            curr_node = graph._path_end_node(list(prefix), start=self.spec.logical_start)
+
+        for step_idx in range(prefix_len, len(logical_path)):
+            edge_name = logical_path[step_idx]
+            step_prefix = logical_path[: step_idx + 1]
+            edge = graph._resolve_edge(edge_name)
+            full_cycle_final_dataset_step = (
+                len(logical_path) > 1
+                and step_idx == len(logical_path) - 1
+                and edge.name == self.dataset_edge
+                and graph._path_end_node(list(logical_path), start=self.spec.logical_start) == self.spec.logical_start
+            )
+
+            if (
+                step_idx == 0
+                and edge.name == self.dataset_edge
+                and curr_node in {edge.source, edge.target}
+                and not full_cycle_final_dataset_step
+            ):
+                # The dataset already contains source/target payloads, so skip evaluation here.
+                curr_node = graph._step_path_node(curr_node, edge)
+            else:
+                payload, graph_aux = graph.push_path(
+                    payload,
+                    [edge_name],
+                    start=curr_node,
+                    aux=graph_aux,
+                    edge_payload_patches=params,
+                    return_aux=True,
+                )
+                curr_node = graph._step_path_node(curr_node, edge)
+
+            payload_cache[self._cache_key(step_prefix)] = payload
+
+        return payload, graph_aux, payload_cache
+
+    def _longest_cached_prefix(
+        self,
+        logical_path: tuple[str, ...],
+        payload_cache: Mapping[_PathPayloadCacheKey, PyTree],
+    ) -> int:
+        """Return the length of the longest cached prefix for ``logical_path``."""
+        for prefix_len in range(len(logical_path), 0, -1):
+            if self._cache_key(logical_path[:prefix_len]) in payload_cache:
+                return prefix_len
+        return 0
+
+    def _cache_key(self, path: tuple[str, ...]) -> _PathPayloadCacheKey:
+        """Return the cross-term payload-cache key for one logical path prefix."""
+        return (self.dataset, self.spec.logical_start, tuple(path))
 
 
 class GraphLossBalancing(BaseModel):
@@ -382,10 +567,18 @@ class GraphLossTerm(BaseModel):
                     return (value, aux) if return_aux else value
                 term_batch = self._stack_sequence_batch(term_batch)
 
-            term_result = jax.lax.map(
-                lambda single_data: self._call_term(params, single_data, graph, aux), term_batch,
-                batch_size=self.batch_size
-            )
+            batch_size = self._batch_axis_size(term_batch)
+            if self._aux_matches_batch(aux, batch_size):
+                term_result = jax.lax.map(
+                    lambda item: self._call_term(params, item[0], graph, item[1]),
+                    (term_batch, aux),
+                    batch_size=self.batch_size,  # batch over aux data too
+                )
+            else:
+                term_result = jax.lax.map(
+                    lambda single_data: self._call_term(params, single_data, graph, aux), term_batch,
+                    batch_size=self.batch_size
+                )
             losses, aux = self._split_term_result(term_result, aux)
             value = self.batch_reduce(losses)
             return (value, aux) if return_aux else value
@@ -404,6 +597,26 @@ class GraphLossTerm(BaseModel):
         if self.accepts_aux:
             return self.term(params, single_data, graph, aux=aux)
         return self.term(params, single_data, graph)
+
+    @staticmethod
+    def _batch_axis_size(term_batch: PyTree) -> int | None:
+        """Return the leading batch-axis size for a mapped term batch when available."""
+        leaves = jax.tree_util.tree_leaves(term_batch)
+        for leaf in leaves:
+            if hasattr(leaf, "shape") and len(leaf.shape) > 0:
+                return int(leaf.shape[0])
+        return None
+
+    @staticmethod
+    def _aux_matches_batch(aux: PyTree | None, batch_size: int | None) -> bool:
+        """Return whether an aux tree appears to carry one entry per batch sample."""
+        if aux is None or batch_size is None:
+            return False
+        if not isinstance(aux, Mapping) or _GRAPH_PATH_PAYLOAD_CACHE not in aux:
+            return False
+        leaves = jax.tree_util.tree_leaves(aux)
+        sized_leaves = [leaf for leaf in leaves if hasattr(leaf, "shape") and len(leaf.shape) > 0]
+        return len(sized_leaves) > 0 and all(int(leaf.shape[0]) == batch_size for leaf in sized_leaves)
 
     @staticmethod
     def _split_term_result(
@@ -425,6 +638,244 @@ class GraphLossTerm(BaseModel):
         return jnp.asarray(self.weight) * self.raw_value(params, batch_data, graph)
 
 
+def _connected_cycle_edge(graph: FunctionGraph, source: Node, target: Node) -> Edge:
+    """Return the unique edge connecting two adjacent cycle nodes."""
+    matches = [
+        edge
+        for edge in graph.edges.values()
+        if (edge.source == source and edge.target == target) or (edge.source == target and edge.target == source)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one cycle edge between {source.name!r} and {target.name!r}, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def _cycle_edges(graph: FunctionGraph, node_names: Sequence[str] | None) -> tuple[list[Node], list[Edge]]:
+    """Resolve and validate clockwise cycle nodes and their adjacent edges."""
+    if node_names is None:
+        node_names = list(graph.nodes.keys())
+    if len(node_names) < 2:
+        raise ValueError("cyclic_path_errors requires at least two cycle nodes.")
+
+    nodes = [graph._resolve_node(name) for name in node_names]
+    if len({node.name for node in nodes}) != len(nodes):
+        raise ValueError("cyclic_path_errors nodes must be unique.")
+
+    edges = [
+        _connected_cycle_edge(graph, nodes[idx], nodes[(idx + 1) % len(nodes)])
+        for idx in range(len(nodes))
+    ]
+    return nodes, edges
+
+
+def _clockwise_path(cycle_edges: Sequence[Edge], start_idx: int, dest_idx: int) -> tuple[str, ...]:
+    """Return clockwise edge names from one cycle index to another."""
+    n_nodes = len(cycle_edges)
+    step_count = (dest_idx - start_idx) % n_nodes
+    if step_count == 0:
+        step_count = n_nodes
+    return tuple(cycle_edges[(start_idx + offset) % n_nodes].name for offset in range(step_count))
+
+
+def _counter_clockwise_path(cycle_edges: Sequence[Edge], start_idx: int, dest_idx: int) -> tuple[str, ...]:
+    """Return counter-clockwise edge names from one cycle index to another."""
+    n_nodes = len(cycle_edges)
+    step_count = (start_idx - dest_idx) % n_nodes
+    if step_count == 0:
+        step_count = n_nodes
+    return tuple(cycle_edges[(start_idx - 1 - offset) % n_nodes].name for offset in range(step_count))
+
+
+def _shortest_seed_path(
+    cycle_edges: Sequence[Edge],
+    dataset_indices: tuple[int, int],
+    target_idx: int,
+) -> tuple[int, tuple[str, ...]]:
+    """Return the nearest dataset endpoint and shortest cycle path used to seed an outside node."""
+    candidates: list[tuple[int, int, tuple[str, ...]]] = []
+    for endpoint_idx in dataset_indices:
+        cw = _clockwise_path(cycle_edges, endpoint_idx, target_idx)
+        ccw = _counter_clockwise_path(cycle_edges, endpoint_idx, target_idx)
+        if endpoint_idx == target_idx:
+            candidates.append((0, endpoint_idx, ()))
+        else:
+            candidates.append((len(cw), endpoint_idx, cw))
+            candidates.append((len(ccw), endpoint_idx, ccw))
+
+    best_distance = min(distance for distance, _, _ in candidates)
+    best = [(endpoint_idx, path) for distance, endpoint_idx, path in candidates if distance == best_distance]
+    if len(best) != 1:
+        raise ValueError("Ambiguous shortest seeding path for cyclic_path_errors; provide a less ambiguous cycle.")
+    return best[0]
+
+
+def _cache_key(dataset: str, logical_start: str, path: tuple[str, ...]) -> _PathPayloadCacheKey:
+    """Return a path payload cache key."""
+    return dataset, logical_start, path
+
+
+def _path_prefixes(dataset: str, logical_start: str, path: tuple[str, ...]) -> tuple[_PathPayloadCacheKey, ...]:
+    """Return all cacheable prefixes for one logical path."""
+    return tuple(_cache_key(dataset, logical_start, path[:idx]) for idx in range(1, len(path) + 1))
+
+
+def _order_cyclic_specs(specs: Sequence[_CyclicPathSpec]) -> list[_CyclicPathSpec]:
+    """Greedily order cyclic terms to improve path-prefix cache reuse."""
+    pending = list(enumerate(specs))
+    ordered: list[_CyclicPathSpec] = []
+    live: set[_PathPayloadCacheKey] = set()
+
+    while pending:
+        best_position = 0
+        best_score: tuple[int, int, int] | None = None
+        for position, (original_idx, spec) in enumerate(pending):
+            keys = set(spec.cache_keys)
+
+            # Prefer large overlap with upstream cached paths, default to original order to initialize
+            score = (len(keys & live), -len(keys - live), -original_idx)
+
+            if best_score is None or score > best_score:
+                best_position = position
+                best_score = score
+
+        _, spec = pending.pop(best_position)
+        ordered.append(spec)
+        live.update(spec.cache_keys)
+
+    return ordered
+
+
+def _finalize_cache_plan(specs: Sequence[_CyclicPathSpec]) -> list[_CyclicPathSpec]:
+    """Assign term indices and last-use metadata for generated cache keys."""
+    last_use: dict[_PathPayloadCacheKey, int] = {}
+    for idx, spec in enumerate(specs):
+        for key in spec.cache_keys:
+            last_use[key] = idx
+
+    finalized = []
+    for idx, spec in enumerate(specs):
+        spec.index = idx
+        spec.last_use = {key: last_use[key] for key in spec.cache_keys}
+        finalized.append(spec)
+    return finalized
+
+
+def _cyclic_path_specs(
+    graph: FunctionGraph,
+    *,
+    nodes: Sequence[str] | None,
+    dataset: str | None,
+    cache_policy: Literal["none", "last_use"] = "last_use",
+) -> tuple[list[_CyclicPathSpec], str]:
+    """Build static term path specs for cyclic graph loss generation."""
+    cycle_nodes, cycle_edges = _cycle_edges(graph, nodes)
+    dataset = dataset or _default_dataset_edge(graph)
+    if dataset is None:
+        raise ValueError("cyclic_path_errors requires a dataset when the graph has no sampleable edges.")
+    dataset_edge = graph._resolve_edge(dataset)
+    endpoint_indices = tuple(
+        idx
+        for idx, node in enumerate(cycle_nodes)
+        if node in {dataset_edge.source, dataset_edge.target}
+    )
+    if len(endpoint_indices) != 2:
+        raise ValueError("cyclic_path_errors dataset edge must connect two nodes in the configured cycle.")
+
+    specs: list[_CyclicPathSpec] = []
+    for start_idx, start_node in enumerate(cycle_nodes):
+        if start_idx in endpoint_indices:
+            # Start the path from a dataset-producing node
+            logical_start_idx = start_idx
+            seed_path: tuple[str, ...] = ()
+        else:
+            # Otherwise, start from the nearest dataset-producing node, and go along a seed path to the start node
+            logical_start_idx, seed_path = _shortest_seed_path(cycle_edges, endpoint_indices, start_idx)
+
+        logical_start = cycle_nodes[logical_start_idx].name
+        for dest_idx, dest_node in enumerate(cycle_nodes):
+            path_a = seed_path + _clockwise_path(cycle_edges, start_idx, dest_idx)
+            path_b = seed_path + _counter_clockwise_path(cycle_edges, start_idx, dest_idx)
+            cache_keys = (
+                *_path_prefixes(dataset, logical_start, path_a),
+                *_path_prefixes(dataset, logical_start, path_b),
+            )
+            specs.append(
+                _CyclicPathSpec(
+                    name=f"{start_node.name}->{dest_node.name}",
+                    start=start_node.name,
+                    dest=dest_node.name,
+                    logical_start=logical_start,
+                    path_a=path_a,
+                    path_b=path_b,
+                    cache_keys=tuple(dict.fromkeys(cache_keys)),
+                )
+            )
+
+    if cache_policy == "last_use":
+        specs = _order_cyclic_specs(specs)
+    elif cache_policy != "none":
+        raise ValueError(f"Unknown cyclic_path_errors cache_policy: {cache_policy!r}")
+
+    return _finalize_cache_plan(specs), dataset_edge.name
+
+
+def cyclic_path_error_terms(
+    graph: FunctionGraph,
+    *,
+    nodes: Sequence[str] | None = None,
+    dataset: str | None = None,
+    weight: float = 1.0,
+    batch_reduce: UnaryOp | None = "mean",
+    batch_size: int | None = None,
+    template_paths: Sequence[TreePath] | None = None,
+    aux_paths: Sequence[TreePath] | None = None,
+    cache_payloads: bool = False,
+    cache_policy: Literal["none", "last_use"] = "last_use",
+) -> list[GraphLossTerm]:
+    """
+    Generate path-error terms for every ordered pair of nodes in a cyclic graph.
+
+    :param graph: function graph containing a simple cycle
+    :param nodes: optional clockwise node ordering; defaults to the graph node order
+    :param dataset: edge name/key for the dataset-producing edge; defaults to the first sampleable graph edge
+    :param weight: shared scalar weight for all generated terms
+    :param batch_reduce: shared batch reduction for all generated terms
+    :param batch_size: optional ``jax.lax.map`` batch size for all generated terms
+    :param template_paths: optional source paths used to form graph auxiliary templates
+    :param aux_paths: optional destination paths for graph auxiliary templates
+    :param cache_payloads: whether generated terms should share intermediate path payloads
+    :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
+    :return: concrete graph loss terms
+    """
+    dataset = dataset or _default_dataset_edge(graph)
+    if dataset is None:
+        raise ValueError("cyclic_path_errors requires a dataset when the graph has no sampleable edges.")
+    specs, dataset_edge = _cyclic_path_specs(graph, nodes=nodes, dataset=dataset, cache_policy=cache_policy)
+    return [
+        GraphLossTerm(
+            name=spec.name,
+            term=_CyclicPathErrorCallable(
+                spec=spec,
+                dataset=dataset,
+                dataset_edge=dataset_edge,
+                template_paths=template_paths,
+                aux_paths=aux_paths,
+                cache_payloads=cache_payloads,
+            ),
+            dataset=dataset,
+            weight=weight,
+            batch_reduce=batch_reduce,
+            batch_size=batch_size,
+        )
+        for spec in specs
+    ]
+
+
+_LOSS_TERM_GENERATOR_REGISTRY.update({"commutativity": cyclic_path_error_terms})
+
+
 class GraphLoss(BaseModel):
     """
     Loss function for a `FunctionGraph`.
@@ -436,7 +887,7 @@ class GraphLoss(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
-    terms: Sequence[GraphLossTerm]
+    terms: Sequence[GraphLossTerm | GraphLossTermGenerator]
     balancing: GraphLossBalancing = Field(default_factory=GraphLossBalancing)
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
     _term_names: tuple[str, ...] = PrivateAttr(default=())
@@ -453,16 +904,52 @@ class GraphLoss(BaseModel):
 
     @model_validator(mode="after")
     def _bind_default_datasets(self):
+        self._expand_generators()
+        if self.graph is None and any(isinstance(term, GraphLossTermGenerator) for term in self.terms):
+            self._refresh_term_cache()
+            return self
         self._set_default_term_names()
         if self.graph is not None:
             self._set_default_datasets()
         self._refresh_term_cache()
         return self
 
+    def bind_graph(self, graph: FunctionGraph) -> None:
+        """
+        Bind a graph and finalize any graph-dependent generated terms.
+
+        :param graph: graph used by generated terms and default dataset inference
+        """
+        self.graph = graph
+        self._expand_generators()
+        self._set_default_term_names()
+        self._set_default_datasets()
+        self._refresh_term_cache()
+
+    def _expand_generators(self) -> None:
+        """Expand configured term generators when a graph is available."""
+        expanded: list[GraphLossTerm | GraphLossTermGenerator] = []
+        changed = False
+        for item in self.terms:
+            if not isinstance(item, GraphLossTermGenerator):
+                expanded.append(item)
+                continue
+            if self.graph is None:
+                expanded.append(item)
+                continue
+            generated = item(self.graph)
+            expanded.extend(GraphLossTerm.model_validate(term) for term in generated)
+            changed = True
+
+        if changed:
+            self.terms = expanded
+
     def _set_default_term_names(self) -> None:
         """Assign deterministic names to unnamed loss terms and require uniqueness."""
         names = []
         for idx, term in enumerate(self.terms):
+            if isinstance(term, GraphLossTermGenerator):
+                continue
             if term.name is None:
                 term.name = f"term_{idx}"
             if term.name in names:
@@ -472,21 +959,19 @@ class GraphLoss(BaseModel):
     def _set_default_datasets(self):
         """Grab the first sampleable edge as the default dataset, i.e. typically there is only one."""
         if self.graph is not None:
-            _default_edge = None
-            for edge_name, edge in self.graph.edges.items():
-                if isinstance(edge, ImplicitSampleable | SourceSampleable):
-                    _default_edge = edge_name
-                break
-
+            _default_edge = _default_dataset_edge(self.graph)
             for term in self.terms:
+                if isinstance(term, GraphLossTermGenerator):
+                    continue
                 if term.dataset is None:
                     term.dataset = _default_edge
             self._refresh_term_cache()
 
     def _refresh_term_cache(self) -> None:
         """Cache term metadata used during loss evaluation."""
-        self._term_names = tuple(term.name or f"term_{idx}" for idx, term in enumerate(self.terms))
-        self._term_weights = [term.weight for term in self.terms]
+        concrete_terms = [term for term in self.terms if isinstance(term, GraphLossTerm)]
+        self._term_names = tuple(term.name or f"term_{idx}" for idx, term in enumerate(concrete_terms))
+        self._term_weights = [term.weight for term in concrete_terms]
 
     @property
     def term_names(self) -> tuple[str, ...]:
@@ -497,6 +982,8 @@ class GraphLoss(BaseModel):
         """Evaluate raw term values as an ordered JAX array."""
         if len(self.terms) == 0:
             return jnp.asarray([])
+        if any(isinstance(term, GraphLossTermGenerator) for term in self.terms):
+            raise ValueError("GraphLoss contains unexpanded term generators; bind a FunctionGraph before evaluation.")
 
         values = []
         aux = None

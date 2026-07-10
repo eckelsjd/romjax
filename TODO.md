@@ -13,16 +13,13 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.
 - [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
 
-## Bugs
-- [ ] Training live plot hangs at beginning -- might need to include progress of loading data / compiling
-
 ## Blind spots
 - [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
 - [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 
 ## Backburner
-- [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm)
+- [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm and GraphLoss)
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file
@@ -71,6 +68,11 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Multi-node dispatch (MPI executor) -- likely we will never have a single train run that is bigger than a single machine, so we can always do embarrassingly parallel dispatch, and we don't have to worry about sharding
 - [ ] Get this all to work on Mac OS
 - [ ] Early validation-based stopping criteria (and keeping best performing checkpoint)
+
+## Assumptions / hidden behavior
+- [ ] Graph loss terms get their dataset from the first implicit model in graph
+- [ ] The name of the dataset edge should be the name of the generated data
+- [ ] Commutativity error does not evaluate the dataset edge -- all data for both nodes should be present
 
 ## Future projects
 - Building surrogate for graph comm as a model error indicator (scalar or field)
