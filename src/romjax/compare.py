@@ -171,8 +171,7 @@ class CompareTable(CompareOrbax):
         for name, metric_fn in list(self.metrics.items()):
             if isinstance(metric_fn, GraphLoss):
                 if metric_fn.graph is None:
-                    metric_fn.graph = self.graph
-                    metric_fn._set_default_datasets()
+                    metric_fn.bind_graph(self.graph)
                 self.metrics[name] = eqx.filter_jit(metric_fn.__call__)
             else:
                 self.metrics[name] = eqx.filter_jit(metric_fn)
