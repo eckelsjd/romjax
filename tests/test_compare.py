@@ -80,6 +80,7 @@ def test_compare_table_format_print_and_write(capsys: pytest.CaptureFixture[str]
     assert r"case_a & 1.00 (0.50) & 2.00 (1.00) & 3.00 (1.50) & 4.00 (2.00) \\" in tex
 
 
+@pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_compare_basic_callables_params_templates_and_multiple_dataloaders(tmp_path: Path) -> None:
     checkpoint_root = tmp_path / "checkpoint"

@@ -12,11 +12,12 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_valida
 from romjax.graph import Edge, Node
 from romjax.tree import (
     TreePath,
+    as_shape_dtype_pytree,
     coerce_tree_path,
-    is_shape_dtype_template_leaf,
+    is_shape_dtype,
     pytree_merge,
     set_subtree,
-    shape_dtype_template_like,
+    shape_dtype_like,
 )
 
 __all__ = ['eqx_evaluate', 'identity_filter', 'ImplicitModel', 'ExplicitModel', 'FilterModel',
@@ -224,7 +225,7 @@ def eqx_evaluate(
     """
     aux_out: dict[str, Any] = {}
     if capture_template:
-        aux_out["template"] = shape_dtype_template_like(x, leaf_filter=leaf_filter)
+        aux_out["template"] = shape_dtype_like(x, leaf_filter=leaf_filter)
 
     if gather is None:
         x_eval = x
@@ -253,6 +254,7 @@ def eqx_evaluate(
         template_tree = aux.get("template")
     if template_tree is None:
         raise ValueError("Reconstruction requires a template supplied explicitly or through auxiliary data.")
+    template_tree = as_shape_dtype_pytree(template_tree)
 
     if callable(scatter):
         reconstructed = scatter(y, template_tree)
@@ -659,7 +661,7 @@ def _scatter_tree_array(
     selected = [
         (idx, leaf)
         for idx, leaf in enumerate(leaves)
-        if is_shape_dtype_template_leaf(leaf) or leaf_filter(leaf)
+        if is_shape_dtype(leaf) or leaf_filter(leaf)
     ]
     if not selected:
         return template

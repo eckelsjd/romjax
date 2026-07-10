@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Generator, Mapping
-from typing import Any, Iterator, Sequence
+from typing import Annotated, Any, Iterator, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import PyTree
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator
 
 __all__ = [
     "at",
@@ -25,8 +25,10 @@ __all__ = [
     "to_pytree",
     "get_subtree",
     "set_subtree",
-    "shape_dtype_template_like",
-    "is_shape_dtype_template_leaf",
+    "shape_dtype_like",
+    "is_shape_dtype",
+    "as_shape_dtype_pytree",
+    "ShapeDtypePyTree",
     "TreePath",
     "coerce_tree_path",
     "coerce_tree_paths",
@@ -66,12 +68,42 @@ def _array_tree(tree: PyTree) -> PyTree:
     return eqx.filter(tree, eqx.is_array_like)
 
 
-def is_shape_dtype_template_leaf(value: Any) -> bool:
+def is_shape_dtype(value: Any) -> bool:
     """Return whether ``value`` is JAX shape/dtype metadata used as a static template leaf."""
     return isinstance(value, jax.ShapeDtypeStruct)
 
 
-def shape_dtype_template_like(
+def as_shape_dtype_pytree(template: PyTree) -> PyTree:
+    """
+    Normalize array-like leaves and YAML-friendly shape/dtype mappings into JAX template leaves.
+
+    A supported mapping contains ``"shape"`` and optionally ``"dtype"`` as its only keys. When ``"dtype"`` is
+    omitted, the active JAX default floating-point dtype is used. Other leaves and container structure are preserved.
+
+    :param template: pytree containing arrays, shape/dtype mappings, and static leaves
+    :return: matching pytree with template leaves represented by :class:`jax.ShapeDtypeStruct`
+    """
+    if is_shape_dtype(template):
+        return template
+    if eqx.is_array(template):
+        return jax.ShapeDtypeStruct(jnp.shape(template), jnp.asarray(template).dtype)
+    if isinstance(template, Mapping):
+        if "shape" in template and set(template) <= {"shape", "dtype"}:
+            dtype = template.get("dtype", jnp.asarray(0.0).dtype)
+            return jax.ShapeDtypeStruct(tuple(template["shape"]), dtype)
+        return {key: as_shape_dtype_pytree(value) for key, value in template.items()}
+    if isinstance(template, tuple):
+        return tuple(as_shape_dtype_pytree(value) for value in template)
+    if isinstance(template, list):
+        return [as_shape_dtype_pytree(value) for value in template]
+    return template
+
+
+type ShapeDtypePyTree = Annotated[Any, BeforeValidator(as_shape_dtype_pytree)]
+"""Pydantic-compatible pytree type that normalizes array template leaves."""
+
+
+def shape_dtype_like(
     tree: PyTree,
     leaf_filter: Callable[[Any], bool] = eqx.is_array,
 ) -> PyTree:
