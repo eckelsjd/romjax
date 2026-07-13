@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import optimistix as optx
@@ -27,6 +29,8 @@ from romjax.train import BatchLoader, CheckpointerConfig, DiagnosticsConfig, Orb
 from romjax.tree import is_shape_dtype, pytree_norm, pytree_resolve_refs
 from romjax.typing import GraphRef
 from romjax.utils import save_h5
+
+train_module = importlib.import_module("romjax.train")
 
 
 def scalar_quadratic_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
@@ -1458,3 +1462,79 @@ def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: Funct
     scales = inverse_scales / np.mean(inverse_scales)
     expected_grad = scales[0] * -4.0 + scales[1] * -400.0
     assert float(params["toy"]["weight"]) == pytest.approx(-0.001 * expected_grad, rel=1e-5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+@pytest.mark.parametrize(
+    ("shared_legend", "color_cycle"),
+    [(False, None), (True, None), (True, "tab20"), (True, "viridis")],
+)
+def test_term_plot_shared_legend(
+    tmp_path: Path,
+    toy_graph: FunctionGraph,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_legend: bool,
+    color_cycle: str | None,
+) -> None:
+    """Term plots retain per-axis legends unless a shared legend is requested."""
+    captured = {}
+    original_gridplot = train_module.gridplot
+
+    def capture_gridplot(*args, **kwargs):
+        fig, axs = original_gridplot(*args, **kwargs)
+        captured["fig"] = fig
+        captured["axs"] = axs
+        return fig, axs
+
+    monkeypatch.setattr(train_module, "gridplot", capture_gridplot)
+    batch = {"toy": [{"x": jnp.array([1.0])}]}
+    train = Train(
+        loss=GraphLoss(
+            terms=[
+                {"name": "small", "term": graph_batch_squared_error, "dataset": "toy"},
+                {"name": "large", "term": graph_batch_large_squared_error, "dataset": "toy"},
+            ],
+            graph=toy_graph,
+        ),
+        init_params={"toy": {"weight": jnp.array(0.0)}},
+        optimizer=optax.sgd(0.0),
+        dataloader=RepeatBatchLoader(batch),
+        termination=TerminationConfig(max_steps=1),
+        diagnostics=DiagnosticsConfig(
+            plot_interval=1,
+            shared_terms_legend=shared_legend,
+            terms_color_cycle=color_cycle,
+            raw_terms_plot=True,
+            scaled_terms_plot=True,
+        ),
+        root=tmp_path.resolve() / "term_legends",
+    )
+
+    assert train.run() == 0
+
+    fig = captured["fig"]
+    term_axes = captured["axs"].ravel()[1:3]
+    if color_cycle is not None:
+        cmap = plt.get_cmap(color_cycle)
+        expected_colors = (
+            np.asarray(cmap.colors[:2])
+            if hasattr(cmap, "colors")
+            else cmap(np.linspace(0.0, 1.0, 2))
+        )
+        for ax in term_axes:
+            np.testing.assert_allclose([line.get_color() for line in ax.lines], expected_colors)
+
+    if shared_legend:
+        assert len(fig.legends) == 1
+        assert [text.get_text() for text in fig.legends[0].get_texts()] == ["small", "large"]
+        assert all(ax.get_legend() is None for ax in term_axes)
+        assert fig.legends[0].get_window_extent().x1 <= fig.bbox.x1
+        if color_cycle is not None:
+            np.testing.assert_allclose(
+                [handle.get_color() for handle in fig.legends[0].legend_handles], expected_colors
+            )
+    else:
+        assert not fig.legends
+        assert all(ax.get_legend() is not None for ax in term_axes)
+
+    plt.close(fig)

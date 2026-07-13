@@ -20,4 +20,4 @@ ytick.minor.width : 0.8
 ytick.minor.visible : True
 legend.framealpha : 0.5
 legend.fancybox : true
-legend.fontsize : small
+legend.fontsize : x-small
