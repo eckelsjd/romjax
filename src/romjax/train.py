@@ -384,6 +384,12 @@ class TermPlotConfig(BaseModel):
 
 
 class DiagnosticsConfig(BaseModel):
+    """
+    Configuration for logging, plotting, and callback diagnostics during training.
+
+    :ivar shared_terms_legend: show one figure-level legend for raw and scaled term plots
+    :ivar terms_color_cycle: optional matplotlib colormap used consistently for term lines
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
@@ -399,6 +405,8 @@ class DiagnosticsConfig(BaseModel):
     scaled_terms_plot: TermPlotConfig = Field(
         default_factory=lambda: TermPlotConfig(spec=_default_plot_spec("Scaled terms"))
     )
+    shared_terms_legend: bool = False
+    terms_color_cycle: str | None = None
     loss_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Loss", "g"))
     test_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Test", "orange"))
 
@@ -408,6 +416,17 @@ class DiagnosticsConfig(BaseModel):
         """Allow just specifying a filename for save plot."""
         if isinstance(value, str | Path):
             return {"fname": value}
+        return value
+
+    @field_validator("terms_color_cycle")
+    @classmethod
+    def _validate_terms_color_cycle(cls, value: str | None) -> str | None:
+        """Validate configured matplotlib colormap names once during setup."""
+        if value is not None:
+            try:
+                plt.get_cmap(value)
+            except ValueError as error:
+                raise ValueError(f"Unknown matplotlib colormap: {value!r}") from error
         return value
 
     @field_validator("raw_terms_plot", "scaled_terms_plot", mode="before")
@@ -442,6 +461,20 @@ class DiagnosticsConfig(BaseModel):
             _default_plot_spec("Test", "orange")
         )
         return _merge_plot_spec(spec, value)
+    
+    def _term_plot_colors(self, names: Sequence[str]) -> dict[str, Any]:
+        """Return deterministic term colors from a configured matplotlib colormap."""
+        color_cycle = self.terms_color_cycle
+        if color_cycle is None:
+            return {}
+
+        cmap = plt.get_cmap(color_cycle)
+        discrete_colors = getattr(cmap, "colors", None)
+        if discrete_colors is not None:
+            colors = [discrete_colors[index % len(discrete_colors)] for index in range(len(names))]
+        else:
+            colors = cmap(np.linspace(0.0, 1.0, len(names)))
+        return dict(zip(names, colors))
 
 
 class TerminationConfig(BaseModel):
@@ -452,7 +485,7 @@ class TerminationConfig(BaseModel):
     :param loss_tol: rolling relative loss tolerance; disabled when non-positive
     :param test_tol: validation/test tolerance; disabled when non-positive
     :param grad_tol: gradient norm tolerance; disabled when non-positive
-    :param max_runtime: runtime limit in seconds or a ``datetime.timedelta` supported string
+    :param max_runtime: runtime limit in seconds or a ``datetime.timedelta` supported string, ISO 8601 for timedelta
     """
 
     @model_validator(mode="before")
@@ -854,7 +887,7 @@ class Train(Routine):
         def _ema_space_value(raw_value: float) -> float:
             """Map a raw loss magnitude into the space tracked by the EMA state."""
             if graph_loss.balancing.kind == "ema_log":
-                return float(np.log(raw_value))
+                return float(np.log(max(raw_value, graph_loss.balancing.min_scale)))
             return raw_value
 
         def _bootstrap_ema_state(raw_terms: Mapping[str, float]) -> None:
@@ -869,6 +902,7 @@ class Train(Routine):
                     continue
                 if raw_value < 0.0:
                     logger.warning(f"EMA GraphLoss balancing assumes non-negative terms; got {name}={raw_value:.3e}")
+                    continue
                 loss_state.ema[name] = _ema_space_value(raw_value)
                 loss_state.initialized[name] = True
             loss_state.scales = _compute_ema_scales()
@@ -889,6 +923,7 @@ class Train(Routine):
                     continue
                 if raw_value < 0.0:
                     logger.warning(f"EMA GraphLoss balancing assumes non-negative terms; got {name}={raw_value:.3e}")
+                    continue
                 
                 if loss_state.initialized[name]:
                     ema = graph_loss.balancing.decay * loss_state.ema[name]
@@ -1019,7 +1054,8 @@ class Train(Routine):
                     if graph_loss is not None:
                         raw_plot_terms = self.diagnostics.raw_terms_plot.selected_terms(term_names)
                         scaled_plot_terms = self.diagnostics.scaled_terms_plot.selected_terms(term_names)
-                    
+                    term_colors = self.diagnostics._term_plot_colors(term_names)
+
                     if self.diagnostics.raw_terms_plot.enabled and raw_plot_terms:
                         plot_specs.append(tuple(
                             _merge_plot_spec(
@@ -1028,6 +1064,7 @@ class Train(Routine):
                                     "data": ([], []),
                                     "name": f"raw_terms_{name}",
                                     "opts": {"leg_label": name},
+                                    "kwargs": {"color": term_colors[name]} if term_colors else {},
                                 },
                             )
                             for name in raw_plot_terms
@@ -1041,12 +1078,66 @@ class Train(Routine):
                                     "data": ([], []),
                                     "name": f"scaled_terms_{name}",
                                     "opts": {"leg_label": name},
+                                    "kwargs": {"color": term_colors[name]} if term_colors else {},
                                 },
                             )
                             for name in scaled_plot_terms
                         ))
                     
-                    fig, axs = gridplot(plot_specs)
+                    term_plots_enabled = (
+                        self.diagnostics.raw_terms_plot.enabled and raw_plot_terms
+                    ) or (
+                        self.diagnostics.scaled_terms_plot.enabled and scaled_plot_terms
+                    )
+
+                    def _adjust_shared_terms_legend(fig, axs, artists, cbars) -> None:
+                        """Replace term subplot legends with one deduplicated figure legend."""
+                        del artists, cbars
+                        handles_by_label = {}
+                        for ax in axs.flat:
+                            legend = ax.get_legend()
+                            if legend is not None:
+                                legend.remove()
+                            for handle, label in zip(*ax.get_legend_handles_labels()):
+                                handles_by_label.setdefault(label, handle)
+
+                        legend = fig.legend(
+                            handles_by_label.values(),
+                            handles_by_label.keys(),
+                            loc="center left",
+                            bbox_to_anchor=(1.0, 0.5),
+                            borderaxespad=0.0,
+                        )
+                        fig.canvas.draw()
+
+                        # Add canvas width for the legend rather than taking space
+                        # away from the diagnostic subplots. Measuring the rendered
+                        # legend keeps this responsive to the configured term names.
+                        figure_width, figure_height = fig.get_size_inches()
+                        legend_width = legend.get_window_extent().width / fig.dpi
+                        legend_padding = 0.2
+                        expanded_width = figure_width + legend_width + legend_padding
+                        main_figure_fraction = figure_width / expanded_width
+                        fig.set_size_inches(expanded_width, figure_height, forward=True)
+
+                        layout_engine = fig.get_layout_engine()
+                        if layout_engine is not None:
+                            layout_engine.set(rect=(0.0, 0.0, main_figure_fraction, 1.0))
+                        else:
+                            fig.subplots_adjust(right=main_figure_fraction)
+
+                        legend.set_bbox_to_anchor(
+                            (main_figure_fraction + legend_padding / expanded_width, 0.5),
+                            transform=fig.transFigure,
+                        )
+                        fig.canvas.draw()
+
+                    adjust = (
+                        _adjust_shared_terms_legend
+                        if self.diagnostics.shared_terms_legend and term_plots_enabled
+                        else None
+                    )
+                    fig, axs = gridplot(plot_specs, adjust=adjust)
                     active_axes = axs.ravel()[:len(plot_specs)]
                     lines = [ax.lines[0] for ax in active_axes]
                     lines[0].set_data(*loss_hist.series())
