@@ -830,7 +830,11 @@ class Train(Routine):
             return dict(loss_state.scales)
 
         def _current_scale_arrays() -> dict[str, jax.Array]:
-            """Return current adaptive scales as dynamic JAX leaves for jitted loss evaluation."""
+            """Transfer the current adaptive scales to device for jitted loss evaluation.
+
+            This is intentionally called only after host-side scale initialization or an
+            EMA update. The resulting mapping is reused by intervening train steps.
+            """
             return {name: jnp.asarray(value, dtype=jnp.float32) for name, value in _current_scales().items()}
 
         def _host_float_terms(terms: Mapping[str, ArrayLike] | None) -> dict[str, float] | None:
@@ -907,13 +911,17 @@ class Train(Routine):
                 loss_state.initialized[name] = True
             loss_state.scales = _compute_ema_scales()
 
-        def _update_ema_state(raw_terms: Mapping[str, float]) -> None:
-            """Update EMA state from raw term values outside the differentiable path."""
+        def _update_ema_state(raw_terms: Mapping[str, float]) -> bool:
+            """Update EMA state from raw term values and report whether scales changed.
+
+            :param raw_terms: Host-resident unscaled GraphLoss term values.
+            :returns: Whether updated scales need to be transferred to the device.
+            """
             if loss_state is None:
-                return
+                return False
             if loss_state.step % graph_loss.balancing.update_interval != 0:
                 loss_state.step += 1
-                return
+                return False
 
             new_step = loss_state.step + 1
             for name in term_names:
@@ -936,6 +944,7 @@ class Train(Routine):
             
             loss_state.scales = _compute_ema_scales()
             loss_state.step = new_step
+            return True
 
         def _save_plot(fig):
             if fig is not None and self.root is not None:
@@ -1036,6 +1045,10 @@ class Train(Routine):
                 raw_terms_hist = _load_term_history("loss_terms_raw.csv") if term_diagnostics_enabled else None
                 scaled_terms_hist = _load_term_history("loss_terms_scaled.csv") if term_diagnostics_enabled else None
                 term_scales_hist = _load_term_history("loss_term_scales.csv") if ema_enabled else None
+                # Keep scales resident on the device between host-active intervals.
+                # The initial transfer is necessary; later transfers occur only after
+                # the host-side EMA state has changed them.
+                current_scale_arrays = _current_scale_arrays()
                 existing_checkpoint_steps = {checkpoint.step for checkpoint in ckptr.checkpoints}
                 fig, axs, lines = None, None, None
                 raw_term_lines, scaled_term_lines = {}, {}
@@ -1216,10 +1229,11 @@ class Train(Routine):
                                 and loss_state is not None
                             ):
                                 _, _, _, bootstrap_terms, _, _ = jax.block_until_ready(
-                                    _graph_train_step(params, opt_state, batch, _current_scale_arrays())
+                                    _graph_train_step(params, opt_state, batch, current_scale_arrays)
                                 )
                                 bootstrap_terms = _host_float_terms(bootstrap_terms)
                                 _bootstrap_ema_state(bootstrap_terms)
+                                current_scale_arrays = _current_scale_arrays()
                                 ema_bootstrapped = True
 
                             with profile_step("train", step_num=curr_step, env=os.environ):
@@ -1229,7 +1243,7 @@ class Train(Routine):
                                             params,
                                             opt_state,
                                             batch,
-                                            _current_scale_arrays(),
+                                            current_scale_arrays,
                                         )
                                     else:
                                         train_result = _train_step(params, opt_state, batch)
@@ -1277,8 +1291,8 @@ class Train(Routine):
                                 scaled_terms_hist.record(curr_step, scaled_terms)
                             if term_scales_hist is not None:
                                 term_scales_hist.record(curr_step, _current_scales())
-                            if raw_terms is not None:
-                                _update_ema_state(raw_terms)
+                            if raw_terms is not None and _update_ema_state(raw_terms):
+                                current_scale_arrays = _current_scale_arrays()
 
                             metrics = {"loss": loss_value}
 
