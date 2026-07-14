@@ -118,7 +118,8 @@ class RoutineConfig(BaseModel):
     """
     Global configurations for routines. Will toggle global settings during model validation.
     
-    :ivar device: jax device (comma-separated string compatiable with 'jax_platforms')
+    :ivar jax_platforms: JAX platform(s), as accepted by the ``jax_platforms`` config
+    :ivar jax_enable_x64: whether JAX should enable 64-bit floating-point values
     :ivar mplstyle: matplotlib plot style
     :ivar gridplot: gridplot style
     :ivar logger: loguru configuration
@@ -128,7 +129,8 @@ class RoutineConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="forbid")
 
-    device: str | None = None
+    jax_platforms: str | None = None
+    jax_enable_x64: bool | None = None
     mplstyle: str | Path | Mapping | None = None
     gridplot: GridplotConfig | None = None
     logger: LoggerConfig | None = None
@@ -137,16 +139,20 @@ class RoutineConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _configure_device(cls, value):
+    def _configure_jax(cls, value):
         if isinstance(value, Mapping):
-            device = value.get("device")
+            jax_platforms = value.get("jax_platforms")
+            enable_x64 = value.get("jax_enable_x64")
         else:
-            device = getattr(value, "device", None)
+            jax_platforms = getattr(value, "jax_platforms", None)
+            enable_x64 = getattr(value, "jax_enable_x64", None)
 
-        if device is not None:
-            import jax
+        import jax
 
-            jax.config.update("jax_platforms", device)
+        if enable_x64 is not None:
+            jax.config.update("jax_enable_x64", enable_x64)
+        if jax_platforms is not None:
+            jax.config.update("jax_platforms", jax_platforms)
         return value
 
     @model_validator(mode="after")

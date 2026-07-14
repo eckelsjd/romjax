@@ -4,6 +4,8 @@ ROM CLI for building reduced-order models with romjax.
 Supported global options (see `romjax.routine.RoutineConfig`):
 
 - root: copies the config file to this directory
+- jax_platforms: configures the JAX platform globally
+- jax_enable_x64: enables JAX 64-bit floating-point values globally
 - logger: configures loguru logger globally
 - progress_bar: configures alive_bar globally
 - mplstyle: configures matplotlib globally (via rcParams or a style file)
