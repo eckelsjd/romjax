@@ -302,6 +302,43 @@ def test_compare_table_histogram_legend_colors_match_plotted_histograms(
     np.testing.assert_allclose(calls["legend_colors"], calls["patch_colors"])
 
 
+def test_compare_table_histogram_uses_per_case_alpha_and_colors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = {}
+
+    def capture_gridplot(plots, **cfg):
+        calls["plots"] = plots
+        return None, None
+
+    monkeypatch.setattr("romjax.compare.gridplot", capture_gridplot)
+
+    compare = CompareTable(
+        root=tmp_path / "compare",
+        show_table=False,
+        show_progress=False,
+        cases={"first": {"w": jnp.array(0.0)}, "second": {"w": jnp.array(1.0)}},
+        params_template={"w": jnp.array(0.0)},
+        dataloaders={"train": FiniteLoader([{"x": jnp.array(0.0)}, {"x": jnp.array(1.0)}])},
+        metrics={"sq": squared_error},
+        stats=["mean"],
+        col_format="{mean:.1f}",
+        hist={
+            "alpha": {"first": 0.8},
+            "colors": {"first": "crimson", "second": "royalblue"},
+        },
+    )
+
+    assert compare.run() == 0
+
+    first, second = calls["plots"][0][0]
+    assert first.kwargs["alpha"] == 0.8
+    assert second.kwargs["alpha"] == 0.45
+    assert first.kwargs["color"] == "crimson"
+    assert second.kwargs["color"] == "royalblue"
+
+
 def test_compare_table_iterates_dataloader_style_batch_mappings(tmp_path: Path) -> None:
     compare = CompareTable(
         root=tmp_path / "compare",

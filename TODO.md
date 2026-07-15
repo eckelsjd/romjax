@@ -20,6 +20,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Backburner
 - [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm and GraphLoss)
+- [ ] Warm start for FOM terms in GC
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file

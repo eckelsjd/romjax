@@ -161,6 +161,8 @@ class RoutineConfig(BaseModel):
             if isinstance(style, str | Path):
                 plt.style.use(style)
             else:
+                if (file := style.pop("file", None)) is not None:
+                    plt.style.use(file)
                 matplotlib.rcParams.update(style)
         
         if (plot := self.gridplot) is not None:     # gridplot style
