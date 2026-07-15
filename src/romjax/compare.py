@@ -78,7 +78,9 @@ class CompareHistogram(DictModel):
     :param metric_labels: optional x-axis labels keyed by metric name
     :param bins: histogram bin specification passed to matplotlib
     :param density: whether to normalize histograms to probability densities
-    :param alpha: histogram transparency
+    :param alpha: histogram transparency, either a default float or per-case values;
+        cases not included in a mapping use ``0.45``
+    :param colors: optional matplotlib colors keyed by case name
     :param histtype: histogram rendering style
     :param scale: the scale for the x-axis (linear or log)
     :param leg_anchor: bbox anchor for legend
@@ -89,10 +91,12 @@ class CompareHistogram(DictModel):
     metric_labels: Mapping[str, str] | None = None
     bins: int | str | Sequence[float] = "auto"
     density: bool = False
-    alpha: float = 0.45
+    alpha: float | Mapping[str, float] = 0.45
+    colors: Mapping[str, str] | None = None
     histtype: str = "stepfilled"
     scale: str | None = None
     leg_anchor: tuple[float, float] = (0.5, 1.1)
+    leg_ncols: int | None = None
 
 
 class CompareTable(CompareOrbax):
@@ -218,7 +222,10 @@ class CompareTable(CompareOrbax):
         metric_names = list(self.metrics)
         case_names = list(self.cases)
         prop_cycle = rcParams["axes.prop_cycle"].by_key()
-        colors = prop_cycle.get("color", [])
+        default_colors = prop_cycle.get("color", [])
+        case_colors = cfg.colors or {}
+        case_alphas = cfg.alpha if isinstance(cfg.alpha, Mapping) else {}
+        default_alpha = cfg.alpha if isinstance(cfg.alpha, float) else 0.45
 
         plots = []
         for row_idx, dataset_name in enumerate(dataset_names):
@@ -248,9 +255,17 @@ class CompareTable(CompareOrbax):
                             kwargs={
                                 "bins": cfg.bins,
                                 "density": cfg.density,
-                                "alpha": cfg.alpha,
+                                "alpha": case_alphas.get(case_name, default_alpha),
                                 "histtype": cfg.histtype,
-                                **({"color": colors[case_idx % len(colors)]} if colors else {}),
+                                **(
+                                    {"color": case_colors[case_name]}
+                                    if case_name in case_colors
+                                    else (
+                                        {"color": default_colors[case_idx % len(default_colors)]}
+                                        if default_colors
+                                        else {}
+                                    )
+                                ),
                             },
                         )
                     )
@@ -272,7 +287,7 @@ class CompareTable(CompareOrbax):
                 labels,
                 loc="upper center",
                 bbox_to_anchor=cfg.leg_anchor,
-                ncols=len(metric_names),
+                ncols=cfg.leg_ncols or len(metric_names),
                 frameon=True,
             )
 
