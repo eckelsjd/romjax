@@ -20,7 +20,6 @@ from pydantic import (
 
 from romjax.data_gen import DataLoader, LoadDataConfig
 from romjax.graph import FunctionGraph
-from romjax.loss import GraphLoss
 from romjax.operators import UnaryOp
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine
@@ -173,7 +172,7 @@ class CompareTable(CompareOrbax):
     def _bind_graph_and_jit_metrics(self):
         """Bind a graph to any metrics that need it and jit them."""
         for name, metric_fn in list(self.metrics.items()):
-            if isinstance(metric_fn, GraphLoss):
+            if hasattr(metric_fn, "bind_graph") and hasattr(metric_fn, "graph"):
                 if metric_fn.graph is None:
                     metric_fn.bind_graph(self.graph)
                 self.metrics[name] = eqx.filter_jit(metric_fn.__call__)
