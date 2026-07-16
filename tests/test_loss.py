@@ -4,7 +4,7 @@ import pytest
 
 from romjax import YamlLoader
 from romjax.graph import Edge, FunctionGraph, Node
-from romjax.loss import GraphLoss, GraphLossTerm, GraphLossTermGenerator, cyclic_path_error_terms
+from romjax.loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, cyclic_path_error_terms
 from romjax.model import SourceSampleable
 from romjax.train import Train
 
@@ -28,6 +28,21 @@ class SampleableOffsetEdge(OffsetEdge, SourceSampleable):
     def sample_source(self, key):
         del key
         return jnp.asarray(0.0)
+
+
+class TreeOffsetEdge(Edge):
+    """Test edge that adds separate offsets to two dictionary leaves."""
+
+    forward_keep: float
+    forward_skip: float
+    backward_keep: float
+    backward_skip: float
+
+    def forward(self, x):
+        return {"keep": x["keep"] + self.forward_keep, "skip": x["skip"] + self.forward_skip}
+
+    def backward(self, x):
+        return {"keep": x["keep"] + self.backward_keep, "skip": x["skip"] + self.backward_skip}
 
 
 def four_node_cycle(sampleable_dataset: bool = False) -> FunctionGraph:
@@ -262,3 +277,106 @@ def test_cyclic_path_error_cache_ordering_limits_peak_cache_size() -> None:
         return peak
 
     assert peak_live_count(ordered) <= peak_live_count(naive)
+
+
+def test_cyclic_path_error_returns_node_ordered_matrix_or_norm() -> None:
+    graph = four_node_cycle()
+    cyclic_error = CyclicPathError(
+        graph=graph,
+        nodes=["i", "j", "k", "l"],
+        dataset="li",
+        cache_policy="none",
+    )
+
+    matrix = cyclic_error({}, {"li": jnp.asarray([0.0])})
+
+    assert matrix.shape == (4, 4)
+    assert matrix[0, 1] == pytest.approx((1.0 - 220.0) ** 2)
+    assert matrix[0, 3] == pytest.approx(abs(111.0))
+
+    normed_error = CyclicPathError(
+        graph=graph,
+        nodes=["i", "j", "k", "l"],
+        dataset="li",
+        cache_policy="none",
+        norm="sum",
+    )
+    assert normed_error({}, {"li": jnp.asarray([0.0])}) == pytest.approx(jnp.sum(matrix))
+
+
+def test_cyclic_path_error_shared_overrides_replace_destination_defaults() -> None:
+    graph = FunctionGraph(
+        nodes={
+            "i": Node(name="i", error_op="mae"),
+            "j": Node(name="j", error_op="mae", ignore=["skip"]),
+            "k": Node(name="k", error_op="mse"),
+            "l": Node(name="l", error_op="mse"),
+        },
+        edges={
+            "ij": TreeOffsetEdge(
+                source="i", target="j", name="ij", forward_keep=1.0, forward_skip=10.0,
+                backward_keep=2.0, backward_skip=20.0,
+            ),
+            "jk": TreeOffsetEdge(
+                source="j", target="k", name="jk", forward_keep=3.0, forward_skip=30.0,
+                backward_keep=4.0, backward_skip=40.0,
+            ),
+            "kl": TreeOffsetEdge(
+                source="k", target="l", name="kl", forward_keep=7.0, forward_skip=70.0,
+                backward_keep=8.0, backward_skip=80.0,
+            ),
+            "li": TreeOffsetEdge(
+                source="l", target="i", name="li", forward_keep=9.0, forward_skip=90.0,
+                backward_keep=10.0, backward_skip=100.0,
+            ),
+        },
+    )
+    batch = {"li": {"keep": jnp.asarray([0.0]), "skip": jnp.asarray([0.0])}}
+    default_error = CyclicPathError(graph=graph, nodes=["i", "j", "k", "l"], dataset="li")
+    overridden_error = CyclicPathError(
+        graph=graph,
+        nodes=["i", "j", "k", "l"],
+        dataset="li",
+        error_op="mae",
+        ignore=[],
+    )
+
+    default_matrix = default_error({}, batch)
+    overridden_matrix = overridden_error({}, batch)
+
+    # The i->j destination normally ignores ``skip``; an explicit empty override includes it.
+    assert default_matrix[0, 1] != overridden_matrix[0, 1]
+    # The shared error operator also replaces the MSE configured on node k.
+    assert default_matrix[0, 2] != overridden_matrix[0, 2]
+
+
+def test_cyclic_path_error_yaml_cache_and_grad() -> None:
+    yaml_text = """
+!romx:CyclicPathError
+graph: !romx:FunctionGraph
+  nodes:
+    i: {name: i, error_op: mae}
+    j: {name: j, error_op: mse}
+    k: {name: k, error_op: mae}
+    l: {name: l, error_op: mae}
+  edges:
+    ij: !romx:tests.test_loss.OffsetEdge
+      {source: i, target: j, name: ij, forward_offset: 1.0, backward_offset: 2.0}
+    jk: !romx:tests.test_loss.OffsetEdge
+      {source: j, target: k, name: jk, forward_offset: 10.0, backward_offset: 20.0}
+    kl: !romx:tests.test_loss.OffsetEdge
+      {source: k, target: l, name: kl, forward_offset: 100.0, backward_offset: 200.0}
+    li: !romx:tests.test_loss.OffsetEdge
+      {source: l, target: i, name: li, forward_offset: 1000.0, backward_offset: 2000.0}
+nodes: [i, j, k, l]
+dataset: li
+cache_payloads: true
+cache_policy: none
+norm: sum
+"""
+    cyclic_error = YamlLoader.load(yaml_text)
+    assert isinstance(cyclic_error, CyclicPathError)
+
+    batch = {"li": jnp.asarray([0.0, 1.0, 2.0])}
+    assert jnp.isfinite(cyclic_error({}, batch))
+    assert jnp.isfinite(jax.grad(lambda scale: cyclic_error({}, {"li": scale * batch["li"]}))(jnp.asarray(1.0)))

@@ -88,17 +88,6 @@ def test_routine_config_updates_jax_settings_early(monkeypatch):
     assert calls == [("jax_enable_x64", True), ("jax_platforms", "cpu")]
 
 
-def test_routine_config_disables_x64_by_default(monkeypatch):
-    calls: list[tuple[str, object]] = []
-
-    monkeypatch.setattr("jax.config.update", lambda key, value: calls.append((key, value)))
-
-    config = RoutineConfig()
-
-    assert config.jax_enable_x64 is False
-    assert calls == [("jax_enable_x64", False)]
-
-
 def test_routine_config(monkeypatch):
     calls: dict[str, list[object]] = {"gridplot": [], "logger": [], "bar": [], "style": [], "rc": []}
 

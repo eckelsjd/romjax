@@ -35,7 +35,14 @@ from romjax.tree import (
 )
 from romjax.typing import CallableModel, from_registry, from_yaml
 
-__all__ = ["GraphLoss", "GraphLossTerm", "GraphLossTermGenerator", "GraphTest", "cyclic_path_error_terms"]
+__all__ = [
+    "CyclicPathError",
+    "GraphLoss",
+    "GraphLossTerm",
+    "GraphLossTermGenerator",
+    "GraphTest",
+    "cyclic_path_error_terms",
+]
 
 
 _GRAPH_PATH_PAYLOAD_CACHE = "graph_path_payloads"
@@ -44,6 +51,11 @@ _LOSS_REGISTRY: dict[str, Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]] 
 
 
 type _PathPayloadCacheKey = tuple[str, str, tuple[str, ...]]
+
+
+def _coerce_optional_tree_paths(value: Any) -> Sequence[TreePath] | None:
+    """Coerce configured tree paths while preserving ``None`` as an unset override."""
+    return None if value is None else coerce_tree_paths(value)
 
 
 def _default_dataset_edge(graph: FunctionGraph | None) -> str | None:
@@ -273,6 +285,15 @@ class _CyclicPathErrorCallable(BaseModel):
     template_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
     aux_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
     cache_payloads: bool = False
+    error_op: BinaryOp | None = None
+    ignore: Annotated[Sequence[TreePath] | None, BeforeValidator(_coerce_optional_tree_paths)] = None
+
+    @field_validator("error_op", mode="before")
+    @classmethod
+    def _coerce_error_op(cls, value: Any) -> BinaryOp | None:
+        if value is None or isinstance(value, BinaryOp):
+            return value
+        return BinaryOp(value)
 
     def __call__(
         self,
@@ -295,15 +316,17 @@ class _CyclicPathErrorCallable(BaseModel):
         )
 
         dest_node = graph._resolve_node(self.spec.dest)
+        error_op = dest_node.error_op if self.error_op is None else self.error_op
+        ignore = dest_node.ignore if self.ignore is None else self.ignore
         if not self.cache_payloads:
-            return dest_node.error_op(out_a, out_b, ignore=dest_node.ignore)
+            return error_op(out_a, out_b, ignore=ignore)
 
         for key, last_index in self.spec.last_use.items():
             if last_index <= self.spec.index:
                 payload_cache.pop(key, None)
 
         aux_out[_GRAPH_PATH_PAYLOAD_CACHE] = payload_cache
-        return dest_node.error_op(out_a, out_b, ignore=dest_node.ignore), aux_out
+        return error_op(out_a, out_b, ignore=ignore), aux_out
 
     def _push_cached_path(
         self,
@@ -833,6 +856,8 @@ def cyclic_path_error_terms(
     aux_paths: Sequence[TreePath] | None = None,
     cache_payloads: bool = False,
     cache_policy: Literal["none", "last_use"] = "last_use",
+    error_op: BinaryOp | None = None,
+    ignore: Sequence[TreePath] | None = None,
 ) -> list[GraphLossTerm]:
     """
     Generate path-error terms for every ordered pair of nodes in a cyclic graph.
@@ -847,6 +872,8 @@ def cyclic_path_error_terms(
     :param aux_paths: optional destination paths for graph auxiliary templates
     :param cache_payloads: whether generated terms should share intermediate path payloads
     :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
+    :param error_op: optional shared override for every generated term's destination-node error operator
+    :param ignore: optional shared override for every generated term's destination-node ignored paths
     :return: concrete graph loss terms
     """
     dataset = dataset or _default_dataset_edge(graph)
@@ -863,6 +890,8 @@ def cyclic_path_error_terms(
                 template_paths=template_paths,
                 aux_paths=aux_paths,
                 cache_payloads=cache_payloads,
+                error_op=error_op,
+                ignore=ignore,
             ),
             dataset=dataset,
             weight=weight,
@@ -874,6 +903,120 @@ def cyclic_path_error_terms(
 
 
 _LOSS_TERM_GENERATOR_REGISTRY.update({"commutativity": cyclic_path_error_terms})
+
+
+class CyclicPathError(BaseModel):
+    """
+    Evaluate all cyclic path errors as a matrix, or reduce the matrix with a norm.
+
+    Rows correspond to configured cycle start nodes and columns to destination nodes. Path errors use the same
+    generation and optional payload-cache behavior as :func:`cyclic_path_error_terms`, but are neither weighted nor
+    adaptively balanced.
+
+    :param graph: function graph containing a simple cycle
+    :param nodes: optional clockwise node ordering; defaults to graph node order
+    :param dataset: edge name/key for the dataset-producing edge; defaults to the first sampleable graph edge
+    :param batch_reduce: reduction applied to each path error over its dataset batch
+    :param batch_size: optional ``jax.lax.map`` batch size for each path error
+    :param template_paths: optional source paths used to form graph auxiliary templates
+    :param aux_paths: optional destination paths for graph auxiliary templates
+    :param cache_payloads: whether path errors should share intermediate path payloads
+    :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
+    :param error_op: optional shared replacement for destination-node error operators
+    :param ignore: optional shared replacement for destination-node ignored paths
+    :param norm: optional unary operator applied to the complete error matrix
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
+
+    graph: Annotated[FunctionGraph, BeforeValidator(from_yaml)] | None = None
+    nodes: Sequence[str] | None = None
+    dataset: str | None = None
+    batch_reduce: UnaryOp | None = "mean"
+    batch_size: int | None = None
+    template_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
+    aux_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
+    cache_payloads: bool = False
+    cache_policy: Literal["none", "last_use"] = "last_use"
+    error_op: BinaryOp | None = None
+    ignore: Annotated[Sequence[TreePath] | None, BeforeValidator(_coerce_optional_tree_paths)] = None
+    norm: UnaryOp | None = None
+    _terms: tuple[GraphLossTerm, ...] = PrivateAttr(default=())
+    _matrix_indices: tuple[tuple[int, int], ...] = PrivateAttr(default=())
+    _matrix_shape: tuple[int, int] = PrivateAttr(default=(0, 0))
+
+    @field_validator("batch_reduce", "norm", mode="before")
+    @classmethod
+    def _coerce_unary_op(cls, value: Any) -> UnaryOp | None:
+        if value is None or isinstance(value, UnaryOp):
+            return value
+        return UnaryOp(value)
+
+    @field_validator("error_op", mode="before")
+    @classmethod
+    def _coerce_error_op(cls, value: Any) -> BinaryOp | None:
+        if value is None or isinstance(value, BinaryOp):
+            return value
+        return BinaryOp(value)
+
+    @model_validator(mode="after")
+    def _check_graph(self) -> "CyclicPathError":
+        if self.graph is not None:
+            self._build_terms()
+        return self
+
+    def _build_terms(self):
+        """Generate path-error terms and static matrix coordinates."""
+        terms = cyclic_path_error_terms(
+            self.graph,
+            nodes=self.nodes,
+            dataset=self.dataset,
+            batch_reduce=self.batch_reduce,
+            batch_size=self.batch_size,
+            template_paths=self.template_paths,
+            aux_paths=self.aux_paths,
+            cache_payloads=self.cache_payloads,
+            cache_policy=self.cache_policy,
+            error_op=self.error_op,
+            ignore=self.ignore,
+        )
+        cycle_nodes, _ = _cycle_edges(self.graph, self.nodes)
+        node_indices = {node.name: idx for idx, node in enumerate(cycle_nodes)}
+
+        self._terms = tuple(terms)
+        self._matrix_indices = tuple(
+            (node_indices[term.term.callable.spec.start], node_indices[term.term.callable.spec.dest])
+            for term in terms
+        )
+        self._matrix_shape = (len(cycle_nodes), len(cycle_nodes))
+    
+    def bind_graph(self, graph: FunctionGraph):
+        self.graph = graph
+        self._build_terms()
+
+    def __call__(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
+        """
+        Evaluate cyclic path errors for a batch.
+
+        :param params: edge-payload parameter patches
+        :param batch: batch data passed to generated path-error terms
+        :return: cyclic path-error matrix, or its configured norm
+        """
+        if self.graph is None:
+            raise ValueError("Must specify a graph to evaluate cyclic path error")
+        params = pytree_resolve_refs(params)
+        aux = None
+        values = []
+        for term in self._terms:
+            value, aux = term.raw_value(params, batch, self.graph, aux=aux, return_aux=True)
+            values.append(value)
+
+        flat_values = jnp.asarray(values)
+        rows, columns = zip(*self._matrix_indices, strict=True)
+        matrix = jnp.zeros(self._matrix_shape, dtype=flat_values.dtype).at[jnp.asarray(rows), jnp.asarray(columns)].set(
+            flat_values
+        )
+        return matrix if self.norm is None else self.norm(matrix)
 
 
 class GraphLoss(BaseModel):
