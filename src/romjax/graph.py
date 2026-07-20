@@ -757,7 +757,7 @@ class FunctionGraph(BaseModel):
     def path_error(
         self,
         payload: PyTree,
-        path_a: list[str | Edge] | tuple[str | Edge, ...],
+        path_a: list[str | Edge] | tuple[str | Edge, ...] | None,
         path_b: list[str | Edge] | tuple[str | Edge, ...] | None,
         *,
         start: Node | str | None = None,
@@ -768,25 +768,41 @@ class FunctionGraph(BaseModel):
         ignore: set | None = None,
     ) -> jax.Array:
         """
-        Propagate one payload along two paths and compare the results at the common destination node. If path_b is 
-        None, then only propagate along path_a and compare to 0.
+        Propagate one payload along two paths and compare the results at the common destination node.
 
-        Empty paths are treated as loopbacks and require an explicit ``start`` node.
+        ``None`` denotes a zero path and an empty path denotes an identity path.  A path used as an identity
+        loopback inherits its start node from the other path, so loopback paths do not require an explicit ``start``.
+        If both paths are absent or empty, the error is zero.
         """
-        normalized_a = self._normalize_path(path_a)
+        if path_a is None and path_b is None:
+            return jnp.asarray(0.0)
+
+        normalized_a = self._normalize_path(path_a) if path_a is not None else None
         normalized_b = self._normalize_path(path_b) if path_b is not None else None
-        start_node = self._resolve_start_node(normalized_a if normalized_a else normalized_b, start)
-        end_a = self._path_end_node(normalized_a, start=start_node)
-        end_b = self._path_end_node(normalized_b, start=start_node) if normalized_b is not None else None
-        if end_b is not None and end_a != end_b:
+        nonempty_path = next(
+            (path for path in (normalized_a, normalized_b) if path),
+            None,
+        )
+        if nonempty_path is None:
+            return jnp.asarray(0.0)
+
+        if start is None:
+            start_a = self._resolve_start_node(normalized_a or nonempty_path, None)
+            start_b = self._resolve_start_node(normalized_b or nonempty_path, None)
+        else:
+            start_a = start_b = self._resolve_node(start)
+
+        end_a = self._path_end_node(normalized_a, start=start_a) if normalized_a else None
+        end_b = self._path_end_node(normalized_b, start=start_b) if normalized_b else None
+        if end_a is not None and end_b is not None and end_a != end_b:
             raise ValueError(
                 f"Path error requires matching destinations, but got {end_a!r} and {end_b!r}."
             )
 
         out_a = self.push_path(
             payload,
-            normalized_a,
-            start=start_node,
+            [] if normalized_a is None else normalized_a,
+            start=start_a,
             aux=aux_a,
             edge_payload_patches=edge_payload_patches,
         )
@@ -794,7 +810,7 @@ class FunctionGraph(BaseModel):
             out_b = self.push_path(
                 payload,
                 normalized_b,
-                start=start_node,
+                start=start_b,
                 aux=aux_b,
                 edge_payload_patches=edge_payload_patches,
             )
@@ -803,9 +819,17 @@ class FunctionGraph(BaseModel):
                 lambda leaf: jnp.zeros_like(jnp.asarray(leaf)) if eqx.is_array(leaf) else leaf,
                 out_a,
             )
-        
-        op = end_a.error_op if error_op is None else BinaryOp(error_op)
-        ignore = ignore or end_a.ignore
+
+        if normalized_a is None:
+            out_a = jax.tree_util.tree_map(
+                lambda leaf: jnp.zeros_like(jnp.asarray(leaf)) if eqx.is_array(leaf) else leaf,
+                out_b,
+            )
+
+        end_node = end_a if end_a is not None else end_b
+        assert end_node is not None
+        op = end_node.error_op if error_op is None else BinaryOp(error_op)
+        ignore = ignore or end_node.ignore
         
         return op(out_a, out_b, ignore=ignore)
 

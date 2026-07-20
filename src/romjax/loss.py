@@ -31,7 +31,6 @@ from romjax.tree import (
     pytree_resolve_refs,
     pytree_square_norm,
     set_subtree,
-    shape_dtype_like,
 )
 from romjax.typing import CallableModel, from_registry, from_yaml
 
@@ -42,6 +41,7 @@ __all__ = [
     "GraphLossTermGenerator",
     "GraphTest",
     "cyclic_path_error_terms",
+    "path_error_loss",
 ]
 
 
@@ -68,125 +68,57 @@ def _default_dataset_edge(graph: FunctionGraph | None) -> str | None:
     return None
 
 
-def _aux_from_template(
-    data: PyTree,
-    template_paths: Sequence[TreePath] | None = None,
-    aux_paths: Sequence[TreePath] | None = None
-) -> PyTree | None:
-    """Form graph aux data by templating from the input data.
-    
-    :param data: the input pytree containing array-like data
-    :param template_paths: Target paths in data to form a template from
-    :param aux_paths: Destination paths in aux graph input to place the formed template (e.g. for reconstruction)
-    """
-    template_paths = coerce_tree_paths(template_paths)
-    aux_paths = coerce_tree_paths(aux_paths)
-    aux = None
-
-    if aux_paths:
-        if len(template_paths) == 0:
-            selected = data
-        else:
-            selected = None
-            for p in template_paths:
-                selected = set_subtree(selected, p, get_subtree(data, p))
-        
-        template = shape_dtype_like(selected)
-        
-        for p in aux_paths:
-            aux = set_subtree(aux, p, template)
-    
-    return aux
-
-
-def reconstruction_loss(
-    params: PyTree, 
-    single_data: PyTree, 
-    graph: FunctionGraph, 
-    path: list[str] | None = None,
-    start: str | None = None,
-    initial_path: list[str] | None = None,
-    template_paths: Sequence[TreePath] | None = None,
-    aux_paths: Sequence[TreePath] | None = None,
-    error_op: BinaryOp | None = None,
-    ignore: set | None = None,
-):
-    """State reconstruction objective. Minimize reconstruction error along a given path.
-
-    Note that templates are generally handled internally by the graph, but sometimes you may need to pass it in
-    a priori depending on which paths are being traversed, e.g. trying to reconstruct before compressing.
-    
-    :param params: optimization params
-    :param single_data: single pytree sample payload
-    :param graph: graph containing function/model definitions along edges
-    :param path: the reconstruction path
-    :param start: the starting node for the reconstruction path (defaults initial in the path)
-    :param initial_path: optional transform for the input data before reconstruction (default uses raw data)
-    :param template_paths: gather template from the input data
-    :param aux_paths: insert template in the aux tree 
-    :param error_op: optional override for node error
-    :param ignore: optional override for node ignore paths
-    """
-    aux = _aux_from_template(single_data, template_paths, aux_paths)
-
-    if initial_path is None:
-        initial_data = single_data
-    else:
-        initial_data, aux = graph.push_path(
-            single_data, initial_path, aux=aux, edge_payload_patches=params, return_aux=True
-        )
-
-    return graph.reconstruction_error(
-        initial_data, path, edge_payload_patches=params, error_op=error_op, ignore=ignore, aux=aux, start=start
-    )
-
-
-def residual_loss(
+def path_error_loss(
     params: PyTree,
     single_data: PyTree,
     graph: FunctionGraph,
-    path: list[str] = None,
-    template_paths: Sequence[TreePath] | None = None,
-    aux_paths: Sequence[TreePath] | None = None,
+    path_a: list[str] | None = None,
+    path_b: list[str] | None = None,
+    start: str | None = None,
     error_op: BinaryOp | None = None,
     ignore: set | None = None,
+    zero_paths: list[str] | None = None,
 ):
-    """Residual minimization objective. Minimize the result of a single forward path."""
-    aux = _aux_from_template(single_data, template_paths, aux_paths)
+    """
+    Minimize the difference between two paths in a graph. A path that is None gets treated as zero. An empty path gets
+    treated as identity (data stays the same).
+
+    !!! Example "Reconstruction Error"
+        ```path_error_loss(..., path_a=[edge, edge], path_b=[])```, this compares going out and back to the
+        original data.
+
+    !!! Example "Residual Error"
+        ```path_error_loss(..., path_a=[edge], path_b=None)```, this compares a single path to zero.
+
+    !!! Example "Similarity Error"
+        ```path_error_loss(..., path_a=[edge_1, edge_2, edge_3], path_b=[])```, this compares a single path to the data.
+
+    :param params: the optimization params, used as edge payload patches in the graph
+    :param single_data: a single sample payload
+    :param graph: the graph containing edge function definitions
+    :param path_a: the first path to traverse
+    :param path_b: the second path to traverse
+    :param start: an optional start node (defaults to start node of each path)
+    :param error_op: optional override to compute error (defaults to end node error_op)
+    :param ignore: optional override for tree paths to ignore in error
+    :param zero_paths: optional override to zero-out any data in the input payload
+    :return: the scalar error between the two path traversals
+    """
+    zero_paths = coerce_tree_paths(zero_paths)
+    if zero_paths is not None:
+        for p in zero_paths:
+            zero_tree = jax.tree.map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, get_subtree(single_data, p))
+            single_data = set_subtree(single_data, p, zero_tree)
+
     return graph.path_error(
         single_data,
-        path_a=path,
-        path_b=None,
+        path_a=path_a,
+        path_b=path_b,
+        start=start,
         edge_payload_patches=params,
         error_op=error_op,
-        ignore=ignore,
-        aux_a=aux,
-        aux_b=aux
+        ignore=ignore
     )
-
-
-def similarity_loss(
-    params: PyTree,
-    single_data: PyTree,
-    graph: FunctionGraph,
-    path: list[str] = None,
-    template_paths: Sequence[TreePath] | None = None,
-    aux_paths: Sequence[TreePath] | None = None,
-    error_op: BinaryOp | None = None,
-    ignore: set | None = None,
-):
-    """
-    Similarity error objective. Minimize difference between a single similarity path and the data. Assumes data contains
-    all inputs, outputs, and residuals (e.g. data from both sides of an implicit model edge).
-    """
-    aux = _aux_from_template(single_data, template_paths, aux_paths)
-    sol = graph.push_path(single_data, path, edge_payload_patches=params, aux=aux)
-
-    end_node = graph._path_end_node(path)
-    op = end_node.error_op if error_op is None else BinaryOp(error_op)
-    ignore = ignore or end_node.ignore
-
-    return op(single_data, sol, ignore=ignore)
 
 
 def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
@@ -205,9 +137,7 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
 
 
 _LOSS_REGISTRY.update({
-    "reconstruction": reconstruction_loss,
-    "residual": residual_loss,
-    "similarity": similarity_loss,
+    "path_error": path_error_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
 })
@@ -282,8 +212,6 @@ class _CyclicPathErrorCallable(BaseModel):
     spec: _CyclicPathSpec
     dataset: str
     dataset_edge: str
-    template_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
-    aux_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
     cache_payloads: bool = False
     error_op: BinaryOp | None = None
     ignore: Annotated[Sequence[TreePath] | None, BeforeValidator(_coerce_optional_tree_paths)] = None
@@ -303,16 +231,14 @@ class _CyclicPathErrorCallable(BaseModel):
         aux: PyTree | None = None,
     ) -> jax.Array | tuple[jax.Array, PyTree]:
         """Evaluate one generated cyclic path-error term for a single sample."""
-        graph_aux = _aux_from_template(single_data, self.template_paths, self.aux_paths)
-
         aux_out = {} if aux is None else dict(aux)
         payload_cache = dict(aux_out.get(_GRAPH_PATH_PAYLOAD_CACHE, {}))
 
         out_a, graph_aux, payload_cache = self._push_cached_path(
-            single_data, self.spec.path_a, graph, params, graph_aux, payload_cache
+            single_data, self.spec.path_a, graph, params, None, payload_cache
         )
         out_b, graph_aux, payload_cache = self._push_cached_path(
-            single_data, self.spec.path_b, graph, params, graph_aux, payload_cache
+            single_data, self.spec.path_b, graph, params, None, payload_cache
         )
 
         dest_node = graph._resolve_node(self.spec.dest)
@@ -852,8 +778,6 @@ def cyclic_path_error_terms(
     weight: float = 1.0,
     batch_reduce: UnaryOp | None = "mean",
     batch_size: int | None = None,
-    template_paths: Sequence[TreePath] | None = None,
-    aux_paths: Sequence[TreePath] | None = None,
     cache_payloads: bool = False,
     cache_policy: Literal["none", "last_use"] = "last_use",
     error_op: BinaryOp | None = None,
@@ -868,8 +792,6 @@ def cyclic_path_error_terms(
     :param weight: shared scalar weight for all generated terms
     :param batch_reduce: shared batch reduction for all generated terms
     :param batch_size: optional ``jax.lax.map`` batch size for all generated terms
-    :param template_paths: optional source paths used to form graph auxiliary templates
-    :param aux_paths: optional destination paths for graph auxiliary templates
     :param cache_payloads: whether generated terms should share intermediate path payloads
     :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
     :param error_op: optional shared override for every generated term's destination-node error operator
@@ -887,8 +809,6 @@ def cyclic_path_error_terms(
                 spec=spec,
                 dataset=dataset,
                 dataset_edge=dataset_edge,
-                template_paths=template_paths,
-                aux_paths=aux_paths,
                 cache_payloads=cache_payloads,
                 error_op=error_op,
                 ignore=ignore,
@@ -918,8 +838,6 @@ class CyclicPathError(BaseModel):
     :param dataset: edge name/key for the dataset-producing edge; defaults to the first sampleable graph edge
     :param batch_reduce: reduction applied to each path error over its dataset batch
     :param batch_size: optional ``jax.lax.map`` batch size for each path error
-    :param template_paths: optional source paths used to form graph auxiliary templates
-    :param aux_paths: optional destination paths for graph auxiliary templates
     :param cache_payloads: whether path errors should share intermediate path payloads
     :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
     :param error_op: optional shared replacement for destination-node error operators
@@ -934,8 +852,6 @@ class CyclicPathError(BaseModel):
     dataset: str | None = None
     batch_reduce: UnaryOp | None = "mean"
     batch_size: int | None = None
-    template_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
-    aux_paths: Annotated[Sequence[TreePath] | None, BeforeValidator(coerce_tree_paths)] = None
     cache_payloads: bool = False
     cache_policy: Literal["none", "last_use"] = "last_use"
     error_op: BinaryOp | None = None
@@ -973,8 +889,6 @@ class CyclicPathError(BaseModel):
             dataset=self.dataset,
             batch_reduce=self.batch_reduce,
             batch_size=self.batch_size,
-            template_paths=self.template_paths,
-            aux_paths=self.aux_paths,
             cache_payloads=self.cache_payloads,
             cache_policy=self.cache_policy,
             error_op=self.error_op,

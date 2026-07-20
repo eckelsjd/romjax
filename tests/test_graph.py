@@ -509,6 +509,21 @@ def test_path_error_matches_destination_node_metric() -> None:
     assert jnp.allclose(zero_error, 0.0)
     assert jnp.allclose(mismatch_error, expected)
 
+    # With no shared start override, each non-empty path may begin at its own node.
+    assert jnp.allclose(graph.path_error(value, ["ab", "bc"], ["bc"]), jnp.mean(jnp.square(jnp.asarray(2.0))))
+
+    # None compares a path against a matching zero payload, while [] compares it against the initial payload.
+    assert jnp.allclose(graph.path_error(value, ["ab", "bc"], None), jnp.mean(jnp.square(value + 2.0)))
+    assert jnp.allclose(graph.path_error(value, None, ["ab", "bc"]), jnp.mean(jnp.square(value + 2.0)))
+    assert jnp.allclose(graph.path_error(value, ["ab", "bc"], []), jnp.mean(jnp.square(jnp.asarray(2.0))))
+    assert jnp.allclose(graph.path_error(value, [], ["ab", "bc"]), jnp.mean(jnp.square(jnp.asarray(2.0))))
+
+    round_trip = graph.reconstruction_error(value, ["ac"])
+    assert jnp.allclose(graph.path_error(value, ["ac", "ac"], []), round_trip)
+    assert jnp.allclose(graph.path_error(value, [], ["ac", "ac"]), round_trip)
+    assert jnp.allclose(graph.path_error(value, None, None), 0.0)
+    assert jnp.allclose(graph.path_error(value, [], []), 0.0)
+
 
 def test_path_error_rejects_mismatched_destinations() -> None:
     graph = FunctionGraph(

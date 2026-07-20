@@ -162,7 +162,7 @@ loss:
   root: {tmp_path / "cases" / "grid-sr"}
   base: !overrides:__parent__/train.yml
     loss:
-      - {{callable: reconstruction, path: [coordinate transform]}}
+      - {{callable: path_error, path_a: [coordinate transform, coordinate transform], path_b: []}}
 """,
         encoding="utf-8",
     )
@@ -170,12 +170,17 @@ loss:
     composite = romjax.load(parent_path)
     search = composite._validate_routine(composite.routines[0])
     case_root = search.root / "cases" / "case_0000"
-    case_config = search._write_case_config(case_root, ("residual",))
+    case_config = search._write_case_config(case_root, ("path_error",))
     loaded = romjax.YamlLoader.load(case_config)
 
     assert isinstance(search, GridSearch)
     assert isinstance(search.base, romjax.YamlSource)
-    assert loaded["loss"] == [{"callable": "residual", "path": ["coordinate transform"]}]
+    assert loaded["loss"] == [{
+        "callable": "path_error",
+        "path": ["original"],
+        "path_a": ["coordinate transform", "coordinate transform"],
+        "path_b": [],
+    }]
 
 
 def test_grid_search_loads_hybrid_executor_from_yaml(tmp_path: Path) -> None:

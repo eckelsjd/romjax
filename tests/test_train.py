@@ -19,7 +19,7 @@ from romjax import YamlLoader
 from romjax.compression import SVD
 from romjax.data_gen import DataLoader, LoadImplicitModel, LoadSource
 from romjax.graph import Edge, FunctionGraph, IdentityEdge, Node
-from romjax.loss import GraphLoss, GraphTest, similarity_loss
+from romjax.loss import GraphLoss, GraphTest
 from romjax.model import ImplicitSampleable
 from romjax.nn import LinearProjection
 from romjax.pde import ImplicitIterativeGalerkin
@@ -790,7 +790,7 @@ def test_train_convergence():
 
 def test_graph_init_params(toy_graph: FunctionGraph) -> None:
     train = Train(
-        loss=GraphLoss(terms=["reconstruction"]),
+        loss=GraphLoss(terms=[{"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}]),
         init_params=PyTreeSampler(
             template={
                 "toy": {
@@ -952,7 +952,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
 
     reconstructed = GraphLoss(
         terms=[
-            {"callable": "reconstruction", "path": ["toy"]},
+            {"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []},
             {"term": "tikhonov", "weight": 0.1, "batch_reduce": None},
         ],
         graph=toy_graph,
@@ -1121,13 +1121,13 @@ train: !romx:Train
         name: toy
   loss: !romx:GraphLoss
     terms:
-      - reconstruction
+      - {{callable: path_error, path_a: [toy, toy], path_b: []}}
       - term: !!python/name:tests.test_train.graph_batch_squared_error
         weight: 0.5
         dataset: toy
   test: !romx:GraphTest
     terms:
-      - reconstruction
+      - {{callable: path_error, path_a: [toy, toy], path_b: []}}
     loader: !romx:DataLoader
       root: {data_root}
       datasets:
@@ -1237,7 +1237,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         root=validation_root,
         datasets={"toy": {"kind": "implicit", "batch_size": 1, "max_epochs": 2}},
     )
-    loss = GraphLoss(terms=[{"callable": "reconstruction", "path": "toy"}])
+    loss = GraphLoss(terms=[{"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}])
 
     def validation_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
         del graph
@@ -1286,33 +1286,17 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     assert abs(float(params["toy"]["bias"])) < 0.2
 
 
-def test_similarity_loss_template_paths_adds_edge_aux_template() -> None:
-    graph = FunctionGraph(
-        edges={
-            "pass": IdentityEdge(source="state", target="template_source", name="pass"),
-            "template": TemplateAuxEdge(),
-        }
-    )
-    single_data = {"x": jnp.array([2.0, -3.0]), "nested": {"y": jnp.array(4.0)}}
-
-    loss = similarity_loss(
-        {},
-        single_data,
-        graph,
-        path=["pass", "template"],
-        template_paths=[("nested", "y")],
-        aux_paths=[("template", "forward")],
-    )
-
-    assert float(loss) == pytest.approx(4.0**2)
-
-
-def test_similarity_loss_trains_through_optimistix_root_find_edge() -> None:
+def test_path_error_loss_trains_through_optimistix_root_find_edge() -> None:
     graph = FunctionGraph(edges={"root": OptimistixRootFindEdge()})
     batch = {"root": [{"x": jnp.array(2.0), "u": jnp.array(6.0)}]}
     train = Train(
         loss=GraphLoss(
-            terms=[{"term": {"callable": "similarity", "path": "root"}, "dataset": "root"}],
+            terms=[
+                {
+                    "term": {"callable": "path_error", "path_a": ["root"], "path_b": []},
+                    "dataset": "root",
+                }
+            ],
             graph=graph,
         ),
         init_params={"root": {"weight": jnp.array(0.0)}},

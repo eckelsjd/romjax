@@ -174,10 +174,9 @@ def build_train(args: argparse.Namespace) -> Train:
                 {
                     "name": "solution",
                     "term": {
-                        "callable": "similarity",
-                        "path": ["residual transform", "galerkin", "coordinate transform"],
-                        "template_paths": ["outputs"],
-                        "aux_paths": [["coordinate transform", "backward", "cached_states", 0, "template"]],
+                        "callable": "path_error",
+                        "path_a": ["residual transform", "galerkin", "coordinate transform"],
+                        "path_b": [],
                     },
                     "dataset": "poisson",
                 },
