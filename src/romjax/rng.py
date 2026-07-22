@@ -14,9 +14,9 @@ from jax.typing import ArrayLike
 from pydantic import AfterValidator, BeforeValidator, Field, TypeAdapter, model_validator
 
 from romjax.operators import UnaryOp
-from romjax.random_field import darcy, kle
+from romjax.random_field import darcy, gaussian_wave_packets, kle
 from romjax.tree import pytree_merge
-from romjax.typing import CallableModel, ThirdPartyType, from_registry, require_type
+from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
            'NearSolutionSampler', 'gen_keys']
@@ -91,12 +91,59 @@ def random_eqx_module(
     return ta.validate_python({"name": name, "args": args, "kwargs": kwargs})
 
 
+class WeightedSumConfig(DictModel):
+    """Configuration for a weighted sum of independent distributions.
+
+    :ivar components: distribution specifications sampled with independent split keys
+    :ivar weights: scalar or broadcastable weights, one per component
+    """
+
+    components: tuple[Any, ...]
+    weights: tuple[ArrayLike, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_components(self) -> "WeightedSumConfig":
+        if not self.components:
+            raise ValueError("weighted_sum requires at least one component distribution.")
+        components = tuple(
+            component if isinstance(component, Distribution) else Distribution.model_validate(component)
+            for component in self.components
+        )
+        if self.weights is None:
+            weights = (1.0,) * len(components)
+        else:
+            weights = self.weights
+            if len(weights) != len(components):
+                raise ValueError("weighted_sum weights must contain one value per component.")
+        object.__setattr__(self, "components", components)
+        object.__setattr__(self, "weights", weights)
+        return self
+
+
+def weighted_sum(key: jaxtyping.Key, **config) -> ArrayLike:
+    """Sample and add independent component distributions with configurable weights.
+
+    :param key: base JAX random key
+    :param config: ``components`` and optional ``weights`` from :class:`WeightedSumConfig`
+    :return: weighted component sum
+    """
+    cfg = WeightedSumConfig(**config)
+    keys = jax.random.split(key, len(cfg.components))
+    samples = [jnp.asarray(component.sample(subkey)) for component, subkey in zip(cfg.components, keys)]
+    reference_shape = samples[0].shape
+    if any(sample.shape != reference_shape for sample in samples[1:]):
+        raise ValueError("weighted_sum components must return identically shaped fields.")
+    return sum(jnp.asarray(weight) * sample for weight, sample in zip(cfg.weights, samples))
+
+
 _distribution_registry = {
     "uniform": uniform,
     "log_uniform": log_uniform,
     "normal": normal,
     "darcy": darcy,
+    "gaussian_wave": gaussian_wave_packets,
     "kle": kle,
+    "sum": weighted_sum,
     "dirac": dirac,
     "eqx_module": random_eqx_module
 }

@@ -9,7 +9,7 @@ import pytest
 from romjax import YamlLoader
 from romjax.pde import IterativeSolver, UniformGrid, homogeneous_boundary
 from romjax.plotting import gridplot
-from romjax.poisson import GaussianForcing, NonlinearConductivity, Poisson2D
+from romjax.poisson import CubicForcing, GaussianForcing, NonlinearConductivity, Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 from romjax.typing import DictModel
 
@@ -22,6 +22,7 @@ def test_gaussian_forcing_jit_and_grad() -> None:
     def f(a0: jnp.ndarray) -> jnp.ndarray:
         inputs = {
             "A0": a0,
+            "offset": 0.25,
             "sigma": 1.5,
             "mu_x": 0.0,
             "mu_y": 0.0,
@@ -34,6 +35,27 @@ def test_gaussian_forcing_jit_and_grad() -> None:
 
     assert jnp.isfinite(value)
     assert jnp.isfinite(grad)
+
+
+def test_cubic_forcing_jit_and_grad() -> None:
+    """Cubic forcing supports scalar and field coefficients in JAX transforms."""
+    phi = jnp.array([[0.0, 1.0], [2.0, 3.0]])
+    forcing = CubicForcing()
+
+    def evaluate(gamma: jax.Array) -> jax.Array:
+        return jnp.sum(
+            forcing(
+                {"q": jnp.array([[1.0, 2.0], [3.0, 4.0]]), "alpha": -1.0, "beta": 0.5, "gamma": gamma},
+                {"phi": phi},
+            )
+        )
+
+    value = jax.jit(evaluate)(-10.0)
+    gradient = jax.grad(evaluate)(-10.0)
+    expected = jnp.sum(jnp.array([[1.0, 2.0], [3.0, 4.0]]) - phi + 0.5 * phi**2 - 10.0 * phi**3)
+
+    assert jnp.allclose(value, expected)
+    assert jnp.allclose(gradient, jnp.sum(phi**3))
 
 
 def test_nonlinear_conductivity_jit_vmap_and_grad() -> None:
