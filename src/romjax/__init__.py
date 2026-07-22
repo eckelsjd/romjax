@@ -94,6 +94,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "GraphLossTerm": ("romjax.loss", "GraphLossTerm"),
     "GraphLossTermGenerator": ("romjax.loss", "GraphLossTermGenerator"),
     "GraphTest": ("romjax.loss", "GraphTest"),
+    "GridBoundaryInputs": ("romjax.pde", "GridBoundaryInputs")
 }
 
 __all__ = list(_LAZY_EXPORTS.keys())
@@ -110,7 +111,7 @@ if TYPE_CHECKING:
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import LinearProjection
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
-    from .pde import ImplicitIterativeGalerkin, AliveProgressMeter
+    from .pde import ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs
     from .plotting import gridplot
     from .poisson import Poisson2D
     from .vlasov import Vlasov1D1V

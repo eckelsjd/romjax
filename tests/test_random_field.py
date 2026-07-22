@@ -4,7 +4,7 @@ import jax
 import numpy as np
 import pytest
 
-from romjax.random_field import KLEConfig, kle
+from romjax.random_field import GaussianWavePacketConfig, KLEConfig, gaussian_wave_packets, kle
 from romjax.rng import Distribution, PyTreeSampler
 
 
@@ -125,3 +125,69 @@ def test_kle_distribution_validation() -> None:
 
     with pytest.raises(ValueError):
         Distribution(callable=kle, shape=(4, 4), variance=-1.0).sample(jax.random.key(0))
+
+
+def test_gaussian_wave_packets_support_shapes_weights_and_jit() -> None:
+    """Wave packets sample reproducibly in every supported spatial dimension."""
+    options_1d = dict(
+        bounds=(0.0, 1.0),
+        shape=7,
+        centers=(0.4,),
+        variances=(0.03,),
+        wavenumbers=(2.0,),
+        variance=0.5,
+    )
+    options_2d = dict(
+        shape=(5, 6),
+        centers=((0.3, 0.6), (0.7, 0.4)),
+        variances=((0.03, 0.04), (0.02, 0.03)),
+        wavenumbers=((2.0, 3.0), (4.0, 1.0)),
+        amplitudes=(1.0, 0.5),
+        variance=0.5,
+        weight="smooth",
+    )
+    options_3d = dict(
+        shape=(3, 4, 5),
+        centers=((0.5, 0.5, 0.5),),
+        variances=((0.05, 0.05, 0.05),),
+        wavenumbers=((1.0, 2.0, 3.0),),
+    )
+
+    sample_1d = gaussian_wave_packets(jax.random.key(2), **options_1d)
+    sample_2d = gaussian_wave_packets(jax.random.key(3), **options_2d)
+    repeat_2d = gaussian_wave_packets(jax.random.key(3), **options_2d)
+    batch_2d = gaussian_wave_packets(jax.random.key(3), nsamples=2, **options_2d)
+    sample_3d = gaussian_wave_packets(jax.random.key(4), **options_3d)
+    jitted = jax.jit(lambda key: gaussian_wave_packets(key, **options_2d))(jax.random.key(5))
+
+    assert sample_1d.shape == (7,)
+    assert sample_2d.shape == (5, 6)
+    assert batch_2d.shape == (2, 5, 6)
+    assert np.allclose(np.asarray(sample_2d), np.asarray(repeat_2d))
+    assert np.isfinite(np.asarray(batch_2d)).all()
+    assert sample_3d.shape == (3, 4, 5)
+    assert np.isfinite(np.asarray(jitted)).all()
+
+
+def test_gaussian_wave_packet_validation_and_weighted_sum_distribution() -> None:
+    """Wave-packet and weighted-sum configurations validate through Distribution."""
+    with pytest.raises(ValueError):
+        GaussianWavePacketConfig(shape=(4, 4), centers=((0.5, 0.5),), variances=((0.1,),))
+
+    distribution = Distribution(
+        callable="sum",
+        components=(
+            {"callable": "dirac", "value": np.ones((2, 3))},
+            {"callable": "dirac", "value": 2.0 * np.ones((2, 3))},
+        ),
+        weights=(2.0, -0.5),
+    )
+    sample = distribution.sample(jax.random.key(8))
+
+    assert np.allclose(np.asarray(sample), np.ones((2, 3)))
+    with pytest.raises(ValueError):
+        Distribution(
+            callable="sum",
+            components=({"callable": "dirac", "value": 1.0},),
+            weights=(1.0, 2.0),
+        ).sample(jax.random.key(9))

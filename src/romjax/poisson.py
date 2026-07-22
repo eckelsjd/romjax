@@ -63,21 +63,23 @@ class GaussianForcing(ForcingCallable):
         """Inputs for Gaussian forcing function.
 
         :ivar A0: amplitude
+        :ivar offset: constant background value
         :ivar sigma: symmetric width of Gaussian
         :ivar mu_x: center of Gaussian in x-direction
         :ivar mu_y: center of Gaussian in y-direction
         :ivar coords: (x,y) coordinates to evaluate at
         """
         A0: ArrayLike = 1.0
+        offset: ArrayLike = 0.0
         sigma: ArrayLike = 1.0
         mu_x: ArrayLike = 0.0
         mu_y: ArrayLike = 0.0
         coords: Coordinates = (0., 0.)
     
     def callable(inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
-        r"""Symmetric Gaussian bump.
+        r"""Constant offset plus a symmetric Gaussian bump.
 
-            $f(x,y) = A_0 \exp(-1/(2\sigma) ((x-\mu_x)^2 + (y-\mu_y)^2))$
+            $f(x,y) = c + A_0 \exp(-1/(2\sigma) ((x-\mu_x)^2 + (y-\mu_y)^2))$
         
         :param inputs: the input parameters
         :param outputs: the scalar potential on the grid (not used)
@@ -85,7 +87,44 @@ class GaussianForcing(ForcingCallable):
         """
         dx = inputs['coords'][0] - inputs['mu_x']
         dy = inputs['coords'][1] - inputs['mu_y']
-        return inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
+        return inputs['offset'] + inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
+
+
+class CubicForcing(ForcingCallable):
+    """State-dependent cubic forcing for reaction-diffusion Poisson problems."""
+
+    class Inputs(DictModel):
+        """Inputs for the cubic forcing function.
+
+        :ivar q: constant or spatial volumetric source term
+        :ivar alpha: linear state coefficient
+        :ivar beta: quadratic state coefficient
+        :ivar gamma: cubic state coefficient
+        """
+
+        q: ArrayLike = 0.0
+        alpha: ArrayLike = -1.0
+        beta: ArrayLike = 0.0
+        gamma: ArrayLike = -10.0
+
+    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
+        r"""Evaluate a broadcastable cubic state-dependent forcing.
+
+        .. math::
+
+            f(\phi) = q + \alpha\phi + \beta\phi^2 + \gamma\phi^3.
+
+        :param inputs: volumetric and reaction coefficients
+        :param outputs: scalar potential containing ``phi``
+        :return: forcing field broadcastable to ``phi``
+        """
+        phi = jnp.asarray(outputs["phi"])
+        return (
+            jnp.asarray(inputs["q"])
+            + jnp.asarray(inputs["alpha"]) * phi
+            + jnp.asarray(inputs["beta"]) * phi**2
+            + jnp.asarray(inputs["gamma"]) * phi**3
+        )
 
 
 class NonlinearConductivity(ForcingCallable):
@@ -143,16 +182,17 @@ class SinusoidForcing(ForcingCallable):
     def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
         r"""Sinusoid forcing. Used in method of manufactured solutions.
     
-            $f(x,y) = -2 \pi^2 \sin{\pi x}\sin{\pi y}$
+            $f(x,y) = 2 \pi^2 \sin{\pi x}\sin{\pi y}$
 
         :param inputs: just uses (x,y) coords
         :param outputs: the scalar potential on grid (not used)
         :return: the forcing on the grid.
         """
-        return -2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
+        return 2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
     
 
 _forcing_registry = {
+    "cubic": CubicForcing,
     "gaussian": GaussianForcing,
     "nonlinear": NonlinearConductivity,
     "sinusoid": SinusoidForcing,
@@ -272,7 +312,8 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
         flux_n = k_face_n * (phi_north - phi) / dx
         flux_s = k_face_s * (phi - phi_south) / dx
 
-        phi_residual = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx - forcing
+        divergence = (flux_e - flux_w) / dy + (flux_n - flux_s) / dx
+        phi_residual = -divergence - forcing
 
         return {self.residual_name: phi_residual}
 

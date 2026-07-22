@@ -8,7 +8,7 @@ from pydantic import Field, PositiveFloat, PositiveInt, field_validator, model_v
 
 from romjax.typing import DictModel
 
-__all__ = ["KLEConfig", "kle", "darcy"]
+__all__ = ["GaussianWavePacketConfig", "KLEConfig", "darcy", "gaussian_wave_packets", "kle"]
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
@@ -125,6 +125,123 @@ class KLEConfig(DictModel):
         if any(mode > size for mode, size in zip(self.truncation, self.shape)):
             raise ValueError("truncation must not exceed the output grid shape.")
 
+        return self
+
+
+class GaussianWavePacketConfig(DictModel):
+    r"""Configuration for a finite Gaussian wave-packet random-field basis.
+
+    Each packet contributes independent sine and cosine components of the form
+
+    .. math::
+
+        g_p(x)\cos(2\pi k_p\cdot(x-c_p)/L),\qquad
+        g_p(x)\sin(2\pi k_p\cdot(x-c_p)/L),
+
+    where ``g_p`` is a separable Gaussian envelope. This provides localized smooth
+    perturbations when all wavenumbers are zero and localized oscillatory modes
+    otherwise.
+
+    :param bounds: rectangular domain bounds ``((x0, x1), ...)``
+    :param shape: output grid shape ``(n0, ...)``
+    :param centers: one packet center per row; defaults to the domain midpoint
+    :param variances: Gaussian variances, one scalar/vector per packet
+    :param wavenumbers: dimensionless sine/cosine wavevectors, one per packet
+    :param amplitudes: optional relative packet amplitudes before global variance scaling
+    :param variance: target average marginal variance across the grid
+    :param mean: scalar or array-like mean field broadcastable to ``shape``
+    :param nsamples: number of fields to draw
+    :param random_override: standard-normal coefficients with shape
+        ``(nsamples, n_packets, 2)`` for deterministic experiments
+    :param weight: optional weighting field to reduce noise near boundaries
+    :param weight_opts: options passed to ``weight``
+    """
+
+    bounds: tuple[tuple[float, float], ...] | tuple[float, float] = (0.0, 1.0)
+    shape: tuple[PositiveInt, ...] | PositiveInt = 16
+    centers: tuple[tuple[float, ...], ...] | tuple[float, ...] | None = None
+    variances: tuple[tuple[PositiveFloat, ...], ...] | tuple[PositiveFloat, ...] | PositiveFloat = 0.05
+    wavenumbers: tuple[tuple[float, ...], ...] | tuple[float, ...] | float = 0.0
+    amplitudes: tuple[float, ...] | None = None
+    variance: PositiveFloat = 1.0
+    mean: ArrayLike = 0.0
+    nsamples: PositiveInt = 1
+    random_override: ArrayLike | None = None
+    weight: Callable[[Coordinates], ArrayLike] | Literal["smooth"] | None = None
+    weight_opts: dict = Field(default_factory=dict)
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def _validate_weight(cls, weight):
+        if isinstance(weight, str):
+            if weight == "smooth":
+                weight = _smooth_ramp
+            else:
+                raise ValueError(f"Unknown weighting function: {weight}")
+        return weight
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_inputs(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        bounds = normalized.get("bounds", cls.model_fields["bounds"].default)
+        if isinstance(bounds, tuple | list) and len(bounds) == 2 and not isinstance(bounds[0], tuple | list):
+            shape = normalized.get("shape", cls.model_fields["shape"].default)
+            ndim = len(shape) if isinstance(shape, tuple | list) else 1
+            normalized["bounds"] = tuple(tuple(bounds) for _ in range(ndim))
+        elif isinstance(bounds, tuple | list):
+            normalized["bounds"] = tuple(tuple(bound) for bound in bounds)
+
+        ndim = len(normalized["bounds"])
+        shape = normalized.get("shape", cls.model_fields["shape"].default)
+        if not isinstance(shape, tuple | list):
+            normalized["shape"] = (shape,) * ndim
+
+        def _as_packet_rows(value: Any, default: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+            if value is None:
+                return (default,)
+            if not isinstance(value, tuple | list):
+                return ((value,) * ndim,)
+            if len(value) == 0:
+                return ()
+            if not isinstance(value[0], tuple | list):
+                if len(value) == ndim:
+                    return (tuple(value),)
+                if ndim == 1:
+                    return tuple((item,) for item in value)
+                raise ValueError("Packet vectors must match the field dimensionality.")
+            return tuple(tuple(row) for row in value)
+
+        lower_upper = normalized["bounds"]
+        midpoint = tuple((lower + upper) / 2.0 for lower, upper in lower_upper)
+        normalized["centers"] = _as_packet_rows(normalized.get("centers"), midpoint)
+        normalized["variances"] = _as_packet_rows(normalized.get("variances", 0.05), (0.05,) * ndim)
+        normalized["wavenumbers"] = _as_packet_rows(normalized.get("wavenumbers", 0.0), (0.0,) * ndim)
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "GaussianWavePacketConfig":
+        ndim = len(self.bounds)
+        if ndim not in (1, 2, 3):
+            raise ValueError("GaussianWavePacketConfig supports only 1D, 2D, or 3D bounds.")
+        if len(self.shape) != ndim:
+            raise ValueError("shape must match the number of bounds.")
+        if not self.centers:
+            raise ValueError("At least one Gaussian wave packet is required.")
+        if len(self.variances) != len(self.centers) or len(self.wavenumbers) != len(self.centers):
+            raise ValueError("centers, variances, and wavenumbers must contain the same number of packets.")
+        if self.amplitudes is not None and len(self.amplitudes) != len(self.centers):
+            raise ValueError("amplitudes must contain one value per packet.")
+        for lower, upper in self.bounds:
+            if upper <= lower:
+                raise ValueError("Grid bounds must be ordered as (lower, upper).")
+        vector_options = (("centers", self.centers), ("variances", self.variances), ("wavenumbers", self.wavenumbers))
+        for name, vectors in vector_options:
+            if any(len(vector) != ndim for vector in vectors):
+                raise ValueError(f"Each {name} vector must match the field dimensionality.")
         return self
 
 
@@ -306,6 +423,68 @@ def kle(key: Key, **config: KLEConfig) -> ArrayLike:
     if cfg.nsamples == 1:
         return samples[0]
     return samples
+
+
+def gaussian_wave_packets(key: Key, **config: GaussianWavePacketConfig) -> ArrayLike:
+    r"""Sample a 1D, 2D, or 3D random field from Gaussian wave packets.
+
+    The finite basis contains sine and cosine modulations for each configured
+    Gaussian envelope. Coefficients are independent standard-normal variates and
+    are normalized so that the average marginal variance is ``variance``.
+
+    :param key: JAX random key
+    :param config: see :class:`GaussianWavePacketConfig`
+    :return: ``shape`` when ``nsamples == 1``, otherwise ``(nsamples, *shape)``
+    """
+    cfg = GaussianWavePacketConfig(**config)
+    axes = tuple(
+        _cell_centered_axis(lower, upper, npts)
+        for (lower, upper), npts in zip(cfg.bounds, cfg.shape)
+    )
+    coords = (axes[0],) if len(axes) == 1 else tuple(jnp.meshgrid(*axes, indexing="ij"))
+    packet_count = len(cfg.centers)
+    packet_shape = (packet_count,) + tuple(cfg.shape)
+    envelope = jnp.ones(packet_shape)
+    phase = jnp.zeros(packet_shape)
+
+    for axis, (lower, upper), center, packet_variance, packet_wavenumber in zip(
+        coords,
+        cfg.bounds,
+        zip(*cfg.centers),
+        zip(*cfg.variances),
+        zip(*cfg.wavenumbers),
+    ):
+        centers = jnp.asarray(center).reshape((packet_count,) + (1,) * len(cfg.shape))
+        variances = jnp.asarray(packet_variance).reshape((packet_count,) + (1,) * len(cfg.shape))
+        wavenumbers = jnp.asarray(packet_wavenumber).reshape((packet_count,) + (1,) * len(cfg.shape))
+        axis_values = jnp.asarray(axis)[jnp.newaxis, ...]
+        envelope = envelope * jnp.exp(-0.5 * (axis_values - centers) ** 2 / variances)
+        phase = phase + 2.0 * jnp.pi * wavenumbers * (axis_values - centers) / (upper - lower)
+
+    amplitudes = jnp.ones(packet_count) if cfg.amplitudes is None else jnp.asarray(cfg.amplitudes)
+    amplitudes = amplitudes.reshape((packet_count,) + (1,) * len(cfg.shape))
+    basis = jnp.stack((envelope * jnp.cos(phase), envelope * jnp.sin(phase)), axis=1)
+    basis = amplitudes[:, jnp.newaxis, ...] * basis
+    pointwise_variance = jnp.sum(basis**2, axis=(0, 1))
+    scale = jnp.where(jnp.mean(pointwise_variance) > 0.0, cfg.variance / jnp.mean(pointwise_variance), 0.0)
+
+    coeff_shape = (cfg.nsamples, packet_count, 2)
+    if cfg.random_override is None:
+        sample_indices = jnp.arange(cfg.nsamples)
+        coefficients = jax.vmap(
+            lambda sample_index: jax.random.normal(jax.random.fold_in(key, sample_index), (packet_count, 2))
+        )(sample_indices)
+    else:
+        coefficients = jnp.asarray(cfg.random_override)
+        if coefficients.shape != coeff_shape:
+            raise ValueError(f"random_override must have shape {coeff_shape}, got {coefficients.shape}.")
+    samples = jnp.sqrt(scale) * jnp.einsum("bpc,pc...->b...", coefficients, basis)
+    samples = samples + jnp.asarray(cfg.mean)
+
+    if cfg.weight is not None:
+        samples = cfg.weight(coords, **cfg.weight_opts)[jnp.newaxis, ...] * samples
+
+    return samples[0] if cfg.nsamples == 1 else samples
 
 
 def darcy(
