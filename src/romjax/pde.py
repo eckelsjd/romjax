@@ -388,8 +388,8 @@ class DiffraxSolver(DictModel):
 
     The `ts` and `num_save` options are for convenience. You can also manually specify any `saveat` config.
 
-    :param solver: diffrax solver instance or module spec, default ``KenCarp4``
-    :param stepsize_controller: diffrax controller, default ``PIDController``
+    :param solver: diffrax solver instance or module spec
+    :param stepsize_controller: diffrax controller
     :param adjoint: diffrax adjoint, default ``RecursiveCheckpointAdjoint``
     :param progress_meter: for showing solution progress
     :param saveat: optional explicit ``diffrax.SaveAt`` object

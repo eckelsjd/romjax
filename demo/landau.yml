@@ -1,7 +1,7 @@
 !romx:Vlasov1D1V
 grid:
-  shape: [32, 32]
-  bounds: [[0.0, 2.0], [-1.0, 1.0]]
+  shape: [128, 256]
+  bounds: [[0.0, 12.56637], [-8.0, 8.0]]
 solver:
   solver: {name: Tsit5}
   # stepsize_controller: {name: ConstantStepSize}
@@ -15,29 +15,29 @@ solver:
       dcoeff: 0.0
   adjoint: {name: RecursiveCheckpointAdjoint}
   t0: 0.0
-  t1: 5.0
-  # dt0: 0.025
-  num_save: 128
-  max_steps: 2000
+  t1: 50.0
+  dt0: 0.008
+  num_save: 500
+  max_steps: 7000
   throw: true
   progress_meter: { name: romjax.AliveProgressMeter }
 fv:
   flux: upwind
   reconstruction: muscl
   limiter: van_leer
-  cfl: 0.8
+  cfl: 0.6
   enforce_cfl: true
 params:
-  knudsen: 1        # LU(-3, 3)
-  debye: 0.5        # U(0.2, 1)
+  knudsen: 1.0e10        # LU(-3, 3)
+  debye: 1.0        # U(0.2, 1)
 initial:
   callable: cosine
   inputs_default:
-    alpha: 0.25     # U(0.05, 0.25)
-    k: 3.141592654  # const
+    alpha: 0.5     # U(0.05, 0.25)
+    k: 0.5  # const
     n0: 1.0         # const
     u0: 0.0         # const
-    T0: 0.1        # U(0.01, 0.1)
+    T0: 1.0       # U(0.01, 0.1)
 boundary:
   callable: identity
   inputs_default:
