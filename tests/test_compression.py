@@ -79,7 +79,7 @@ def test_svd_orbax_checkpoint_matches_nested_compare_template(tmp_path):
     compression.save_orbax(checkpoint_dir)
 
     params_template = {
-        "coordinate transform": {"call_args": LinearProjection(matrix=jnp.zeros((2, 4)))},
+        "coordinate transform": {"call_args": LinearProjection(matrix=jnp.zeros((2, 4)), bias=jnp.zeros(4))},
         "residual transform": None,
     }
     params = OrbaxParams(params=checkpoint_dir).resolve_params(params_template)
@@ -87,5 +87,6 @@ def test_svd_orbax_checkpoint_matches_nested_compare_template(tmp_path):
     projection = params["coordinate transform"]["call_args"]
     assert isinstance(projection, LinearProjection)
     np.testing.assert_allclose(projection.matrix, compression.basis)
+    np.testing.assert_allclose(projection.bias, compression.mean)
     assert params["residual transform"] is None
     assert "matrix" not in params

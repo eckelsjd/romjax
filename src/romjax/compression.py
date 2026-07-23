@@ -252,7 +252,7 @@ class SVD(Compression):
         if self.basis is None:
             raise ValueError("Cannot save orbax with no basis. Must call fit() first.")
 
-        params = LinearProjection(matrix=self.basis)
+        params = LinearProjection(matrix=self.basis, bias=self.mean)
 
         if self.orbax_template is not None:
             # Replaces all "Nones" in the template with the projection basis object

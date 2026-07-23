@@ -409,6 +409,43 @@ def test_linear_projection() -> None:
     assert final_loss <= float(pod_loss) * 1.35
 
 
+def test_linear_projection_with_bias_supports_jit_grad_and_vmap() -> None:
+    """Check affine projection transformations and differentiation."""
+    matrix = jnp.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]])
+    bias = jnp.array([0.5, -1.0, 2.0])
+    projection = LinearProjection(matrix=matrix, bias=bias)
+    samples = jnp.array([[1.0, 2.0, 3.0], [2.0, 0.0, 1.0]])
+
+    def loss(module: LinearProjection, values: jax.Array) -> jax.Array:
+        latent = jax.vmap(module.reduce)(values)
+        reconstructed = jax.vmap(module.reconstruct)(latent)
+        return jnp.mean(reconstructed**2)
+
+    jit_loss = jax.jit(loss)
+    value, gradients = jax.value_and_grad(jit_loss)(projection, samples)
+    encoded = jax.jit(jax.vmap(projection.reduce))(samples)
+    decoded = jax.jit(jax.vmap(projection.reconstruct))(encoded)
+
+    expected_encoded = (samples - bias) @ matrix.T
+    expected_decoded = expected_encoded @ matrix + bias
+    assert jnp.allclose(encoded, expected_encoded)
+    assert jnp.allclose(decoded, expected_decoded)
+    assert jnp.isfinite(value)
+    assert gradients.matrix.shape == matrix.shape
+    assert gradients.bias is not None
+    assert gradients.bias.shape == bias.shape
+
+    random_projection = LinearProjection(
+        latent=2,
+        dof=3,
+        key=jax.random.PRNGKey(12),
+        random_bias=True,
+    )
+    assert random_projection.bias is not None
+    assert random_projection.bias.shape == (3,)
+    assert LinearProjection(latent=2, dof=3, key=jax.random.PRNGKey(12)).bias is None
+
+
 def test_filter_model_in_graph() -> None:
     """Test linear projection with a filter model in a FunctionGraph"""
     key = jax.random.PRNGKey(24)

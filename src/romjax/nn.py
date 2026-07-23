@@ -7,9 +7,10 @@ __all__ = ["LinearProjection"]
 
 
 class LinearProjection(eqx.Module):
-    """Linear projection module with tied transpose reconstruction."""
+    """Affine projection module with tied transpose reconstruction."""
 
     matrix: ArrayLike  # (r x N)
+    bias: ArrayLike | None  # (N,)
 
     def __init__(
         self,
@@ -17,6 +18,8 @@ class LinearProjection(eqx.Module):
         dof: int | None = None,
         key: Key | None = None,
         matrix: ArrayLike | None = None,
+        bias: ArrayLike | None = None,
+        random_bias: bool = False,
         scale: float = 0.25,
     ):
         """
@@ -27,21 +30,43 @@ class LinearProjection(eqx.Module):
         - explicit matrix: ``LinearProjection(matrix=...)``
         - random init: ``LinearProjection(latent=..., dof=..., key=...)``
 
+        When supplied, ``bias`` is a full-space offset. The projection centers
+        inputs with this offset and adds it back during reconstruction.
+
         :param latent: latent dimension when using random initialization
         :param dof: full-space dimension when using random initialization
         :param key: random key when using random initialization
         :param matrix: explicit projection matrix with shape ``(latent, dof)``
+        :param bias: optional full-space offset with shape ``(dof,)``
+        :param random_bias: whether to initialize an omitted bias randomly
         :param scale: random init scaling factor
         """
         if matrix is not None:
             self.matrix = jnp.asarray(matrix)
+            if self.matrix.ndim != 2:
+                raise ValueError(f"matrix must have dim 2, got shape {self.matrix.shape}.")
+            if bias is not None:
+                self.bias = jnp.asarray(bias)
+                if self.bias.shape != (self.matrix.shape[1],):
+                    raise ValueError(
+                        f"bias must have shape {(self.matrix.shape[1],)}, got shape {self.bias.shape}."
+                    )
+            else:
+                self.bias = None
             return
 
         if key is None or latent is None or dof is None:
             raise ValueError(
                 "LinearProjection requires either `matrix` or all of (`latent`, `dof`, `key`)."
             )
-        self.matrix = scale * jax.random.normal(key, (latent, dof))
+        matrix_key, bias_key = jax.random.split(key)
+        self.matrix = scale * jax.random.normal(matrix_key, (latent, dof))
+        if bias is None:
+            self.bias = scale * jax.random.normal(bias_key, (dof,)) if random_bias else None
+        else:
+            self.bias = jnp.asarray(bias)
+            if self.bias.shape != (dof,):
+                raise ValueError(f"bias must have shape {(dof,)}, got shape {self.bias.shape}.")
 
     def reduce(self, x: ArrayLike) -> ArrayLike:
         """
@@ -51,7 +76,10 @@ class LinearProjection(eqx.Module):
         :return: reduced coordinates with last axis ``n_latent``
         """
         matrix = jnp.asarray(self.matrix)
-        return jnp.matmul(jnp.asarray(x), jnp.swapaxes(matrix, -1, -2))
+        values = jnp.asarray(x)
+        if self.bias is not None:
+            values = values - jnp.asarray(self.bias)
+        return jnp.matmul(values, jnp.swapaxes(matrix, -1, -2))
 
     def reconstruct(self, z: ArrayLike) -> ArrayLike:
         """
@@ -60,7 +88,10 @@ class LinearProjection(eqx.Module):
         :param z: reduced coordinates with last axis ``n_latent``
         :return: reconstructed full coordinates with last axis ``n_full``
         """
-        return jnp.matmul(jnp.asarray(z), jnp.asarray(self.matrix))
+        values = jnp.matmul(jnp.asarray(z), jnp.asarray(self.matrix))
+        if self.bias is not None:
+            values = values + jnp.asarray(self.bias)
+        return values
 
     def __call__(self, x: ArrayLike) -> ArrayLike:
         """Alias for :meth:`reduce`."""
