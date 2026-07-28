@@ -431,6 +431,9 @@ class GraphLossTerm(BaseModel):
     :param term: callable to apply to a single sample of data
     :param dataset: which dataset name to read data from
     :param weight: scalar term weight
+    :param ramp_start: optimizer iteration at which cosine ramping begins; values less than or equal to zero disable
+        the term permanently
+    :param ramp_duration: positive number of iterations over which the effective term weight reaches ``weight``
     :param batch_reduce: reduce the loss over batch data; skip batch reduce if none
     :param batch_size: optional, passed to jax.lax.map for balancing memory with vmap; use batch_size=0 for vmap-like
         behavior
@@ -446,6 +449,8 @@ class GraphLossTerm(BaseModel):
     name: str | None = None
     dataset: str | None = None
     weight: float = 1.0
+    ramp_start: int | None = None
+    ramp_duration: int | None = None
     batch_reduce: UnaryOp | None = "mean"
     batch_size: int | None = None
 
@@ -483,6 +488,26 @@ class GraphLossTerm(BaseModel):
         if callable(value) or isinstance(value, str) or (isinstance(value, Mapping) and "callable" in value):
             return {"term": value}
         return value
+
+    @model_validator(mode="after")
+    def _check_ramp(self) -> "GraphLossTerm":
+        """Validate the optional evaluation and weighting schedule."""
+        if self.ramp_start is None:
+            if self.ramp_duration is not None:
+                raise ValueError("ramp_duration requires ramp_start")
+            return self
+        if self.ramp_start > 0 and (self.ramp_duration is None or self.ramp_duration <= 0):
+            raise ValueError("positive ramp_start requires a positive ramp_duration")
+        return self
+
+    @property
+    def is_scheduled(self) -> bool:
+        """Whether this term has an explicit evaluation schedule."""
+        return self.ramp_start is not None
+
+    def is_active_at(self, iteration: int) -> bool:
+        """Return whether this term should be evaluated at a host-side optimizer iteration."""
+        return self.ramp_start is None or (self.ramp_start > 0 and iteration >= self.ramp_start)
 
     @staticmethod
     def _stack_sequence_batch(term_batch: Sequence[PyTree]) -> PyTree:
@@ -770,6 +795,77 @@ def _cyclic_path_specs(
     return _finalize_cache_plan(specs), dataset_edge.name
 
 
+class CyclicPathRampRule(BaseModel):
+    """Schedule generated cyclic-path terms that traverse one edge direction.
+
+    :param edge: graph edge name to match
+    :param direction: traversal direction relative to the edge declaration
+    :param ramp_start: optimizer iteration at which matching terms begin cosine ramping; non-positive values disable
+        matching terms
+    :param ramp_duration: positive duration of an enabled cosine ramp
+    """
+
+    edge: str
+    direction: Literal["forward", "backward"]
+    ramp_start: int
+    ramp_duration: int | None = None
+
+    @model_validator(mode="after")
+    def _check_ramp(self) -> "CyclicPathRampRule":
+        """Validate the rule's schedule without requiring a duration for disabled rules."""
+        if self.ramp_start > 0 and (self.ramp_duration is None or self.ramp_duration <= 0):
+            raise ValueError("positive ramp_start requires a positive ramp_duration")
+        return self
+
+
+def _path_directions(
+    graph: FunctionGraph,
+    logical_start: str,
+    path: Sequence[str],
+    dataset_edge: str,
+) -> set[tuple[str, Literal["forward", "backward"]]]:
+    """Return evaluated edge directions traversed by one logical graph path.
+
+    The first dataset-edge step is omitted because the dataset already provides that endpoint payload and
+    :meth:`_CyclicPathErrorCallable._push_cached_path` does not evaluate the edge in this case.
+    """
+    node = graph._resolve_node(logical_start)
+    directions: set[tuple[str, Literal["forward", "backward"]]] = set()
+    for step_idx, edge_name in enumerate(path):
+        edge = graph._resolve_edge(edge_name)
+        if node == edge.source:
+            direction: Literal["forward", "backward"] = "forward"
+        elif node == edge.target:
+            direction = "backward"
+        else:
+            raise ValueError(f"Path traverses edge {edge.name!r} from a non-endpoint node {node.name!r}.")
+        if not (step_idx == 0 and edge.name == dataset_edge):
+            directions.add((edge.name, direction))
+        node = graph._step_path_node(node, edge)
+    return directions
+
+
+def _matching_cyclic_ramp(
+    graph: FunctionGraph,
+    spec: _CyclicPathSpec,
+    dataset_edge: str,
+    ramps: Sequence[CyclicPathRampRule],
+) -> CyclicPathRampRule | None:
+    """Select the latest-start matching schedule for one generated cyclic term."""
+    directions = _path_directions(graph, spec.logical_start, spec.path_a, dataset_edge)
+    directions.update(_path_directions(graph, spec.logical_start, spec.path_b, dataset_edge))
+    matches = [rule for rule in ramps if (rule.edge, rule.direction) in directions]
+    if not matches:
+        return None
+
+    latest_start = max(rule.ramp_start for rule in matches)
+    latest = [rule for rule in matches if rule.ramp_start == latest_start]
+    schedules = {(rule.ramp_start, rule.ramp_duration) for rule in latest}
+    if len(schedules) != 1:
+        raise ValueError(f"Ambiguous cyclic ramp rules for generated term {spec.name!r}.")
+    return latest[0]
+
+
 def cyclic_path_error_terms(
     graph: FunctionGraph,
     *,
@@ -782,6 +878,7 @@ def cyclic_path_error_terms(
     cache_policy: Literal["none", "last_use"] = "last_use",
     error_op: BinaryOp | None = None,
     ignore: Sequence[TreePath] | None = None,
+    ramps: Sequence[CyclicPathRampRule] | None = None,
 ) -> list[GraphLossTerm]:
     """
     Generate path-error terms for every ordered pair of nodes in a cyclic graph.
@@ -796,14 +893,18 @@ def cyclic_path_error_terms(
     :param cache_policy: deterministic term ordering/eviction strategy for shared payload cache
     :param error_op: optional shared override for every generated term's destination-node error operator
     :param ignore: optional shared override for every generated term's destination-node ignored paths
+    :param ramps: optional edge-direction schedules applied to generated terms that traverse a matching direction
     :return: concrete graph loss terms
     """
     dataset = dataset or _default_dataset_edge(graph)
     if dataset is None:
         raise ValueError("cyclic_path_errors requires a dataset when the graph has no sampleable edges.")
     specs, dataset_edge = _cyclic_path_specs(graph, nodes=nodes, dataset=dataset, cache_policy=cache_policy)
-    return [
-        GraphLossTerm(
+    ramps = () if ramps is None else tuple(CyclicPathRampRule.model_validate(rule) for rule in ramps)
+    terms = []
+    for spec in specs:
+        ramp = _matching_cyclic_ramp(graph, spec, dataset_edge, ramps)
+        terms.append(GraphLossTerm(
             name=spec.name,
             term=_CyclicPathErrorCallable(
                 spec=spec,
@@ -815,11 +916,12 @@ def cyclic_path_error_terms(
             ),
             dataset=dataset,
             weight=weight,
+            ramp_start=None if ramp is None else ramp.ramp_start,
+            ramp_duration=None if ramp is None else ramp.ramp_duration,
             batch_reduce=batch_reduce,
             batch_size=batch_size,
-        )
-        for spec in specs
-    ]
+        ))
+    return terms
 
 
 _LOSS_TERM_GENERATOR_REGISTRY.update({"commutativity": cyclic_path_error_terms})
@@ -1035,7 +1137,50 @@ class GraphLoss(BaseModel):
         """Stable names for all terms in order."""
         return self._term_names
 
-    def _raw_term_array(self, params: Mapping[str, PyTree], batch: Mapping[str, PyTree]) -> jax.Array:
+    @property
+    def has_scheduled_terms(self) -> bool:
+        """Whether any concrete term requires an explicit optimizer iteration."""
+        return any(term.is_scheduled for term in self.terms if isinstance(term, GraphLossTerm))
+
+    def active_term_names(self, iteration: int) -> tuple[str, ...]:
+        """Return the concrete terms that should be evaluated at a host-side iteration.
+
+        :param iteration: absolute optimizer iteration
+        :return: names of terms whose raw values must be evaluated
+        """
+        if iteration < 0:
+            raise ValueError("iteration must be non-negative")
+        return tuple(
+            name
+            for name, term in zip(self._term_names, self.terms, strict=True)
+            if isinstance(term, GraphLossTerm) and term.is_active_at(iteration)
+        )
+
+    def _ramp_array(self, iteration: ArrayLike | None) -> jax.Array:
+        """Return JAX-compatible per-term cosine ramp factors."""
+        if not self.has_scheduled_terms:
+            return jnp.ones(len(self._term_names))
+        if iteration is None:
+            raise ValueError("GraphLoss with scheduled terms requires an explicit iteration.")
+
+        iteration = jnp.asarray(iteration)
+        factors = []
+        for term in self.terms:
+            if not isinstance(term, GraphLossTerm) or term.ramp_start is None:
+                factors.append(jnp.asarray(1.0))
+            elif term.ramp_start <= 0:
+                factors.append(jnp.asarray(0.0))
+            else:
+                progress = jnp.clip((iteration - term.ramp_start) / term.ramp_duration, 0.0, 1.0)
+                factors.append(0.5 * (1.0 - jnp.cos(jnp.pi * progress)))
+        return jnp.asarray(factors)
+
+    def _raw_term_array(
+        self,
+        params: Mapping[str, PyTree],
+        batch: Mapping[str, PyTree],
+        active_terms: frozenset[str] | None = None,
+    ) -> jax.Array:
         """Evaluate raw term values as an ordered JAX array."""
         if len(self.terms) == 0:
             return jnp.asarray([])
@@ -1044,7 +1189,10 @@ class GraphLoss(BaseModel):
 
         values = []
         aux = None
-        for term in self.terms:
+        for name, term in zip(self._term_names, self.terms, strict=True):
+            if active_terms is not None and name not in active_terms:
+                values.append(jnp.asarray(0.0))
+                continue
             value, aux = term.raw_value(params, batch, self.graph, aux=aux, return_aux=True)
             values.append(value)
 
@@ -1064,6 +1212,8 @@ class GraphLoss(BaseModel):
         params: Mapping[str, PyTree],
         batch: Mapping[str, PyTree],
         scales: Mapping[str, ArrayLike] | None = None,
+        iteration: ArrayLike | None = None,
+        active_terms: Sequence[str] | None = None,
         return_aux: bool = False,
     ) -> jax.Array | tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
         """Evaluate the total graph loss.
@@ -1071,12 +1221,32 @@ class GraphLoss(BaseModel):
         :param params: edge-payload parameter patches
         :param batch: batch data passed to graph loss terms
         :param scales: optional adaptive scale for each term; missing scales default to one
+        :param iteration: optional absolute optimizer iteration required when any term has a schedule
+        :param active_terms: optional static subset of names to evaluate; used by :class:`Train` to avoid executing
+            inactive scheduled terms in JIT-compiled training steps
         :param return_aux: if True, return ``(total, (raw_terms, scaled_terms))``
         :return: scalar total loss, optionally with raw and scaled term values keyed by term name
         """
         params = pytree_resolve_refs(params)
-        raw_values = self._raw_term_array(params, batch)
-        scaled_values = jnp.asarray(self._term_weights) * self._scale_array(scales) * raw_values
+        if active_terms is None and iteration is not None:
+            try:
+                active_terms = self.active_term_names(int(iteration))
+            except (TypeError, jax.errors.ConcretizationTypeError):
+                # A traced iteration cannot select Python control flow. Evaluation remains JIT compatible and the
+                # ramp factor still masks inactive terms; Train supplies a static active subset to avoid this work.
+                pass
+        active_set = None if active_terms is None else frozenset(active_terms)
+        if active_set is not None:
+            unknown = active_set.difference(self._term_names)
+            if unknown:
+                raise ValueError(f"Unknown GraphLoss active terms: {sorted(unknown)!r}")
+        raw_values = self._raw_term_array(params, batch, active_set)
+        scaled_values = (
+            jnp.asarray(self._term_weights)
+            * self._scale_array(scales)
+            * self._ramp_array(iteration)
+            * raw_values
+        )
         total = jnp.sum(scaled_values)
 
         if return_aux:

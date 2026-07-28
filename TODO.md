@@ -20,7 +20,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Backburner
 - [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm and GraphLoss)
-- [ ] Warm start for FOM terms in GC
 
 ## Ergonomics
 - [ ] !include pydantic tag for loading from another .yml file
@@ -54,6 +53,11 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] How to use filter model with eqx_evaluate for projection, neural nets, etc.
 - [ ] Composite functions for unary operators, normalizations, error/tree operators, etc.
 - [ ] Pydantic workflow, !romx, !pd, !overrides, __parent__, etc..
+- [ ] There are a lot of really frustrating gotchas/traps that I keep springing myself:
+      - When a live plot freezes, probably something has crashed. Close the live plot to view the crash
+      - When you can't kill a train routine, it's probably in the middle of a jax kernel execution. Not compiling, not crashed, just running.
+      - Trying to run big models on cpu can end up in an endlessly running jax kernel. Make sure to reset jax_platforms so gpu is used.
+      - Set batch_size to null for gpu execution -- gpu kernels struggle with vmap for some reason
 
 ## Profiling
 - [ ] Make sure the expensive part of data generation is the model evaluation

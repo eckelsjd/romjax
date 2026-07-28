@@ -4,7 +4,13 @@ import pytest
 
 from romjax import YamlLoader
 from romjax.graph import Edge, FunctionGraph, Node
-from romjax.loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, cyclic_path_error_terms
+from romjax.loss import (
+    CyclicPathError,
+    GraphLoss,
+    GraphLossTerm,
+    GraphLossTermGenerator,
+    cyclic_path_error_terms,
+)
 from romjax.model import SourceSampleable
 from romjax.train import Train
 
@@ -87,6 +93,12 @@ def term_by_name(loss: GraphLoss, name: str) -> GraphLossTerm:
     raise AssertionError(f"Missing term {name!r}")
 
 
+def scheduled_constant_term(params, single_data, graph) -> jax.Array:
+    """Constant loss used to test GraphLoss term scheduling."""
+    del params, single_data, graph
+    return jnp.asarray(3.0)
+
+
 def test_cyclic_path_error_generator_expands_all_terms_and_uses_destination_error() -> None:
     loss = generated_cycle_loss(weight=2.0, batch_reduce=None)
 
@@ -137,6 +149,76 @@ def test_cyclic_path_error_generator_seeds_outside_nodes_from_nearest_dataset_en
     assert k_term.term.callable.spec.path_b[0] == "kl"
 
 
+def test_cyclic_path_error_generator_applies_edge_direction_ramps() -> None:
+    terms = cyclic_path_error_terms(
+        four_node_cycle(),
+        nodes=["i", "j", "k", "l"],
+        dataset="li",
+        batch_reduce=None,
+        ramps=[{"edge": "ij", "direction": "backward", "ramp_start": 5, "ramp_duration": 10}],
+    )
+    by_name = {term.name: term for term in terms}
+
+    assert by_name["i->j"].ramp_start is None
+    assert by_name["j->i"].ramp_start == 5
+    assert by_name["j->i"].ramp_duration == 10
+
+
+def test_cyclic_path_error_ramp_ignores_unevaluated_first_dataset_edge() -> None:
+    terms = cyclic_path_error_terms(
+        four_node_cycle(),
+        nodes=["i", "j", "k", "l"],
+        dataset="li",
+        batch_reduce=None,
+        ramps=[{"edge": "li", "direction": "backward", "ramp_start": 5, "ramp_duration": 10}],
+    )
+    by_name = {term.name: term for term in terms}
+
+    # The counter-clockwise path for i->l starts by traversing li backward, but that edge evaluation is supplied
+    # directly by the dataset and therefore must not schedule the term.
+    assert by_name["i->l"].ramp_start is None
+    # The l->l counter-clockwise path later evaluates li backward, so the same rule still applies.
+    assert by_name["l->l"].ramp_start == 5
+
+
+def test_graph_loss_term_schedule_blocks_and_cosine_ramps() -> None:
+    loss = GraphLoss(
+        graph=four_node_cycle(),
+        terms=[
+            {
+                "name": "scheduled",
+                "term": scheduled_constant_term,
+                "batch_reduce": None,
+                "weight": 2.0,
+                "ramp_start": 5,
+                "ramp_duration": 10,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="explicit iteration"):
+        loss({}, {})
+
+    before, (before_raw, before_scaled) = loss({}, {}, iteration=4, return_aux=True)
+    assert before == pytest.approx(0.0)
+    assert before_raw["scheduled"] == pytest.approx(0.0)
+    assert before_scaled["scheduled"] == pytest.approx(0.0)
+    assert loss({}, {}, iteration=5) == pytest.approx(0.0)
+    assert loss({}, {}, iteration=10) == pytest.approx(3.0)
+    assert loss({}, {}, iteration=15) == pytest.approx(6.0)
+    assert jax.jit(lambda step: loss({}, {}, iteration=step))(jnp.asarray(10)) == pytest.approx(3.0)
+
+    disabled = GraphLoss(
+        graph=four_node_cycle(),
+        terms=[{"term": scheduled_constant_term, "batch_reduce": None, "ramp_start": 0}],
+    )
+    assert disabled.active_term_names(100) == ()
+    assert disabled({}, {}, iteration=100) == pytest.approx(0.0)
+
+    with pytest.raises(ValueError, match="positive ramp_duration"):
+        GraphLoss(graph=four_node_cycle(), terms=[{"term": scheduled_constant_term, "ramp_start": 5}])
+
+
 def test_cyclic_path_error_generator_yaml_and_train_deferred_binding() -> None:
     graph = four_node_cycle(sampleable_dataset=True)
     yaml_text = """
@@ -144,6 +226,8 @@ def test_cyclic_path_error_generator_yaml_and_train_deferred_binding() -> None:
 terms:
   - callable: commutativity
     batch_reduce: null
+    ramps:
+      - {edge: ij, direction: backward, ramp_start: 5, ramp_duration: 10}
   - {callable: tikhonov, batch_reduce: null}
 """
     loss = YamlLoader.load(yaml_text)
@@ -152,6 +236,7 @@ terms:
     loss.bind_graph(graph)
     assert len(loss.terms) == 17
     assert isinstance(loss.terms[0], GraphLossTerm)
+    assert term_by_name(loss, "j->i").ramp_start == 5
     assert loss.terms[-1].name == "term_16"
 
     train_yaml = """

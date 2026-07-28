@@ -772,10 +772,12 @@ class Train(Routine):
         test_fn = self.test if self.test is not None else None
         _, static_params = eqx.partition(self.init_params, eqx.is_array)
         graph_loss = self.loss if isinstance(self.loss, GraphLoss) else None
+        scheduled_graph_loss = graph_loss is not None and graph_loss.has_scheduled_terms
         ema_enabled = graph_loss is not None and graph_loss.balancing.kind in {"ema", "ema_log"}
         term_names = graph_loss.term_names if graph_loss is not None else ()
         term_diagnostics_enabled = graph_loss is not None and (
             ema_enabled
+            or scheduled_graph_loss
             or self.diagnostics.raw_terms_plot.enabled
             or self.diagnostics.scaled_terms_plot.enabled
         )
@@ -808,9 +810,18 @@ class Train(Routine):
             opt_state: optax.OptState,
             batch: PyTree,
             scales: Mapping[str, ArrayLike],
+            iteration: jax.Array,
+            active_terms: tuple[str, ...],
         ):
             def _loss(params: PyTree, batch: PyTree):
-                return graph_loss(params, batch, scales=scales, return_aux=True)
+                return graph_loss(
+                    params,
+                    batch,
+                    scales=scales,
+                    iteration=iteration,
+                    active_terms=active_terms,
+                    return_aux=True,
+                )
 
             (loss, (raw_terms, scaled_terms)), grads = eqx.filter_value_and_grad(_loss, has_aux=True)(params, batch)
             params, opt_state, grad_norm = _apply_optimizer_update(params, opt_state, grads)
@@ -894,12 +905,12 @@ class Train(Routine):
                 return float(np.log(max(raw_value, graph_loss.balancing.min_scale)))
             return raw_value
 
-        def _bootstrap_ema_state(raw_terms: Mapping[str, float]) -> None:
+        def _bootstrap_ema_state(raw_terms: Mapping[str, float], active_terms: Sequence[str]) -> None:
             """Initialize EMA state from the first batch before optimizer gradients are computed."""
             if loss_state is None:
                 return
 
-            for name in term_names:
+            for name in active_terms:
                 raw_value = raw_terms[name]
                 if not np.isfinite(raw_value):
                     logger.warning(f"Skipping EMA bootstrap for non-finite GraphLoss term '{name}': {raw_value}")
@@ -911,7 +922,7 @@ class Train(Routine):
                 loss_state.initialized[name] = True
             loss_state.scales = _compute_ema_scales()
 
-        def _update_ema_state(raw_terms: Mapping[str, float]) -> bool:
+        def _update_ema_state(raw_terms: Mapping[str, float], active_terms: Sequence[str]) -> bool:
             """Update EMA state from raw term values and report whether scales changed.
 
             :param raw_terms: Host-resident unscaled GraphLoss term values.
@@ -924,7 +935,7 @@ class Train(Routine):
                 return False
 
             new_step = loss_state.step + 1
-            for name in term_names:
+            for name in active_terms:
                 raw_value = raw_terms[name]
                 if not np.isfinite(raw_value):
                     logger.warning(f"Skipping EMA update for non-finite GraphLoss term '{name}': {raw_value}")
@@ -1216,6 +1227,10 @@ class Train(Routine):
 
                         ## LOSS/VALIDATION EVALUATION
                         host_active = _interval_active(self.host_interval, curr_step)
+                        active_terms = (
+                            graph_loss.active_term_names(curr_step) if scheduled_graph_loss else term_names
+                        )
+                        iteration = jnp.asarray(curr_step, dtype=jnp.int32)
                         next_batch = None
                         dataloader_stopped = False
 
@@ -1229,10 +1244,17 @@ class Train(Routine):
                                 and loss_state is not None
                             ):
                                 _, _, _, bootstrap_terms, _, _ = jax.block_until_ready(
-                                    _graph_train_step(params, opt_state, batch, current_scale_arrays)
+                                    _graph_train_step(
+                                        params,
+                                        opt_state,
+                                        batch,
+                                        current_scale_arrays,
+                                        iteration,
+                                        active_terms,
+                                    )
                                 )
                                 bootstrap_terms = _host_float_terms(bootstrap_terms)
-                                _bootstrap_ema_state(bootstrap_terms)
+                                _bootstrap_ema_state(bootstrap_terms, active_terms)
                                 current_scale_arrays = _current_scale_arrays()
                                 ema_bootstrapped = True
 
@@ -1244,6 +1266,8 @@ class Train(Routine):
                                             opt_state,
                                             batch,
                                             current_scale_arrays,
+                                            iteration,
+                                            active_terms,
                                         )
                                     else:
                                         train_result = _train_step(params, opt_state, batch)
@@ -1291,7 +1315,7 @@ class Train(Routine):
                                 scaled_terms_hist.record(curr_step, scaled_terms)
                             if term_scales_hist is not None:
                                 term_scales_hist.record(curr_step, _current_scales())
-                            if raw_terms is not None and _update_ema_state(raw_terms):
+                            if raw_terms is not None and _update_ema_state(raw_terms, active_terms):
                                 current_scale_arrays = _current_scale_arrays()
 
                             metrics = {"loss": loss_value}

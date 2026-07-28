@@ -144,6 +144,16 @@ class ToyLinearReconstructionEdge(Edge, ImplicitSampleable):
         return self.forward(inputs)
 
 
+class CycleScalingEdge(Edge):
+    """Cycle edge whose forward map consumes a graph payload parameter patch."""
+
+    def forward(self, payload: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        return {"x": payload["w"] * payload["x"]}
+
+    def backward(self, payload: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        return payload
+
+
 class TemplateAuxEdge(Edge):
     source: Node = Node(name="template_source")
     target: Node = Node(name="template_target")
@@ -785,6 +795,100 @@ def test_train_convergence():
     expected = {"x": jnp.array([1.0, 1.0])}
     assert jnp.allclose(params["x"], expected["x"], atol=1e-3)
     assert float(rosenbrock_loss(params, None)) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_train_recompiles_at_ramp_start_and_completes_scheduled_ramp(toy_graph: FunctionGraph) -> None:
+    trace_counts = {"baseline": 0, "scheduled": 0}
+
+    def baseline_term(params: dict[str, jax.Array], batch: object, graph: FunctionGraph) -> jax.Array:
+        del params, batch, graph
+        trace_counts["baseline"] += 1
+        return jnp.asarray(0.0)
+
+    def scheduled_term(params: dict[str, jax.Array], batch: object, graph: FunctionGraph) -> jax.Array:
+        del batch, graph
+        trace_counts["scheduled"] += 1
+        return jnp.square(params["w"] - 1.0)
+
+    train = Train(
+        loss=GraphLoss(
+            graph=toy_graph,
+            terms=[
+                {
+                    "name": "baseline",
+                    "term": baseline_term,
+                    "batch_reduce": None,
+                },
+                {
+                    "name": "scheduled",
+                    "term": scheduled_term,
+                    "batch_reduce": None,
+                    "ramp_start": 2,
+                    "ramp_duration": 3,
+                }
+            ],
+        ),
+        init_params={"w": jnp.asarray(0.0)},
+        optimizer=optax.sgd(0.4),
+        dataloader=BatchLoader(data=[0], batch_size=1, max_epochs=10),
+        termination=10,
+        diagnostics=DiagnosticsConfig(show_progress=False),
+    )
+
+    params = train()
+    # The always-active term is traced once before activation and once when the scheduled term changes the static
+    # active-term tuple at iteration two. The scheduled term is first traced at that activation boundary only.
+    assert trace_counts == {"baseline": 2, "scheduled": 1}
+    # Updates at iterations 3 through 6 include the completed (factor-one) ramp, proving training continues past it.
+    assert params["w"] == pytest.approx(1.0, abs=0.001)
+
+
+def test_train_recompiles_and_continues_for_scheduled_cyclic_path_terms() -> None:
+    trace_count = 0
+
+    def baseline_term(params: dict[str, jax.Array], batch: object, graph: FunctionGraph) -> jax.Array:
+        nonlocal trace_count
+        del params, batch, graph
+        trace_count += 1
+        return jnp.asarray(0.0)
+
+    graph = FunctionGraph(
+        edges={
+            "ab": CycleScalingEdge(source="a", target="b", name="ab"),
+            "bc": IdentityEdge(source="b", target="c", name="bc"),
+            "cd": IdentityEdge(source="c", target="d", name="cd"),
+            "da": IdentityEdge(source="d", target="a", name="da"),
+        }
+    )
+    train = Train(
+        graph=graph,
+        loss=GraphLoss(
+            terms=[
+                {"name": "baseline", "term": baseline_term, "batch_reduce": None},
+                {
+                    "callable": "commutativity",
+                    "nodes": ["a", "b", "c", "d"],
+                    "dataset": "da",
+                    "batch_reduce": None,
+                    "ramps": [{"edge": "ab", "direction": "forward", "ramp_start": 2, "ramp_duration": 3}],
+                },
+            ]
+        ),
+        init_params={"ab": {"w": jnp.asarray(0.0)}},
+        optimizer=optax.sgd(0.2),
+        dataloader=BatchLoader(data=[{"x": jnp.asarray(1.0)}], batch_size=1, max_epochs=10),
+        termination=7,
+        diagnostics=DiagnosticsConfig(show_progress=True),
+    )
+
+    params = train()
+
+    # Generated cyclic terms containing ab forward enter together at iteration two, requiring one recompilation of
+    # the otherwise unchanged baseline graph-loss path.
+    assert trace_count == 2
+    # The scheduled commutativity terms have their full weight after iteration five, and the patched edge parameter
+    # continues toward the identity map after that point.
+    assert params["ab"]["w"] > 0.9
 
 
 
