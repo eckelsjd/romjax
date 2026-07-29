@@ -1,15 +1,14 @@
 """PyTree utilities."""
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable, Generator, Mapping
-from typing import Annotated, Any, Iterator, Sequence
+from typing import Annotated, Any, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import PyTree
-from pydantic import BaseModel, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, field_validator, model_validator
 
 __all__ = [
     "at",
@@ -22,6 +21,7 @@ __all__ = [
     "pytree_iter",
     "pytree_path_iter",
     "pytree_resolve_refs",
+    "TreeRef",
     "to_pytree",
     "get_subtree",
     "set_subtree",
@@ -36,6 +36,33 @@ __all__ = [
 
 type PathToken = str | int
 type TreePath = tuple[PathToken, ...]
+
+
+class TreeRef(BaseModel):
+    """Reference a value at ``path`` in a related PyTree.
+
+    ``TreeRef`` is deliberately a static object: it is resolved before values
+    are consumed by numerical code, so it does not participate in JAX array
+    computations or Orbax dynamic-array checkpoints.
+
+    :param path: path to resolve in a reference tree
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    path: TreePath
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_path(cls, value: Any) -> Any:
+        if isinstance(value, list | tuple):
+            return {"path": value}
+        return value
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _coerce_path(cls, value: Any) -> TreePath:
+        return coerce_tree_path(value)
 
 
 def coerce_tree_path(value: Any) -> TreePath:
@@ -331,51 +358,58 @@ def pytree_stack(items: Sequence[PyTree]) -> PyTree:
     return jax.tree.map(lambda *xs: jnp.stack(xs), *items)
 
 
-def pytree_resolve_refs(tree: PyTree, reference_type: type = str):
-    """Resolve references in a pytree to other locations in the pytree. Replace the references with pointers."""
-    if reference_type is not str:
-        raise ValueError("Only str-type references are supported in a param PyTree.")
+def pytree_resolve_refs(
+    tree: PyTree,
+    reference: PyTree | None = None,
+    *,
+    raise_on_missing: bool = True,
+) -> PyTree:
+    """Resolve :class:`TreeRef` leaves in ``tree``.
 
-    def _coerce_token(token: str) -> str | int:
-        token = token.strip()
-        if token.lstrip("-").isdigit():
-            return int(token)
-        return token
+    :param tree: tree containing ``TreeRef`` objects
+    :param reference: optional tree against which paths are resolved; defaults
+        to ``tree`` itself
+    :param raise_on_missing: raise for unresolved paths; if false, preserve
+        the unresolved ``TreeRef`` for a later resolution pass
+    :return: ``tree`` with resolvable references replaced by their targets
+    """
+    reference = tree if reference is None else reference
 
-    def _coerce_reference_path(reference: str) -> tuple[str | int, ...]:
-        return tuple(_coerce_token(token) for token in reference.split(","))
+    def _target(value: TreeRef) -> Any:
+        target = get_subtree(reference, value.path)
+        if target is None and value.path:
+            parent = get_subtree(reference, value.path[:-1])
+            resolver = getattr(parent, f"resolve_{value.path[-1]}", None)
+            if callable(resolver):
+                target = resolver()
+        if target is None:
+            if raise_on_missing:
+                raise KeyError(f"Could not resolve TreeRef at path {value.path!r}.")
+            return value
+        return target
 
-    def _iter_reference_paths(
-        tree: PyTree,
-        path: tuple[str | int, ...] = (),
-    ) -> Iterator[tuple[tuple[str | int, ...], str]]:
-        if isinstance(tree, reference_type):
-            yield path, tree
-            return
+    def _resolve(value: Any) -> Any:
+        if isinstance(value, TreeRef):
+            return _target(value)
+        if isinstance(value, Mapping):
+            return {key: _resolve(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_resolve(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_resolve(item) for item in value)
+        if isinstance(value, BaseModel):
+            for field_name in type(value).model_fields:
+                current = getattr(value, field_name)
+                resolved = _resolve(current)
+                if resolved is not current:
+                    object.__setattr__(value, field_name, resolved)
+            for extra_name, extra_value in (value.model_extra or {}).items():
+                resolved = _resolve(extra_value)
+                if resolved is not extra_value:
+                    setattr(value, extra_name, resolved)
+        return value
 
-        if isinstance(tree, Mapping):
-            for key, value in tree.items():
-                yield from _iter_reference_paths(value, (*path, key))
-            return
-
-        if isinstance(tree, tuple | list):
-            for i, value in enumerate(tree):
-                yield from _iter_reference_paths(value, (*path, i))
-
-    resolved = tree
-    for ref_path, reference in _iter_reference_paths(tree):
-        target_path = _coerce_reference_path(reference)
-        try:
-            target = get_subtree(tree, target_path)
-        except (AttributeError, IndexError, KeyError, TypeError) as exc:
-            warnings.warn(
-                f"Could not resolve parameter reference {reference!r} at path {ref_path!r}: {exc}",
-                stacklevel=2,
-            )
-            continue
-        resolved = set_subtree(resolved, ref_path, target)
-
-    return resolved
+    return _resolve(tree)
 
 
 at = pytree_at

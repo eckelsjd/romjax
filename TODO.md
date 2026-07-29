@@ -9,12 +9,14 @@ Keeping track of ideas, bugs, thoughts, etc.
 - Train Vlasov/Euler graph
 - Routine for sampling knudsen, training surrogate for E(v)
 
+## Testing
+- [ ] Need to consolidate test_train and test_vlasov to be quicker
+
 ## Critical
 - [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.
 - [ ] Getting Galerkin to work for diffrax ODE models -- solving ODE in latent space, building basis over snapshots
 
 ## Blind spots
-- [ ] Resolving references in GraphLoss may be flaky -- what if some eqx.Module has string params that aren't meant to be references?
 - [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
 - [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 
@@ -53,6 +55,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] How to use filter model with eqx_evaluate for projection, neural nets, etc.
 - [ ] Composite functions for unary operators, normalizations, error/tree operators, etc.
 - [ ] Pydantic workflow, !romx, !pd, !overrides, __parent__, etc..
+- [ ] All the various `resolve` functions (compression, norm, samplers, helper methods)
 - [ ] There are a lot of really frustrating gotchas/traps that I keep springing myself:
       - When a live plot freezes, probably something has crashed. Close the live plot to view the crash
       - When you can't kill a train routine, it's probably in the middle of a jax kernel execution. Not compiling, not crashed, just running.

@@ -58,7 +58,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "FilterModel": ("romjax.model", "FilterModel"),
     "ImplicitModel": ("romjax.model", "ImplicitModel"),
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
+    "Affine": ("romjax.nn", "Affine"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
+    "ImplicitAffine": ("romjax.pde", "ImplicitAffine"),
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
     "gridplot": ("romjax.plotting", "gridplot"),
@@ -67,7 +69,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "gen_keys": ("romjax.rng", "gen_keys"),
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
-    "GraphRef": ("romjax.typing", "GraphRef"),
+    "TreeRef": ("romjax.tree", "TreeRef"),
     "UnaryOp": ("romjax.operators", "UnaryOp"),
     "BinaryOp": ("romjax.operators", "BinaryOp"),
     "DictModel": ("romjax.typing", "DictModel"),
@@ -75,7 +77,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CallableModel": ("romjax.typing", "CallableModel"),
     "ThirdPartyType": ("romjax.typing", "ThirdPartyType"),
     "from_yaml": ("romjax.typing", "from_yaml"),
-    "resolve_graph_refs": ("romjax.typing", "resolve_graph_refs"),
     "CompositeRoutine": ("romjax.routine", "CompositeRoutine"),
     "Routine": ("romjax.routine", "Routine"),
     "RoutineConfig": ("romjax.routine", "RoutineConfig"),
@@ -86,7 +87,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "DataLoader": ("romjax.data_gen", "DataLoader"),
     "CompareOrbax": ("romjax.compare", "CompareOrbax"),
     "CompareTable": ("romjax.compare", "CompareTable"),
-    "OrbaxParams": ("romjax.train", "OrbaxParams"),
+    "OrbaxRef": ("romjax.train", "OrbaxRef"),
+    "resolve_orbax_params": ("romjax.train", "resolve_orbax_params"),
     "Train": ("romjax.train", "Train"),
     "BatchLoader": ("romjax.train", "BatchLoader"),
     "GraphLoss": ("romjax.loss", "GraphLoss"),
@@ -109,17 +111,18 @@ if TYPE_CHECKING:
     from .graph import CompositeEdge, FunctionGraph
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
-    from .nn import LinearProjection
+    from .nn import Affine, LinearProjection
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
-    from .pde import ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs
+    from .pde import ImplicitAffine, ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs
     from .plotting import gridplot
     from .poisson import Poisson2D
     from .vlasov import Vlasov1D1V
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .operators import BinaryOp, UnaryOp
-    from .train import BatchLoader, OrbaxParams, Train
-    from .typing import CallableModel, DictModel, GraphRef, ListModel, ThirdPartyType, resolve_graph_refs, from_yaml
+    from .train import BatchLoader, OrbaxRef, Train, resolve_orbax_params
+    from .tree import TreeRef
+    from .typing import CallableModel, DictModel, ListModel, ThirdPartyType, from_yaml
     from .utils import load_h5, save_h5
 
 def __getattr__(name: str) -> _Any:

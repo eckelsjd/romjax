@@ -17,13 +17,12 @@ from pydantic import (
     PrivateAttr,
     SerializationInfo,
     TypeAdapter,
-    field_validator,
     model_serializer,
     model_validator,
 )
 
-__all__ = ['DictModel', 'ListModel', 'CallableModel', 'GraphRef', 'ThirdPartyType', 'WriteStream',
-           'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec', 'resolve_graph_refs']
+__all__ = ['DictModel', 'ListModel', 'CallableModel', 'ThirdPartyType', 'WriteStream',
+           'from_yaml', 'from_registry', 'require_type', 'from_module_spec', 'to_module_spec']
 
 
 _SPEC_REGISTRY: WeakKeyDictionary[object, dict[str, Any]] = WeakKeyDictionary()
@@ -42,77 +41,6 @@ def require_type(required_type: type, value: Any):
 def require_attr(required_attr: str, value: Any):
     if not hasattr(value, required_attr):
         raise ValueError(f"Expected attribute '{required_attr}'")
-    return value
-
-
-class GraphRef(BaseModel):
-    """Reference a value inside a graph or graph-backed config tree by path."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    path: tuple[str | int, ...]
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_path(cls, value):
-        if isinstance(value, list | tuple):
-            return {"path": value}
-        return value
-
-    @field_validator("path", mode="before")
-    @classmethod
-    def _coerce_path(cls, value):
-        if isinstance(value, list | tuple):
-            return tuple(
-                int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token
-                for token in value
-            )
-        return value
-
-    def resolve(self, graph: Any) -> Any:
-        """Resolve this reference against a graph-like object."""
-        from romjax.tree import get_subtree
-
-        value = get_subtree(graph, self.path)
-
-        if len(self.path) == 0:
-            return value
-        
-        if value is None:
-            parent = get_subtree(graph, self.path[:-1])
-            field_name = str(self.path[-1])
-            resolver = getattr(parent, f"resolve_{field_name}", None)
-            if callable(resolver):
-                resolved = resolver()
-                if resolved is not None:
-                    return resolved
-
-        return value
-
-
-def resolve_graph_refs(value: Any, graph) -> Any:
-    """Resolve graph-field references inside nested config trees. For use with init_params."""
-    if graph is None:
-        return value
-    if isinstance(value, GraphRef):
-        return value.resolve(graph)
-    if isinstance(value, BaseModel):
-        for field_name in type(value).model_fields:
-            if hasattr(value, field_name):
-                resolved = resolve_graph_refs(getattr(value, field_name), graph)
-                if resolved is not getattr(value, field_name):
-                    object.__setattr__(value, field_name, resolved)
-        for extra_name, extra_value in (value.model_extra or {}).items():
-            resolved = resolve_graph_refs(extra_value, graph)
-            if resolved is not extra_value:
-                setattr(value, extra_name, resolved)
-        return value
-    if isinstance(value, Mapping):
-        return {key: resolve_graph_refs(item, graph) for key, item in value.items()}
-    if isinstance(value, list):
-        return [resolve_graph_refs(item, graph) for item in value]
-    if isinstance(value, tuple):
-        return tuple(resolve_graph_refs(item, graph) for item in value)
     return value
 
 

@@ -8,6 +8,7 @@ from romjax import YamlLoader
 from romjax.operators import BinaryOp, UnaryOp
 from romjax.tree import (
     ShapeDtypePyTree,
+    TreeRef,
     as_shape_dtype_pytree,
     pytree_at,
     pytree_iter,
@@ -16,6 +17,7 @@ from romjax.tree import (
     pytree_norm,
     pytree_path_iter,
     pytree_reduce,
+    pytree_resolve_refs,
     pytree_size,
     to_pytree,
 )
@@ -56,6 +58,13 @@ def test_shape_dtype_template_pytree_validator() -> None:
     assert validated["nested"][0] == "static"
     assert validated["nested"][1] is static_fn
     assert validated["not_a_template"] == template["not_a_template"]
+
+
+def test_tree_ref_yaml_and_resolution() -> None:
+    tree = YamlLoader.load("target: 3\nreference: !romx:TreeRef [target]\n")
+
+    assert isinstance(tree["reference"], TreeRef)
+    assert pytree_resolve_refs(tree)["reference"] == 3
 
 
 def test_to_pytree():

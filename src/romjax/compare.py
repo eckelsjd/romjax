@@ -23,21 +23,21 @@ from romjax.graph import FunctionGraph
 from romjax.operators import UnaryOp
 from romjax.plotting import PlotSpec, gridplot
 from romjax.routine import Routine
-from romjax.train import OrbaxParams
-from romjax.tree import pytree_path_iter
-from romjax.typing import DictModel, from_yaml, resolve_graph_refs
+from romjax.train import resolve_orbax_params
+from romjax.tree import pytree_path_iter, pytree_resolve_refs
+from romjax.typing import DictModel, from_yaml
 from romjax.utils import _NullProgress, load_h5, save_h5
 
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 
-__all__ = ["CompareOrbax", "CompareTable", "OrbaxParams"]
+__all__ = ["CompareOrbax", "CompareTable"]
 
 
 class CompareOrbax(Routine):
     """
     Routine for comparing models via orbax checkpoints from `Train`.
     """
-    cases: Mapping[str, OrbaxParams]
+    cases: Mapping[str, PyTree]
 
     root: Path | None = None
     write_policy: SUPPORTED_POLICIES = "reuse"
@@ -57,7 +57,9 @@ class CompareOrbax(Routine):
         if self.graph is not None:
             self.graph.resolve_norms()
             for case in self.cases:
-                self.params_template[case] = resolve_graph_refs(self.params_template[case], self.graph)
+                self.params_template[case] = pytree_resolve_refs(
+                    self.params_template[case], self.graph, raise_on_missing=False
+                )
         
         # Initialize param templates just like in train
         for case in self.cases:
@@ -382,7 +384,7 @@ class CompareTable(CompareOrbax):
                 case_results = tab_results.setdefault(case_name, {})
                 case_distributions = distributions.setdefault(case_name, {})
 
-                params = case.resolve_params(self.params_template[case_name])
+                params = resolve_orbax_params(case, self.params_template[case_name])
 
                 for metric_name, metric_fn in self.metrics.items():
                     metric_results = case_results.setdefault(metric_name, {})

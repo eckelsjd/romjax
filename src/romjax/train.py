@@ -42,11 +42,12 @@ from romjax.tree import (
     as_shape_dtype_pytree,
     is_shape_dtype,
     pytree_norm,
+    pytree_resolve_refs,
 )
-from romjax.typing import ThirdPartyType, from_yaml, require_type, resolve_graph_refs
+from romjax.typing import ThirdPartyType, from_yaml, require_type
 from romjax.utils import _NullProgress
 
-__all__ = ["Train", "BatchLoader", "OrbaxParams"]
+__all__ = ["Train", "BatchLoader", "OrbaxRef", "resolve_orbax_params"]
 
 
 def _prettify_timedelta(delta: float) -> str:
@@ -221,58 +222,103 @@ type GradientTransformation = Annotated[
 ]
 
 
-class OrbaxParams(BaseModel):
+class OrbaxRef(BaseModel):
+    """Explicit reference to an Orbax checkpoint directory.
+
+    :param path: checkpoint directory
     """
-    Utility for loading parameter PyTrees from Orbax checkpoints.
 
-    :param params: direct parameter PyTree or path to a checkpoint directory containing a ``params`` checkpointable
-    """
+    model_config = ConfigDict(frozen=True)
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    params: PyTree | str | Path
-    _resolved_params: PyTree | None = PrivateAttr(default=None)
+    path: Path
 
     @model_validator(mode="before")
     @classmethod
-    def _from_plain_params(cls, value: PyTree | str | Path | Mapping[str, PyTree]) -> dict[str, PyTree] | PyTree:
-        if not isinstance(value, OrbaxParams):
-            if isinstance(value, Mapping) and "params" in value:
-                return value
-            return {"params": value}
+    def _from_plain_path(cls, value: Any) -> Any:
+        if isinstance(value, str | Path):
+            return {"path": value}
         return value
 
-    def resolve_params(self, template: PyTree | None = None) -> PyTree | None:
-        """
-        Load parameters from Orbax using a template for static leaves.
 
-        :param template: optional full parameter PyTree template
-        :returns: resolved parameters, or ``None`` if a checkpoint path has no latest checkpoint
-        """
-        if self._resolved_params is not None:
-            return self._resolved_params
+def _orbax_checkpoint_path(value: Any) -> Path | None:
+    """Return an existing checkpoint path represented by one override leaf."""
+    if isinstance(value, OrbaxRef):
+        return value.path
+    if isinstance(value, str | Path):
+        path = Path(value)
+        return path if path.exists() else None
+    return None
 
-        if isinstance(self.params, str | Path):
-            with ocp.training.Checkpointer(Path(self.params).absolute()) as ckptr:
-                if ckptr.latest is not None:
-                    if template is not None:
-                        template = as_shape_dtype_pytree(template)
-                        dynamic_params, static_params = eqx.partition(
-                            template,
-                            lambda leaf: eqx.is_array(leaf) or is_shape_dtype(leaf),
-                        )
-                        loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
-                        params = eqx.combine(loaded["params"], static_params)
-                    else:
-                        params = ckptr.load_checkpointables()["params"]
 
-                    self._resolved_params = params
-                    return params
+def _contains_orbax_ref(value: Any) -> bool:
+    """Return whether an override tree includes an Orbax checkpoint reference."""
+    if _orbax_checkpoint_path(value) is not None:
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_orbax_ref(item) for item in value.values())
+    if isinstance(value, tuple | list):
+        return any(_contains_orbax_ref(item) for item in value)
+    return False
 
+
+def _load_orbax_checkpoint(path: Path, template: PyTree | None) -> PyTree | None:
+    """Load one Orbax ``params`` checkpoint, recombining static template leaves."""
+    with ocp.training.Checkpointer(path.absolute()) as ckptr:
+        if ckptr.latest is None:
             return None
+        if template is None:
+            return ckptr.load_checkpointables()["params"]
+        shape_template = as_shape_dtype_pytree(template)
+        dynamic_params, static_params = eqx.partition(
+            shape_template,
+            lambda leaf: eqx.is_array(leaf) or is_shape_dtype(leaf),
+        )
+        loaded = ckptr.load_checkpointables(abstract_checkpointables={"params": dynamic_params})
+        return eqx.combine(loaded["params"], static_params)
 
-        self._resolved_params = self.params
-        return self._resolved_params
+
+def _resolve_orbax_overlay(override: Any, template: PyTree) -> PyTree | None:
+    """Recursively replace template subtrees referenced by Orbax checkpoints."""
+    path = _orbax_checkpoint_path(override)
+    if path is not None:
+        return _load_orbax_checkpoint(path, template)
+    if override is None:
+        return template
+    if isinstance(override, Mapping) and isinstance(template, Mapping):
+        return {
+            key: _resolve_orbax_overlay(override[key], template[key]) if key in override else template[key]
+            for key in template
+        }
+    if isinstance(override, list) and isinstance(template, list):
+        if len(override) != len(template):
+            raise ValueError("Orbax override lists must match the parameter template length.")
+        return [_resolve_orbax_overlay(item, item_template) for item, item_template in zip(override, template)]
+    if isinstance(override, tuple) and isinstance(template, tuple):
+        if len(override) != len(template):
+            raise ValueError("Orbax override tuples must match the parameter template length.")
+        return tuple(_resolve_orbax_overlay(item, item_template) for item, item_template in zip(override, template))
+    return override
+
+
+def resolve_orbax_params(params: PyTree, template: PyTree | None = None) -> PyTree | None:
+    """Resolve direct parameters and nested Orbax checkpoint references.
+
+    A root checkpoint reference replaces the complete template. In an overlay
+    tree, ``None`` preserves a template subtree and each checkpoint reference
+    replaces its matching subtree while retaining static Equinox leaves.
+
+    :param params: direct parameter tree, checkpoint reference, or recursive override tree
+    :param template: complete parameter template used for static leaves and overlays
+    :return: resolved parameter tree, or ``None`` when a checkpoint has no latest step
+    """
+    if isinstance(params, Mapping) and set(params) == {"params"} and template is not None:
+        params = params["params"]
+    path = _orbax_checkpoint_path(params)
+    if path is not None:
+        return _load_orbax_checkpoint(path, template)
+    if template is not None and _contains_orbax_ref(params):
+        return _resolve_orbax_overlay(params, template)
+    return params
 
 
 class CheckpointerConfig(BaseModel):
@@ -667,6 +713,7 @@ class Train(Routine):
     :param diagnostics: configs for plotting and logging
     :param host_interval: global host synchronization interval; ``None`` synchronizes only at the final iteration
     :param checkpoint_interval: outer checkpoint check interval; ``None`` checks only at the final iteration
+    :param freeze_params: a partial tree indicating true, false, or iteration at which a params subtree should be frozen
 
     :param root: run directory for checkpoints, logs, and history (optional)
     :param write_policy: ``reuse`` restores checkpoints, ``overwrite`` replaces artifacts, ``error`` fails
@@ -689,12 +736,13 @@ class Train(Routine):
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     host_interval: PositiveInt | None = 1
     checkpoint_interval: PositiveInt | None = 1
+    freeze_params: PyTree | None = None
 
     # Persistence
     root: Path | None = None
     write_policy: Literal["reuse", "overwrite", "error"] = "reuse"
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
-    load_orbax: OrbaxParams | None = None
+    load_orbax: PyTree | None = None
 
     # Other
     init_seed: int = 0
@@ -729,7 +777,7 @@ class Train(Routine):
                         else:
                             ele.graph = self.graph
 
-            self.init_params = resolve_graph_refs(self.init_params, self.graph)
+            self.init_params = pytree_resolve_refs(self.init_params, self.graph, raise_on_missing=False)
 
         sample_fn = getattr(self.init_params, "sample", None)
         if callable(sample_fn):
@@ -761,6 +809,75 @@ class Train(Routine):
             root.mkdir(parents=True, exist_ok=True)
         
         return policy
+
+    def _freeze_label(self, path: tuple[Any, ...]) -> str:
+        """Return the Optax transform label selected for one parameter path."""
+        selector = self.freeze_params
+        for entry in path:
+            if isinstance(selector, bool) or isinstance(selector, int):
+                break
+            token = (
+                entry.key if hasattr(entry, "key") else entry.idx if hasattr(entry, "idx")
+                else entry.name if hasattr(entry, "name") else entry
+            )
+            if isinstance(selector, Mapping):
+                selector = selector.get(token, False)
+            elif isinstance(selector, tuple | list) and isinstance(token, int) and token < len(selector):
+                selector = selector[token]
+            elif selector is None:
+                selector = False
+            else:
+                raise ValueError(f"freeze_params cannot select parameter path {path!r}.")
+
+        if selector is None or selector is False:
+            return "train"
+        if selector is True:
+            return "freeze"
+        if isinstance(selector, int) and selector >= 0:
+            return f"until_{selector}"
+        raise ValueError(f"freeze_params leaf at {path!r} must be bool or a non-negative integer.")
+
+    def _build_optimizer(self, params: PyTree) -> optax.GradientTransformation:
+        """Build an Optax-native optimizer with configured frozen parameter groups."""
+        if self.freeze_params is None:
+            return self.optimizer
+
+        labels = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: self._freeze_label(path) if eqx.is_array(leaf) else "static",
+            params,
+        )
+        label_leaves, _ = jax.tree_util.tree_flatten(labels)
+        active_labels = {label for label in label_leaves if label != "static"}
+        transforms: dict[str, optax.GradientTransformation] = {
+            "train": self.optimizer,
+            "freeze": optax.freeze(True),
+            "static": optax.identity(),
+        }
+        for label in active_labels:
+            if label.startswith("until_"):
+                deadline = int(label.removeprefix("until_"))
+                transforms[label] = optax.conditionally_mask(
+                    self.optimizer,
+                    lambda step, limit=deadline: step < limit,
+                )
+        return optax.multi_transform(transforms, labels)
+
+    def _freeze_deadlines(self, params: PyTree) -> PyTree | None:
+        """Build a static PyTree of optimizer-step freeze deadlines."""
+        if self.freeze_params is None:
+            return None
+
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (
+                0 if self._freeze_label(path) == "freeze"
+                else int(self._freeze_label(path).removeprefix("until_"))
+                if self._freeze_label(path).startswith("until_")
+                else jnp.iinfo(jnp.int32).max
+            )
+            if eqx.is_array(leaf)
+            else jnp.iinfo(jnp.int32).max,
+            params,
+        )
     
     def run(self) -> int:
         """For compatibility with Routine."""
@@ -770,6 +887,8 @@ class Train(Routine):
     def __call__(self) -> PyTree:
 
         test_fn = self.test if self.test is not None else None
+        optimizer = self._build_optimizer(self.init_params)
+        freeze_deadlines = self._freeze_deadlines(self.init_params)
         _, static_params = eqx.partition(self.init_params, eqx.is_array)
         graph_loss = self.loss if isinstance(self.loss, GraphLoss) else None
         scheduled_graph_loss = graph_loss is not None and graph_loss.has_scheduled_terms
@@ -793,14 +912,36 @@ class Train(Routine):
             return eqx.combine(dynamic_params, static_params)
 
         def _apply_optimizer_update(params: PyTree, opt_state: optax.OptState, grads: PyTree):
-            updates, opt_state = self.optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
+            updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(params, eqx.is_array))
             params = eqx.apply_updates(params, updates)
-            grad_norm = pytree_norm(grads) if self.termination.grad_tol else None
+            grad_norm = pytree_norm(updates) if self.termination.grad_tol else None
             return params, opt_state, grad_norm
 
+        def _params_for_grad(params: PyTree, iteration: jax.Array) -> PyTree:
+            """Treat frozen leaves as constants before automatic differentiation."""
+            if freeze_deadlines is None:
+                return params
+
+            return jax.tree.map(
+                lambda leaf, deadline: (
+                    jax.lax.cond(
+                        iteration >= deadline,
+                        jax.lax.stop_gradient,
+                        lambda value: value,
+                        leaf,
+                    )
+                    if eqx.is_array(leaf)
+                    else leaf
+                ),
+                params,
+                freeze_deadlines,
+            )
+
         @eqx.filter_jit
-        def _train_step(params: PyTree, opt_state: optax.OptState, batch: PyTree):
-            loss, grads = eqx.filter_value_and_grad(self.loss)(params, batch)
+        def _train_step(params: PyTree, opt_state: optax.OptState, batch: PyTree, iteration: jax.Array):
+            loss, grads = eqx.filter_value_and_grad(
+                lambda candidate: self.loss(_params_for_grad(candidate, iteration), batch)
+            )(params)
             params, opt_state, grad_norm = _apply_optimizer_update(params, opt_state, grads)
             return params, opt_state, loss, grad_norm
 
@@ -815,7 +956,7 @@ class Train(Routine):
         ):
             def _loss(params: PyTree, batch: PyTree):
                 return graph_loss(
-                    params,
+                    _params_for_grad(params, iteration),
                     batch,
                     scales=scales,
                     iteration=iteration,
@@ -1001,15 +1142,15 @@ class Train(Routine):
                 if ckptr.latest is None:
                     params = self.init_params
                     if self.load_orbax is not None:
-                        params = self.load_orbax.resolve_params(self.init_params)
-                    opt_state = self.optimizer.init(eqx.filter(params, eqx.is_array))
+                        params = resolve_orbax_params(self.load_orbax, self.init_params)
+                    opt_state = optimizer.init(eqx.filter(params, eqx.is_array))
                     curr_step = 0
                     total_steps = self.termination.max_steps
                     logger.debug("Initialized train")
                 else:
                     abstract_checkpointables = {
                         "params": _checkpoint_params(self.init_params),
-                        "opt_state": self.optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
+                        "opt_state": optimizer.init(eqx.filter(self.init_params, eqx.is_array)),
                     }
                     if loss_state is not None:
                         abstract_checkpointables["loss_state"] = loss_state.checkpoint_tree()
@@ -1270,7 +1411,7 @@ class Train(Routine):
                                             active_terms,
                                         )
                                     else:
-                                        train_result = _train_step(params, opt_state, batch)
+                                        train_result = _train_step(params, opt_state, batch, iteration)
 
                             if curr_step < self.termination.max_steps:
                                 try:

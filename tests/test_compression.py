@@ -5,9 +5,9 @@ import numpy as np
 import pytest
 from pydantic import TypeAdapter
 
-from romjax.compare import OrbaxParams
 from romjax.compression import SVD, Compression
 from romjax.nn import LinearProjection
+from romjax.train import resolve_orbax_params
 
 
 def _sample_pytree() -> list[dict[str, dict[str, jnp.ndarray]]]:
@@ -82,7 +82,7 @@ def test_svd_orbax_checkpoint_matches_nested_compare_template(tmp_path):
         "coordinate transform": {"call_args": LinearProjection(matrix=jnp.zeros((2, 4)), bias=jnp.zeros(4))},
         "residual transform": None,
     }
-    params = OrbaxParams(params=checkpoint_dir).resolve_params(params_template)
+    params = resolve_orbax_params(checkpoint_dir, params_template)
 
     projection = params["coordinate transform"]["call_args"]
     assert isinstance(projection, LinearProjection)

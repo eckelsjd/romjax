@@ -1,4 +1,5 @@
 """Utilites for PDE-based solvers."""
+from collections.abc import Mapping
 from enum import IntEnum
 from functools import partial
 from pathlib import Path
@@ -9,6 +10,7 @@ import equinox as eqx
 import equinox.internal as eqxi
 import jax
 import jax.numpy as jnp
+import lineax as lx
 import numpy as np
 import optimistix as optx
 from alive_progress import alive_bar
@@ -29,17 +31,22 @@ from pydantic import (
 
 from romjax.compression import Compression
 from romjax.graph import CompositeEdge, EdgePatch
-from romjax.model import SourceSampleable
+from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
+from romjax.nn import Affine
 from romjax.rng import PyTreeSampler, SamplerCallable
 from romjax.tree import TreePath, pytree_merge, set_subtree
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'InitializeCallable', 'ForcingCallable', 'IterativeSolver', 'RegisteredInitialize', 'ConstantInitialize',
-           'LatentSamplerFactory', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
+           'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
+type LinearSolver = Annotated[
+    ThirdPartyType(default_modules=lx.__name__),
+    AfterValidator(partial(require_type, lx.AbstractLinearSolver)),
+]
 
 
 class InitializeCallable(CallableModel):
@@ -636,6 +643,133 @@ class LatentSamplerFactory(CallableModel):
     """Factory for building a source sampler from latent size and latent bounds."""
 
     callable: Callable[[Compression], SamplerCallable] = _default_latent_sampler
+
+
+class ImplicitAffine(ImplicitModel, ImplicitSampleable):
+    """Invertible input-conditioned affine residual model in latent space.
+
+    $f(u;b) = A(b)u + c(b)$ for inputs $b$ and outputs $u$.
+
+    Inputs are a mapping with latent ``values`` and a runtime
+    :class:`~romjax.nn.Affine` under ``call_args``. Compression artifacts
+    provide ranks and default latent samplers without becoming part of the
+    numerical JAX path.
+    """
+
+    solver: LinearSolver = Field(default_factory=lambda: lx.AutoLinearSolver(well_posed=True))
+    inputs_compression: Path | str | Compression | None = None
+    outputs_compression: Path | str | Compression | None = None
+    inputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
+        default_factory=lambda: LatentSamplerFactory(
+            callable=partial(_default_latent_sampler, path=("values",))
+        )
+    )
+    outputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
+    _resolved_inputs_compression: Compression | None = PrivateAttr(default=None)
+    _resolved_outputs_compression: Compression | None = PrivateAttr(default=None)
+    _resolved_inputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
+    _resolved_outputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
+
+    def _resolve_compression(self, artifact: Path | str | Compression | None, cache_name: str) -> Compression | None:
+        cached = getattr(self, cache_name)
+        if cached is not None:
+            return cached
+        if isinstance(artifact, Compression):
+            object.__setattr__(self, cache_name, artifact)
+            return artifact
+        if isinstance(artifact, str | Path) and Path(artifact).exists():
+            compression = Compression.load(Path(artifact))
+            object.__setattr__(self, cache_name, compression)
+            return compression
+        return None
+
+    def resolve_inputs_compression(self) -> Compression | None:
+        """Resolve the input compression artifact."""
+        return self._resolve_compression(self.inputs_compression, "_resolved_inputs_compression")
+
+    def resolve_outputs_compression(self) -> Compression | None:
+        """Resolve the output compression artifact."""
+        return self._resolve_compression(self.outputs_compression, "_resolved_outputs_compression")
+
+    def resolve_inputs_rank(self) -> int | None:
+        """Resolve the input latent rank from its compression artifact."""
+        compression = self.resolve_inputs_compression()
+        return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
+
+    def resolve_outputs_rank(self) -> int | None:
+        """Resolve the output latent rank from its compression artifact."""
+        compression = self.resolve_outputs_compression()
+        return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
+
+    def _resolve_sampler(
+        self,
+        sampler: LatentSamplerFactory | SamplerCallable | None,
+        compression: Compression | None,
+        cache_name: str,
+    ) -> SamplerCallable | None:
+        cached = getattr(self, cache_name)
+        if cached is not None:
+            return cached
+        if isinstance(sampler, SamplerCallable):
+            object.__setattr__(self, cache_name, sampler)
+            return sampler
+        if sampler is not None and compression is not None:
+            resolved = sampler(compression)
+            object.__setattr__(self, cache_name, resolved)
+            return resolved
+        return None
+
+    def _affine_inputs(self, inputs: PyTree) -> tuple[ArrayLike, Affine]:
+        """Extract latent inputs and the runtime affine module from the input PyTree."""
+        if not isinstance(inputs, Mapping) or "values" not in inputs or "call_args" not in inputs:
+            raise TypeError("ImplicitAffine inputs must contain 'values' and runtime 'call_args'.")
+        return jnp.asarray(inputs["values"]), self._affine(inputs["call_args"])
+
+    def _affine(self, call_args: Any) -> Affine:
+        if isinstance(call_args, Affine):
+            return call_args
+        if isinstance(call_args, Mapping) and isinstance(call_args.get("affine"), Affine):
+            return call_args["affine"]
+        raise TypeError("ImplicitAffine requires an Affine instance in edge payload call_args.")
+
+    def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
+        """Evaluate ``A(inputs) @ outputs + c(inputs)``.
+
+        :param inputs: input payload containing latent ``values`` and ``call_args``
+        :param outputs: output latent vector
+        :return: residual latent vector
+        """
+        values, affine = self._affine_inputs(inputs)
+        matrix, offset = affine.materialize(values)
+        return matrix @ jnp.asarray(outputs) + offset
+
+    def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
+        """Solve the affine residual equation for output latent coordinates."""
+        values, affine = self._affine_inputs(inputs)
+        matrix, offset = affine.materialize(values)
+        return lx.linear_solve(
+            lx.MatrixLinearOperator(matrix),
+            jnp.asarray(residuals) - offset,
+            solver=self.solver,
+        ).value
+
+    def sample_inputs(self, key: Key) -> PyTree:
+        """Sample an input latent vector."""
+        sampler = self._resolve_sampler(
+            self.inputs_sampler, self.resolve_inputs_compression(), "_resolved_inputs_sampler"
+        )
+        if sampler is None:
+            raise ValueError("ImplicitAffine input sampler could not be resolved.")
+        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
+
+    def sample_outputs(self, key: Key, inputs: PyTree | None = None, solution: PyTree | None = None) -> PyTree:
+        """Sample an output latent vector, optionally conditioned on a solution."""
+        sampler = self._resolve_sampler(
+            self.outputs_sampler, self.resolve_outputs_compression(), "_resolved_outputs_sampler"
+        )
+        if sampler is None:
+            raise ValueError("ImplicitAffine output sampler could not be resolved.")
+        return sampler(key, inputs=inputs, solution=solution)
 
 
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
