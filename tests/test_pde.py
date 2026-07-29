@@ -9,9 +9,11 @@ import pytest
 from romjax.compression import SVD
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
+from romjax.nn import Affine
 from romjax.pde import (
     AliveProgressMeter,
     BoundaryType,
+    ImplicitAffine,
     ImplicitIterativeGalerkin,
     LatentSamplerFactory,
     UniformGrid,
@@ -232,6 +234,44 @@ def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Pat
     assert sample["outputs"].shape == (2,)
     assert jnp.all(sample["outputs"] >= jnp.asarray([-1.0, -2.0]))
     assert jnp.all(sample["outputs"] <= jnp.asarray([1.0, 2.0]))
+
+
+def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
+    compression = SVD(
+        energy_tol=0.9,
+        center=False,
+        rank=2,
+        mean=np.zeros(2),
+        basis=np.eye(2),
+        singular_values=np.ones(2),
+        minval=-np.ones(2),
+        maxval=np.ones(2),
+        latent_mean=np.zeros(2),
+        latent_std=np.ones(2),
+    )
+    inputs_path = tmp_path / "inputs.npz"
+    outputs_path = tmp_path / "outputs.npz"
+    compression.dump(inputs_path)
+    compression.dump(outputs_path)
+    affine = Affine(
+        matrix_basis=jnp.asarray([[[0.0, 0.2], [-0.1, 0.0]], [[0.1, 0.0], [0.0, -0.1]], [[0.0, 0.0], [0.0, 0.0]]]),
+        offset_basis=jnp.asarray([[0.2, -0.1], [0.1, 0.0], [0.0, 0.1]]),
+    )
+    edge = ImplicitAffine(inputs_compression=inputs_path, outputs_compression=outputs_path)
+    inputs = jnp.asarray([0.3, -0.4])
+    outputs = jnp.asarray([0.5, -0.2])
+    runtime_inputs = {"values": inputs, "call_args": affine}
+    residuals = edge.evaluate(runtime_inputs, outputs)
+
+    assert edge.resolve_inputs_rank() == 2
+    assert edge.resolve_outputs_rank() == 2
+    assert jnp.allclose(edge.solve(runtime_inputs, residuals), outputs)
+    assert jnp.allclose(
+        edge.forward({"inputs": runtime_inputs, "outputs": outputs})["residuals"],
+        residuals,
+    )
+    assert edge.sample_inputs(jax.random.key(0))["values"].shape == (2,)
+    assert edge.sample_outputs(jax.random.key(1))["outputs"].shape == (2,)
 
 
 def test_alive_progress_meter_is_jit_compatible() -> None:

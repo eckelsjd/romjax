@@ -3,7 +3,79 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key
 
-__all__ = ["LinearProjection"]
+__all__ = ["Affine", "LinearProjection"]
+
+
+class Affine(eqx.Module):
+    """Input-conditioned invertible affine operator in latent coordinates.
+
+    The matrix generator and offset are affine in ``inputs``. The actual
+    residual matrix is the matrix exponential of the generator, which is
+    invertible for every finite input.
+    """
+
+    matrix_basis: ArrayLike  # (inputs_rank + 1, outputs_rank, outputs_rank)
+    offset_basis: ArrayLike  # (inputs_rank + 1, outputs_rank)
+
+    def __init__(
+        self,
+        inputs_rank: int | None = None,
+        outputs_rank: int | None = None,
+        key: Key | None = None,
+        matrix_basis: ArrayLike | None = None,
+        offset_basis: ArrayLike | None = None,
+        scale: float = 0.25,
+    ) -> None:
+        """
+        Initialize affine bases.
+
+        :param inputs_rank: input latent dimension for random initialization
+        :param outputs_rank: output latent dimension for random initialization
+        :param key: JAX random key for random initialization
+        :param matrix_basis: explicit generator bases with shape
+            ``(inputs_rank + 1, outputs_rank, outputs_rank)``
+        :param offset_basis: explicit offset bases with shape
+            ``(inputs_rank + 1, outputs_rank)``
+        :param scale: random initialization scale
+        """
+        if matrix_basis is not None or offset_basis is not None:
+            if matrix_basis is None or offset_basis is None:
+                raise ValueError("Affine requires both matrix_basis and offset_basis when explicitly initialized.")
+            self.matrix_basis = jnp.asarray(matrix_basis)
+            self.offset_basis = jnp.asarray(offset_basis)
+            if self.matrix_basis.ndim != 3 or self.offset_basis.ndim != 2:
+                raise ValueError("Affine basis arrays must have dimensions 3 and 2 respectively.")
+            expected = (self.matrix_basis.shape[0], self.matrix_basis.shape[1])
+            if self.matrix_basis.shape[1:] != (self.matrix_basis.shape[2], self.matrix_basis.shape[2]):
+                raise ValueError("matrix_basis must have square output matrices.")
+            if self.offset_basis.shape != expected:
+                raise ValueError(f"offset_basis must have shape {expected}, got {self.offset_basis.shape}.")
+            return
+
+        if key is None or inputs_rank is None or outputs_rank is None:
+            raise ValueError("Affine requires explicit bases or inputs_rank, outputs_rank, and key.")
+        matrix_key, offset_key = jax.random.split(key)
+        self.matrix_basis = scale * jax.random.normal(matrix_key, (inputs_rank + 1, outputs_rank, outputs_rank))
+        self.offset_basis = scale * jax.random.normal(offset_key, (inputs_rank + 1, outputs_rank))
+
+    def materialize(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
+        """Materialize the invertible matrix and offset for one input vector.
+
+        :param inputs: latent input vector with shape ``(inputs_rank,)``
+        :return: ``(matrix, offset)`` with shapes ``(outputs_rank, outputs_rank)``
+            and ``(outputs_rank,)``
+        """
+        values = jnp.asarray(inputs)
+        if values.ndim != 1 or values.shape[0] != self.matrix_basis.shape[0] - 1:
+            raise ValueError(f"inputs must have shape {(self.matrix_basis.shape[0] - 1,)}, got {values.shape}.")
+        coefficients = jnp.concatenate((jnp.ones((1,), dtype=values.dtype), values))
+        generator = jnp.einsum("i,ijk->jk", coefficients, self.matrix_basis)
+        offset = jnp.einsum("i,ij->j", coefficients, self.offset_basis)
+        return jax.scipy.linalg.expm(generator), offset
+
+    def __call__(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
+        """Alias for :meth:`materialize`."""
+        return self.materialize(inputs)
 
 
 class LinearProjection(eqx.Module):

@@ -25,9 +25,15 @@ from romjax.nn import LinearProjection
 from romjax.pde import ImplicitIterativeGalerkin
 from romjax.rng import PyTreeSampler
 from romjax.routine import RoutineError
-from romjax.train import BatchLoader, CheckpointerConfig, DiagnosticsConfig, OrbaxParams, TerminationConfig, Train
-from romjax.tree import is_shape_dtype, pytree_norm, pytree_resolve_refs
-from romjax.typing import GraphRef
+from romjax.train import (
+    BatchLoader,
+    CheckpointerConfig,
+    DiagnosticsConfig,
+    TerminationConfig,
+    Train,
+    resolve_orbax_params,
+)
+from romjax.tree import TreeRef, is_shape_dtype, pytree_norm, pytree_resolve_refs
 from romjax.utils import save_h5
 
 train_module = importlib.import_module("romjax.train")
@@ -45,6 +51,11 @@ def scalar_zero_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
 
 def scalar_quadratic_test(params: dict[str, jax.Array]) -> jax.Array:
     return jnp.abs(params["w"] - 1.0)
+
+
+def two_parameter_quadratic_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
+    del batch
+    return jnp.square(params["train"] - 1.0) + jnp.square(params["frozen"] - 1.0)
 
 
 def mlp_quadratic_loss(params: eqx.nn.MLP, batch: object) -> jax.Array:
@@ -683,7 +694,7 @@ def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
         load_orbax=checkpoint_root,
     )
 
-    assert isinstance(train.load_orbax, OrbaxParams)
+    assert train.load_orbax == checkpoint_root
     assert train.run() == 0
     assert _history_csv(root / "loss.csv")[1].tolist() == pytest.approx([4.0, 2.56])
 
@@ -715,15 +726,9 @@ def test_train_load_orbax_uses_eqx_static_template(tmp_path: Path) -> None:
     np.testing.assert_allclose(loaded_params.layers[0].bias, source_params.layers[0].bias)
 
 
-def test_orbax_params_compare_import_compatibility() -> None:
-    from romjax.compare import OrbaxParams as CompareOrbaxParams
-
-    assert CompareOrbaxParams is OrbaxParams
-
-
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
-def test_orbax_params_resolve_params_accepts_shape_dtype_template(tmp_path: Path) -> None:
+def test_resolve_orbax_params_accepts_shape_dtype_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "shape_dtype_template"
     source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
     template = {
@@ -734,7 +739,7 @@ def test_orbax_params_resolve_params_accepts_shape_dtype_template(tmp_path: Path
     with ocp.training.Checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
 
-    loaded_params = OrbaxParams(params=checkpoint_root).resolve_params(template)
+    loaded_params = resolve_orbax_params(checkpoint_root, template)
 
     assert loaded_params is not None
     np.testing.assert_allclose(loaded_params["w"], source_params["w"])
@@ -743,7 +748,7 @@ def test_orbax_params_resolve_params_accepts_shape_dtype_template(tmp_path: Path
 
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
-def test_orbax_params_resolve_params_accepts_yaml_shape_dtype_template(tmp_path: Path) -> None:
+def test_resolve_orbax_params_accepts_yaml_shape_dtype_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "yaml_shape_dtype_template"
     source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
     template = {"w": {"shape": [2], "dtype": "float32"}, "b": {"shape": []}}
@@ -751,11 +756,27 @@ def test_orbax_params_resolve_params_accepts_yaml_shape_dtype_template(tmp_path:
     with ocp.training.Checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
 
-    loaded_params = OrbaxParams(params=checkpoint_root).resolve_params(template)
+    loaded_params = resolve_orbax_params(checkpoint_root, template)
 
     assert loaded_params is not None
     np.testing.assert_allclose(loaded_params["w"], source_params["w"])
     np.testing.assert_allclose(loaded_params["b"], source_params["b"])
+
+
+@pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
+@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+def test_resolve_orbax_params_partially_overrides_template(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path.resolve() / "partial"
+    source_params = {"weight": jnp.array(3.0)}
+    template = {"left": {"weight": jnp.array(0.0)}, "right": {"weight": jnp.array(1.0)}}
+    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+        ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
+
+    params = resolve_orbax_params({"left": checkpoint_root, "right": None}, template)
+
+    assert params is not None
+    assert float(params["left"]["weight"]) == 3.0
+    assert float(params["right"]["weight"]) == 1.0
 
 
 def test_basic_batch_loader():
@@ -795,6 +816,36 @@ def test_train_convergence():
     expected = {"x": jnp.array([1.0, 1.0])}
     assert jnp.allclose(params["x"], expected["x"], atol=1e-3)
     assert float(rosenbrock_loss(params, None)) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_train_freeze_params_uses_optax_transforms() -> None:
+    train = Train(
+        loss=two_parameter_quadratic_loss,
+        init_params={"train": jnp.array(0.0), "frozen": jnp.array(0.0)},
+        freeze_params={"frozen": True},
+        optimizer=optax.sgd(0.2),
+        termination=TerminationConfig(max_steps=3),
+    )
+
+    params = train()
+
+    assert float(params["frozen"]) == 0.0
+    assert float(params["train"]) > 0.0
+
+
+def test_train_freezes_parameter_after_configured_step() -> None:
+    train = Train(
+        loss=two_parameter_quadratic_loss,
+        init_params={"train": jnp.array(0.0), "frozen": jnp.array(0.0)},
+        freeze_params={"frozen": 1},
+        optimizer=optax.sgd(0.2),
+        termination=TerminationConfig(max_steps=3),
+    )
+
+    params = train()
+
+    assert float(params["frozen"]) == pytest.approx(0.4)
+    assert float(params["train"]) > float(params["frozen"])
 
 
 def test_train_recompiles_at_ramp_start_and_completes_scheduled_ramp(toy_graph: FunctionGraph) -> None:
@@ -1019,7 +1070,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     assert scaled_terms["term_0"] == pytest.approx(loss_value)
 
     reference = GraphLoss(terms=[{"term": graph_reference_loss, "dataset": "toy"}], graph=toy_graph)
-    ref_params = {"toy": {"weight": jnp.array(0.5), "alias": "toy,weight"}}
+    ref_params = {"toy": {"weight": jnp.array(0.5), "alias": TreeRef(path=("toy", "weight"))}}
     resolved_params = pytree_resolve_refs(ref_params)
     assert reference(ref_params, batch) == pytest.approx(squared(params, batch))
     assert eqx.filter_jit(reference)(ref_params, batch) == pytest.approx(squared(params, batch))
@@ -1318,7 +1369,7 @@ def test_train_initialization_resolves_graph_latent_dim_from_source_sampler(tmp_
                 "module": {
                     "name": "LinearProjection",
                     "kwargs": {
-                        "latent": GraphRef(path=("edges", "galerkin", "compression", "rank")),
+                        "latent": TreeRef(path=("edges", "galerkin", "compression", "rank")),
                         "dof": 4,
                     },
                 }
