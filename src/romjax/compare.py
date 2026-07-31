@@ -121,10 +121,15 @@ class CompareTable(CompareOrbax):
     Will write/load table results from a yaml file of this format. Cases are loaded from orbax checkpoints. 
     Metrics are callable of the form `f(params, data) -> float`. 
     Stats are computed over all data loaded from each dataloader.
+
+    :param dataset_cases: optional per-dataset case mappings. A supplied mapping
+        replaces the global ``cases`` mapping for that dataset; datasets not
+        listed here use the global cases.
     """
 
     dataloaders: SkipValidation[Mapping[str, Iterable[Any]]]
     metrics: Mapping[str, Callable[[PyTree, Any], float]]
+    dataset_cases: Mapping[str, Mapping[str, PyTree]] | None = None
 
     stats: Mapping[str, UnaryOp] = Field(default_factory=lambda: ["mean", "std"])
     latex_template: str | None = None
@@ -189,6 +194,32 @@ class CompareTable(CompareOrbax):
 
         return self
 
+    @model_validator(mode="after")
+    def _validate_dataset_cases(self):
+        """Validate optional per-dataset case overrides."""
+        if self.dataset_cases is None:
+            return self
+
+        unknown_datasets = set(self.dataset_cases) - set(self.dataloaders)
+        if unknown_datasets:
+            raise ValueError(f"dataset_cases contains unknown datasets: {sorted(unknown_datasets)}")
+
+        known_cases = set(self.cases)
+        for dataset_name, cases in self.dataset_cases.items():
+            unknown_cases = set(cases) - known_cases
+            if unknown_cases:
+                raise ValueError(
+                    f"dataset_cases[{dataset_name!r}] contains unknown cases: {sorted(unknown_cases)}"
+                )
+
+        return self
+
+    def _cases_for_dataset(self, dataset_name: str) -> Mapping[str, PyTree]:
+        """Return the cases active for one dataset."""
+        if self.dataset_cases is not None and dataset_name in self.dataset_cases:
+            return self.dataset_cases[dataset_name]
+        return self.cases
+
     def _format_table(self, data: Mapping) -> list[list[str]]:
         """Format computed comparison values as case rows with metric/dataset columns."""
         rows = []
@@ -197,6 +228,12 @@ class CompareTable(CompareOrbax):
             for metric_name in self.metrics:
                 metric_data = case_data.get(metric_name, {})
                 for dataset_name in self.dataloaders:
+                    if (
+                        self.dataset_cases is not None
+                        and case_name not in self._cases_for_dataset(dataset_name)
+                    ) or dataset_name not in metric_data:
+                        row.append("")
+                        continue
                     dataset = dict(metric_data.get(dataset_name, {}))
                     if "std" in dataset:
                         dataset["std"] = 2.0 * dataset["std"]
@@ -221,7 +258,7 @@ class CompareTable(CompareOrbax):
         case_labels = cfg.case_labels or {}
         dataset_names = list(self.dataloaders)
         metric_names = list(self.metrics)
-        case_names = list(self.cases)
+        case_indices = {case_name: index for index, case_name in enumerate(self.cases)}
         prop_cycle = rcParams["axes.prop_cycle"].by_key()
         default_colors = prop_cycle.get("color", [])
         case_colors = cfg.colors or {}
@@ -231,9 +268,10 @@ class CompareTable(CompareOrbax):
         plots = []
         for row_idx, dataset_name in enumerate(dataset_names):
             row = []
+            case_names = list(self._cases_for_dataset(dataset_name))
             for col_idx, metric_name in enumerate(metric_names):
                 specs = []
-                for case_idx, case_name in enumerate(case_names):
+                for case_name in case_names:
                     try:
                         values = distributions[case_name][metric_name][dataset_name]
                     except KeyError as exc:
@@ -262,7 +300,7 @@ class CompareTable(CompareOrbax):
                                     {"color": case_colors[case_name]}
                                     if case_name in case_colors
                                     else (
-                                        {"color": default_colors[case_idx % len(default_colors)]}
+                                        {"color": default_colors[case_indices[case_name] % len(default_colors)]}
                                         if default_colors
                                         else {}
                                     )
@@ -375,22 +413,23 @@ class CompareTable(CompareOrbax):
             if dist_file.exists():
                 distributions = load_h5({}, dist_file, jax=False)
         
-        num_items = len(self.cases) * len(self.metrics)
+        num_items = sum(
+            len(self._cases_for_dataset(dataset_name)) * len(self.metrics)
+            for dataset_name in self.dataloaders
+        )
         ctxt = alive_bar(num_items) if self.show_progress else _NullProgress()
 
         with ctxt as bar:
-            for case_name, case in self.cases.items():
-                bar.text(f"Comparing case: {case_name}")
-                case_results = tab_results.setdefault(case_name, {})
-                case_distributions = distributions.setdefault(case_name, {})
+            for ds_name, loader in self.dataloaders.items():
+                for case_name, case in self._cases_for_dataset(ds_name).items():
+                    bar.text(f"Comparing case: {case_name} on dataset: {ds_name}")
+                    case_results = tab_results.setdefault(case_name, {})
+                    case_distributions = distributions.setdefault(case_name, {})
+                    params = resolve_orbax_params(case, self.params_template[case_name])
 
-                params = resolve_orbax_params(case, self.params_template[case_name])
-
-                for metric_name, metric_fn in self.metrics.items():
-                    metric_results = case_results.setdefault(metric_name, {})
-                    metric_distributions = case_distributions.setdefault(metric_name, {})
-                
-                    for ds_name, loader in self.dataloaders.items():
+                    for metric_name, metric_fn in self.metrics.items():
+                        metric_results = case_results.setdefault(metric_name, {})
+                        metric_distributions = case_distributions.setdefault(metric_name, {})
                         ds_results = metric_results.setdefault(ds_name, {})
 
                         has_stats = all(stat_name in ds_results for stat_name in self.stats)
@@ -402,6 +441,7 @@ class CompareTable(CompareOrbax):
                                 f"and write_policy='error'"
                             )
                         if has_stats and has_distribution and self.write_policy == "reuse":
+                            bar()
                             continue
 
                         if has_distribution and self.write_policy == "reuse":
@@ -415,8 +455,8 @@ class CompareTable(CompareOrbax):
 
                         for stat_name, stat_fn in self.stats.items():
                             ds_results[stat_name] = float(stat_fn(results))
-                        
-                    bar()
+
+                        bar()
         
         if self.root is not None:
             tab_file = self.root / self.filename

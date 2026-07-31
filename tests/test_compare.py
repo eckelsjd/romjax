@@ -339,6 +339,108 @@ def test_compare_table_histogram_uses_per_case_alpha_and_colors(
     assert second.kwargs["color"] == "royalblue"
 
 
+def test_compare_table_supports_per_dataset_cases_and_sparse_tables(tmp_path: Path) -> None:
+    compare = CompareTable(
+        root=tmp_path / "compare",
+        show_table=False,
+        show_progress=False,
+        cases={
+            "first": {"w": jnp.array(0.0)},
+            "second": {"w": jnp.array(0.0)},
+        },
+        dataset_cases={
+            "train": {
+                "first": {"w": jnp.array(0.0)},
+                "second": {"w": jnp.array(1.0)},
+            },
+            "test": {"first": {"w": jnp.array(2.0)}},
+        },
+        params_template={"w": jnp.array(0.0)},
+        dataloaders={
+            "train": FiniteLoader([{"x": jnp.array(0.0)}, {"x": jnp.array(1.0)}]),
+            "test": FiniteLoader([{"x": jnp.array(2.0)}]),
+        },
+        metrics={"sq": squared_error},
+        stats=["mean"],
+        col_format="{mean:.1f}",
+    )
+
+    assert compare.run() == 0
+
+    result_path = tmp_path / "compare" / "compare_table.yml"
+    results = yaml.safe_load(result_path.read_text(encoding="utf-8"))
+    assert results["first"]["sq"]["train"]["mean"] == pytest.approx(0.5)
+    assert results["first"]["sq"]["test"]["mean"] == pytest.approx(0.0)
+    assert results["second"]["sq"]["train"]["mean"] == pytest.approx(0.5)
+    assert "test" not in results["second"]["sq"]
+
+    assert compare._format_table(results) == [["first", "0.5", "0.0"], ["second", "0.5", ""]]
+    tex = (tmp_path / "compare" / "compare_table.tex").read_text(encoding="utf-8")
+    assert "second & 0.5 &  \\\\" in tex
+
+    distributions = load_h5({}, tmp_path / "compare" / "compare_table.h5", jax=False)
+    assert "test" not in distributions["second"]["sq"]
+
+
+def test_compare_table_per_dataset_histograms_keep_case_colors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = {}
+
+    def capture_gridplot(plots, **cfg):
+        calls["plots"] = plots
+        Path(cfg["save"]).touch()
+        return None, None
+
+    monkeypatch.setattr("romjax.compare.gridplot", capture_gridplot)
+
+    compare = CompareTable(
+        root=tmp_path / "compare",
+        show_table=False,
+        show_progress=False,
+        cases={
+            "first": {"w": jnp.array(0.0)},
+            "second": {"w": jnp.array(1.0)},
+        },
+        dataset_cases={"test": {"first": {"w": jnp.array(2.0)}}},
+        params_template={"w": jnp.array(0.0)},
+        dataloaders={
+            "train": FiniteLoader([{"x": jnp.array(0.0)}]),
+            "test": FiniteLoader([{"x": jnp.array(2.0)}]),
+        },
+        metrics={"sq": squared_error},
+        stats=["mean"],
+        col_format="{mean:.1f}",
+        hist=True,
+    )
+
+    assert compare.run() == 0
+
+    assert len(calls["plots"]) == 2
+    assert len(calls["plots"][0][0]) == 2
+    assert len(calls["plots"][1][0]) == 1
+    assert calls["plots"][0][0][0].kwargs["color"] == calls["plots"][1][0][0].kwargs["color"]
+
+
+def test_compare_table_rejects_unknown_dataset_cases() -> None:
+    with pytest.raises(ValueError, match="unknown datasets"):
+        CompareTable(
+            cases={"case": {"w": jnp.array(0.0)}},
+            dataset_cases={"validation": {"case": {"w": jnp.array(0.0)}}},
+            dataloaders={"train": FiniteLoader([])},
+            metrics={"sq": squared_error},
+        )
+
+    with pytest.raises(ValueError, match="unknown cases"):
+        CompareTable(
+            cases={"case": {"w": jnp.array(0.0)}},
+            dataset_cases={"train": {"other": {"w": jnp.array(0.0)}}},
+            dataloaders={"train": FiniteLoader([])},
+            metrics={"sq": squared_error},
+        )
+
+
 def test_compare_table_iterates_dataloader_style_batch_mappings(tmp_path: Path) -> None:
     compare = CompareTable(
         root=tmp_path / "compare",
