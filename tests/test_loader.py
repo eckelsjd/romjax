@@ -7,7 +7,8 @@ import pytest
 
 from romjax import YamlLoader, YamlSource
 from romjax.model import ImplicitModel
-from romjax.poisson import GaussianForcing, Poisson2D
+from romjax.pde import GaussianForcing
+from romjax.poisson import Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler
 
 

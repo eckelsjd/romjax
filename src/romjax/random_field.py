@@ -41,7 +41,7 @@ class KLEConfig(DictModel):
     :param weight_opts: options to pass to weight function
     """
 
-    bounds: tuple[tuple[float, float], ...] | tuple[float, float] = (0.0, 1.0)
+    bounds: tuple[tuple[Any, Any], ...] | tuple[Any, Any] = (0.0, 1.0)
     shape: tuple[PositiveInt, ...] | PositiveInt = 16
     truncation: tuple[PositiveInt, ...] | PositiveInt | None = None
     correlation_lengths: tuple[PositiveFloat, ...] | PositiveFloat = 0.2
@@ -119,6 +119,11 @@ class KLEConfig(DictModel):
             raise ValueError("correlation_lengths must match the number of bounds.")
 
         for lower, upper in self.bounds:
+            # Bounds inferred from coordinates may be tracers while the sampler is
+            # being staged by ``jax.jit``. Defer their runtime ordering to the
+            # numerical path, while retaining validation for ordinary configs.
+            if isinstance(lower, jax.core.Tracer) or isinstance(upper, jax.core.Tracer):
+                continue
             if upper <= lower:
                 raise ValueError("Grid bounds must be ordered as (lower, upper).")
 

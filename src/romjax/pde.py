@@ -38,7 +38,8 @@ from romjax.tree import TreePath, pytree_merge, set_subtree
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
-           'InitializeCallable', 'ForcingCallable', 'IterativeSolver', 'RegisteredInitialize', 'ConstantInitialize',
+           'ForcingCallable', 'RegisteredForcing', 'FORCING_REGISTRY', 'IdentityInputs', 'ConstantForcing',
+           'GaussianForcing', 'SinusoidForcing', 'IterativeSolver',
            'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
@@ -46,29 +47,6 @@ type Coordinates = tuple[ArrayLike, ...] | ArrayLike
 type LinearSolver = Annotated[
     ThirdPartyType(default_modules=lx.__name__),
     AfterValidator(partial(require_type, lx.AbstractLinearSolver)),
-]
-
-
-class InitializeCallable(CallableModel):
-
-    def __call__(self, coords: Coordinates) -> ArrayLike:
-        return super().__call__(coords)
-
-
-class ConstantInitialize(InitializeCallable):
-    const: ArrayLike = 0.0
-
-    def callable(self, coords: Coordinates) -> ArrayLike:
-        return self.const * jnp.ones_like(coords[0] if isinstance(coords, tuple) else coords)
-    
-
-_initialize_registry = {
-    "constant": ConstantInitialize
-}
-
-type RegisteredInitialize = Annotated[
-    InitializeCallable, 
-    BeforeValidator(partial(from_registry, _initialize_registry))
 ]
 
 
@@ -106,6 +84,79 @@ class IdentityInputs(ForcingCallable):
     def callable(self, inputs, outputs):
         """Simple boundary that uses boundary input params directly (just pass them through)."""
         return inputs
+
+
+class ConstantForcing(ForcingCallable):
+    """Return a constant scalar or broadcastable field."""
+
+    class Inputs(DictModel):
+        const: ArrayLike = 0.0
+
+    def callable(self, inputs: Inputs, outputs: PyTree) -> ArrayLike:
+        """Return the configured constant value.
+
+        :param inputs: constant forcing parameters
+        :param outputs: current model outputs, unused
+        :return: constant scalar or field
+        """
+        del outputs
+        return inputs["const"]
+
+
+class GaussianForcing(ForcingCallable):
+    """Return a two-dimensional Gaussian bump with an optional offset."""
+
+    class Inputs(DictModel):
+        A0: ArrayLike = 1.0
+        offset: ArrayLike = 0.0
+        sigma: ArrayLike = 1.0
+        mu_x: ArrayLike = 0.0
+        mu_y: ArrayLike = 0.0
+        coords: Coordinates = (0.0, 0.0)
+
+    def callable(self, inputs: Inputs, outputs: PyTree) -> ArrayLike:
+        r"""Evaluate ``offset + A0 exp(-((x-mu_x)^2 + (y-mu_y)^2)/(2 sigma))``.
+
+        :param inputs: Gaussian parameters and coordinates
+        :param outputs: current model outputs, unused
+        :return: Gaussian field
+        """
+        del outputs
+        dx = inputs["coords"][0] - inputs["mu_x"]
+        dy = inputs["coords"][1] - inputs["mu_y"]
+        return inputs["offset"] + inputs["A0"] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs["sigma"]))
+
+
+class SinusoidForcing(ForcingCallable):
+    """Return the manufactured-solution sinusoidal forcing field."""
+
+    class Inputs(DictModel):
+        coords: Coordinates = (0.0, 0.0)
+
+    def callable(self, inputs: Inputs, outputs: PyTree) -> ArrayLike:
+        """Evaluate ``2 pi^2 sin(pi x) sin(pi y)``.
+
+        :param inputs: coordinates
+        :param outputs: current model outputs, unused
+        :return: sinusoidal field
+        """
+        del outputs
+        return 2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs["coords"][0]) * jnp.sin(
+            jnp.pi * inputs["coords"][1]
+        )
+
+
+FORCING_REGISTRY = {
+    "identity": IdentityInputs,
+    "constant": ConstantForcing,
+    "gaussian": GaussianForcing,
+    "sinusoid": SinusoidForcing,
+}
+
+type RegisteredForcing = Annotated[
+    ForcingCallable,
+    BeforeValidator(partial(from_registry, FORCING_REGISTRY)),
+]
 
 
 class BoundaryType(IntEnum):
@@ -776,7 +827,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     """Galerkin ROM that solves any `ImplicitModel` via an iterative solver in latent space."""
 
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
-    initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
+    initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
     compression: Path | str | Compression | None = None
     _resolved_source_sampler: SamplerCallable | None = PrivateAttr(default=None)
@@ -848,9 +899,19 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
 
             return result["residuals"] - args["residuals"]
         
+        initial_inputs = {}
+        if isinstance(x.get("inputs"), Mapping):
+            initial_inputs = x["inputs"].get("initial", {})
+
+        if isinstance(initial_inputs, Mapping) and "outputs" in initial_inputs:
+            initial = jnp.asarray(initial_inputs["outputs"])
+        else:
+            initial = jnp.asarray(self.initial(initial_inputs, {}))
+        initial = jnp.broadcast_to(initial, jnp.asarray(x["residuals"]).shape)
+
         solution = self.solver.root_find(
             lambda z, args: residual_fn(z, args, aux, edge_payload_patches, composite_stack), 
-            jnp.asarray(self.initial_guess(x["residuals"])), 
+            initial,
             x, 
             return_sol=False
         )
