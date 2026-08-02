@@ -494,6 +494,41 @@ def test_source_data_config_types(tmp_path):
     assert loader.datasets["source"].stack_batch is False
 
 
+def test_data_generation_expands_generic_base_configurations(tmp_path: Path) -> None:
+    graph = FunctionGraph(edges={"source": _ToySourceEdge(source="noise", target="source")})
+    generation = DataGeneration(
+        root=tmp_path,
+        bases=[
+            {"name": "inputs", "source": {"samples": 1, "seed": 0}},
+            {"name": "outputs", "source": {"samples": 1, "seed": 0}},
+        ],
+        overrides=[
+            {"path": ["source", "samples"], "cases": [1, 2]},
+            {"path": ["source", "seed"], "cases": [0, 1]},
+        ],
+        graph=graph,
+    )
+
+    generation.run()
+
+    for samples in (1, 2):
+        for seed in (0, 1):
+            for base_name in ("inputs", "outputs"):
+                base_root = tmp_path / f"samples={samples}" / f"seed={seed}" / base_name
+                source_root = base_root / "source"
+                assert (source_root / f"seed_{seed}").exists()
+                assert (source_root / f"seed_{seed}" / "sample_0" / "source.h5").exists()
+
+
+def test_data_generation_rejects_mixed_dataset_modes(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="both 'datasets' and 'bases'"):
+        DataGeneration(
+            root=tmp_path,
+            datasets={"source": {"samples": 1, "seed": 0}},
+            bases=[{"name": "source", "samples": 1, "seed": 0}],
+        )
+
+
 def test_data_loader_source_lru_cache_reuses_samples(tmp_path, monkeypatch):
     _write_source_dataset(tmp_path, sample_count=1)
     counts: dict[Path, int] = {}
