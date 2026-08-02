@@ -8,7 +8,7 @@ solver: !romx:Poisson2D
       kwargs:
         rtol: 1.0e-2
         atol: 1.0e-6
-  forcing: !pd:romjax.poisson.GaussianForcing
+  forcing: !pd:romjax.pde.GaussianForcing
     inputs_default:
       mu_x: 0.5
       mu_y: 0.5

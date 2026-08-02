@@ -7,9 +7,14 @@ import numpy as np
 import pytest
 
 from romjax import YamlLoader
-from romjax.pde import IterativeSolver, UniformGrid, homogeneous_boundary
+from romjax.pde import (
+    GaussianForcing,
+    IterativeSolver,
+    UniformGrid,
+    homogeneous_boundary,
+)
 from romjax.plotting import gridplot
-from romjax.poisson import CubicForcing, GaussianForcing, NonlinearConductivity, Poisson2D
+from romjax.poisson import CubicForcing, NonlinearConductivity, Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 from romjax.typing import DictModel
 
@@ -105,6 +110,26 @@ def test_poisson_coercion() -> None:
     assert model.conductivity.inputs_default["k0"] == 1.0
 
 
+def test_poisson_initial_field_callable_and_runtime_override() -> None:
+    """Poisson initial fields use the configured callable or a direct runtime field."""
+    model = Poisson2D(
+        grid=UniformGrid(bounds=((0.0, 2.0), (-1.0, 1.0)), shape=(5, 4)),
+        initial={"callable": "constant", "inputs_default": {"const": 2.0}},
+    )
+
+    resolved = model._merge_coords({})
+    sample = model._initial_field(resolved)
+    direct = jnp.arange(20, dtype=float).reshape(5, 4)
+    overridden = model._initial_field(model._merge_coords({"initial": {"phi": direct}}))
+
+    assert sample.shape == (5, 4)
+    assert jnp.all(sample == 2.0)
+    assert jnp.allclose(overridden, direct)
+
+    with pytest.raises(ValueError):
+        Poisson2D(grid=model.grid, initial_guess=lambda coords: jnp.ones_like(coords[0]))
+
+
 def test_poisson_evaluate_and_autodiff() -> None:
     model = Poisson2D(
         grid={"shape": (8, 8), "bounds": ((0, 1), (0, 1))},
@@ -163,7 +188,7 @@ def get_laplace_solver() -> Poisson2D:
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1, "atol": 1e-4}},
             "max_steps": 10,
         },
-        initial_guess=lambda coords: jnp.ones_like(coords[0]),
+        initial={"callable": "constant", "inputs_default": {"const": 1.0}},
     )
 
 
@@ -210,7 +235,7 @@ def test_poisson_manufactured_solve(show_plot: bool = False) -> None:
             "max_steps": 15,
             "throw": False,
         },
-        initial_guess=lambda coords: jnp.ones_like(coords[0]),
+        initial={"callable": "constant", "inputs_default": {"const": 1.0}},
         forcing="sinusoid",
     )
 

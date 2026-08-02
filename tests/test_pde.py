@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from romjax.compression import SVD
 from romjax.graph import Edge, FunctionGraph, Node
@@ -166,12 +167,11 @@ def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
                 source="galerkin_source",
                 target="galerkin_target",
                 path=["src_map", "implicit", "tgt_map"],
-                initial_guess=lambda arr: 0.1 * jnp.ones_like(arr),
             ),
         }
     )
 
-    inputs = {"b": jnp.array([1.0, 1.5])}
+    inputs = {"b": jnp.array([1.0, 1.5]), "initial": {"outputs": 0.1 * jnp.ones(2)}}
     z_true = jnp.array([0.2, 0.4])
 
     target_payload = graph.push_path(
@@ -204,6 +204,9 @@ def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
     )["outputs"]
 
     assert jnp.allclose(z_galerkin, z_direct, atol=1e-6, rtol=1e-6)
+
+    with pytest.raises(ValidationError):
+        ImplicitIterativeGalerkin(path=["src_map", "implicit", "tgt_map"], initial_guess=lambda x: x)
 
 
 def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Path) -> None:

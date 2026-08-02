@@ -1,7 +1,7 @@
 """Example 2D Poisson solver."""
 import functools
 from collections.abc import Mapping
-from typing import Annotated, Callable, Literal, TypedDict
+from typing import Annotated, Any, Callable, Literal, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -12,14 +12,14 @@ from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 from romjax.graph import Node
 from romjax.model import ImplicitModel, ImplicitSampleable
 from romjax.pde import (
+    FORCING_REGISTRY,
     BoundarySpec,
     BoundaryType,
-    ConstantInitialize,
+    ConstantForcing,
     Coordinates,
     ForcingCallable,
     IdentityInputs,
     IterativeSolver,
-    RegisteredInitialize,
     UniformGrid,
     homogeneous_boundary,
 )
@@ -30,16 +30,18 @@ from romjax.typing import DictModel, from_registry
 __all__ = ["Poisson2D"]
 
 
-class PoissonInputs(TypedDict):
+class PoissonInputs(TypedDict, total=False):
     """Inputs for the Poisson equation.
     
     :ivar forcing: forcing inputs
     :ivar conductivity: conductivity inputs
     :ivar boundary: boundary condition parameters
+    :ivar initial: initial-field parameters or a direct ``phi`` field
     """
     forcing: dict
     conductivity: dict
     boundary: dict
+    initial: dict[str, Any]
 
 
 class PoissonOutputs(TypedDict):
@@ -56,38 +58,6 @@ class PoissonResiduals(TypedDict):
     :ivar phi_residual: the residual of the scalar potential on the grid
     """
     phi_residual: ArrayLike
-
-
-class GaussianForcing(ForcingCallable):
-    class Inputs(DictModel):
-        """Inputs for Gaussian forcing function.
-
-        :ivar A0: amplitude
-        :ivar offset: constant background value
-        :ivar sigma: symmetric width of Gaussian
-        :ivar mu_x: center of Gaussian in x-direction
-        :ivar mu_y: center of Gaussian in y-direction
-        :ivar coords: (x,y) coordinates to evaluate at
-        """
-        A0: ArrayLike = 1.0
-        offset: ArrayLike = 0.0
-        sigma: ArrayLike = 1.0
-        mu_x: ArrayLike = 0.0
-        mu_y: ArrayLike = 0.0
-        coords: Coordinates = (0., 0.)
-    
-    def callable(inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
-        r"""Constant offset plus a symmetric Gaussian bump.
-
-            $f(x,y) = c + A_0 \exp(-1/(2\sigma) ((x-\mu_x)^2 + (y-\mu_y)^2))$
-        
-        :param inputs: the input parameters
-        :param outputs: the scalar potential on the grid (not used)
-        :return: the forcing on the grid
-        """
-        dx = inputs['coords'][0] - inputs['mu_x']
-        dy = inputs['coords'][1] - inputs['mu_y']
-        return inputs['offset'] + inputs['A0'] * jnp.exp(-(dx * dx + dy * dy) / (2 * inputs['sigma']))
 
 
 class CubicForcing(ForcingCallable):
@@ -164,40 +134,10 @@ class NonlinearConductivity(ForcingCallable):
         return self.amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
 
 
-class ConstantForcing(ForcingCallable):
-
-    class Inputs(DictModel):
-        const: ArrayLike = 0.0
-    
-    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
-        """Just a constant forcing (inputs/outputs not used)."""
-        return inputs['const']
-
-
-class SinusoidForcing(ForcingCallable):
-
-    class Inputs(DictModel):
-        coords: Coordinates = (0., 0.)
-    
-    def callable(self, inputs: Inputs, outputs: PoissonOutputs) -> ArrayLike:
-        r"""Sinusoid forcing. Used in method of manufactured solutions.
-    
-            $f(x,y) = 2 \pi^2 \sin{\pi x}\sin{\pi y}$
-
-        :param inputs: just uses (x,y) coords
-        :param outputs: the scalar potential on grid (not used)
-        :return: the forcing on the grid.
-        """
-        return 2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs['coords'][0]) * jnp.sin(jnp.pi * inputs['coords'][1])
-    
-
 _forcing_registry = {
+    **FORCING_REGISTRY,
     "cubic": CubicForcing,
-    "gaussian": GaussianForcing,
     "nonlinear": NonlinearConductivity,
-    "sinusoid": SinusoidForcing,
-    "constant": ConstantForcing,
-    "identity": IdentityInputs
 }
 
 
@@ -210,7 +150,6 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
     grid: UniformGrid  # Required
 
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
-    initial_guess: RegisteredInitialize = Field(default_factory=ConstantInitialize)
 
     # To satisfy criteria for being a graph edge
     source: Node = Node(name="poisson_in")
@@ -224,6 +163,7 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
     boundary: PoissonForcing = Field(
         default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2))
     )
+    initial: PoissonForcing = Field(default_factory=ConstantForcing)
 
     inputs_sampler: SamplerCallable | None = None
     outputs_sampler: SamplerCallable | None = None
@@ -243,13 +183,26 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
     def _merge_coords(self, inputs: PoissonInputs, coords: Coordinates | None = None) -> PoissonInputs:
         """Merge grid coords into incoming inputs."""
         inputs = to_pytree(inputs)
-        for name in ("forcing", "conductivity", "boundary"):
+        for name in ("forcing", "conductivity", "boundary", "initial"):
             inputs.setdefault(name, {})
         coords = {"coords": self._jax_coords() if coords is None else coords}
         for k in inputs:
             inputs[k].update(coords)
         
         return inputs
+
+    def _initial_field(self, inputs: PoissonInputs) -> jax.Array:
+        """Resolve the initial field from runtime inputs or the configured callable.
+
+        :param inputs: resolved Poisson inputs, including grid coordinates
+        :return: initial scalar field on the grid
+        """
+        initial_inputs = inputs.get("initial", {})
+        if self.field_name in initial_inputs:
+            initial = initial_inputs[self.field_name]
+        else:
+            initial = self.initial(initial_inputs, {})
+        return jnp.broadcast_to(jnp.asarray(initial), inputs["initial"]["coords"][0].shape)
     
     def _compute_residual(self, inputs: PoissonInputs, outputs: PoissonOutputs) -> PoissonResiduals:
         """Helper to compute the finite volume residual on the grid. Used for forward and backward directions."""
@@ -353,7 +306,7 @@ class Poisson2D(ImplicitModel, ImplicitSampleable):
             residual = self._compute_residual(args['inputs'], {self.field_name: phi})
             return residual[self.residual_name] - args['target']
         
-        y0 = jnp.asarray(self.initial_guess(grid_coords))
+        y0 = self._initial_field(args['inputs'])
         solution = self.solver.root_find(residual_fn, y0, args, return_sol=return_sol)
 
         ret = solution if return_sol else {self.field_name: solution} 

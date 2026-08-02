@@ -14,6 +14,7 @@ from pydantic import BeforeValidator, ConfigDict, Field, PositiveFloat, field_va
 from romjax.graph import Node
 from romjax.model import ImplicitModel, ImplicitSampleable
 from romjax.pde import (
+    FORCING_REGISTRY,
     BoundarySpec,
     BoundaryType,
     Coordinates,
@@ -155,7 +156,7 @@ class CosinePerturbation(ForcingCallable):
 
 
 _forcing_registry = {
-    "identity": IdentityInputs,
+    **FORCING_REGISTRY,
     "cosine": CosinePerturbation,
 }
 
