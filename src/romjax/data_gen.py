@@ -6,6 +6,7 @@ import json
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from itertools import product
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
 
@@ -34,14 +35,16 @@ from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
 from romjax.tree import (
     TreePath,
+    coerce_tree_path,
     coerce_tree_paths,
     get_subtree,
     pytree_iter,
+    pytree_merge,
     pytree_path_iter,
     pytree_stack,
     set_subtree,
 )
-from romjax.typing import CallableModel, from_yaml
+from romjax.typing import CallableModel, DictModel, from_yaml
 from romjax.utils import _NullProgress, load_h5, required_fields, save_h5
 
 __all__ = [
@@ -1777,19 +1780,92 @@ type GenDataPyTree = Annotated[PyTree, BeforeValidator(_validate_gendata_pytree)
 type LoadDataPyTree = Annotated[PyTree, BeforeValidator(_validate_loaddata_pytree)]
 
 
+class DataGenerationBase(DictModel):
+    """Named, arbitrary configuration used as one data-generation base case.
+
+    All fields other than ``name`` are intentionally unrestricted at this stage. They are validated as a
+    :class:`GenDataConfig` or dataset PyTree when the generation routine runs.
+
+    :param name: directory name for this base case
+    """
+
+    name: str
+
+    @model_validator(mode="after")
+    def _validate_name(self) -> "DataGenerationBase":
+        if not self.name or self.name in {".", ".."} or any(separator in self.name for separator in ("/", "\\")):
+            raise ValueError("Data-generation base names must be non-empty single path components.")
+        return self
+
+
+class DataGenerationOverride(BaseModel):
+    """One path and its candidate values for base configuration expansion.
+
+    :param path: path in a base configuration to override
+    :param cases: candidate values for the override path
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    path: TreePath
+    cases: tuple[Any, ...]
+
+    @classmethod
+    def _coerce_path(cls, value: Any) -> TreePath:
+        path = coerce_tree_path(value)
+        if not isinstance(path, tuple) or not all(isinstance(token, str | int) for token in path):
+            raise ValueError("Data-generation override paths must be sequences of string or integer tokens.")
+        if not path:
+            raise ValueError("Data-generation override paths cannot be empty.")
+        if any(isinstance(token, int) and token < 0 for token in path):
+            raise ValueError("Data-generation override paths do not support negative list indices.")
+        return path
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            raise ValueError("Data-generation overrides must be mappings with 'path' and 'cases'.")
+        normalized = dict(value)
+        normalized["path"] = cls._coerce_path(normalized.get("path"))
+        cases = normalized.get("cases")
+        if isinstance(cases, str | bytes) or not isinstance(cases, Sequence):
+            cases = [cases]
+        if not cases:
+            raise ValueError("Data-generation override cases must contain at least one value.")
+        normalized["cases"] = tuple(cases)
+        return normalized
+
+
+def _override_directory_name(override: DataGenerationOverride, value: Any) -> str:
+    """Return a readable, safe directory name for one override value."""
+    if isinstance(value, str | int | float | bool) or value is None:
+        rendered = str(value)
+    elif isinstance(value, Path):
+        rendered = value.as_posix()
+    else:
+        rendered = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    rendered = rendered.replace("/", "_").replace("\\", "_")
+    return f"{override.path[-1]}={rendered}"
+
+
 class DataGeneration(Routine):
     """
     File-based data generation routine.
 
     :ivar root: root directory for saving data
     :ivar datasets: pytree template for datasets to generate under root
+    :ivar bases: named arbitrary base configurations to expand under root
+    :ivar overrides: Cartesian-product overrides applied to each base configuration
     :ivar format: the data format to save samples. Only `h5` supported.
     :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
     :ivar graph: graph object or YAML path (optional, for graph-related datasets)
     """
 
     root: Path
-    datasets: GenDataPyTree
+    datasets: GenDataPyTree | None = None
+    bases: list[DataGenerationBase] = Field(default_factory=list)
+    overrides: list[DataGenerationOverride] = Field(default_factory=list)
 
     format: SUPPORTED_FORMATS = "h5"
     write_policy: SUPPORTED_POLICIES = "reuse"
@@ -1799,17 +1875,68 @@ class DataGeneration(Routine):
     @model_validator(mode="after")
     def _bind_graph(self):
         # Pass graph object to graph datasets
-        if self.graph is not None:
-            leaves, _ = jax.tree.flatten(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig))
-            for ds in leaves:
-                if hasattr(ds, "graph"):
-                    if ds.graph is None:
-                        ds.graph = self.graph
-        
+        if self.graph is not None and self.datasets is not None:
+            self._bind_graph_to_datasets(self.datasets)
+
+        if self.bases and self.datasets is not None:
+            raise ValueError("DataGeneration cannot specify both 'datasets' and 'bases'.")
+        if self.overrides and not self.bases:
+            raise ValueError("DataGeneration overrides require at least one base configuration.")
+        if not self.datasets and not self.bases:
+            raise ValueError("DataGeneration requires either 'datasets' or at least one base configuration.")
+
+        names = [base.name for base in self.bases]
+        if len(names) != len(set(names)):
+            raise ValueError("Data-generation base names must be unique.")
+
         return self
-    
+
+    def _bind_graph_to_datasets(self, datasets: PyTree) -> None:
+        """Pass the configured graph to graph-based dataset leaves."""
+        leaves, _ = jax.tree.flatten(datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig))
+        for ds in leaves:
+            if hasattr(ds, "graph") and ds.graph is None:
+                ds.graph = self.graph
+
+    def _base_datasets(self, base: DataGenerationBase, values: Sequence[Any]) -> PyTree:
+        """Validate one overridden base as a generic dataset PyTree."""
+        config = base.model_dump(mode="python")
+        for override, value in zip(self.overrides, values):
+            if override.path[0] == "name":
+                raise ValueError("Data-generation overrides cannot modify the reserved base 'name'.")
+            config = pytree_merge(config, set_subtree(None, override.path, value))
+        config.pop("name", None)
+        datasets = _validate_gendata_pytree(config)
+        self._bind_graph_to_datasets(datasets)
+        if not any(isinstance(leaf, GenDataConfig) for leaf in jax.tree.leaves(
+            datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
+        )):
+            raise ValueError(f"Base configuration {base.name!r} does not contain a supported data generator.")
+        return datasets
+
+    def _run_base_cases(self) -> None:
+        """Generate every Cartesian-product base case."""
+        case_values = product(*(override.cases for override in self.overrides))
+        for values in case_values:
+            override_root = self.root
+            for override, value in zip(self.overrides, values):
+                override_root /= _override_directory_name(override, value)
+
+            for base in self.bases:
+                datasets = self._base_datasets(base, values)
+                base_root = override_root / base.name
+                for path, dataset in pytree_path_iter(
+                    datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
+                ):
+                    dataset.generate(base_root / "/".join(path), format=self.format, write_policy=self.write_policy)
+
     def run(self) -> int:
         """Generate all datasets."""
+        if self.bases:
+            self._run_base_cases()
+            return 0
+
+        assert self.datasets is not None
         for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
             dataset.generate(self.root / "/".join(path), format=self.format, write_policy=self.write_policy)
         
