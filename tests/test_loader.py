@@ -8,8 +8,8 @@ import pytest
 from romjax import YamlLoader, YamlSource
 from romjax.model import ImplicitModel
 from romjax.pde import GaussianForcing
-from romjax.poisson import Poisson2D
 from romjax.rng import Distribution, NearSolutionSampler
+from romjax.transport import AdvectionDiffusion2D
 
 
 def example_forcing(inputs: dict, outputs: dict):
@@ -81,24 +81,24 @@ def test_basic_model_load_and_dump(tmp_path: Path) -> None:
     assert out_path.exists()
 
 
-def test_poisson_model_load_and_dump() -> None:
-    fixture_path = Path("tests/fixtures_poisson.yml")
+def test_transport_model_load_and_dump() -> None:
+    fixture_path = Path("tests/fixtures_transport.yml")
     data = YamlLoader.load(fixture_path)
     solver = data["solver"]
-    assert isinstance(solver, Poisson2D)
+    assert isinstance(solver, AdvectionDiffusion2D)
     assert isinstance(solver.forcing, GaussianForcing)
     assert solver.grid.shape == (8, 8)
     assert solver.forcing.inputs_default["A0"] == 0.5
 
     dumped = YamlLoader.dump(data)
     assert dumped is not None
-    assert "!romx:romjax.poisson.Poisson2D" in dumped
+    assert "!romx:romjax.transport.AdvectionDiffusion2D" in dumped
     _assert_round_trip(data)
 
 
 def test_custom_model_load_and_dump() -> None:
     yaml_text_colon = (
-        "solver: !romx:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.transport.AdvectionDiffusion2D\n"
         "  forcing:\n"
         "    callable: !!python/name:tests.test_loader.example_forcing\n"
         "    inputs_default:\n"
@@ -108,13 +108,13 @@ def test_custom_model_load_and_dump() -> None:
         "    bounds: [[0, 1], [0, 1]]\n"
     )
     data_colon = YamlLoader.load(yaml_text_colon)
-    assert isinstance(data_colon["solver"], Poisson2D)
+    assert isinstance(data_colon["solver"], AdvectionDiffusion2D)
     assert data_colon["solver"].forcing.callable is example_forcing
     assert data_colon["solver"].forcing({"value": 5}, {"phi": 0}) == 5
     _assert_round_trip(data_colon)
 
     yaml_text_space = (
-        "solver: !romx:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.transport.AdvectionDiffusion2D\n"
         "  forcing:\n"
         "    callable: !!python/name tests.test_loader.example_forcing\n"
         "    inputs_default:\n"
@@ -124,15 +124,15 @@ def test_custom_model_load_and_dump() -> None:
         "    bounds: [[0, 1], [0, 1]]\n"
     )
     data_space = YamlLoader.load(yaml_text_space)
-    assert isinstance(data_space["solver"], Poisson2D)
+    assert isinstance(data_space["solver"], AdvectionDiffusion2D)
     assert data_space["solver"].forcing.callable is example_forcing
     assert data_space["solver"].forcing({}, {"phi": 0}) == 2
     _assert_round_trip(data_space)
 
 
-def test_poisson_registered_callable_inline_load_and_dump() -> None:
+def test_transport_registered_callable_inline_load_and_dump() -> None:
     yaml_text = (
-        "solver: !romx:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.transport.AdvectionDiffusion2D\n"
         "  forcing:\n"
         "    callable: gaussian\n"
         "    inputs_default:\n"
@@ -145,16 +145,16 @@ def test_poisson_registered_callable_inline_load_and_dump() -> None:
     data = YamlLoader.load(yaml_text)
     solver = data["solver"]
 
-    assert isinstance(solver, Poisson2D)
+    assert isinstance(solver, AdvectionDiffusion2D)
     assert isinstance(solver.forcing, GaussianForcing)
     assert solver.forcing.inputs_default["A0"] == 0.75
     assert solver.forcing.inputs_default["sigma"] == 0.2
     _assert_round_trip(data)
 
 
-def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
+def test_transport_builtin_outputs_sampler_load_and_dump() -> None:
     yaml_text = (
-        "solver: !romx:romjax.poisson.Poisson2D\n"
+        "solver: !romx:romjax.transport.AdvectionDiffusion2D\n"
         "  outputs_sampler: !romx:NearSolutionSampler\n"
         "    phi:\n"
         "      callable: normal\n"
@@ -167,7 +167,7 @@ def test_poisson_builtin_outputs_sampler_load_and_dump() -> None:
     data = YamlLoader.load(yaml_text)
     solver = data["solver"]
 
-    assert isinstance(solver, Poisson2D)
+    assert isinstance(solver, AdvectionDiffusion2D)
     assert isinstance(solver.outputs_sampler, NearSolutionSampler)
     assert isinstance(solver.outputs_sampler.template["phi"], Distribution)
     _assert_round_trip(data)

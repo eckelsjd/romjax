@@ -182,7 +182,7 @@ for i, true_input in enumerate(true_inputs):
     error_specs.append(sample_specs)
 
 
-output_path = Path(__file__).with_name("poisson-grid.png")
+output_path = Path(__file__).with_name("transport-grid.png")
 fig, ax = romx.gridplot(
     error_specs,
     scheme="white",

@@ -59,9 +59,9 @@ def _get_graph():
     return graph
 
 
-def _write_poisson_dataset(
+def _write_transport_dataset(
     root: Path,
-    dataset_name: str = "train/poisson",
+    dataset_name: str = "train/transport",
     sample_count: int = 2,
     outputs_per_input: int = 1,
 ) -> None:
@@ -662,13 +662,13 @@ def test_data_loader_implicit_epoch_cache_reuses_full_epoch(tmp_path, monkeypatc
     assert counts[tmp_path / "toy" / "seed_0" / "sample_1" / "seed_0" / "sample_0" / "output.h5"] == 1
 
 
-def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None:
-    _write_poisson_dataset(tmp_path)
+def test_generate_galerkin_compression_from_transport_data(tmp_path: Path) -> None:
+    _write_transport_dataset(tmp_path)
     loader = DataLoader(
         root=tmp_path,
         datasets={
             "train": {
-                "poisson": {
+                "transport": {
                     "kind": "implicit",
                     "batch_size": 1,
                     "load_solution": False,
@@ -679,7 +679,7 @@ def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None
     artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
     generator = GenLatent(
         loader=loader,
-        gather_paths=[("poisson", "outputs", "phi")],
+        gather_paths=[("transport", "outputs", "phi")],
         compression=_DummyCompression(scale=2.0, rank=1),
         filename="galerkin_compression.npz",
     )
@@ -699,12 +699,12 @@ def test_generate_galerkin_compression_from_poisson_data(tmp_path: Path) -> None
 
 
 def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:
-    _write_poisson_dataset(tmp_path, sample_count=5)
+    _write_transport_dataset(tmp_path, sample_count=5)
     loader = DataLoader(
         root=tmp_path,
         datasets={
             "train": {
-                "poisson": {
+                "transport": {
                     "kind": "implicit",
                     "batch_size": 2,
                     "max_samples": 3,
@@ -718,22 +718,22 @@ def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:
     batches = list(loader)
 
     assert len(batches) == 2
-    assert sum(len(batch["poisson"]) for batch in batches) == 3
+    assert sum(len(batch["transport"]) for batch in batches) == 3
     inputs = [
         float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
         for batch in batches
-        for sample in batch["poisson"]
+        for sample in batch["transport"]
     ]
     assert len(np.unique(np.asarray(inputs))) == 3
 
 
 def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Path) -> None:
-    _write_poisson_dataset(tmp_path, sample_count=4, outputs_per_input=3)
+    _write_transport_dataset(tmp_path, sample_count=4, outputs_per_input=3)
     loader = DataLoader(
         root=tmp_path,
         datasets={
             "train": {
-                "poisson": {
+                "transport": {
                     "kind": "implicit",
                     "batch_size": 2,
                     "max_samples": 5,
@@ -751,10 +751,10 @@ def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Pat
     inputs = [
         float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
         for batch in batches
-        for sample in batch["poisson"]
+        for sample in batch["transport"]
     ]
 
-    assert sum(len(batch["poisson"]) for batch in batches) == 4
+    assert sum(len(batch["transport"]) for batch in batches) == 4
     assert len(np.unique(np.asarray(inputs))) == 2
     assert all(count <= 2 for count in np.unique(np.asarray(inputs), return_counts=True)[1])
 
@@ -776,12 +776,12 @@ def test_loader_selects_epoch_pool_once_per_dataset(tmp_path: Path) -> None:
 
 
 def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -> None:
-    _write_poisson_dataset(tmp_path)
+    _write_transport_dataset(tmp_path)
     for sample_idx in range(2):
         output_dir = (
             tmp_path
             / "train"
-            / "poisson"
+            / "transport"
             / "seed_0"
             / f"sample_{sample_idx}"
             / "seed_0"
@@ -800,7 +800,7 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
         root=tmp_path,
         datasets={
             "train": {
-                "poisson": {
+                "transport": {
                     "kind": "implicit",
                     "batch_size": 1,
                     "load_solution": False,
@@ -811,7 +811,7 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
     artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
     generator = GenLatent(
         loader=loader,
-        gather_paths=[("poisson", "outputs", "phi"), ("poisson", "outputs", "psi")],
+        gather_paths=[("transport", "outputs", "phi"), ("transport", "outputs", "psi")],
         compression=SVD(rank=1, center=False),
         filename="galerkin_compression.npz",
     )
@@ -823,8 +823,8 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
     assert compression.latent_size() == 1
     assert compression.template is not None
     reconstructed = compression.reconstruct(compression.compress(compression.template))
-    assert reconstructed["poisson"]["outputs"]["phi"].shape == (2,)
-    assert reconstructed["poisson"]["outputs"]["psi"].shape == (2,)
+    assert reconstructed["transport"]["outputs"]["phi"].shape == (2,)
+    assert reconstructed["transport"]["outputs"]["psi"].shape == (2,)
 
 
 def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> None:

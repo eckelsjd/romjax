@@ -1,4 +1,4 @@
-"""Compare PCA and Adam-learned subspaces for Poisson solution reconstruction."""
+"""Compare PCA and Adam-learned subspaces for transport solution reconstruction."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _load_phi_matrix(data_root: Path, split: str, batch_size: int = 64) -> jax.A
         root=data_root,
         datasets={
             split: {
-                "poisson": {
+                "transport": {
                     "kind": "implicit",
                     "batch_size": batch_size,
                     "load_solution": True,
@@ -45,10 +45,10 @@ def _load_phi_matrix(data_root: Path, split: str, batch_size: int = 64) -> jax.A
 
     phi_batches: list[jax.Array] = []
     for batch in loader:
-        phi_batches.append(jnp.asarray(batch["poisson"]["outputs"]["phi"]))
+        phi_batches.append(jnp.asarray(batch["transport"]["outputs"]["phi"]))
 
     if not phi_batches:
-        raise ValueError(f"No Poisson samples were loaded from {data_root / split}.")
+        raise ValueError(f"No transport samples were loaded from {data_root / split}.")
 
     matrix = jnp.concatenate(phi_batches, axis=0)
     return matrix.reshape(matrix.shape[0], -1)
@@ -161,18 +161,18 @@ def _orthogonal_norm(basis):
 
 
 def main() -> None:
-    """Run the Poisson subspace comparison demo."""
+    """Run the transport subspace comparison demo."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "journal" / "poisson" / "data",
-        help="Root directory containing the journal Poisson data.",
+        default=Path(__file__).resolve().parents[1] / "journal" / "transport" / "data",
+        help="Root directory containing the journal transport data.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).with_name("poisson_subspace_compare"),
+        default=Path(__file__).with_name("transport_subspace_compare"),
         help="Directory used to store the matrices, summary, and histogram plot.",
     )
     parser.add_argument("--steps", type=int, default=1000, help="Adam optimization steps.")
@@ -211,7 +211,7 @@ def main() -> None:
         seed=0,
     )
 
-    artifact_path = args.output_dir / "poisson_subspace_bases.npz"
+    artifact_path = args.output_dir / "transport_subspace_bases.npz"
     np.savez_compressed(
         artifact_path,
         pca_basis=np.asarray(pca_basis),
@@ -235,11 +235,11 @@ def main() -> None:
     ax.hist(adam_errors, bins=bins, alpha=0.65, label="Adam basis", density=True)
     ax.set_xlabel("Relative reconstruction error")
     ax.set_ylabel("Density")
-    ax.set_title("Validation reconstruction error on Poisson fields")
+    ax.set_title("Validation reconstruction error on transport fields")
     ax.legend()
     ax.grid(True, alpha=0.25)
 
-    histogram_path = args.output_dir / "poisson_subspace_errors.png"
+    histogram_path = args.output_dir / "transport_subspace_errors.png"
     fig.savefig(histogram_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -260,7 +260,7 @@ def main() -> None:
         "adam_validation_relative_error_median": float(np.median(adam_errors)),
     }
 
-    summary_path = args.output_dir / "poisson_subspace_summary.json"
+    summary_path = args.output_dir / "transport_subspace_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
     # print(f"Saved basis archive to {artifact_path}")

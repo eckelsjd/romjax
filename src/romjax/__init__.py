@@ -64,7 +64,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
     "gridplot": ("romjax.plotting", "gridplot"),
-    "Poisson2D": ("romjax.poisson", "Poisson2D"),
+    "AdvectionDiffusion2D": ("romjax.transport", "AdvectionDiffusion2D"),
     "Vlasov1D1V": ("romjax.vlasov", "Vlasov1D1V"),
     "gen_keys": ("romjax.rng", "gen_keys"),
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
@@ -115,7 +115,7 @@ if TYPE_CHECKING:
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
     from .pde import ImplicitAffine, ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs
     from .plotting import gridplot
-    from .poisson import Poisson2D
+    from .transport import AdvectionDiffusion2D
     from .vlasov import Vlasov1D1V
     from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError

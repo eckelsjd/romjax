@@ -1,4 +1,4 @@
-solver: !romx:Poisson2D
+solver: !romx:AdvectionDiffusion2D
   grid:
     shape: &s [8, 8]
     bounds: &b [[0, 1], [0, 1]]
@@ -14,7 +14,7 @@ solver: !romx:Poisson2D
       mu_y: 0.5
       sigma: 0.1
       A0: 0.5
-  conductivity: !pd:romjax.poisson.NonlinearConductivity
+  diffusion: !pd:romjax.transport.QuadraticDiffusion
     inputs_default:
       alpha: 0.0
       k0: 1.0
@@ -22,7 +22,7 @@ solver: !romx:Poisson2D
     forcing:
       mu_x: { callable: uniform, minval: 0.4, maxval: 0.6 }
       A0: { callable: normal, mean: 0.5, std: 0.1 }
-    conductivity:
+    diffusion:
       k0:
         callable: darcy
         shape: *s
