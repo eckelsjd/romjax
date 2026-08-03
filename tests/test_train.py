@@ -1331,7 +1331,7 @@ train: !romx:Train
     assert train.init_params["toy"]["alias"] == "toy,weight"
 
 
-def test_train_initialization_resolves_graph_latent_dim_from_source_sampler(tmp_path: Path) -> None:
+def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: Path) -> None:
     compression = SVD(
         energy_tol=0.9,
         center=False,
@@ -1380,7 +1380,7 @@ def test_train_initialization_resolves_graph_latent_dim_from_source_sampler(tmp_
     )
 
     assert train.init_params["toy"]["module"].matrix.shape == (3, 4)
-    assert train.graph.edges["galerkin"].resolve_latent_dim() == 3
+    assert train.graph.edges["galerkin"].resolve_rank() == 3
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")

@@ -121,8 +121,9 @@ def path_error_loss(
     )
 
 
-def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph):
+def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph, ref: list[str] = None):
     del single_data, graph
+    params = params if ref is None else get_subtree(params, ref)
     return pytree_square_norm(params)
 
 
@@ -136,10 +137,29 @@ def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: Functi
     return pytree_square_norm(gram - jnp.eye(gram.shape[0]))
 
 
+def symmetric_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph, ref: list[str] = None,
+                             remove_trace: bool = True):
+    del single_data, graph
+
+    matrix = get_subtree(params, ref)  # assumed (..., N, N), square in the last 2 axes.
+    S = 0.5 * (matrix + jnp.matrix_transpose(matrix))
+
+    if remove_trace:
+        tr = jnp.linalg.trace(S)
+        r = S.shape[-1]
+        S = S - (tr[..., None, None] / r) * jnp.eye(r)
+
+    if matrix is None:
+        raise ValueError("Can't locate matrix for symmetric regularization via ref: '{ref}'")
+
+    return pytree_square_norm(S)
+
+
 _LOSS_REGISTRY.update({
     "path_error": path_error_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
+    "symmetric": symmetric_regularization,
 })
 
 

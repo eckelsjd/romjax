@@ -16,6 +16,7 @@ class Affine(eqx.Module):
 
     matrix_basis: ArrayLike  # (inputs_rank + 1, outputs_rank, outputs_rank)
     offset_basis: ArrayLike  # (inputs_rank + 1, outputs_rank)
+    eps: float
 
     def __init__(
         self,
@@ -25,6 +26,7 @@ class Affine(eqx.Module):
         matrix_basis: ArrayLike | None = None,
         offset_basis: ArrayLike | None = None,
         scale: float = 0.25,
+        eps: float = 1e-6,
     ) -> None:
         """
         Initialize affine bases.
@@ -36,7 +38,8 @@ class Affine(eqx.Module):
             ``(inputs_rank + 1, outputs_rank, outputs_rank)``
         :param offset_basis: explicit offset bases with shape
             ``(inputs_rank + 1, outputs_rank)``
-        :param scale: random initialization scale
+        :param scale: random initialization scale (std dev)
+        :param eps: nugget to add to diagonal of matrix operator
         """
         if matrix_basis is not None or offset_basis is not None:
             if matrix_basis is None or offset_basis is None:
@@ -57,6 +60,7 @@ class Affine(eqx.Module):
         matrix_key, offset_key = jax.random.split(key)
         self.matrix_basis = scale * jax.random.normal(matrix_key, (inputs_rank + 1, outputs_rank, outputs_rank))
         self.offset_basis = scale * jax.random.normal(offset_key, (inputs_rank + 1, outputs_rank))
+        self.eps = eps
 
     def materialize(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
         """Materialize the invertible matrix and offset for one input vector.
@@ -71,7 +75,8 @@ class Affine(eqx.Module):
         coefficients = jnp.concatenate((jnp.ones((1,), dtype=values.dtype), values))
         generator = jnp.einsum("i,ijk->jk", coefficients, self.matrix_basis)
         offset = jnp.einsum("i,ij->j", coefficients, self.offset_basis)
-        return jax.scipy.linalg.expm(generator), offset
+        r = offset.shape[-1]
+        return jax.scipy.linalg.expm(generator) + self.eps * jnp.eye(r), offset
 
     def __call__(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
         """Alias for :meth:`materialize`."""

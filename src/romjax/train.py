@@ -782,6 +782,9 @@ class Train(Routine):
         sample_fn = getattr(self.init_params, "sample", None)
         if callable(sample_fn):
             self.init_params = sample_fn(jax.random.key(self.init_seed))
+
+        if self.load_orbax is not None:
+            self.init_params = resolve_orbax_params(self.load_orbax, self.init_params)
         
         # Start dataloader from current training step if applicable
         if self.root is not None and hasattr(self.dataloader, "set_iterator"):
@@ -1141,8 +1144,6 @@ class Train(Routine):
 
                 if ckptr.latest is None:
                     params = self.init_params
-                    if self.load_orbax is not None:
-                        params = resolve_orbax_params(self.load_orbax, self.init_params)
                     opt_state = optimizer.init(eqx.filter(params, eqx.is_array))
                     curr_step = 0
                     total_steps = self.termination.max_steps
