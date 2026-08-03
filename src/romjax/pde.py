@@ -708,6 +708,8 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
     """
 
     solver: LinearSolver = Field(default_factory=lambda: lx.AutoLinearSolver(well_posed=True))
+    inputs_rank: PositiveInt | None = None
+    outputs_rank: PositiveInt | None = None
     inputs_compression: Path | str | Compression | None = None
     outputs_compression: Path | str | Compression | None = None
     inputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
@@ -743,12 +745,16 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
         return self._resolve_compression(self.outputs_compression, "_resolved_outputs_compression")
 
     def resolve_inputs_rank(self) -> int | None:
-        """Resolve the input latent rank from its compression artifact."""
+        """Resolve the input rank from explicit configuration or compression."""
+        if self.inputs_rank is not None:
+            return int(self.inputs_rank)
         compression = self.resolve_inputs_compression()
         return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
 
     def resolve_outputs_rank(self) -> int | None:
-        """Resolve the output latent rank from its compression artifact."""
+        """Resolve the output rank from explicit configuration or compression."""
+        if self.outputs_rank is not None:
+            return int(self.outputs_rank)
         compression = self.resolve_outputs_compression()
         return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
 
@@ -829,6 +835,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
     initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
+    rank: PositiveInt | None = None
     compression: Path | str | Compression | None = None
     _resolved_source_sampler: SamplerCallable | None = PrivateAttr(default=None)
     _resolved_compression: Compression | None = PrivateAttr(default=None)
@@ -852,11 +859,13 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
             
         return None
 
-    def resolve_latent_dim(self) -> int | None:
-        """Resolve the latent dimension from the compression artifact."""
+    def resolve_rank(self) -> int | None:
+        """Resolve the rank from explicit configuration or compression."""
+        if self.rank is not None:
+            return int(self.rank)
         compression = self.resolve_compression()
-        latent_dim = None if compression is None else compression.latent_size()
-        return None if latent_dim is None else int(latent_dim)
+        rank = None if compression is None else compression.latent_size()
+        return None if rank is None else int(rank)
 
     def resolve_source_sampler(self) -> SamplerCallable | None:
         """Resolve the source sampler from explicit configuration or a compression artifact."""

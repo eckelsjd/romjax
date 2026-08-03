@@ -231,7 +231,7 @@ def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Pat
         source_sampler=LatentSamplerFactory(distribution="uniform"),
     )
 
-    assert edge.resolve_latent_dim() == 2
+    assert edge.resolve_rank() == 2
     edge.resolve_source_sampler()
     sample = edge.sample_source(jax.random.key(0))
     assert sample["outputs"].shape == (2,)
@@ -275,6 +275,36 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
     )
     assert edge.sample_inputs(jax.random.key(0))["values"].shape == (2,)
     assert edge.sample_outputs(jax.random.key(1))["outputs"].shape == (2,)
+
+
+def test_implicit_rank_fields_take_priority_over_compression() -> None:
+    compression = SVD(
+        energy_tol=0.9,
+        center=False,
+        rank=2,
+        mean=np.zeros(3),
+        basis=np.eye(2, 3),
+        singular_values=np.ones(2),
+    )
+
+    affine = ImplicitAffine(
+        inputs_rank=3,
+        outputs_rank=4,
+        inputs_compression=compression,
+        outputs_compression=compression,
+    )
+    galerkin = ImplicitIterativeGalerkin(
+        source="a",
+        target="b",
+        name="galerkin",
+        path=["ab"],
+        rank=5,
+        compression=compression,
+    )
+
+    assert affine.resolve_inputs_rank() == 3
+    assert affine.resolve_outputs_rank() == 4
+    assert galerkin.resolve_rank() == 5
 
 
 def test_alive_progress_meter_is_jit_compatible() -> None:
