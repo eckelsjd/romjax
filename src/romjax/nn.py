@@ -16,7 +16,7 @@ class Affine(eqx.Module):
 
     matrix_basis: ArrayLike  # (inputs_rank + 1, outputs_rank, outputs_rank)
     offset_basis: ArrayLike  # (inputs_rank + 1, outputs_rank)
-    eps: float
+    eps: float = 1e-6
 
     def __init__(
         self,

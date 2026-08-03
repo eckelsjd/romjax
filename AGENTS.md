@@ -55,7 +55,7 @@ The public API provided by `romjax` is generally structured as the following:
 
 - `graph.py` - defines `FunctionGraph`, the main graph-based ROM interface.
 - `model.py` - defines core `Edge` implementations such as `ImplicitModel` and `FilterModel`.
-- `poisson.py` - provides `Poisson2D`, the main PDE example and configuration reference.
+- `transport.py` - provides `AdvectionDiffusion2D`, the main PDE example and configuration reference.
 - `train.py` - provides training utilities built around `jax.grad` and `optax`.
 - `data_gen.py` - provides data generation utilities
 - `plotting.py` - provides plotting helpers for ROM results.

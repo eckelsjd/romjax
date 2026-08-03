@@ -87,10 +87,12 @@ class IdentityInputs(ForcingCallable):
 
 
 class ConstantForcing(ForcingCallable):
-    """Return a constant scalar or broadcastable field."""
+    """Return a constant scalar, vector, or broadcastable field."""
 
     class Inputs(DictModel):
-        const: ArrayLike = 0.0
+        # ``Any`` preserves YAML-friendly Python sequences such as ``[vx, vy]``;
+        # the numerical path converts the value to a JAX array when evaluating it.
+        const: ArrayLike | list[Any] | tuple[Any, ...] = 0.0
 
     def callable(self, inputs: Inputs, outputs: PyTree) -> ArrayLike:
         """Return the configured constant value.

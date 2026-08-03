@@ -1,20 +1,20 @@
-"""Profile JAX tracing and compilation for Poisson solution-loss training.
+"""Profile JAX tracing and compilation for transport solution-loss training.
 
 Run with diagnostic flags, for example:
 
     ROMJAX_PROFILE=1 \
-    ROMJAX_PROFILE_DIR=/tmp/romjax-poisson-profile/trace \
-    ROMJAX_PROFILE_LABEL=poisson-solution-loss \
+    ROMJAX_PROFILE_DIR=/tmp/romjax-transport-profile/trace \
+    ROMJAX_PROFILE_LABEL=transport-solution-loss \
     ROMJAX_PROFILE_HOST_TRACER_LEVEL=3 \
     ROMJAX_PROFILE_DEVICE_TRACER_LEVEL=1 \
     ROMJAX_PROFILE_PYTHON_TRACER_LEVEL=1 \
     JAX_LOG_COMPILES=1 \
     JAX_EXPLAIN_CACHE_MISSES=1 \
     TF_CPP_MIN_LOG_LEVEL=0 \
-    JAX_DUMP_IR_TO=/tmp/romjax-poisson-profile/ir \
+    JAX_DUMP_IR_TO=/tmp/romjax-transport-profile/ir \
     JAX_DUMP_IR_MODES=eqn_count_pprof \
-    uv run python demo/profile_poisson_solution_loss.py 2>&1 \
-      | tee /tmp/romjax-poisson-profile/compile.log
+    uv run python demo/profile_transport_solution_loss.py 2>&1 \
+      | tee /tmp/romjax-transport-profile/compile.log
 """
 
 from __future__ import annotations
@@ -35,12 +35,12 @@ from romjax.graph import FunctionGraph
 from romjax.model import FilterModel, eqx_evaluate
 from romjax.nn import LinearProjection
 from romjax.pde import ImplicitIterativeGalerkin, IterativeSolver
-from romjax.poisson import Poisson2D
+from romjax.transport import AdvectionDiffusion2D
 from romjax.train import BatchLoader, DiagnosticsConfig, GraphLoss, TerminationConfig, Train
 
 
 def _solver(max_steps: int) -> IterativeSolver:
-    """Build the Optimistix solver used by both full and Galerkin Poisson solves."""
+    """Build the Optimistix solver used by both full and Galerkin transport solves."""
     return IterativeSolver(
         solver=optx.Newton(rtol=1.0, atol=5.0e-4),
         max_steps=max_steps,
@@ -58,18 +58,18 @@ def _projection(latent: int, dof: int) -> LinearProjection:
 
 
 def _build_graph(grid_size: int, solver_steps: int) -> FunctionGraph:
-    """Build the reduced Poisson graph used by the solution-loss path."""
+    """Build the reduced transport graph used by the solution-loss path."""
     solver = _solver(solver_steps)
     grid = {"shape": [grid_size, grid_size], "bounds": [[0.0, 1.0], [0.0, 1.0]]}
 
-    poisson = Poisson2D(
+    transport = AdvectionDiffusion2D(
         source="hf_coord",
         target="hf_res",
-        name="poisson",
+        name="transport",
         grid=grid,
         solver=solver,
         forcing={"callable": "constant", "inputs_default": {"const": -1.0}},
-        conductivity={"callable": "constant", "inputs_default": {"const": 1.0}},
+        diffusion={"callable": "constant", "inputs_default": {"const": 1.0}},
     )
     coordinate_transform = FilterModel(
         source="hf_coord",
@@ -117,7 +117,7 @@ def _build_graph(grid_size: int, solver_steps: int) -> FunctionGraph:
         source="lf_coord",
         target="lf_res",
         name="galerkin",
-        path=["coordinate transform", "poisson", "residual transform"],
+        path=["coordinate transform", "transport", "residual transform"],
         solver=solver,
     )
 
@@ -128,15 +128,15 @@ def _build_graph(grid_size: int, solver_steps: int) -> FunctionGraph:
             {"name": "lf_coord", "ignore": "inputs", "error_op": "sum-square"},
             {"name": "lf_res", "ignore": "inputs", "error_op": "sum-square"},
         ],
-        edges=[poisson, coordinate_transform, residual_transform, galerkin],
+        edges=[transport, coordinate_transform, residual_transform, galerkin],
     )
 
 
-def _sample(poisson: Poisson2D) -> dict[str, Any]:
+def _sample(transport: AdvectionDiffusion2D) -> dict[str, Any]:
     """Create one fixed-shape solution-only training sample."""
     inputs = {}
-    residuals = {"phi_residual": jnp.zeros(poisson.grid.shape, dtype=jnp.float32)}
-    outputs = poisson.solve(inputs=inputs, residuals=residuals)
+    residuals = {"phi_residual": jnp.zeros(transport.grid.shape, dtype=jnp.float32)}
+    outputs = transport.solve(inputs=inputs, residuals=residuals)
     return {"inputs": inputs, "residuals": residuals, "outputs": outputs}
 
 
@@ -154,14 +154,14 @@ def _tree_summary(tree: Any) -> Any:
 def build_train(args: argparse.Namespace) -> Train:
     """Construct the minimal Train routine."""
     graph = _build_graph(args.grid_size, args.solver_steps)
-    poisson = graph.edges["poisson"]
-    dof = int(np.prod(poisson.grid.shape))
+    transport = graph.edges["transport"]
+    dof = int(np.prod(transport.grid.shape))
     params = {
         "coordinate transform": {"call_args": _projection(args.latent_dim, dof)},
         "residual transform": {"call_args": _projection(args.latent_dim, dof)},
     }
-    sample = _sample(poisson)
-    batch = {"poisson": [sample for _ in range(args.batch_size)]}
+    sample = _sample(transport)
+    batch = {"transport": [sample for _ in range(args.batch_size)]}
 
     # print("Batch tree summary:")
     # print(json.dumps(_tree_summary(batch), indent=2, sort_keys=True))
@@ -178,7 +178,7 @@ def build_train(args: argparse.Namespace) -> Train:
                         "path_a": ["residual transform", "galerkin", "coordinate transform"],
                         "path_b": [],
                     },
-                    "dataset": "poisson",
+                    "dataset": "transport",
                 },
                 {
                     "name": "orth",
