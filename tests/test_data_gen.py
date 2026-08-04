@@ -49,6 +49,37 @@ class _ToySampleableEdge(Edge, ImplicitSampleable):
         return self.solve(inputs)
 
 
+class _ConditionedSampleableEdge(Edge, ImplicitSampleable):
+    """Small edge used to exercise persisted per-output conditions."""
+
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def sample_inputs(self, key):
+        del key
+        return {"x": jnp.asarray([1.0], dtype=jnp.float32)}
+
+    def sample_conditions(self, key):
+        del key
+        return {"x": jnp.asarray([4.0], dtype=jnp.float32)}
+
+    def solve(self, inputs):
+        return {"y": inputs["x"] + 1.0}
+
+    def evaluate(self, inputs, outputs):
+        return {"residual": outputs["y"] - self.solve(inputs)["y"]}
+
+    def sample_outputs(self, key, inputs=None, solution=None, conditions=None):
+        del key, solution
+        assert inputs is not None
+        assert conditions is not None
+        augmented_inputs = {**inputs, **conditions}
+        return self.solve(augmented_inputs)
+
+
 def _get_graph():
     graph = FunctionGraph(
         edges={
@@ -57,6 +88,40 @@ def _get_graph():
         }
     )
     return graph
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
+    graph = FunctionGraph(
+        edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")}
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "train": {
+                "conditioned": {
+                    "input_samples": 2,
+                    "outputs_per_input": 2,
+                    "input_seed": 3,
+                    "output_seed": 5,
+                    "batch_size": batch_size,
+                }
+            }
+        },
+        graph=graph,
+    )
+
+    assert generation.run() == 0
+
+    edge_dir = tmp_path / "train" / "conditioned"
+    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
+    output_refs = [ref for ref in refs if ref[2] == "output"]
+    assert len(output_refs) == 4
+    for input_path, output_path, _ in output_refs:
+        assert (output_path / "conditions.h5").exists()
+        sample = LoadImplicitModel().load_sample((input_path, output_path, "output"))
+        assert np.allclose(sample["conditions"]["x"], 4.0)
+        assert np.allclose(sample["outputs"]["y"], 5.0)
 
 
 def _write_transport_dataset(

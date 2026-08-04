@@ -19,7 +19,7 @@ from romjax.tree import pytree_merge
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
-           'NearSolutionSampler', 'gen_keys']
+           'NearSolutionSampler', 'SolverSampler', 'gen_keys']
 
 
 type RelativeScale = tuple[UnaryOp, float]
@@ -235,6 +235,42 @@ class PyTreeSampler(SamplerCallable):
         return self(key)
 
 
+class SolverSampler(SamplerCallable):
+    """Re-solve an implicit model after merging sampled conditions into its inputs.
+
+    The model supplies its bound ``solve`` method at call time.  Conditions override
+    matching paths in ``inputs`` and may add new paths.
+    """
+
+    def callable(
+        self,
+        key: jaxtyping.Key,
+        inputs: jaxtyping.PyTree | None = None,
+        solution: jaxtyping.PyTree | None = None,
+        conditions: jaxtyping.PyTree | None = None,
+        solve: Callable | None = None,
+    ) -> jaxtyping.PyTree:
+        """Return a solution computed with condition-overridden inputs.
+
+        :param key: unused random key, accepted for sampler compatibility
+        :param inputs: baseline model inputs
+        :param solution: baseline solution used when no re-solve is requested
+        :param conditions: partial input pytree overrides
+        :param solve: bound model solver accepting inputs
+        :return: recomputed or baseline solution
+        """
+        del key
+        if conditions is None:
+            if solution is not None:
+                return solution
+            if solve is None:
+                raise ValueError("SolverSampler requires a solve callable when no solution is provided.")
+            return solve(inputs)
+        if solve is None:
+            raise ValueError("SolverSampler requires a solve callable.")
+        return solve(pytree_merge(inputs, conditions))
+
+
 class NearSolutionSampler(PyTreeSampler):
 
     scale: jaxtyping.PyTree[ArrayLike | RelativeScale] = 1.0
@@ -277,6 +313,7 @@ class NearSolutionSampler(PyTreeSampler):
         key: jaxtyping.Key, 
         inputs: jaxtyping.PyTree | None = None, 
         solution: jaxtyping.PyTree | None = None,
+        conditions: jaxtyping.PyTree | None = None,
         **template
     ) -> jaxtyping.PyTree:
         """
@@ -285,6 +322,7 @@ class NearSolutionSampler(PyTreeSampler):
         :param key: the JAX random key
         :param inputs: optional conditioning inputs passed for API consistency
         :param solution: reference output pytree to perturb
+        :param conditions: pre-sampled noise pytree; when omitted, sample from ``template``
         :param **template: contains a Pytree of Distribution-like objects for sampling noise
         :return: sampled output pytree with the same structure as ``solution``
         """
@@ -292,7 +330,9 @@ class NearSolutionSampler(PyTreeSampler):
         if solution is None:
             raise ValueError("NearSolutionSampler requires a reference solution.")
         
-        noise = PyTreeSampler.model_fields["callable"].default(self, key, **template)
+        noise = conditions
+        if noise is None:
+            noise = PyTreeSampler.model_fields["callable"].default(self, key, **template)
         scaled_noise = self._scale_noise(noise, solution)
         return jax.tree.map(lambda ref, delta: jnp.asarray(ref) + delta, solution, scaled_noise)
     
@@ -300,10 +340,11 @@ class NearSolutionSampler(PyTreeSampler):
         self, 
         key: jaxtyping.Key, 
         inputs: jaxtyping.PyTree | None = None, 
-        solution: jaxtyping.PyTree | None = None
+        solution: jaxtyping.PyTree | None = None,
+        conditions: jaxtyping.PyTree | None = None,
     ) -> jaxtyping.PyTree:
         """Just a convenience alias."""
-        return self(key, inputs=inputs, solution=solution)
+        return self(key, inputs=inputs, solution=solution, conditions=conditions)
 
 
 def gen_keys(

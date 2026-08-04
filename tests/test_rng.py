@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys, log_uniform
+from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys, log_uniform
 
 
 def test_distribution() -> None:
@@ -156,6 +156,33 @@ def test_near_solution_sampler_with_noise_wrapper() -> None:
 
     assert np.allclose(np.asarray(sample["phi"]), np.asarray(expected_phi))
     assert np.isclose(float(sample["stats"]["mean"]), float(expected_mean))
+
+
+def test_near_solution_sampler_uses_pre_sampled_conditions() -> None:
+    solution = {"phi": jnp.ones((2,))}
+    conditions = {"phi": jnp.asarray([0.25, -0.5])}
+    sampler = NearSolutionSampler(template={"phi": {"callable": "dirac", "value": 99.0, "shape": (2,)}})
+
+    sample = sampler(jax.random.key(0), solution=solution, conditions=conditions)
+
+    assert np.allclose(np.asarray(sample["phi"]), np.asarray([1.25, 0.5]))
+
+
+def test_solver_sampler_merges_conditions_before_solving() -> None:
+    sampler = SolverSampler()
+
+    def solve(inputs):
+        return {"y": 2.0 * inputs["x"]}
+
+    sample = sampler(
+        jax.random.key(0),
+        inputs={"x": jnp.asarray(1.0), "nested": {"keep": jnp.asarray(3.0)}},
+        solution={"y": jnp.asarray(-1.0)},
+        conditions={"x": jnp.asarray(4.0), "nested": {"new": jnp.asarray(5.0)}},
+        solve=solve,
+    )
+
+    assert np.isclose(float(sample["y"]), 8.0)
 
 
 def test_near_solution_sampler_broadcast_relative_scale_spec() -> None:

@@ -32,21 +32,41 @@ class ImplicitSampleable(ABC):
         """Sample a single model input for the given key."""
         raise NotImplementedError
 
+    def sample_conditions(self, key: Key) -> PyTree | None:
+        """Sample optional per-output conditions for the given key.
+
+        Conditions are sampled after the model inputs and baseline solution.  They may
+        represent output noise, solver settings, or partial input overrides consumed by
+        :meth:`sample_outputs`.
+
+        :param key: random key
+        :return: sampled conditions, or ``None`` when no conditions are configured
+        """
+        del key
+        return None
+
     @abstractmethod
-    def sample_outputs(self, key: Key, inputs: PyTree | None = None, solution: PyTree | None = None) -> PyTree:
+    def sample_outputs(
+        self,
+        key: Key,
+        inputs: PyTree | None = None,
+        solution: PyTree | None = None,
+        conditions: PyTree | None = None,
+    ) -> PyTree:
         """
         Produce one sample of outputs for the given key.
 
         Implementations may delegate to configurable samplers with the conditioning contract
-        ``sampler(key, inputs=..., solution=..., **opts)``.
+        ``sampler(key, inputs=..., solution=..., conditions=..., **opts)``.
 
         :param key: random key
         :param inputs: optional conditioning inputs
         :param solution: optional precomputed solution of ``solve(inputs)=0``
+        :param conditions: optional sampled output conditions
         :return: sampled outputs
         """
         raise NotImplementedError
-    
+
 
 class SourceSampleable(ABC):
     """Mixin for models that sample arbitrary source nodes."""

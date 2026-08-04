@@ -30,6 +30,7 @@ from pydantic import (
 
 from romjax.compression import SVD, Compression
 from romjax.graph import Edge, FunctionGraph
+from romjax.model import ImplicitSampleable
 from romjax.norm import NormOperator, NormTree
 from romjax.rng import gen_keys
 from romjax.routine import Routine, RoutineError
@@ -70,23 +71,56 @@ def _get_kwargs(fn: Callable) -> set[str]:
     }
 
 
+def _accepts_kwarg(fn: Callable, name: str) -> bool:
+    """Return whether a callable accepts a named keyword argument."""
+    parameters = inspect.signature(fn).parameters.values()
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
+
+
+def _has_custom_sample_conditions(model: Any) -> bool:
+    """Return whether a model overrides the optional condition sampler."""
+    if hasattr(model, "conditions_sampler") and getattr(model, "conditions_sampler") is None:
+        return False
+    return type(model).sample_conditions is not ImplicitSampleable.sample_conditions
+
+
+def _call_sample_outputs(
+    model: Any,
+    key: Key,
+    one_input: PyTree | None,
+    one_solution: PyTree | None,
+    one_conditions: PyTree | None,
+) -> PyTree:
+    """Call a model output sampler while preserving legacy signatures."""
+    kwargs: dict[str, PyTree] = {}
+    if _accepts_kwarg(model.sample_outputs, "inputs"):
+        kwargs["inputs"] = one_input
+    if _accepts_kwarg(model.sample_outputs, "solution"):
+        kwargs["solution"] = one_solution
+    if one_conditions is not None:
+        if not _accepts_kwarg(model.sample_outputs, "conditions"):
+            raise TypeError("sample_outputs must accept conditions when sample_conditions returns a value.")
+        kwargs["conditions"] = one_conditions
+    return model.sample_outputs(key, **kwargs)
+
+
 def _build_batched_sample_outputs(model):
     """Build one batched ``sample_outputs`` function for a model."""
-    sample_output_kwargs = _get_kwargs(model.sample_outputs)
+    has_conditions = _has_custom_sample_conditions(model)
 
-    if all(arg in sample_output_kwargs for arg in ["inputs", "solution"]):
-        def _sample_outputs(keys, one_input, one_solution):
+    def _sample_outputs(keys, one_input, one_solution, one_conditions=None):
+        if has_conditions:
             return jax.vmap(
-                lambda key: model.sample_outputs(key, inputs=one_input, solution=one_solution)
-            )(keys)
-    elif "solution" in sample_output_kwargs:
-        def _sample_outputs(keys, _, one_solution):
-            return jax.vmap(
-                lambda key: model.sample_outputs(key, solution=one_solution)
-            )(keys)
-    else:
-        def _sample_outputs(keys, *_):
-            return jax.vmap(model.sample_outputs)(keys)
+                lambda key, conditions: _call_sample_outputs(
+                    model, key, one_input, one_solution, conditions
+                )
+            )(keys, one_conditions)
+        return jax.vmap(
+            lambda key: _call_sample_outputs(model, key, one_input, one_solution, None)
+        )(keys)
 
     return eqx.filter_jit(_sample_outputs)
 
@@ -385,10 +419,11 @@ class GenImplicitModel(GenGraph):
     """
     Sampling configuration for a nested input/output strategy for implicit models in a FunctionGraph.
 
-    A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the 
+    A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the
     result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
-    Generally, output samples are conditioned on input samples, and so several output samples may be requested 
-    for a single input sample.
+    Generally, output samples are conditioned on input samples, and so several output samples may be requested
+    for a single input sample. When implemented, `sample_conditions` is called for each inner sample and its
+    result is saved as `conditions.h5` alongside the output.
 
     If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
     and a residual will be computed and saved alongside each output.
@@ -430,20 +465,16 @@ class GenImplicitModel(GenGraph):
             sample_inputs = eqx.filter_jit(model.sample_inputs)
             solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") else None
             evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") else None
-
-            sample_output_kwargs = _get_kwargs(model.sample_outputs)
-            if all(arg in sample_output_kwargs for arg in ["inputs", "solution"]):
-                sample_outputs = eqx.filter_jit(
-                    lambda key, one_input, one_solution: model.sample_outputs(
-                        key, inputs=one_input, solution=one_solution
-                    )
+            sample_conditions = (
+                eqx.filter_jit(model.sample_conditions)
+                if _has_custom_sample_conditions(model)
+                else None
+            )
+            sample_outputs = eqx.filter_jit(
+                lambda key, one_input, one_solution, one_conditions=None: _call_sample_outputs(
+                    model, key, one_input, one_solution, one_conditions
                 )
-            elif "solution" in sample_output_kwargs:
-                sample_outputs = eqx.filter_jit(
-                    lambda key, _, one_solution: model.sample_outputs(key, solution=one_solution)
-                )
-            else:
-                sample_outputs = eqx.filter_jit(lambda key, *_: model.sample_outputs(key))
+            )
 
             for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
                 input_path = input_dir / "input.h5"
@@ -493,7 +524,11 @@ class GenImplicitModel(GenGraph):
                 for output_key, output_dir in gen_keys(
                     self.outputs_per_input, self.output_seed, path=input_dir, skip=skip
                 ):
-                    one_output = sample_outputs(output_key, one_input, one_solution)
+                    one_conditions = sample_conditions(output_key) if sample_conditions is not None else None
+                    if one_conditions is not None:
+                        save_h5(one_conditions, output_dir / "conditions.h5", mode="w")
+
+                    one_output = sample_outputs(output_key, one_input, one_solution, one_conditions)
                     one_residual = None
                     if evaluate is not None:
                         if self.throw:
@@ -531,13 +566,27 @@ class GenImplicitModel(GenGraph):
 
         def _save_outputs(
             sample_outputs: Callable,
+            sample_conditions: Callable | None,
             one_input: PyTree,
             one_solution: PyTree,
             output_keys: tuple[Key, ...],
             output_paths: tuple[Path, ...],
             evaluate: Callable | None,
         ) -> None:
-            outputs = sample_outputs(pytree_stack(output_keys), one_input, one_solution)
+            conditions = sample_conditions(pytree_stack(output_keys)) if sample_conditions is not None else None
+            conditions = jax.device_get(conditions) if conditions is not None else None
+            if conditions is not None:
+                condition_iter = pytree_iter(conditions)
+                for output_path in output_paths:
+                    if format != "h5":
+                        raise RoutineError(f"Save format '{format}' not recognized")
+                    save_h5(next(condition_iter), output_path / "conditions.h5", mode="w")
+
+            outputs = (
+                sample_outputs(pytree_stack(output_keys), one_input, one_solution, conditions)
+                if conditions is not None
+                else sample_outputs(pytree_stack(output_keys), one_input, one_solution)
+            )
             residuals = evaluate(one_input, outputs) if evaluate is not None else None
             outputs = jax.device_get(outputs)
             residuals = jax.device_get(residuals) if residuals is not None else None
@@ -559,6 +608,7 @@ class GenImplicitModel(GenGraph):
             solve: Callable | None,
             evaluate_solution: Callable | None,
             sample_outputs: Callable,
+            sample_conditions: Callable | None,
             evaluate: Callable | None,
             bar: Callable,
         ) -> None:
@@ -640,13 +690,29 @@ class GenImplicitModel(GenGraph):
                         continue
 
                     output_keys, output_paths = zip(*output_batch)
-                    _save_outputs(sample_outputs, one_input, one_solution, output_keys, output_paths, evaluate)
+                    _save_outputs(
+                        sample_outputs,
+                        sample_conditions,
+                        one_input,
+                        one_solution,
+                        output_keys,
+                        output_paths,
+                        evaluate,
+                    )
                     output_batch.clear()
                     output_batch.append((output_key, output_dir))
 
                 if output_batch:
                     output_keys, output_paths = zip(*output_batch)
-                    _save_outputs(sample_outputs, one_input, one_solution, output_keys, output_paths, evaluate)
+                    _save_outputs(
+                        sample_outputs,
+                        sample_conditions,
+                        one_input,
+                        one_solution,
+                        output_keys,
+                        output_paths,
+                        evaluate,
+                    )
 
                 bar()
 
@@ -665,6 +731,11 @@ class GenImplicitModel(GenGraph):
             sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
             solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
             sample_outputs = _build_batched_sample_outputs(model)
+            sample_conditions = (
+                eqx.filter_jit(eqx.filter_vmap(model.sample_conditions))
+                if _has_custom_sample_conditions(model)
+                else None
+            )
             evaluate_solution = eqx.filter_jit(eqx.filter_vmap(model.evaluate)) if hasattr(model, "evaluate") else None
             evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
                         if hasattr(model, "evaluate") else None)
@@ -682,12 +753,22 @@ class GenImplicitModel(GenGraph):
                     solve,
                     evaluate_solution,
                     sample_outputs,
+                    sample_conditions,
                     evaluate,
                     bar,
                 )
                 input_batch.append((input_key, input_dir))
 
-            _process_input_batch(input_batch, sample_inputs, solve, evaluate_solution, sample_outputs, evaluate, bar)
+            _process_input_batch(
+                input_batch,
+                sample_inputs,
+                solve,
+                evaluate_solution,
+                sample_outputs,
+                sample_conditions,
+                evaluate,
+                bar,
+            )
 
 
 type ImplicitSampleRef = tuple[Path, Path, Literal["output", "solution"]]
@@ -704,6 +785,7 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     :param skip_output: decide whether to skip a particular output sample when loading
     :param load_solution: whether to include ``solution.h5`` and ``solution_residual.h5`` as an extra
         sample for each input (defaults to ``True``)
+    Output samples include ``conditions.h5`` as ``conditions`` when present.
     :param solution_only: whether to load only ``solution.h5`` and skip all output samples (defaults to ``False``)
     """
 
@@ -840,6 +922,10 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
         output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
         if output_file.exists():
             sample["outputs"] = load_h5({}, output_file, jax=False)
+
+        conditions_file = output_path / "conditions.h5"
+        if sample_kind == "output" and conditions_file.exists():
+            sample["conditions"] = load_h5({}, conditions_file, jax=False)
 
         residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
         residual_file = output_path / residual_name

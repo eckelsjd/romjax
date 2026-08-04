@@ -23,7 +23,7 @@ from romjax.pde import (
     UniformGrid,
     homogeneous_boundary,
 )
-from romjax.rng import SamplerCallable
+from romjax.rng import SamplerCallable, SolverSampler
 from romjax.tree import to_pytree
 from romjax.typing import DictModel, from_registry
 
@@ -283,6 +283,7 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
     incompressible: bool = False
 
     inputs_sampler: SamplerCallable | None = None
+    conditions_sampler: SamplerCallable | None = None
     outputs_sampler: SamplerCallable | None = None
 
     @field_validator("grid", mode="after")
@@ -508,12 +509,19 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
         if self.inputs_sampler is not None:
             return self.inputs_sampler(key)
         return {}
+
+    def sample_conditions(self, key: Key) -> PyTree | None:
+        """Produce one optional output-condition sample for the given key."""
+        if self.conditions_sampler is not None:
+            return self.conditions_sampler(key)
+        return None
     
     def sample_outputs(
         self, 
         key: Key, 
         inputs: AdvectionDiffusionInputs | None = None,
-        solution: AdvectionDiffusionOutputs | None = None
+        solution: AdvectionDiffusionOutputs | None = None,
+        conditions: PyTree | None = None,
     ) -> AdvectionDiffusionOutputs:
         """
         Produce one sample of outputs for the given key.
@@ -521,6 +529,7 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
         :param key: the random key
         :param inputs: optionally condition on inputs
         :param solution: for efficiency, optionally condition on the precomputed solution of solve(inputs)=0
+        :param conditions: optional pre-sampled output noise or solver-condition pytree
         :return: the outputs sample
         """
         if self.outputs_sampler is None:
@@ -529,7 +538,12 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
         if solution is None:
             solution = self.solve(inputs)
 
-        sample = self.outputs_sampler(key, inputs=inputs, solution=solution)
+        sampler_kwargs = {"inputs": inputs, "solution": solution}
+        if conditions is not None:
+            sampler_kwargs["conditions"] = conditions
+        if isinstance(self.outputs_sampler, SolverSampler):
+            sampler_kwargs["solve"] = self.solve
+        sample = self.outputs_sampler(key, **sampler_kwargs)
         if isinstance(sample, Mapping):
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}
