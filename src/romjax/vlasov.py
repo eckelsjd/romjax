@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, TypedDict, get_origin
 import diffrax
 import jax
 import jax.numpy as jnp
-from jaxtyping import ArrayLike, Key
+from jaxtyping import ArrayLike, Key, PyTree
 from loguru import logger
 from pydantic import BeforeValidator, ConfigDict, Field, PositiveFloat, field_validator
 
@@ -25,7 +25,7 @@ from romjax.pde import (
     UniformGrid,
     homogeneous_boundary,
 )
-from romjax.rng import SamplerCallable
+from romjax.rng import SamplerCallable, SolverSampler
 from romjax.tree import pytree_merge, to_pytree
 from romjax.typing import DictModel, from_registry
 
@@ -206,6 +206,7 @@ class Vlasov1D1V(ImplicitModel, ImplicitSampleable):
     density_floor: PositiveFloat = 1e-12
     temperature_floor: PositiveFloat = 1e-12
     inputs_sampler: SamplerCallable | None = None
+    conditions_sampler: SamplerCallable | None = None
     outputs_sampler: SamplerCallable | None = None
 
     @field_validator("grid", mode="after")
@@ -866,18 +867,30 @@ class Vlasov1D1V(ImplicitModel, ImplicitSampleable):
             return self.inputs_sampler(key)
         return {}
 
+    def sample_conditions(self, key: Key) -> PyTree | None:
+        """Produce one optional output-condition sample for the given key."""
+        if self.conditions_sampler is not None:
+            return self.conditions_sampler(key)
+        return None
+
     def sample_outputs(
         self,
         key: Key,
         inputs: VlasovInputs | None = None,
         solution: VlasovOutputs | None = None,
+        conditions: PyTree | None = None,
     ) -> VlasovOutputs:
         """Produce one sample of outputs for the given key."""
         if self.outputs_sampler is None:
             return {}
         if solution is None:
             solution = self.solve(inputs)
-        sample = self.outputs_sampler(key, inputs=inputs, solution=solution)
+        sampler_kwargs = {"inputs": inputs, "solution": solution}
+        if conditions is not None:
+            sampler_kwargs["conditions"] = conditions
+        if isinstance(self.outputs_sampler, SolverSampler):
+            sampler_kwargs["solve"] = self.solve
+        sample = self.outputs_sampler(key, **sampler_kwargs)
         if isinstance(sample, Mapping):
             return {"fields": sample["fields"]} if "fields" in sample else {"fields": sample}
         return {"fields": {"vdf": jnp.asarray(sample)}}

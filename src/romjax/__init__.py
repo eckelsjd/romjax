@@ -69,6 +69,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "gen_keys": ("romjax.rng", "gen_keys"),
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
+    "SolverSampler": ("romjax.rng", "SolverSampler"),
     "TreeRef": ("romjax.tree", "TreeRef"),
     "UnaryOp": ("romjax.operators", "UnaryOp"),
     "BinaryOp": ("romjax.operators", "BinaryOp"),
@@ -117,7 +118,7 @@ if TYPE_CHECKING:
     from .plotting import gridplot
     from .transport import AdvectionDiffusion2D
     from .vlasov import Vlasov1D1V
-    from .rng import NearSolutionSampler, PyTreeSampler, gen_keys
+    from .rng import NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .operators import BinaryOp, UnaryOp
     from .train import BatchLoader, OrbaxRef, Train, resolve_orbax_params

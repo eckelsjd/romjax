@@ -486,3 +486,19 @@ def test_transport_sample_outputs_custom_callable_support() -> None:
     assert seen["inputs"] == inputs
     assert seen["solution"] == solution
     assert jnp.allclose(sample["phi"], 0.25)
+
+
+def test_transport_conditions_are_sampled_separately_from_outputs() -> None:
+    model = get_small_transport(
+        conditions_sampler=PyTreeSampler(
+            template={"phi": {"callable": "normal", "mean": 0.25, "std": 0.0, "shape": (6, 6)}}
+        ),
+        outputs_sampler=NearSolutionSampler(),
+    )
+    solution = {"phi": jnp.ones(model.grid.shape)}
+
+    conditions = model.sample_conditions(jax.random.key(4))
+    sample = model.sample_outputs(jax.random.key(5), solution=solution, conditions=conditions)
+
+    assert conditions["phi"].shape == model.grid.shape
+    assert jnp.allclose(sample["phi"], solution["phi"] + 0.25)

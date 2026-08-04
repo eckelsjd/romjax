@@ -33,7 +33,7 @@ from romjax.compression import Compression
 from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
-from romjax.rng import PyTreeSampler, SamplerCallable
+from romjax.rng import PyTreeSampler, SamplerCallable, SolverSampler
 from romjax.tree import TreePath, pytree_merge, set_subtree
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
@@ -719,6 +719,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
             callable=partial(_default_latent_sampler, path=("values",))
         )
     )
+    conditions_sampler: SamplerCallable | None = None
     outputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
     _resolved_inputs_compression: Compression | None = PrivateAttr(default=None)
     _resolved_outputs_compression: Compression | None = PrivateAttr(default=None)
@@ -821,14 +822,31 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
             raise ValueError("ImplicitAffine input sampler could not be resolved.")
         return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
 
-    def sample_outputs(self, key: Key, inputs: PyTree | None = None, solution: PyTree | None = None) -> PyTree:
+    def sample_conditions(self, key: Key) -> PyTree | None:
+        """Produce one optional output-condition sample for the given key."""
+        if self.conditions_sampler is not None:
+            return self.conditions_sampler(key)
+        return None
+
+    def sample_outputs(
+        self,
+        key: Key,
+        inputs: PyTree | None = None,
+        solution: PyTree | None = None,
+        conditions: PyTree | None = None,
+    ) -> PyTree:
         """Sample an output latent vector, optionally conditioned on a solution."""
         sampler = self._resolve_sampler(
             self.outputs_sampler, self.resolve_outputs_compression(), "_resolved_outputs_sampler"
         )
         if sampler is None:
             raise ValueError("ImplicitAffine output sampler could not be resolved.")
-        return sampler(key, inputs=inputs, solution=solution)
+        sampler_kwargs = {"inputs": inputs, "solution": solution}
+        if conditions is not None:
+            sampler_kwargs["conditions"] = conditions
+        if isinstance(sampler, SolverSampler):
+            sampler_kwargs["solve"] = self.solve
+        return sampler(key, **sampler_kwargs)
 
 
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
