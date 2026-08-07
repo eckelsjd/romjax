@@ -51,6 +51,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
     "tree": ("romjax.tree", None),
     "Compression": ("romjax.compression", "Compression"),
+    "IdentityEdge": ("romjax.graph", "IdentityEdge"),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
@@ -109,7 +110,7 @@ if TYPE_CHECKING:
     from .compression import Compression
     from .compare import CompareOrbax, CompareTable
     from .data_gen import DataGeneration, DataLoader
-    from .graph import CompositeEdge, FunctionGraph
+    from .graph import CompositeEdge, FunctionGraph, IdentityEdge
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import Affine, LinearProjection

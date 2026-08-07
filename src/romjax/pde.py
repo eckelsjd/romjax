@@ -703,7 +703,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
 
     $f(u;b) = A(b)u + c(b)$ for inputs $b$ and outputs $u$.
 
-    Inputs are a mapping with latent ``values`` and a runtime
+    Inputs are a mapping with latent values ``latent`` and a runtime
     :class:`~romjax.nn.Affine` under ``call_args``. Compression artifacts
     provide ranks and default latent samplers without becoming part of the
     numerical JAX path.
@@ -716,11 +716,15 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
     outputs_compression: Path | str | Compression | None = None
     inputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
         default_factory=lambda: LatentSamplerFactory(
-            callable=partial(_default_latent_sampler, path=("values",))
+            callable=partial(_default_latent_sampler, path=("latent",))
         )
     )
     conditions_sampler: SamplerCallable | None = None
-    outputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
+    outputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
+        default_factory=lambda: LatentSamplerFactory(
+            callable=partial(_default_latent_sampler, path=("latent",))
+        )
+    )
     _resolved_inputs_compression: Compression | None = PrivateAttr(default=None)
     _resolved_outputs_compression: Compression | None = PrivateAttr(default=None)
     _resolved_inputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
@@ -737,6 +741,24 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
             compression = Compression.load(Path(artifact))
             object.__setattr__(self, cache_name, compression)
             return compression
+        return None
+
+    def _resolve_sampler(
+        self,
+        sampler: LatentSamplerFactory | SamplerCallable | None,
+        compression: Compression | None,
+        cache_name: str,
+    ) -> SamplerCallable | None:
+        cached = getattr(self, cache_name)
+        if cached is not None:
+            return cached
+        if isinstance(sampler, SamplerCallable):
+            object.__setattr__(self, cache_name, sampler)
+            return sampler
+        if sampler is not None and compression is not None:
+            resolved = sampler(compression)
+            object.__setattr__(self, cache_name, resolved)
+            return resolved
         return None
 
     def resolve_inputs_compression(self) -> Compression | None:
@@ -761,29 +783,23 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
         compression = self.resolve_outputs_compression()
         return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
 
-    def _resolve_sampler(
-        self,
-        sampler: LatentSamplerFactory | SamplerCallable | None,
-        compression: Compression | None,
-        cache_name: str,
-    ) -> SamplerCallable | None:
-        cached = getattr(self, cache_name)
-        if cached is not None:
-            return cached
-        if isinstance(sampler, SamplerCallable):
-            object.__setattr__(self, cache_name, sampler)
-            return sampler
-        if sampler is not None and compression is not None:
-            resolved = sampler(compression)
-            object.__setattr__(self, cache_name, resolved)
-            return resolved
-        return None
+    def resolve_inputs_sampler(self) -> SamplerCallable | None:
+        """Resolve the inputs sampler from explicit configuration or a compression artifact."""
+        return self._resolve_sampler(
+            self.inputs_sampler, self.resolve_inputs_compression(), "_resolved_inputs_sampler"
+        )
+
+    def resolve_outputs_sampler(self) -> SamplerCallable | None:
+        """Resolve the outputs sampler from explicit configuration or a compression artifact."""
+        return self._resolve_sampler(
+            self.outputs_sampler, self.resolve_outputs_compression(), "_resolved_outputs_sampler"
+        )
 
     def _affine_inputs(self, inputs: PyTree) -> tuple[ArrayLike, Affine]:
         """Extract latent inputs and the runtime affine module from the input PyTree."""
-        if not isinstance(inputs, Mapping) or "values" not in inputs or "call_args" not in inputs:
-            raise TypeError("ImplicitAffine inputs must contain 'values' and runtime 'call_args'.")
-        return jnp.asarray(inputs["values"]), self._affine(inputs["call_args"])
+        if not isinstance(inputs, Mapping) or "latent" not in inputs or "call_args" not in inputs:
+            raise TypeError("ImplicitAffine inputs must contain 'latent' and runtime 'call_args'.")
+        return jnp.asarray(inputs["latent"]), self._affine(inputs["call_args"])
 
     def _affine(self, call_args: Any) -> Affine:
         if isinstance(call_args, Affine):
@@ -795,31 +811,31 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
     def evaluate(self, inputs: PyTree, outputs: PyTree) -> PyTree:
         """Evaluate ``A(inputs) @ outputs + c(inputs)``.
 
-        :param inputs: input payload containing latent ``values`` and ``call_args``
+        :param inputs: input payload containing latent values ``latent`` and ``call_args``
         :param outputs: output latent vector
         :return: residual latent vector
         """
         values, affine = self._affine_inputs(inputs)
         matrix, offset = affine.materialize(values)
-        return matrix @ jnp.asarray(outputs) + offset
+        return {'latent': matrix @ jnp.asarray(outputs) + offset}
 
     def solve(self, inputs: PyTree, residuals: PyTree) -> PyTree:
         """Solve the affine residual equation for output latent coordinates."""
         values, affine = self._affine_inputs(inputs)
         matrix, offset = affine.materialize(values)
-        return lx.linear_solve(
+        return {'latent': lx.linear_solve(
             lx.MatrixLinearOperator(matrix),
-            jnp.asarray(residuals) - offset,
+            jnp.asarray(residuals['latent']) - offset,
             solver=self.solver,
-        ).value
+        ).value}
 
     def sample_inputs(self, key: Key) -> PyTree:
         """Sample an input latent vector."""
-        sampler = self._resolve_sampler(
-            self.inputs_sampler, self.resolve_inputs_compression(), "_resolved_inputs_sampler"
-        )
+        sampler = self.resolve_inputs_sampler()
+
         if sampler is None:
             raise ValueError("ImplicitAffine input sampler could not be resolved.")
+        
         return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
 
     def sample_conditions(self, key: Key) -> PyTree | None:
@@ -835,18 +851,15 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable):
         solution: PyTree | None = None,
         conditions: PyTree | None = None,
     ) -> PyTree:
-        """Sample an output latent vector, optionally conditioned on a solution."""
-        sampler = self._resolve_sampler(
-            self.outputs_sampler, self.resolve_outputs_compression(), "_resolved_outputs_sampler"
-        )
+        """Sample an output latent vector, inputs/solution/conditions not used."""
+        del inputs, solution, conditions
+
+        sampler = self.resolve_outputs_sampler()
+
         if sampler is None:
             raise ValueError("ImplicitAffine output sampler could not be resolved.")
-        sampler_kwargs = {"inputs": inputs, "solution": solution}
-        if conditions is not None:
-            sampler_kwargs["conditions"] = conditions
-        if isinstance(sampler, SolverSampler):
-            sampler_kwargs["solve"] = self.solve
-        return sampler(key, **sampler_kwargs)
+
+        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
 
 
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
@@ -920,13 +933,13 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         
         def residual_fn(z: ArrayLike, args: PyTree, aux, edge_payload_patches, composite_stack) -> ArrayLike:
             """Root find residual function, with `z` as the latent coordinates."""
-            payload = {"outputs": z}
+            payload = {"outputs": {"latent": z}}
             if (inputs := args.get("inputs", None)) is not None:
                 payload["inputs"] = inputs
 
             result, aux = self.forward_aux(payload, aux, edge_payload_patches, composite_stack)
 
-            return result["residuals"] - args["residuals"]
+            return result["residuals"]["latent"] - args["residuals"]["latent"]
         
         initial_inputs = {}
         if isinstance(x.get("inputs"), Mapping):
@@ -936,7 +949,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
             initial = jnp.asarray(initial_inputs["outputs"])
         else:
             initial = jnp.asarray(self.initial(initial_inputs, {}))
-        initial = jnp.broadcast_to(initial, jnp.asarray(x["residuals"]).shape)
+        initial = jnp.broadcast_to(initial, jnp.asarray(x["residuals"]["latent"]).shape)
 
         solution = self.solver.root_find(
             lambda z, args: residual_fn(z, args, aux, edge_payload_patches, composite_stack), 
@@ -945,7 +958,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
             return_sol=False
         )
 
-        ret = {"outputs": solution}
+        ret = {"outputs": {"latent": solution}}
 
         # Pass inputs through
         if (inputs := x.get("inputs", None)) is not None:

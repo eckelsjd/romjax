@@ -49,6 +49,21 @@ class _ToySampleableEdge(Edge, ImplicitSampleable):
         return self.solve(inputs)
 
 
+class _RandomOutputEdge(Edge, ImplicitSampleable):
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def sample_inputs(self, key):
+        return {"x": jax.random.uniform(key)}
+
+    def sample_outputs(self, key, inputs=None, solution=None):
+        del inputs, solution
+        return {"y": jax.random.uniform(key)}
+
+
 class _ConditionedSampleableEdge(Edge, ImplicitSampleable):
     """Small edge used to exercise persisted per-output conditions."""
 
@@ -122,6 +137,56 @@ def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
         sample = LoadImplicitModel().load_sample((input_path, output_path, "output"))
         assert np.allclose(sample["conditions"]["x"], 4.0)
         assert np.allclose(sample["outputs"]["y"], 5.0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_implicit_mixes_output_keys_with_input_keys(tmp_path, batch_size):
+    graph = FunctionGraph(edges={"random": _RandomOutputEdge(source="inputs", target="random")})
+
+    generation = DataGeneration(
+        root=tmp_path / "mixed",
+        datasets={
+            "random": {
+                "input_samples": 2,
+                "outputs_per_input": 1,
+                "input_seed": 3,
+                "output_seed": 5,
+                "batch_size": batch_size,
+            }
+        },
+        graph=graph,
+    )
+    assert generation.run() == 0
+
+    mixed_values = [
+        load_h5({}, tmp_path / "mixed" / "random" / "seed_3" / f"sample_{i}" / "seed_5" / "sample_0" / "output.h5")["y"]
+        for i in range(2)
+    ]
+    assert not np.array_equal(mixed_values[0], mixed_values[1])
+
+    legacy_generation = DataGeneration(
+        root=tmp_path / "legacy",
+        datasets={
+            "random": {
+                "input_samples": 2,
+                "outputs_per_input": 1,
+                "input_seed": 3,
+                "output_seed": 5,
+                "mix_output_seed": False,
+                "batch_size": batch_size,
+            }
+        },
+        graph=graph,
+    )
+    assert legacy_generation.run() == 0
+
+    legacy_values = [
+        load_h5(
+            {}, tmp_path / "legacy" / "random" / "seed_3" / f"sample_{i}" / "seed_5" / "sample_0" / "output.h5"
+        )["y"]
+        for i in range(2)
+    ]
+    assert np.array_equal(legacy_values[0], legacy_values[1])
 
 
 def _write_transport_dataset(

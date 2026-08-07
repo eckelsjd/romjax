@@ -426,21 +426,49 @@ class GenImplicitModel(GenGraph):
     result is saved as `conditions.h5` alongside the output.
 
     If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
-    and a residual will be computed and saved alongside each output.
+    and a residual will be computed and saved alongside each output (unless explicitly skipped using the flags).
 
     :ivar input_samples: number of input samples
     :ivar outputs_per_input: number of output samples for each input sample
     :ivar input_seed: random seed for inputs
     :ivar output_seed: random seed for outputs
+    :ivar mix_output_seed: whether output keys should also depend on the input key (default: true)
     :ivar throw: whether solve/evaluate failures should propagate immediately
+    :ivar skip_solve: whether to skip implicit model solve (even if the model has a solve method)
+    :ivar skip_evaluate: whether to skip implicit model evaluate (even if the model has an evaluate method)
     """
 
     input_samples: int
     outputs_per_input: int
     input_seed: int
     output_seed: int
+    mix_output_seed: bool = True
     throw: bool = True
+    skip_solve: bool = False
+    skip_evaluate: bool = False
     _required_methods: list[str] = PrivateAttr(default=["sample_inputs"])
+
+    def _gen_output_keys(
+        self,
+        input_key: Key,
+        input_dir: Path,
+        skip: Literal["existing"] | None = None,
+    ) -> Iterator[tuple[Key, Path]]:
+        """Generate output keys and paths for one input sample."""
+        mixed_key = jax.random.fold_in(input_key, self.output_seed) if self.mix_output_seed else None
+        for output_index in range(self.outputs_per_input):
+            output_generator = gen_keys(
+                [output_index], self.output_seed, path=input_dir, skip=skip
+            )
+            try:
+                legacy_key, output_dir = next(output_generator)
+            except StopIteration:
+                continue
+
+            output_key = (
+                jax.random.fold_in(mixed_key, output_index) if mixed_key is not None else legacy_key
+            )
+            yield output_key, Path(output_dir)
 
     def generate_serial(self, path, format, write_policy):
         """Generate data in serial for an ImplicitModel."""
@@ -462,9 +490,14 @@ class GenImplicitModel(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
+            if hasattr(model, "resolve_inputs_sampler"):
+                model.resolve_inputs_sampler()  # may need to load from a compression
+            if hasattr(model, "resolve_outputs_sampler"):
+                model.resolve_outputs_sampler()
+
             sample_inputs = eqx.filter_jit(model.sample_inputs)
-            solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") else None
-            evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") else None
+            solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") and not self.skip_solve else None
+            evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") and not self.skip_evaluate else None
             sample_conditions = (
                 eqx.filter_jit(model.sample_conditions)
                 if _has_custom_sample_conditions(model)
@@ -521,9 +554,7 @@ class GenImplicitModel(GenGraph):
                         raise RoutineError(f"Save format '{format}' not recognized")
 
                 skip = "existing" if write_policy == "reuse" else None
-                for output_key, output_dir in gen_keys(
-                    self.outputs_per_input, self.output_seed, path=input_dir, skip=skip
-                ):
+                for output_key, output_dir in self._gen_output_keys(input_key, input_dir, skip=skip):
                     one_conditions = sample_conditions(output_key) if sample_conditions is not None else None
                     if one_conditions is not None:
                         save_h5(one_conditions, output_dir / "conditions.h5", mode="w")
@@ -657,7 +688,7 @@ class GenImplicitModel(GenGraph):
                     if solution_residual_samples is not None:
                         solution_residuals_by_index[input_index] = solution_residual_samples[batch_index]
 
-            for i, (_, input_path) in enumerate(input_batch):
+            for i, (input_key, input_path) in enumerate(input_batch):
                 if i in inputs_by_index:
                     one_input = inputs_by_index[i]
                     one_solution = solutions_by_index.get(i)
@@ -682,9 +713,7 @@ class GenImplicitModel(GenGraph):
                 output_batch: list[tuple[Key, Path]] = []
                 skip = 'existing' if write_policy == 'reuse' else None
 
-                for output_key, output_dir in gen_keys(
-                    self.outputs_per_input, self.output_seed, path=input_path, skip=skip
-                ):
+                for output_key, output_dir in self._gen_output_keys(input_key, input_path, skip=skip):
                     if len(output_batch) < self.batch_size:
                         output_batch.append((output_key, output_dir))
                         continue
@@ -728,17 +757,30 @@ class GenImplicitModel(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
+            if hasattr(model, "resolve_inputs_sampler"):
+                model.resolve_inputs_sampler()  # may need to load from a compression
+            if hasattr(model, "resolve_outputs_sampler"):
+                model.resolve_outputs_sampler()
+
             sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
-            solve = eqx.filter_jit(eqx.filter_vmap(model.solve)) if hasattr(model, "solve") else None
+            solve = (
+                eqx.filter_jit(eqx.filter_vmap(model.solve))
+                if hasattr(model, "solve") and not self.skip_solve else None
+            )
             sample_outputs = _build_batched_sample_outputs(model)
             sample_conditions = (
                 eqx.filter_jit(eqx.filter_vmap(model.sample_conditions))
                 if _has_custom_sample_conditions(model)
                 else None
             )
-            evaluate_solution = eqx.filter_jit(eqx.filter_vmap(model.evaluate)) if hasattr(model, "evaluate") else None
-            evaluate = (eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
-                        if hasattr(model, "evaluate") else None)
+            evaluate_solution = (
+                eqx.filter_jit(eqx.filter_vmap(model.evaluate))
+                if hasattr(model, "evaluate") and not self.skip_evaluate else None
+            )
+            evaluate = (
+                eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
+                if hasattr(model, "evaluate") and not self.skip_evaluate else None
+            )
 
             input_batch: list[tuple[Key, Path]] = []
 
@@ -1149,7 +1191,7 @@ class GenNormLeaf(BaseModel):
     Extra fields are preserved as runtime normalization options in the saved artifact.
 
     :param callable: runtime normalization callable or registered name
-    :param axes: axes to reduce over within each single-sample leaf
+    :param axes: axes to reduce over within each single-sample leaf (use empty axes to keep all)
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")

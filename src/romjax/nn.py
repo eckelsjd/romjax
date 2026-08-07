@@ -1,3 +1,5 @@
+from typing import Callable
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -9,14 +11,35 @@ __all__ = ["Affine", "LinearProjection"]
 class Affine(eqx.Module):
     """Input-conditioned invertible affine operator in latent coordinates.
 
-    The matrix generator and offset are affine in ``inputs``. The actual
-    residual matrix is the matrix exponential of the generator, which is
-    invertible for every finite input.
+    The matrix generator and offset are affine in ``inputs``: 
+        A(inputs) * outputs + c(inputs) 
+    
+    There are two options for the matrix and offset generators:
+
+    Basis approach:
+        A(b) = expm( sum Ai*bi )
+        c(b) = sum ci*bi
+    MLP approach:
+        A(b) = A0*(I + U(b)V(b)^T),  with U(b)~MLP(b) and V(b)~MLP(b)
+        c(b) = MLP(b)
+    
+    The matrix exponential guarantees invertibility. The MLPs are normalized to guarantee invertibility.
+
+    You may either pass in the corresponding arrays/modules directly, or use kwargs to randomly initialize them.
+    You are responsible for using appropriate MLP options (e.g. shape consistency).
     """
 
     matrix_basis: ArrayLike  # (inputs_rank + 1, outputs_rank, outputs_rank)
     offset_basis: ArrayLike  # (inputs_rank + 1, outputs_rank)
-    eps: float = 1e-6
+    
+    base_matrix: ArrayLike   # (outputs_rank, outputs_rank)
+    u_mlp: eqx.nn.MLP        # f(inputs_rank) -> (outputs_rank x r)
+    v_mlp: eqx.nn.MLP        # f(inputs_rank) -> (outputs_rank x r)
+    offset_mlp: eqx.nn.MLP   # f(inputs_rank) -> outputs_rank
+
+    eps: float
+    rho: float
+    mlp: bool
 
     def __init__(
         self,
@@ -25,8 +48,20 @@ class Affine(eqx.Module):
         key: Key | None = None,
         matrix_basis: ArrayLike | None = None,
         offset_basis: ArrayLike | None = None,
+        base_matrix: ArrayLike | None = None,
+        u_mlp: eqx.nn.MLP | None = None,
+        v_mlp: eqx.nn.MLP | None = None,
+        offset_mlp: eqx.nn.MLP | None = None,
+        mlp: bool = False,
+        matrix_width_size: int | None = None,
+        offset_width_size: int | None = None,
+        matrix_depth: int = 2,
+        offset_depth: int = 2,
+        mlp_rank: int = 4,
+        activation: Callable = jax.nn.swish,
         scale: float = 0.25,
-        eps: float = 1e-6,
+        eps: float = 1e-4,
+        rho: float = 0.95,
     ) -> None:
         """
         Initialize affine bases.
@@ -41,6 +76,11 @@ class Affine(eqx.Module):
         :param scale: random initialization scale (std dev)
         :param eps: nugget to add to diagonal of matrix operator
         """
+        self.eps = eps
+        self.rho = rho
+        self.mlp = mlp
+
+        ## EXPLICIT INITIALIZATION
         if matrix_basis is not None or offset_basis is not None:
             if matrix_basis is None or offset_basis is None:
                 raise ValueError("Affine requires both matrix_basis and offset_basis when explicitly initialized.")
@@ -53,30 +93,120 @@ class Affine(eqx.Module):
                 raise ValueError("matrix_basis must have square output matrices.")
             if self.offset_basis.shape != expected:
                 raise ValueError(f"offset_basis must have shape {expected}, got {self.offset_basis.shape}.")
+
+            # Not used for matrix/offset basis approach
+            if base_matrix is not None or u_mlp is not None or v_mlp is not None or offset_mlp is not None:
+                raise ValueError("Affine can only do matrix/offset basis approach or MLP approach, not both.")
+            
+            self.base_matrix = None
+            self.u_mlp = None
+            self.v_mlp = None
+            self.offset_mlp = None 
+            self.mlp = False
             return
 
+        if base_matrix is not None or u_mlp is not None or v_mlp is not None or offset_mlp is not None:
+            if base_matrix is None or u_mlp is None or v_mlp is None or offset_mlp is None:
+                raise ValueError("Affine requires all base_matrix, u_mlp, v_mlp, offset_mlp for explicit init.")
+
+            # Not used for MLP approach
+            if matrix_basis is not None or offset_basis is not None:
+                raise ValueError("Affine can only do matrix/offset basis approach or MLP approach, not both.")
+            
+            self.matrix_basis = None
+            self.offset_basis = None
+            self.mlp = True
+            return
+
+        ## RANDOM INITIALIZATION
         if key is None or inputs_rank is None or outputs_rank is None:
             raise ValueError("Affine requires explicit bases or inputs_rank, outputs_rank, and key.")
-        matrix_key, offset_key = jax.random.split(key)
-        self.matrix_basis = scale * jax.random.normal(matrix_key, (inputs_rank + 1, outputs_rank, outputs_rank))
-        self.offset_basis = scale * jax.random.normal(offset_key, (inputs_rank + 1, outputs_rank))
-        self.eps = eps
+
+        if mlp:
+            out_size = outputs_rank*mlp_rank  # low-rank matrix
+            default_width = int((inputs_rank + out_size) / 2)
+
+            base_key, u_key, v_key, offset_key = jax.random.split(key, 4)
+
+            self.base_matrix = scale * jax.random.normal(base_key, (outputs_rank, outputs_rank))
+            self.u_mlp = eqx.nn.MLP(
+                in_size=inputs_rank, 
+                out_size=out_size,
+                width_size=matrix_width_size or default_width,
+                depth=matrix_depth,
+                activation=activation,
+                key=u_key,
+            )
+            self.v_mlp = eqx.nn.MLP(
+                in_size=inputs_rank,
+                out_size=out_size,
+                width_size=matrix_width_size or default_width,
+                depth=matrix_depth,
+                activation=activation,
+                key=v_key,
+            )
+            self.offset_mlp = eqx.nn.MLP(
+                in_size=inputs_rank,
+                out_size=outputs_rank,
+                width_size=offset_width_size or int((inputs_rank+outputs_rank) / 2),
+                depth=offset_depth,
+                activation=activation,
+                key=offset_key,
+            )
+
+            self.matrix_basis = None
+            self.offset_basis = None
+
+        # Default to matrix/offset basis approach
+        else:
+            matrix_key, offset_key = jax.random.split(key)
+            self.matrix_basis = scale * jax.random.normal(matrix_key, (inputs_rank + 1, outputs_rank, outputs_rank))
+            self.offset_basis = scale * jax.random.normal(offset_key, (inputs_rank + 1, outputs_rank))
+
+            self.base_matrix = None
+            self.u_mlp = None
+            self.v_mlp = None
+            self.offset_mlp = None 
+
 
     def materialize(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
-        """Materialize the invertible matrix and offset for one input vector.
+        """Materialize the invertible matrix and offset for one input latent vector.
 
         :param inputs: latent input vector with shape ``(inputs_rank,)``
         :return: ``(matrix, offset)`` with shapes ``(outputs_rank, outputs_rank)``
             and ``(outputs_rank,)``
         """
-        values = jnp.asarray(inputs)
-        if values.ndim != 1 or values.shape[0] != self.matrix_basis.shape[0] - 1:
-            raise ValueError(f"inputs must have shape {(self.matrix_basis.shape[0] - 1,)}, got {values.shape}.")
-        coefficients = jnp.concatenate((jnp.ones((1,), dtype=values.dtype), values))
-        generator = jnp.einsum("i,ijk->jk", coefficients, self.matrix_basis)
-        offset = jnp.einsum("i,ij->j", coefficients, self.offset_basis)
-        r = offset.shape[-1]
-        return jax.scipy.linalg.expm(generator) + self.eps * jnp.eye(r), offset
+        # MLP approach
+        if self.mlp:
+            values = jnp.asarray(inputs)
+            outputs_rank = self.base_matrix.shape[-1]
+
+            alpha = jnp.linalg.norm(self.base_matrix) + self.eps
+            I = jnp.eye(outputs_rank)
+            A0 = self.base_matrix + alpha * I    # (outputs_rank, outputs_rank)
+
+            root_rho = jnp.sqrt(self.rho)
+            U = jnp.reshape(self.u_mlp(values), (outputs_rank, -1))   # (outputs_rank, r) ~ e.g. (32, 4)
+            V = jnp.reshape(self.v_mlp(values), (outputs_rank, -1))
+            U = (root_rho / jnp.maximum(jnp.linalg.norm(U), root_rho)) * U  # ||U|| < sqrt(rho)
+            V = (root_rho / jnp.maximum(jnp.linalg.norm(V), root_rho)) * V  # ||V|| < sqrt(rho)
+
+            generator = A0 @ (I + U @ jnp.matrix_transpose(V)) # guaranteed invertibility
+            offset = self.offset_mlp(values)
+
+            return generator, offset
+
+        # Matrix/offset basis approach
+        else:
+            values = jnp.asarray(inputs)
+            if values.ndim != 1 or values.shape[0] != self.matrix_basis.shape[0] - 1:
+                raise ValueError(f"inputs must have shape {(self.matrix_basis.shape[0] - 1,)}, got {values.shape}.")
+            coefficients = jnp.concatenate((jnp.ones((1,), dtype=values.dtype), values))
+            generator = jnp.einsum("i,ijk->jk", coefficients, self.matrix_basis)
+            offset = jnp.einsum("i,ij->j", coefficients, self.offset_basis)
+            r = offset.shape[-1]
+
+            return jax.scipy.linalg.expm(generator) + self.eps * jnp.eye(r), offset
 
     def __call__(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
         """Alias for :meth:`materialize`."""
