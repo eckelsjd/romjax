@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, PositiveInt, model_validator
 from pydantic_core import core_schema
 
 from romjax.nn import LinearProjection
+from romjax.tree import ShapeDtypePyTree, is_shape_dtype
 
 __all__ = ["Compression"]
 
@@ -180,7 +181,7 @@ class SVD(Compression):
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
     latent_std: np.ndarray | None = None
-    template: PyTree | None = None  # for samples
+    template: ShapeDtypePyTree | None = None  # for samples
     orbax_template: PyTree | None = None
 
     @model_validator(mode="after")
@@ -191,10 +192,33 @@ class SVD(Compression):
             raise ValueError("energy_tol must be in the interval (0, 1].")
         return self
 
-    @staticmethod
-    def _flatten_sample(sample: PyTree) -> jax.Array:
+    def _flatten_sample(self, sample: PyTree) -> jax.Array:
         """Flatten one sample pytree into a single feature vector."""
-        leaves = [jnp.ravel(jnp.asarray(leaf)) for leaf in jax.tree.leaves(sample) if eqx.is_array_like(leaf)]
+        if self.template is None:
+            leaves = [jnp.ravel(jnp.asarray(leaf)) for leaf in jax.tree.leaves(sample) if eqx.is_array_like(leaf)]
+        else:
+            sample_leaves, sample_treedef = jax.tree.flatten(sample)
+            template_leaves, template_treedef = jax.tree.flatten(self.template)
+            if sample_treedef != template_treedef:
+                raise ValueError("Sample pytree structure does not match the SVD template.")
+
+            leaves = []
+            for leaf, template_leaf in zip(sample_leaves, template_leaves):
+                if not is_shape_dtype(template_leaf):
+                    continue
+                if is_shape_dtype(leaf):
+                    # Shape/dtype-only templates carry no sample values. Zeros let
+                    # the template remain usable for shape-only reconstruction.
+                    array = jnp.zeros(leaf.shape, dtype=leaf.dtype)
+                else:
+                    array = jnp.asarray(leaf)
+                if array.shape != template_leaf.shape or array.dtype != template_leaf.dtype:
+                    raise ValueError(
+                        "Sample array does not match the SVD template: "
+                        f"expected shape/dtype {template_leaf.shape}/{template_leaf.dtype}, "
+                        f"got {array.shape}/{array.dtype}."
+                    )
+                leaves.append(jnp.ravel(array))
         if not leaves:
             return jnp.asarray([], dtype=jnp.float32)
         return jnp.concatenate(leaves, axis=0)
@@ -243,7 +267,7 @@ class SVD(Compression):
             maxval=np.asarray(maxval),
             latent_mean=np.asarray(latent_mean),
             latent_std=np.asarray(latent_std),
-            template=samples[0],
+            template=self.template if self.template is not None else samples[0],
             orbax_template=self.orbax_template,
         )
 
@@ -288,19 +312,21 @@ class SVD(Compression):
         if self.template is None:
             return vector
 
-        array_template, static_template = eqx.partition(self.template, eqx.is_array_like)
-        leaves, treedef = jax.tree.flatten(array_template)
-        sizes = [int(jnp.size(leaf)) for leaf in leaves]
-
+        template_leaves, treedef = jax.tree.flatten(self.template)
         offset = 0
         reconstructed_leaves = []
-        for leaf, size in zip(leaves, sizes):
+        for leaf in template_leaves:
+            if not is_shape_dtype(leaf):
+                reconstructed_leaves.append(leaf)
+                continue
+            size = int(np.prod(leaf.shape, dtype=int))
             chunk = vector[offset : offset + size]
-            reconstructed_leaves.append(jnp.asarray(chunk).reshape(jnp.asarray(leaf).shape))
+            reconstructed_leaves.append(jnp.asarray(chunk, dtype=leaf.dtype).reshape(leaf.shape))
             offset += size
 
-        reconstructed_arrays = jax.tree.unflatten(treedef, reconstructed_leaves)
-        return eqx.combine(reconstructed_arrays, static_template)
+        if offset != vector.shape[-1]:
+            raise ValueError("Latent reconstruction produced a vector with an incompatible template size.")
+        return jax.tree.unflatten(treedef, reconstructed_leaves)
 
     def latent_size(self) -> int:
         if self.rank is not None:
