@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from romjax.data_gen import DataLoader
 from romjax.graph import FunctionGraph
 from romjax.loss import GraphLoss, _GraphLossEmaState
 from romjax.plotting import GridplotConfig, PlotSpec, gridplot
@@ -773,7 +774,8 @@ class Train(Routine):
                 if hasattr(ele := getattr(self, attr), "graph"):
                     if ele.graph is None:
                         if isinstance(ele, GraphLoss):
-                            ele.bind_graph(self.graph)
+                            # Only set dataset names if we're using the built-in dataloader
+                            ele.bind_graph(self.graph, default_datasets=isinstance(self.dataloader, DataLoader))
                         else:
                             ele.graph = self.graph
 

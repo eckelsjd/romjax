@@ -10,8 +10,10 @@ from romjax.loss import (
     GraphLossTerm,
     GraphLossTermGenerator,
     cyclic_path_error_terms,
+    log_determinant_regularization,
 )
 from romjax.model import SourceSampleable
+from romjax.nn import Affine
 from romjax.train import Train
 
 
@@ -34,6 +36,74 @@ class SampleableOffsetEdge(OffsetEdge, SourceSampleable):
     def sample_source(self, key):
         del key
         return jnp.asarray(0.0)
+
+
+class AffinePayloadEdge(Edge):
+    """Pack a scalar source value into an Affine log-determinant payload."""
+
+    def forward(self, x):
+        offset = x.get("call_args", {}).get("offset", 0.0)
+        value = jnp.asarray(x["value"]) + offset
+        return {"inputs": {"value": value}, "outputs": {"value": value + 0.5}}
+
+    def backward(self, x):
+        del x
+        raise NotImplementedError
+
+
+def test_log_determinant_regularization_uses_matrix_or_module() -> None:
+    matrix_value = log_determinant_regularization(
+        {"matrix": jnp.asarray([[2.0, 1.0], [3.0, 4.0]])},
+        {},
+        None,
+        ref=("matrix",),
+        square=True
+    )
+    assert matrix_value == pytest.approx(jnp.square(jnp.log(5.0)))
+
+    affine = Affine(inputs_rank=1, outputs_rank=2, key=jax.random.key(10), eps=1.0)
+    module_value = log_determinant_regularization(
+        {"affine": affine},
+        {"inputs": {"value": jnp.asarray([0.25])}, "outputs": {"value": jnp.asarray([0.75, -0.25])}},
+        None,
+        ref=("affine",),
+    )
+    assert jnp.isfinite(module_value)
+    matrix_grad = jax.grad(
+        lambda diagonal: log_determinant_regularization(
+            {"matrix": jnp.diag(diagonal)}, {}, None, ref=("matrix",)
+        )
+    )(jnp.asarray([2.0, 3.0]))
+    assert jnp.all(jnp.isfinite(matrix_grad))
+
+
+def test_log_determinant_regularization_pushes_prefix_path() -> None:
+    graph = FunctionGraph(
+        nodes={"source": Node(name="source"), "payload": Node(name="payload")},
+        edges={"pack": AffinePayloadEdge(source="source", target="payload", name="pack")},
+    )
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(11), eps=1.0)
+    source_data = {"value": jnp.asarray(0.25)}
+    params = {"affine": affine, "pack": {"call_args": {"offset": 1.0}}}
+    payload = graph.push_path(source_data, path=["pack"], edge_payload_patches=params)
+
+    expected = affine.log_determinant(payload)
+    actual = log_determinant_regularization(
+        params,
+        source_data,
+        graph,
+        ref=("affine",),
+        path=["pack"],
+    )
+    assert jnp.allclose(actual, expected)
+
+    identity = log_determinant_regularization(
+        {"affine": affine},
+        payload,
+        graph,
+        ref=("affine",),
+    )
+    assert jnp.allclose(identity, expected)
 
 
 class TreeOffsetEdge(Edge):
