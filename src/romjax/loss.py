@@ -41,6 +41,7 @@ __all__ = [
     "GraphLossTermGenerator",
     "GraphTest",
     "cyclic_path_error_terms",
+    "log_determinant_regularization",
     "path_error_loss",
 ]
 
@@ -155,11 +156,59 @@ def symmetric_regularization(params: PyTree, single_data: PyTree, graph: Functio
     return pytree_square_norm(S)
 
 
+def log_determinant_regularization(
+    params: PyTree,
+    single_data: PyTree,
+    graph: FunctionGraph,
+    ref: TreePath | None = None,
+    path: Sequence[str | Edge] | None = None,
+    square: bool = True
+) -> ArrayLike:
+    """Regularize the square of the log absolute determinant of a referenced matrix.
+
+    Squaring prevents both small and large determinants.
+
+    If the referenced object provides ``log_determinant()``, that method is
+    used.  Otherwise the reference is treated as a square matrix and its
+    log absolute determinant is computed directly.
+
+    Optionally specify whether to square the log (default True). This option is passed to the referenced object as well.
+    For example, it may be more beneficial to square the log diagonals before summing to also regularize the spread
+    of the scales in each direction, and not just the total volume scaling.
+
+    :param params: graph parameter pytree
+    :param single_data: single sample of data
+    :param graph: graph used to transform data when ``path`` is configured
+    :param ref: path locating the matrix or affine module
+    :param path: optional graph-edge path applied to ``single_data`` before method dispatch
+    :param square: whether to square the log (default True)
+    :return: the log-determinant regularization
+    """
+    target = params if ref is None else get_subtree(params, ref)
+    if target is None:
+        raise ValueError(f"Can't locate matrix for log-determinant regularization via ref: '{ref}'")
+
+    log_determinant = getattr(target, "log_determinant", None)
+    if callable(log_determinant):
+        if path:
+            if graph is None:
+                raise ValueError("log-determinant regularization requires a graph when path is configured.")
+            single_data = graph.push_path(single_data, path=path, edge_payload_patches=params)
+        return log_determinant(single_data, square=square)
+    else:
+        matrix = jnp.asarray(target)
+        if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+            raise ValueError("log-determinant regularization requires a square matrix or log_determinant method.")
+        value = jnp.linalg.slogdet(matrix).logabsdet
+        return jnp.square(value) if square else value
+
+
 _LOSS_REGISTRY.update({
     "path_error": path_error_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
     "symmetric": symmetric_regularization,
+    "log_determinant": log_determinant_regularization,
 })
 
 
@@ -550,11 +599,13 @@ class GraphLossTerm(BaseModel):
     ) -> jax.Array | tuple[jax.Array, PyTree | None]:
         """Evaluate the unweighted, batch-reduced term value."""
         if self.batch_reduce is not None:
-            if self.dataset is not None and self.dataset not in batch_data:
+            check_dataset = self.dataset is not None and isinstance(batch_data, Mapping)
+            if check_dataset and self.dataset not in batch_data:
                 value = jnp.asarray(0.0)  # if a dataset runs out during iteration
                 return (value, aux) if return_aux else value
 
-            term_batch = batch_data[self.dataset] if self.dataset is not None else batch_data
+            # Get per-dataset batch, otherwise use batch directly
+            term_batch = batch_data[self.dataset] if check_dataset and self.dataset in batch_data else batch_data
             if isinstance(term_batch, (list, tuple)):
                 if len(term_batch) == 0:
                     value = jnp.asarray(0.0)
@@ -1088,21 +1139,21 @@ class GraphLoss(BaseModel):
             self._refresh_term_cache()
             return self
         self._set_default_term_names()
-        if self.graph is not None:
-            self._set_default_datasets()
         self._refresh_term_cache()
         return self
 
-    def bind_graph(self, graph: FunctionGraph) -> None:
+    def bind_graph(self, graph: FunctionGraph, default_datasets: bool = False) -> None:
         """
         Bind a graph and finalize any graph-dependent generated terms.
 
         :param graph: graph used by generated terms and default dataset inference
+        :param default_datasets: whether to set default dataset names
         """
         self.graph = graph
         self._expand_generators()
         self._set_default_term_names()
-        self._set_default_datasets()
+        if default_datasets:
+            self._set_default_datasets()
         self._refresh_term_cache()
 
     def _expand_generators(self) -> None:

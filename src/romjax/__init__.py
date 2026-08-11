@@ -64,6 +64,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ImplicitAffine": ("romjax.pde", "ImplicitAffine"),
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
+    "IterativeSolver": ("romjax.pde", "IterativeSolver"),
     "gridplot": ("romjax.plotting", "gridplot"),
     "AdvectionDiffusion2D": ("romjax.transport", "AdvectionDiffusion2D"),
     "Vlasov1D1V": ("romjax.vlasov", "Vlasov1D1V"),
@@ -115,7 +116,7 @@ if TYPE_CHECKING:
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import Affine, LinearProjection
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
-    from .pde import ImplicitAffine, ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs
+    from .pde import ImplicitAffine, ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs, IterativeSolver
     from .plotting import gridplot
     from .transport import AdvectionDiffusion2D
     from .vlasov import Vlasov1D1V

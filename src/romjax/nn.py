@@ -1,216 +1,228 @@
-from typing import Callable
+from collections.abc import Mapping
+from typing import Callable, Literal
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import ArrayLike, Key
+from jaxtyping import ArrayLike, Key, PyTree
 
 __all__ = ["Affine", "LinearProjection"]
 
 
 class Affine(eqx.Module):
-    """Input-conditioned invertible affine operator in latent coordinates.
+    """Input-conditioned affine residual operator.
 
-    The matrix generator and offset are affine in ``inputs``: 
-        A(inputs) * outputs + c(inputs) 
-    
-    There are two options for the matrix and offset generators:
+    The residual is parameterized as
 
-    Basis approach:
-        A(b) = expm( sum Ai*bi )
-        c(b) = sum ci*bi
-    MLP approach:
-        A(b) = A0*(I + U(b)V(b)^T),  with U(b)~MLP(b) and V(b)~MLP(b)
-        c(b) = MLP(b)
-    
-    The matrix exponential guarantees invertibility. The MLPs are normalized to guarantee invertibility.
+    .. math:: f(b, u) = H(b, u) (u - g(b)).
 
-    You may either pass in the corresponding arrays/modules directly, or use kwargs to randomly initialize them.
-    You are responsible for using appropriate MLP options (e.g. shape consistency).
+    ``solution`` is the MLP for :math:`g`.  ``lower``, ``upper``, and ``diagonal``
+    produce the factors of :math:`H = LDU`, with unit diagonals in ``L`` and
+    ``U``.  The Jacobian MLPs can depend on inputs, outputs, or their
+    concatenation.
     """
 
-    matrix_basis: ArrayLike  # (inputs_rank + 1, outputs_rank, outputs_rank)
-    offset_basis: ArrayLike  # (inputs_rank + 1, outputs_rank)
-    
-    base_matrix: ArrayLike   # (outputs_rank, outputs_rank)
-    u_mlp: eqx.nn.MLP        # f(inputs_rank) -> (outputs_rank x r)
-    v_mlp: eqx.nn.MLP        # f(inputs_rank) -> (outputs_rank x r)
-    offset_mlp: eqx.nn.MLP   # f(inputs_rank) -> outputs_rank
-
-    eps: float
-    rho: float
-    mlp: bool
+    solution: eqx.nn.MLP | None
+    lower: eqx.nn.MLP | None
+    upper: eqx.nn.MLP | None
+    diagonal: eqx.nn.MLP | None
+    inputs_rank: int = eqx.field(static=True)
+    outputs_rank: int = eqx.field(static=True)
+    jacobian_inputs: Literal["inputs", "outputs", "both"] = eqx.field(static=True)
+    identity_jac: bool = eqx.field(static=True)
+    eps: float = eqx.field(static=True)
 
     def __init__(
         self,
         inputs_rank: int | None = None,
         outputs_rank: int | None = None,
         key: Key | None = None,
-        matrix_basis: ArrayLike | None = None,
-        offset_basis: ArrayLike | None = None,
-        base_matrix: ArrayLike | None = None,
-        u_mlp: eqx.nn.MLP | None = None,
-        v_mlp: eqx.nn.MLP | None = None,
-        offset_mlp: eqx.nn.MLP | None = None,
-        mlp: bool = False,
+        identity_jac: bool = False,
+        jacobian_inputs: Literal["inputs", "outputs", "both"] = "inputs",
         matrix_width_size: int | None = None,
-        offset_width_size: int | None = None,
+        vector_width_size: int | None = None,
         matrix_depth: int = 2,
-        offset_depth: int = 2,
-        mlp_rank: int = 4,
+        vector_depth: int = 2,
         activation: Callable = jax.nn.swish,
-        scale: float = 0.25,
-        eps: float = 1e-4,
-        rho: float = 0.95,
+        eps: float = 0.0,
     ) -> None:
         """
-        Initialize affine bases.
+        Initialize the affine residual MLPs.
 
-        :param inputs_rank: input latent dimension for random initialization
-        :param outputs_rank: output latent dimension for random initialization
-        :param key: JAX random key for random initialization
-        :param matrix_basis: explicit generator bases with shape
-            ``(inputs_rank + 1, outputs_rank, outputs_rank)``
-        :param offset_basis: explicit offset bases with shape
-            ``(inputs_rank + 1, outputs_rank)``
-        :param scale: random initialization scale (std dev)
-        :param eps: nugget to add to diagonal of matrix operator
+        :param inputs_rank: input vector dimension
+        :param outputs_rank: output vector dimension
+        :param key: JAX random key for the solution and optional Jacobian MLPs
+        :param identity_jac: use a fixed identity Jacobian with no Jacobian MLPs
+        :param jacobian_inputs: values supplied to the Jacobian MLPs
+        :param matrix_width_size: hidden width for the lower and upper MLPs
+        :param vector_width_size: hidden width for the solution and diagonal MLPs
+        :param matrix_depth: depth of the lower and upper MLPs
+        :param vector_depth: depth of the solution and diagonal MLPs
+        :param activation: activation shared by all MLPs
+        :param eps: optional nugget added to the diagonal of ``H``
         """
+        if inputs_rank is None or outputs_rank is None:
+            raise ValueError("Affine requires inputs_rank and outputs_rank.")
+        if key is None:
+            raise ValueError("Affine requires inputs_rank, outputs_rank, and key.")
+        if inputs_rank < 1 or outputs_rank < 1:
+            raise ValueError("inputs_rank and outputs_rank must be positive.")
+        if jacobian_inputs not in ("inputs", "outputs", "both"):
+            raise ValueError("jacobian_inputs must be 'inputs', 'outputs', or 'both'.")
+        if matrix_depth < 0 or vector_depth < 0:
+            raise ValueError("MLP depths must be nonnegative.")
+        if eps < 0.0:
+            raise ValueError("eps must be nonnegative.")
+
+        self.inputs_rank = inputs_rank
+        self.outputs_rank = outputs_rank
+        self.jacobian_inputs = jacobian_inputs
+        self.identity_jac = identity_jac
         self.eps = eps
-        self.rho = rho
-        self.mlp = mlp
 
-        ## EXPLICIT INITIALIZATION
-        if matrix_basis is not None or offset_basis is not None:
-            if matrix_basis is None or offset_basis is None:
-                raise ValueError("Affine requires both matrix_basis and offset_basis when explicitly initialized.")
-            self.matrix_basis = jnp.asarray(matrix_basis)
-            self.offset_basis = jnp.asarray(offset_basis)
-            if self.matrix_basis.ndim != 3 or self.offset_basis.ndim != 2:
-                raise ValueError("Affine basis arrays must have dimensions 3 and 2 respectively.")
-            expected = (self.matrix_basis.shape[0], self.matrix_basis.shape[1])
-            if self.matrix_basis.shape[1:] != (self.matrix_basis.shape[2], self.matrix_basis.shape[2]):
-                raise ValueError("matrix_basis must have square output matrices.")
-            if self.offset_basis.shape != expected:
-                raise ValueError(f"offset_basis must have shape {expected}, got {self.offset_basis.shape}.")
+        lower_size = outputs_rank * (outputs_rank - 1) // 2
+        jacobian_size = {
+            "inputs": inputs_rank,
+            "outputs": outputs_rank,
+            "both": inputs_rank + outputs_rank,
+        }[jacobian_inputs]
+        vector_width = vector_width_size if vector_width_size is not None else max(1, (inputs_rank + outputs_rank) // 2)
+        matrix_width = (
+            matrix_width_size
+            if matrix_width_size is not None
+            else max(1, (jacobian_size + outputs_rank**2) // 2)
+        )
+        if vector_width < 1 or matrix_width < 1:
+            raise ValueError("MLP widths must be positive.")
 
-            # Not used for matrix/offset basis approach
-            if base_matrix is not None or u_mlp is not None or v_mlp is not None or offset_mlp is not None:
-                raise ValueError("Affine can only do matrix/offset basis approach or MLP approach, not both.")
-            
-            self.base_matrix = None
-            self.u_mlp = None
-            self.v_mlp = None
-            self.offset_mlp = None 
-            self.mlp = False
+        def make_mlp(
+            *,
+            in_size: int,
+            out_size: int,
+            width_size: int,
+            depth: int,
+            mlp_key: Key,
+        ) -> eqx.nn.MLP:
+            module = eqx.nn.MLP(
+                in_size=in_size,
+                out_size=out_size,
+                width_size=width_size,
+                depth=depth,
+                activation=activation,
+                key=mlp_key,
+            )
+            return module
+
+        solution_key, lower_key, upper_key, diagonal_key = jax.random.split(key, 4)
+        self.solution = make_mlp(
+            in_size=inputs_rank,
+            out_size=outputs_rank,
+            width_size=vector_width,
+            depth=vector_depth,
+            mlp_key=solution_key,
+        )
+        if identity_jac:
+            self.lower = None
+            self.upper = None
+            self.diagonal = None
             return
 
-        if base_matrix is not None or u_mlp is not None or v_mlp is not None or offset_mlp is not None:
-            if base_matrix is None or u_mlp is None or v_mlp is None or offset_mlp is None:
-                raise ValueError("Affine requires all base_matrix, u_mlp, v_mlp, offset_mlp for explicit init.")
+        self.lower = None if lower_size == 0 else make_mlp(
+            in_size=jacobian_size,
+            out_size=lower_size,
+            width_size=matrix_width,
+            depth=matrix_depth,
+            mlp_key=lower_key,
+        )
+        self.upper = None if lower_size == 0 else make_mlp(
+            in_size=jacobian_size,
+            out_size=lower_size,
+            width_size=matrix_width,
+            depth=matrix_depth,
+            mlp_key=upper_key,
+        )
+        self.diagonal = make_mlp(
+            in_size=jacobian_size,
+            out_size=outputs_rank,
+            width_size=vector_width,
+            depth=vector_depth,
+            mlp_key=diagonal_key,
+        )
 
-            # Not used for MLP approach
-            if matrix_basis is not None or offset_basis is not None:
-                raise ValueError("Affine can only do matrix/offset basis approach or MLP approach, not both.")
-            
-            self.matrix_basis = None
-            self.offset_basis = None
-            self.mlp = True
-            return
+    def _vector(self, value: ArrayLike, rank: int, name: str) -> ArrayLike:
+        values = jnp.asarray(value).reshape(-1)
+        if values.shape != (rank,):
+            raise ValueError(f"{name} must have shape ({rank},) or be scalar when rank is one; got {values.shape}.")
+        return values
 
-        ## RANDOM INITIALIZATION
-        if key is None or inputs_rank is None or outputs_rank is None:
-            raise ValueError("Affine requires explicit bases or inputs_rank, outputs_rank, and key.")
+    def _jacobian_values(self, inputs: ArrayLike, outputs: ArrayLike | None) -> ArrayLike:
+        values = self._vector(inputs, self.inputs_rank, "inputs")
+        if self.jacobian_inputs == "inputs":
+            return values
+        if outputs is None:
+            raise ValueError("outputs are required when jacobian_inputs is 'outputs' or 'both'.")
+        output_values = self._vector(outputs, self.outputs_rank, "outputs")
+        return output_values if self.jacobian_inputs == "outputs" else jnp.concatenate((values, output_values))
 
-        if mlp:
-            out_size = outputs_rank*mlp_rank  # low-rank matrix
-            default_width = int((inputs_rank + out_size) / 2)
+    def _triangular(self, values: ArrayLike, lower: bool) -> ArrayLike:
+        rows, cols = jnp.tril_indices(self.outputs_rank, -1) if lower else jnp.triu_indices(self.outputs_rank, 1)
+        matrix = jnp.zeros((self.outputs_rank, self.outputs_rank), dtype=values.dtype)
+        return matrix.at[rows, cols].set(values)
 
-            base_key, u_key, v_key, offset_key = jax.random.split(key, 4)
+    def materialize(self, inputs: ArrayLike, outputs: ArrayLike | None = None) -> tuple[ArrayLike, ArrayLike]:
+        """Materialize ``H`` and ``g`` for one input/output pair.
 
-            self.base_matrix = scale * jax.random.normal(base_key, (outputs_rank, outputs_rank))
-            self.u_mlp = eqx.nn.MLP(
-                in_size=inputs_rank, 
-                out_size=out_size,
-                width_size=matrix_width_size or default_width,
-                depth=matrix_depth,
-                activation=activation,
-                key=u_key,
-            )
-            self.v_mlp = eqx.nn.MLP(
-                in_size=inputs_rank,
-                out_size=out_size,
-                width_size=matrix_width_size or default_width,
-                depth=matrix_depth,
-                activation=activation,
-                key=v_key,
-            )
-            self.offset_mlp = eqx.nn.MLP(
-                in_size=inputs_rank,
-                out_size=outputs_rank,
-                width_size=offset_width_size or int((inputs_rank+outputs_rank) / 2),
-                depth=offset_depth,
-                activation=activation,
-                key=offset_key,
-            )
-
-            self.matrix_basis = None
-            self.offset_basis = None
-
-        # Default to matrix/offset basis approach
-        else:
-            matrix_key, offset_key = jax.random.split(key)
-            self.matrix_basis = scale * jax.random.normal(matrix_key, (inputs_rank + 1, outputs_rank, outputs_rank))
-            self.offset_basis = scale * jax.random.normal(offset_key, (inputs_rank + 1, outputs_rank))
-
-            self.base_matrix = None
-            self.u_mlp = None
-            self.v_mlp = None
-            self.offset_mlp = None 
-
-
-    def materialize(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
-        """Materialize the invertible matrix and offset for one input latent vector.
-
-        :param inputs: latent input vector with shape ``(inputs_rank,)``
-        :return: ``(matrix, offset)`` with shapes ``(outputs_rank, outputs_rank)``
-            and ``(outputs_rank,)``
+        :param inputs: input vector, accepting a scalar when ``inputs_rank == 1``
+        :param outputs: output vector, required for output-dependent Jacobians
+        :return: ``(H, g)`` with shapes ``(outputs_rank, outputs_rank)`` and ``(outputs_rank,)``
         """
-        # MLP approach
-        if self.mlp:
-            values = jnp.asarray(inputs)
-            outputs_rank = self.base_matrix.shape[-1]
+        input_values = self._vector(inputs, self.inputs_rank, "inputs")
+        if self.identity_jac:
+            solution = self.solution(input_values)
+            return jnp.eye(self.outputs_rank, dtype=solution.dtype), solution
 
-            alpha = jnp.linalg.norm(self.base_matrix) + self.eps
-            I = jnp.eye(outputs_rank)
-            A0 = self.base_matrix + alpha * I    # (outputs_rank, outputs_rank)
-
-            root_rho = jnp.sqrt(self.rho)
-            U = jnp.reshape(self.u_mlp(values), (outputs_rank, -1))   # (outputs_rank, r) ~ e.g. (32, 4)
-            V = jnp.reshape(self.v_mlp(values), (outputs_rank, -1))
-            U = (root_rho / jnp.maximum(jnp.linalg.norm(U), root_rho)) * U  # ||U|| < sqrt(rho)
-            V = (root_rho / jnp.maximum(jnp.linalg.norm(V), root_rho)) * V  # ||V|| < sqrt(rho)
-
-            generator = A0 @ (I + U @ jnp.matrix_transpose(V)) # guaranteed invertibility
-            offset = self.offset_mlp(values)
-
-            return generator, offset
-
-        # Matrix/offset basis approach
+        jacobian_values = self._jacobian_values(input_values, outputs)
+        solution = self.solution(input_values)
+        diagonal = self.diagonal(jacobian_values) + jnp.asarray(self.eps, dtype=solution.dtype)
+        if self.outputs_rank == 1:
+            matrix = diagonal.reshape(1, 1)
         else:
-            values = jnp.asarray(inputs)
-            if values.ndim != 1 or values.shape[0] != self.matrix_basis.shape[0] - 1:
-                raise ValueError(f"inputs must have shape {(self.matrix_basis.shape[0] - 1,)}, got {values.shape}.")
-            coefficients = jnp.concatenate((jnp.ones((1,), dtype=values.dtype), values))
-            generator = jnp.einsum("i,ijk->jk", coefficients, self.matrix_basis)
-            offset = jnp.einsum("i,ij->j", coefficients, self.offset_basis)
-            r = offset.shape[-1]
+            lower = jnp.eye(self.outputs_rank, dtype=diagonal.dtype) + self._triangular(
+                self.lower(jacobian_values), True
+            )
+            upper = jnp.eye(self.outputs_rank, dtype=diagonal.dtype) + self._triangular(
+                self.upper(jacobian_values), False
+            )
+            matrix = lower @ jnp.diag(diagonal) @ upper
+        return matrix, solution
 
-            return jax.scipy.linalg.expm(generator) + self.eps * jnp.eye(r), offset
+    def log_determinant(self, payload: PyTree, square: bool = True) -> ArrayLike:
+        """Return the log absolute determinant from an implicit-model payload. Optionally sum the squared log instead.
 
-    def __call__(self, inputs: ArrayLike) -> tuple[ArrayLike, ArrayLike]:
+        :param payload: mapping with ``inputs`` and ``outputs`` value payloads
+        :param square: whether to square the log *before* summing (prevents total volume scaling and spread/condition)
+        :return: sum of the log absolute values of the LDU diagonal
+        """
+        if self.identity_jac:
+            return jnp.asarray(0.0)
+        if not isinstance(payload, Mapping) or 'inputs' not in payload or 'outputs' not in payload:
+            raise TypeError("Affine.log_determinant payload must be a Mapping with 'inputs' and 'outputs'.")
+
+        def payload_value(value: PyTree, name: str) -> ArrayLike:
+            if not isinstance(value, Mapping) or 'value' not in value:
+                raise TypeError(f"Affine.log_determinant {name} must contain 'value'.")
+            return value["value"]
+
+        input_values = self._vector(payload_value(payload["inputs"], "inputs"), self.inputs_rank, "inputs")
+        output_values = self._vector(payload_value(payload["outputs"], "outputs"), self.outputs_rank, "outputs")
+        jacobian_values = self._jacobian_values(input_values, output_values)
+        diagonal = self.diagonal(jacobian_values)
+        diagonal = diagonal + jnp.asarray(self.eps, dtype=diagonal.dtype)
+        return jnp.sum(jnp.square(jnp.log(jnp.abs(diagonal)))) if square else jnp.sum(jnp.log(jnp.abs(diagonal)))
+
+    def __call__(self, inputs: ArrayLike, outputs: ArrayLike | None = None) -> tuple[ArrayLike, ArrayLike]:
         """Alias for :meth:`materialize`."""
-        return self.materialize(inputs)
+        return self.materialize(inputs, outputs)
 
 
 class LinearProjection(eqx.Module):

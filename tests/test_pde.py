@@ -256,25 +256,88 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
     outputs_path = tmp_path / "outputs.npz"
     compression.dump(inputs_path)
     compression.dump(outputs_path)
-    affine = Affine(
-        matrix_basis=jnp.asarray([[[0.0, 0.2], [-0.1, 0.0]], [[0.1, 0.0], [0.0, -0.1]], [[0.0, 0.0], [0.0, 0.0]]]),
-        offset_basis=jnp.asarray([[0.2, -0.1], [0.1, 0.0], [0.0, 0.1]]),
-    )
+    affine = Affine(inputs_rank=2, outputs_rank=2, key=jax.random.key(2), eps=1.0)
     edge = ImplicitAffine(inputs_compression=inputs_path, outputs_compression=outputs_path)
     inputs = jnp.asarray([0.3, -0.4])
     outputs = jnp.asarray([0.5, -0.2])
-    runtime_inputs = {"values": inputs, "call_args": affine}
-    residuals = edge.evaluate(runtime_inputs, outputs)
+    runtime_inputs = {"value": inputs, "module": affine}
+    output_payload = {"value": outputs}
+    residuals = edge.evaluate(runtime_inputs, output_payload)
 
     assert edge.resolve_inputs_rank() == 2
     assert edge.resolve_outputs_rank() == 2
-    assert jnp.allclose(edge.solve(runtime_inputs, residuals), outputs)
+    assert jnp.allclose(edge.solve(runtime_inputs, residuals)["value"], outputs)
     assert jnp.allclose(
-        edge.forward({"inputs": runtime_inputs, "outputs": outputs})["residuals"],
-        residuals,
+        edge.forward({"inputs": runtime_inputs, "outputs": output_payload})["residuals"]["value"],
+        residuals["value"],
     )
-    assert edge.sample_inputs(jax.random.key(0))["values"].shape == (2,)
-    assert edge.sample_outputs(jax.random.key(1))["outputs"].shape == (2,)
+    assert edge.sample_inputs(jax.random.key(0))["value"].shape == (2,)
+    assert edge.sample_outputs(jax.random.key(1))["value"].shape == (2,)
+
+
+def test_implicit_affine_scalar_and_nonlinear_jacobian() -> None:
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(3), eps=1.0)
+    edge = ImplicitAffine(inputs_rank=1, outputs_rank=1)
+    inputs = {"value": jnp.asarray(0.3), "module": affine}
+    outputs = {"value": jnp.asarray(0.5)}
+    residuals = edge.evaluate(inputs, outputs)
+
+    assert residuals["value"].shape == (1,)
+    assert jnp.allclose(edge.solve(inputs, residuals)["value"], outputs["value"])
+
+    nonlinear_affine = Affine(
+        inputs_rank=1,
+        outputs_rank=1,
+        key=jax.random.key(4),
+        jacobian_inputs="both",
+        eps=1.0,
+    )
+    nonlinear_inputs = {"value": jnp.asarray(0.3), "module": nonlinear_affine}
+    nonlinear_residuals = edge.evaluate(nonlinear_inputs, outputs)
+    nonlinear_solution = edge.solve(nonlinear_inputs, nonlinear_residuals)
+    assert jnp.allclose(nonlinear_solution["value"], outputs["value"], atol=1e-4)
+
+    def evaluate_scalar(value: jax.Array) -> jax.Array:
+        return edge.evaluate({"value": value, "module": affine}, {"value": value})["value"]
+
+    values = jnp.asarray([0.0, 0.5, 1.0])
+    assert jax.vmap(evaluate_scalar)(values).shape == (3, 1)
+    assert jax.jit(evaluate_scalar)(jnp.asarray(0.2)).shape == (1,)
+
+
+def test_affine_materializes_ldu_and_log_determinant() -> None:
+    affine = Affine(inputs_rank=2, outputs_rank=3, key=jax.random.key(5), eps=1.0)
+    matrix, solution = affine.materialize(jnp.ones(2), jnp.ones(3))
+
+    assert matrix.shape == (3, 3)
+    assert solution.shape == (3,)
+    assert jnp.isfinite(matrix).all()
+    payload = {"inputs": {"value": jnp.ones(2)}, "outputs": {"value": jnp.ones(3)}}
+    assert jnp.allclose(
+        affine.log_determinant(payload),
+        jnp.sum(jnp.square(jnp.log(jnp.abs(affine.diagonal(jnp.ones(2)) + affine.eps)))),
+    )
+
+    scalar = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(6), eps=1.0)
+    assert scalar.lower is None
+    assert scalar.upper is None
+    scalar_matrix, scalar_solution = scalar.materialize(jnp.asarray(0.0), jnp.asarray(0.0))
+    assert scalar_matrix.shape == (1, 1)
+    assert scalar_solution.shape == (1,)
+
+
+def test_affine_identity_jacobian_skips_mlps() -> None:
+    affine = Affine(inputs_rank=2, outputs_rank=3, key=jax.random.key(7), identity_jac=True)
+
+    assert affine.solution is not None
+    assert affine.lower is None
+    assert affine.upper is None
+    assert affine.diagonal is None
+
+    matrix, solution = affine.materialize(jnp.ones(2), jnp.ones(3))
+    assert jnp.array_equal(matrix, jnp.eye(3))
+    assert jnp.allclose(solution, affine.solution(jnp.ones(2)))
+    assert affine.log_determinant({"not": "used"}) == pytest.approx(0.0)
 
 
 def test_implicit_rank_fields_take_priority_over_compression() -> None:

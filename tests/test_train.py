@@ -962,7 +962,7 @@ def test_graph_init_params(toy_graph: FunctionGraph) -> None:
     )
 
     assert train.loss.graph is toy_graph
-    assert train.loss.terms[0].dataset == "toy"
+    assert train.loss.terms[0].dataset is None  # do not set default datasets unless using romx DataLoader
     assert isinstance(train.init_params["toy"]["module"], LinearProjection)
     assert jnp.shape(train.init_params["toy"]["weight"]) == ()
     assert float(train.init_params["toy"]["bias"]) == pytest.approx(0.25)
@@ -1107,7 +1107,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
 
     reconstructed = GraphLoss(
         terms=[
-            {"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []},
+            {"term": {"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}, "dataset": "toy"},
             {"term": "tikhonov", "weight": 0.1, "batch_reduce": None},
         ],
         graph=toy_graph,
@@ -1392,7 +1392,9 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         root=validation_root,
         datasets={"toy": {"kind": "implicit", "batch_size": 1, "max_epochs": 2}},
     )
-    loss = GraphLoss(terms=[{"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}])
+    loss = GraphLoss(
+        terms=[{"term": {"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}, "dataset": "toy"}]
+    )
 
     def validation_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
         del graph
@@ -1400,7 +1402,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         return jnp.square(x - (params["toy"]["weight"] * x + params["toy"]["bias"]))
 
     test = GraphTest(
-        terms=[{"callable": validation_error}],
+        terms=[{"term": {"callable": validation_error}, "dataset": "toy"}],
         loader=validation_loader,
     )
 
