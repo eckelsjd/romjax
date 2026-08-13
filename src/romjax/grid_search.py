@@ -605,7 +605,7 @@ def _yaml_path_text(path: str | Path | PathLike[str]) -> str:
     return str(path).replace("\\", "/")
 
 
-def orbax_metric(case_root: Path, window: int = 10) -> float:
+def orbax_metric(case_root: Path, window: int = 10, file: str = "loss.csv") -> float:
     """Return the best loss recorded for a training case (only near the end of training).
 
     The fast path reads ``loss.csv`` written by :class:`romjax.train.Train`. If no loss history is present, the
@@ -615,7 +615,7 @@ def orbax_metric(case_root: Path, window: int = 10) -> float:
     :return: minimum observed loss
     :raises RoutineError: if no numeric loss metric can be found
     """
-    loss_path = case_root / "loss.csv"
+    loss_path = case_root / file
     if loss_path.exists():
         values = np.atleast_2d(np.loadtxt(loss_path, delimiter=",", skiprows=1))
         if values.size and values.shape[1] >= 2:

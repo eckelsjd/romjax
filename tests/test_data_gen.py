@@ -64,6 +64,12 @@ class _RandomOutputEdge(Edge, ImplicitSampleable):
         return {"y": jax.random.uniform(key)}
 
 
+class _NoneInputEdge(_RandomOutputEdge):
+    def sample_inputs(self, key):
+        del key
+        return None
+
+
 class _ConditionedSampleableEdge(Edge, ImplicitSampleable):
     """Small edge used to exercise persisted per-output conditions."""
 
@@ -187,6 +193,36 @@ def test_generate_implicit_mixes_output_keys_with_input_keys(tmp_path, batch_siz
         for i in range(2)
     ]
     assert np.array_equal(legacy_values[0], legacy_values[1])
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_and_load_implicit_none_inputs(tmp_path, batch_size):
+    graph = FunctionGraph(edges={"random": _NoneInputEdge(source="inputs", target="random")})
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "random": {
+                "input_samples": 2,
+                "outputs_per_input": 1,
+                "input_seed": 3,
+                "output_seed": 5,
+                "batch_size": batch_size,
+            }
+        },
+        graph=graph,
+    )
+
+    assert generation.run() == 0
+
+    edge_dir = tmp_path / "random"
+    input_dirs = sorted(edge_dir.glob("seed_3/sample_*"))
+    assert len(input_dirs) == 2
+    assert all(not (input_dir / "input.h5").exists() for input_dir in input_dirs)
+    assert all((input_dir / "seed_5/sample_0/output.h5").exists() for input_dir in input_dirs)
+
+    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
+    assert len(refs) == 2
+    assert all("inputs" not in LoadImplicitModel().load_sample(ref) for ref in refs)
 
 
 def _write_transport_dataset(

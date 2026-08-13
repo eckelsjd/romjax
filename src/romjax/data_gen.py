@@ -522,7 +522,7 @@ class GenImplicitModel(GenGraph):
                 else:
                     one_input = sample_inputs(input_key)
                     one_solution = None
-                    if solve is not None:
+                    if solve is not None and one_input is not None:
                         if self.throw:
                             one_solution = solve(one_input)
                         else:
@@ -545,7 +545,8 @@ class GenImplicitModel(GenGraph):
                                 )
 
                     if format == "h5":
-                        save_h5(one_input, input_path, mode="w")
+                        if one_input is not None:
+                            save_h5(one_input, input_path, mode="w")
                         if one_solution is not None:
                             save_h5(one_solution, solution_path, mode="w")
                         if one_solution_residual is not None:
@@ -660,10 +661,22 @@ class GenImplicitModel(GenGraph):
             if missing_indices:
                 missing_keys = tuple(input_batch[i][0] for i in missing_indices)
                 generated_inputs = sample_inputs(pytree_stack(missing_keys))
-                generated_solutions = solve(generated_inputs) if solve is not None else None
+                # ``sample_inputs`` may intentionally return ``None`` for an input
+                # sample.  In that case there is no input to solve, but output
+                # sampling can still be meaningful for models whose outputs are
+                # independent of inputs.
+                generated_solutions = (
+                    solve(generated_inputs)
+                    if solve is not None and generated_inputs is not None
+                    else None
+                )
                 generated_solution_residuals = (
                     evaluate_solution(generated_inputs, generated_solutions)
-                    if evaluate_solution is not None and generated_solutions is not None
+                    if (
+                        evaluate_solution is not None
+                        and generated_inputs is not None
+                        and generated_solutions is not None
+                    )
                     else None
                 )
                 generated_inputs = jax.device_get(generated_inputs)
@@ -673,7 +686,11 @@ class GenImplicitModel(GenGraph):
                     if generated_solution_residuals is not None
                     else None
                 )
-                input_samples = list(pytree_iter(generated_inputs))
+                input_samples = (
+                    [None] * len(missing_indices)
+                    if generated_inputs is None
+                    else list(pytree_iter(generated_inputs))
+                )
                 solution_samples = list(pytree_iter(generated_solutions)) if generated_solutions is not None else None
                 solution_residual_samples = (
                     list(pytree_iter(generated_solution_residuals))
@@ -695,7 +712,8 @@ class GenImplicitModel(GenGraph):
                     one_solution_residual = solution_residuals_by_index.get(i)
 
                     if format == "h5":
-                        save_h5(one_input, input_path / "input.h5", mode="w")
+                        if one_input is not None:
+                            save_h5(one_input, input_path / "input.h5", mode="w")
                         if one_solution is not None:
                             save_h5(one_solution, input_path / "solution.h5", mode="w")
                         if one_solution_residual is not None:
@@ -959,7 +977,11 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     def load_sample(self, ref: ImplicitSampleRef) -> PyTree:
         """Load one implicit-model sample from disk."""
         input_path, output_path, sample_kind = ref
-        sample: dict[str, PyTree] = {"inputs": load_h5({}, input_path / "input.h5", jax=False)}
+        sample: dict[str, PyTree] = {}
+
+        input_file = input_path / "input.h5"
+        if input_file.exists():
+            sample["inputs"] = load_h5({}, input_file, jax=False)
 
         output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
         if output_file.exists():

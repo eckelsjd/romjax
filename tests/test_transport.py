@@ -12,6 +12,7 @@ from romjax.pde import (
     GaussianForcing,
     GridBoundaryInputs,
     IterativeSolver,
+    SinusoidForcing,
     UniformGrid,
     homogeneous_boundary,
 )
@@ -109,10 +110,10 @@ def test_potential_velocity_is_jit_grad_compatible() -> None:
     psi = jnp.sin(jnp.pi * coords[0]) * jnp.cos(jnp.pi * coords[1])
 
     def evaluate(scale: jax.Array) -> jax.Array:
-        velocity = forcing({"psi": scale * psi, "coords": coords}, {})
+        velocity = forcing({"const": scale * psi, "coords": coords}, {})
         return jnp.sum(velocity**2)
 
-    velocity = forcing({"psi": psi, "coords": coords}, {})
+    velocity = forcing({"const": psi, "coords": coords}, {})
     dx = x[1] - x[0]
     dy = y[1] - y[0]
     divergence = forcing._differentiate(velocity[0], dx, axis=0) + forcing._differentiate(
@@ -125,11 +126,11 @@ def test_potential_velocity_is_jit_grad_compatible() -> None:
     assert jnp.isfinite(jax.grad(evaluate)(1.5))
 
     normalized_forcing = PotentialVelocity(normalize=True)
-    normalized_velocity = normalized_forcing({"psi": psi, "coords": coords}, {})
+    normalized_velocity = normalized_forcing({"const": psi, "coords": coords}, {})
     speed_rms = jnp.sqrt(jnp.mean(jnp.sum(normalized_velocity**2, axis=0)))
     assert jnp.allclose(speed_rms, 1.0)
 
-    zero_velocity = normalized_forcing({"psi": jnp.zeros_like(psi), "coords": coords}, {})
+    zero_velocity = normalized_forcing({"const": jnp.zeros_like(psi), "coords": coords}, {})
     assert jnp.isfinite(zero_velocity).all()
     assert jnp.all(zero_velocity == 0.0)
 
@@ -143,12 +144,46 @@ def test_potential_velocity_registry_and_shape_validation() -> None:
     )
     x, y = model.grid.coords
     psi = jnp.sin(x) * jnp.cos(y)
-    velocity = model.velocity({"psi": psi, "coords": (x, y)}, {})
+    velocity = model.velocity({"const": psi, "coords": (x, y)}, {})
     assert velocity.shape == (2, 5, 4)
     assert jnp.allclose(jnp.sqrt(jnp.mean(jnp.sum(velocity**2, axis=0))), 1.0)
 
     with pytest.raises(ValueError, match="does not match grid shape"):
-        model.velocity({"psi": jnp.zeros((5, 5)), "coords": (x, y)}, {})
+        model.velocity({"const": jnp.zeros((5, 5)), "coords": (x, y)}, {})
+
+
+def test_potential_velocity_uses_configured_potential_forcing() -> None:
+    """PotentialVelocity forwards runtime inputs to its configured potential forcing."""
+    x = jnp.linspace(0.0, 1.0, 5)
+    y = jnp.linspace(0.0, 1.0, 4)
+    coords = jnp.meshgrid(x, y, indexing="ij")
+    potential = SinusoidForcing(inputs_default={"a": 1.0, "b": 2.0, "c": 3.0})
+    forcing = PotentialVelocity(potential=potential)
+
+    expected_potential = (
+        jnp.sin(jnp.pi * coords[0]) * jnp.sin(jnp.pi * coords[1])
+        + 2.0 * jnp.sin(2.0 * jnp.pi * coords[0]) * jnp.sin(jnp.pi * coords[1])
+        + 3.0 * jnp.sin(jnp.pi * coords[0]) * jnp.sin(2.0 * jnp.pi * coords[1])
+    )
+    velocity = forcing({"coords": coords}, {})
+
+    expected = jnp.stack(
+        (forcing._differentiate(expected_potential, y[1] - y[0], axis=1),
+         -forcing._differentiate(expected_potential, x[1] - x[0], axis=0)),
+        axis=0,
+    )
+    assert jnp.allclose(velocity, expected)
+
+
+def test_sinusoid_forcing_coefficients() -> None:
+    """SinusoidForcing evaluates all three configurable spatial modes."""
+    x = jnp.array([[0.25]])
+    y = jnp.array([[0.25]])
+    forcing = SinusoidForcing()
+
+    value = forcing({"a": 2.0, "b": 3.0, "c": 5.0, "coords": (x, y)}, {})
+    expected = 2.0 * 0.5 + (3.0 + 5.0) * jnp.sin(jnp.pi * 0.25)
+    assert jnp.allclose(value, expected)
 
 
 def test_transport_coercion() -> None:

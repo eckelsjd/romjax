@@ -12,15 +12,43 @@ from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
 from romjax.nn import Affine
 from romjax.pde import (
+    FORCING_REGISTRY,
     AliveProgressMeter,
     BoundaryType,
+    ConstantForcing,
     ImplicitAffine,
     ImplicitIterativeGalerkin,
     LatentSamplerFactory,
+    SumForcing,
     UniformGrid,
     homogeneous_boundary,
 )
 from romjax.tree import pytree_merge
+
+
+def test_sum_forcing_delegates_to_independently_configured_forcings() -> None:
+    forcing = SumForcing(
+        forcings=(
+            ConstantForcing(inputs_default={"const": 2.0}),
+            ConstantForcing(inputs_default={"const": 3.0}),
+        )
+    )
+
+    assert jnp.allclose(forcing({}, {}), 5.0)
+    assert FORCING_REGISTRY["sum"] is SumForcing
+
+
+def test_sum_forcing_validates_nested_registered_specs() -> None:
+    forcing = SumForcing.model_validate(
+        {
+            "forcings": [
+                {"name": "constant", "inputs_default": {"const": 1.5}},
+                {"callable": "constant", "inputs_default": {"const": 2.5}},
+            ]
+        }
+    )
+
+    assert jnp.allclose(forcing({}, {}), 4.0)
 
 
 def test_merge_boundary_conditions():
@@ -303,6 +331,32 @@ def test_implicit_affine_scalar_and_nonlinear_jacobian() -> None:
     values = jnp.asarray([0.0, 0.5, 1.0])
     assert jax.vmap(evaluate_scalar)(values).shape == (3, 1)
     assert jax.jit(evaluate_scalar)(jnp.asarray(0.2)).shape == (1,)
+
+
+def test_implicit_affine_collects_additional_input_arrays_deterministically() -> None:
+    affine = Affine(inputs_rank=5, outputs_rank=1, key=jax.random.key(8), identity_jac=True)
+    inputs = {
+        "value": jnp.asarray([0.3]),
+        "module": affine,
+        "inputs": [{"args": {"z": jnp.asarray([1.0, 2.0]), "a": jnp.asarray([3.0])}}],
+        "diffusion": {"alpha": jnp.asarray(0.5)},
+    }
+
+    configured = ImplicitAffine(
+        additional_inputs=[
+            ["inputs", 0, "args"],
+            ["diffusion", "alpha"],
+        ]
+    )
+    configured_values, _ = configured._affine_inputs(inputs)
+    assert jnp.array_equal(configured_values, jnp.asarray([0.3, 3.0, 1.0, 2.0, 0.5]))
+
+    collect_all = ImplicitAffine(additional_inputs=())
+    all_values, _ = collect_all._affine_inputs(inputs)
+    assert jnp.array_equal(all_values, jnp.asarray([0.3, 0.5, 3.0, 1.0, 2.0]))
+
+    residuals = configured.evaluate(inputs, {"value": jnp.asarray([0.2])})
+    assert configured.solve(inputs, residuals)["value"].shape == (1,)
 
 
 def test_affine_materializes_ldu_and_log_determinant() -> None:

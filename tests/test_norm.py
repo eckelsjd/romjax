@@ -203,6 +203,46 @@ def test_h5_norm_tree_artifact_overrides_can_create_paths(tmp_path: Path) -> Non
     assert jnp.allclose(out["outputs"]["y"], jnp.asarray([1.0]))
 
 
+def test_h5_norm_tree_artifact_can_override_with_root_tree_subtree(tmp_path: Path) -> None:
+    root_artifact = tmp_path / "norm_one.h5"
+    subtree_artifact = tmp_path / "norm_two.h5"
+
+    with h5py.File(root_artifact, "w") as h5:
+        h5.attrs["romjax_type"] = "norm_tree"
+        leaf = h5.create_group("tree/subtree/keep")
+        leaf.attrs["callable"] = "zscore"
+        leaf.attrs["mean"] = 0.0
+        leaf.attrs["std"] = 1.0
+
+    with h5py.File(subtree_artifact, "w") as h5:
+        h5.attrs["romjax_type"] = "norm_tree"
+        leaf = h5.create_group("tree/replaced")
+        leaf.attrs["callable"] = "minmax"
+        leaf.attrs["xmin"] = 0.0
+        leaf.attrs["xmax"] = 10.0
+        leaf.attrs["ymin"] = -1.0
+        leaf.attrs["ymax"] = 1.0
+
+    norm = NormTree(
+        root={
+            "artifact": root_artifact,
+            "overrides": {"subtree": subtree_artifact},
+        }
+    )
+    out = norm(
+        {
+            "subtree": {
+                "keep": jnp.asarray([10.0]),
+                "replaced": jnp.asarray([5.0]),
+            }
+        }
+    )
+
+    assert jnp.allclose(out["subtree"]["keep"], jnp.asarray([10.0]))
+    assert jnp.allclose(out["subtree"]["replaced"], jnp.asarray([0.0]))
+    assert "replaced" in norm.resolve_root()["subtree"]
+
+
 def test_edge_norm_artifact_loads_lazily_and_caches(tmp_path: Path) -> None:
     artifact = tmp_path / "lazy_norm.h5"
     edge = IdentityEdge(

@@ -624,8 +624,11 @@ def test_filter_model_runtime_input_normalization_and_errors() -> None:
     assert jnp.array_equal(encoded_shared["latent"]["z1"], jnp.array([1.0, 2.0]))
     assert jnp.array_equal(encoded_shared["latent"]["z2"], jnp.array([1.0, 2.0]))
 
-    with pytest.raises(ValueError):
-        multi_model.forward({"full": {"x": jnp.array([1.0, 2.0])}, "call_args": [1.0]})
+    encoded_partial = multi_model.forward(
+        {"full": {"x": jnp.array([1.0, 2.0])}, "call_args": [1.0]}
+    )
+    assert jnp.array_equal(encoded_partial["latent"]["z1"], jnp.array([1.0, 2.0]))
+    assert jnp.array_equal(encoded_partial["latent"]["z2"], jnp.array([1.0, 2.0]))
 
     with pytest.raises(ValueError):
         multi_model.forward(

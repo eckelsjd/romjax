@@ -71,8 +71,8 @@ def coerce_tree_path(value: Any) -> TreePath:
         return tuple(int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token for token in value)
     if isinstance(value, list):
         return tuple(int(token) if isinstance(token, str) and token.lstrip("-").isdigit() else token for token in value)
-    if isinstance(value, str):
-        return (value,)
+    if isinstance(value, str | int):
+        return (int(value) if isinstance(value, str) and value.lstrip("-").isdigit() else value,)
     return value
 
 
