@@ -159,7 +159,7 @@ class OuterToInnerRoute(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _from_path(cls, value: Any) -> Any:
-        if isinstance(value, tuple | list):
+        if isinstance(value, tuple | list | str | int):
             return {"outer": value}
         return value
 
@@ -193,7 +193,7 @@ class InnerToOuterRoute(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _from_path(cls, value: Any) -> Any:
-        if isinstance(value, tuple | list):
+        if isinstance(value, tuple | list | str | int):
             return {"outer": value}
         return value
 
@@ -400,7 +400,8 @@ class FilterModel(Edge):
 
     - a single shared value, broadcast to every spec,
     - ``{"shared": value}`` for an explicit shared value, or
-    - ``{"per_spec": [value0, value1, ...]}`` for one value per spec.
+    - ``{"per_spec": [value0, value1, ...]}`` for one value per spec. Short lists are
+      padded with ``None``; lists longer than the number of specs raise ``ValueError``.
 
     When there is exactly one filter spec, a bare value of any type is treated as that spec's runtime input.
 
@@ -439,17 +440,21 @@ class FilterModel(Edge):
                 )
             runtime_args = runtime_args.get(self._PER_SPEC_CALL_ARGS_KEY)
             if not isinstance(runtime_args, (list, tuple)):
-                raise ValueError("call_args['per_spec'] must be a list or tuple aligned with the filter specs.")
+                raise ValueError("call_args['per_spec'] must be a list or tuple of per-spec runtime inputs.")
 
         if len(self.filters) == 1:
             return outer_payload, [runtime_args]
 
         if isinstance(runtime_args, (list, tuple)):
             args = list(runtime_args)
-            if len(args) != len(self.filters):
+            if len(args) > len(self.filters):
                 raise ValueError(
                     f"Received {len(args)} per-spec runtime inputs but model has {len(self.filters)} filter specs."
                 )
+
+            # Fill empty args with None
+            args = args + [None] * (len(self.filters) - len(args))
+
             return outer_payload, args
 
         return outer_payload, [runtime_args] * len(self.filters)

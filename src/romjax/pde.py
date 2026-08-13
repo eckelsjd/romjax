@@ -34,12 +34,12 @@ from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
 from romjax.rng import PyTreeSampler, SamplerCallable
-from romjax.tree import TreePath, pytree_merge, set_subtree
+from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge, set_subtree
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'ForcingCallable', 'RegisteredForcing', 'FORCING_REGISTRY', 'IdentityInputs', 'ConstantForcing',
-           'GaussianForcing', 'SinusoidForcing', 'IterativeSolver',
+           'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'IterativeSolver',
            'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
@@ -130,21 +130,41 @@ class GaussianForcing(ForcingCallable):
 
 
 class SinusoidForcing(ForcingCallable):
-    """Return the manufactured-solution sinusoidal forcing field."""
+    """Return a configurable combination of two-dimensional sinusoidal modes."""
 
     class Inputs(DictModel):
+        """Inputs for the sinusoidal forcing function.
+
+        :ivar a: coefficient of ``sin(pi x) sin(pi y)``
+        :ivar b: coefficient of ``sin(2 pi x) sin(pi y)``
+        :ivar c: coefficient of ``sin(pi x) sin(2 pi y)``
+        :ivar coords: spatial coordinates
+        """
+
+        a: ArrayLike = 2.0 * jnp.pi**2
+        b: ArrayLike = 0.0
+        c: ArrayLike = 0.0
         coords: Coordinates = (0.0, 0.0)
 
     def callable(self, inputs: Inputs, outputs: PyTree) -> ArrayLike:
-        """Evaluate ``2 pi^2 sin(pi x) sin(pi y)``.
+        r"""Evaluate the configurable sinusoidal forcing field.
 
-        :param inputs: coordinates
+        .. math::
+
+            f(x, y) = a\sin(\pi x)\sin(\pi y)
+                + b\sin(2\pi x)\sin(\pi y)
+                + c\sin(\pi x)\sin(2\pi y).
+
+        :param inputs: sinusoidal coefficients and coordinates
         :param outputs: current model outputs, unused
         :return: sinusoidal field
         """
         del outputs
-        return 2 * jnp.pi**2 * jnp.sin(jnp.pi * inputs["coords"][0]) * jnp.sin(
-            jnp.pi * inputs["coords"][1]
+        x, y = (jnp.asarray(coord) for coord in inputs["coords"])
+        return (
+            inputs["a"] * jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
+            + inputs["b"] * jnp.sin(2.0 * jnp.pi * x) * jnp.sin(jnp.pi * y)
+            + inputs["c"] * jnp.sin(jnp.pi * x) * jnp.sin(2.0 * jnp.pi * y)
         )
 
 
@@ -159,6 +179,29 @@ type RegisteredForcing = Annotated[
     ForcingCallable,
     BeforeValidator(partial(from_registry, FORCING_REGISTRY)),
 ]
+
+
+class SumForcing(ForcingCallable):
+    """Evaluate and add a sequence of independently configured forcings.
+
+    Each nested forcing receives the same runtime ``inputs`` and ``outputs``.
+    Its own ``inputs_default`` and ``outputs_default`` are applied by its
+    :class:`ForcingCallable` implementation before evaluation.
+    """
+
+    forcings: tuple[RegisteredForcing, ...] = Field(min_length=1)
+
+    def callable(self, inputs: PyTree, outputs: PyTree) -> ArrayLike:
+        """Return the sum of all nested forcing evaluations.
+
+        :param inputs: runtime inputs shared by all nested forcings
+        :param outputs: runtime outputs shared by all nested forcings
+        :return: sum of the nested forcing values
+        """
+        return sum((forcing(inputs, outputs) for forcing in self.forcings), jnp.asarray(0.0))
+
+
+FORCING_REGISTRY["sum"] = SumForcing
 
 
 class BoundaryType(IntEnum):
@@ -705,6 +748,11 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     payload ``{"value": ..., "module": Affine(...)}``; outputs and residuals
     use ``{"value": ...}``.
 
+    ``additional_inputs`` appends flattened array leaves from configured
+    input subtrees to ``inputs["value"]``. ``None`` disables this behavior;
+    an empty tuple collects all array leaves except the reserved ``value`` and
+    ``module`` payloads.
+
     Implicit sampling is for sampling inputs/outputs in latent space.
     Source sampling is for sampling residuals in latent space.
     """
@@ -712,6 +760,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     solver: LinearSolver | IterativeSolver | None = None
     inputs_rank: PositiveInt | None = None
     outputs_rank: PositiveInt | None = None
+    additional_inputs: tuple[TreePath, ...] | None = None
     initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     inputs_compression: Path | str | Compression | None = None
     outputs_compression: Path | str | Compression | None = None
@@ -729,7 +778,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     )
     residuals_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
         default_factory=lambda: LatentSamplerFactory(
-            callable=partial(_default_latent_sampler, path=("value",))
+            callable=partial(_default_latent_sampler, path=("residuals", "value",))
         )
     )
     _resolved_inputs_compression: Compression | None = PrivateAttr(default=None)
@@ -738,6 +787,14 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     _resolved_inputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
     _resolved_outputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
     _resolved_residuals_sampler: SamplerCallable | None = PrivateAttr(default=None)
+
+    @field_validator("additional_inputs", mode="before")
+    @classmethod
+    def _coerce_additional_inputs(cls, value: Any) -> Any:
+        """Normalize configured paths while preserving ``()`` as the all-arrays sentinel."""
+        if value is None or (isinstance(value, tuple | list) and len(value) == 0):
+            return tuple(value)
+        return tuple(coerce_tree_paths(value))
 
     def _resolve_compression(self, artifact: Path | str | Compression | None, cache_name: str) -> Compression | None:
         cached = getattr(self, cache_name)
@@ -815,12 +872,65 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         )
 
     def _affine_inputs(self, inputs: PyTree) -> tuple[ArrayLike, Affine]:
-        """Extract the input value and runtime affine module."""
-        if not isinstance(inputs, Mapping) or {"value", "module"} - set(inputs):
-            raise TypeError("ImplicitAffine inputs must contain {'value', 'module'}.")
+        """Extract the augmented input value and runtime affine module."""
+        if not isinstance(inputs, Mapping) or "module" not in inputs:
+            raise TypeError("ImplicitAffine inputs must contain 'module'.")
         if not isinstance(inputs["module"], Affine):
             raise TypeError("ImplicitAffine input 'module' must be an Affine instance.")
-        return jnp.asarray(inputs["value"]).reshape(-1), inputs["module"]
+
+        value = jnp.asarray(inputs["value"]).reshape(-1) if "value" in inputs else None
+
+        if self.additional_inputs is None:
+            if value is None:
+                raise ValueError("Must pass in 'value' or additional_inputs to Affine.")
+            
+            return value, inputs["module"]
+
+        paths = self.additional_inputs
+        if paths == ():
+            paths = ((),)
+
+        leaves: list[ArrayLike] = []
+        for path in paths:
+            subtree = get_subtree(inputs, path)
+            if subtree is None:
+                raise KeyError(f"ImplicitAffine additional input path not found: {path!r}.")
+            subtree_leaves = jax.tree_util.tree_flatten_with_path(subtree)[0]
+            for relative_path, leaf in subtree_leaves:
+                full_path = path + self._path_tokens(relative_path)
+                if self._is_special_input_path(full_path) or not eqx.is_array_like(leaf):
+                    continue
+                leaves.append(jnp.asarray(leaf).reshape(-1))
+
+        if not leaves:
+            if value is None:
+                raise ValueError("Must pass in 'value' or additional_inputs to Affine.")
+            return value, inputs["module"]
+
+        leaves = (value, *leaves) if value is not None else tuple(leaves)
+
+        return jnp.concatenate(leaves), inputs["module"]
+
+    @staticmethod
+    def _path_tokens(path: tuple[Any, ...]) -> TreePath:
+        """Convert JAX key-path entries to the project's string/integer path tokens."""
+        tokens: list[str | int] = []
+        for entry in path:
+            if hasattr(entry, "key"):
+                tokens.append(entry.key)
+            elif hasattr(entry, "idx"):
+                tokens.append(entry.idx)
+            else:
+                tokens.append(str(entry))
+        return tuple(tokens)
+
+    @staticmethod
+    def _is_special_input_path(path: TreePath) -> bool:
+        """Return whether a path belongs to the reserved value or affine module payloads."""
+        return (
+            path[:1] in (("value",), ("module",))
+            or path[:2] in (("inputs", "value"), ("inputs", "module"))
+        )
 
     @staticmethod
     def _value(payload: PyTree, name: str) -> ArrayLike:
@@ -880,7 +990,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         sampler = self.resolve_inputs_sampler()
 
         if sampler is None:
-            raise ValueError("ImplicitAffine input sampler could not be resolved.")
+            return None
         
         return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
 

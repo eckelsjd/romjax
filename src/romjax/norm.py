@@ -244,10 +244,26 @@ def _is_leaf_norm_spec(value: Any) -> bool:
     return isinstance(value, Mapping) and "callable" in value
 
 
+def _resolve_norm_override_artifact(value: Any) -> Any:
+    """Resolve an artifact referenced from a norm-tree override.
+
+    Override artifacts may contain either a single callable or a complete
+    ``NormTree``.  The latter is deliberately loaded here, before recursive
+    merging, so its root can be used as the value of a subtree path.
+    """
+    if isinstance(value, str | Path) and _is_norm_artifact_path(value):
+        return _load_norm_tree_artifact(value)
+    if isinstance(value, Mapping) and "artifact" in value:
+        loaded = _load_norm_tree_artifact(value["artifact"])
+        return _merge_norm_override(loaded, value.get("overrides"))
+    return value
+
+
 def _merge_norm_override(base: Any, override: Any, path: tuple[str | int, ...] = ()) -> Any:
     """Deep-merge a YAML override into a loaded norm tree, creating missing mapping paths."""
     if override is None:
         return base
+    override = _resolve_norm_override_artifact(override)
     if isinstance(base, Mapping) and isinstance(override, Mapping):
         if _is_leaf_norm_spec(base):
             merged = dict(base)
@@ -484,7 +500,8 @@ class NormTree(BaseModel):
 
     :param root: either one :class:`NormOperator` broadcast over all array leaves or a pytree of operators
     :param artifact: optional HDF5 artifact path resolved lazily at runtime
-    :param overrides: optional deep-merge overrides applied after loading ``artifact``
+    :param overrides: optional deep-merge overrides applied after loading ``artifact``; ``.h5`` values may
+        reference either leaf artifacts or full norm-tree artifacts
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
