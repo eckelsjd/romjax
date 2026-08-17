@@ -278,6 +278,41 @@ def test_hybrid_grid_search_rejects_scheduler_owned_child_env(tmp_path: Path) ->
         )
 
 
+def test_grid_search_propagates_parent_jax_options_to_child_processes(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10]}],
+        jax_platforms="cpu",
+        jax_enable_x64=True,
+    )
+
+    specs, _ = search._prepare_cases()
+
+    assert specs[0].env["JAX_PLATFORMS"] == "cpu"
+    assert specs[0].env["JAX_ENABLE_X64"] == "true"
+
+
+def test_hybrid_grid_search_keeps_slot_platform_selection(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": [10]}],
+        executor={"kind": "hybrid", "gpu": {"devices": []}, "cpu": {"max_workers": 1}},
+        jax_platforms="cpu",
+        jax_enable_x64=True,
+    )
+
+    specs, _ = search._prepare_cases()
+
+    assert "JAX_PLATFORMS" not in specs[0].env
+    assert specs[0].env["JAX_ENABLE_X64"] == "true"
+
+
 def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
     config = HybridExecutorConfig.model_validate(
         {
@@ -448,6 +483,51 @@ def test_grid_search_rolling_save_policy_works_with_out_of_order_completion(
     assert manifest["cases"]["case_0001"]["retained"] is True
     assert not (search.root / "cases" / "case_0000").exists()
     assert (search.root / "cases" / "case_0001").exists()
+
+
+def test_grid_search_rolling_save_policy_rejects_nonfinite_metrics_with_hybrid_executor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
+    losses = {f"case_{index:04d}": float("nan") for index in range(8)}
+    losses.update({"case_0008": 2.0, "case_0009": 1.0})
+
+    def fake_run_case(spec):
+        (spec.root / "loss.csv").write_text(
+            f"Iteration,Value\n0,{losses[spec.name]}\n", encoding="utf-8"
+        )
+        return GridSearchCaseResult(
+            name=spec.name,
+            root=spec.root,
+            config_path=spec.config_path,
+            exit_code=0,
+            start_time="2026-06-09T10:00:00-04:00",
+            end_time="2026-06-09T10:00:01-04:00",
+        )
+
+    monkeypatch.setattr("romjax.grid_search._run_case_subprocess", fake_run_case)
+    search = GridSearch(
+        root=tmp_path / "grid",
+        base=base_path,
+        override=[{"path": ["value"], "cases": list(range(10))}],
+        save_policy={"rolling": 8},
+        executor={
+            "kind": "hybrid",
+            "gpu": {"devices": []},
+            "cpu": {"max_workers": 2},
+            "show_progress": False,
+        },
+    )
+
+    assert search.run() == 0
+
+    manifest = yaml.safe_load((search.root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["best"] == "case_0009"
+    assert [entry["case"] for entry in manifest["ranking"]] == ["case_0009", "case_0008"]
+    assert not (search.root / "cases" / "case_0000").exists()
+    assert (search.root / "cases" / "case_0009").exists()
+    assert (search.root / "best" / "case.yml").exists()
 
 
 def test_grid_search_reuse_policy_skips_existing_cases(tmp_path: Path, monkeypatch) -> None:

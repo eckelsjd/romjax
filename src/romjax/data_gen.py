@@ -2007,6 +2007,7 @@ class DataGeneration(Routine):
     :ivar datasets: pytree template for datasets to generate under root
     :ivar bases: named arbitrary base configurations to expand under root
     :ivar overrides: Cartesian-product overrides applied to each base configuration
+    :ivar base_name: Optional prefix for each base directory as "/base_name=base.name"
     :ivar format: the data format to save samples. Only `h5` supported.
     :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
     :ivar graph: graph object or YAML path (optional, for graph-related datasets)
@@ -2016,6 +2017,7 @@ class DataGeneration(Routine):
     datasets: GenDataPyTree | None = None
     bases: list[DataGenerationBase] = Field(default_factory=list)
     overrides: list[DataGenerationOverride] = Field(default_factory=list)
+    base_name: str | None = None
 
     format: SUPPORTED_FORMATS = "h5"
     write_policy: SUPPORTED_POLICIES = "reuse"
@@ -2074,7 +2076,7 @@ class DataGeneration(Routine):
 
             for base in self.bases:
                 datasets = self._base_datasets(base, values)
-                base_root = override_root / base.name
+                base_root = override_root / f"{self.base_name}={base.name}" if self.base_name is not None else base.name
                 for path, dataset in pytree_path_iter(
                     datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
                 ):

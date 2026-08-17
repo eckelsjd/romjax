@@ -299,6 +299,7 @@ class YamlLoader(ConfigLoader):
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
+        _Dumper.add_multi_representer(_Path, lambda dumper, data: dumper.represent_str(str(data)))
         _Dumper.add_representer(YamlSource, _represent_yaml_source)
         _Dumper.add_multi_representer(_BaseModel, _represent_base_model)
         return _Dumper
