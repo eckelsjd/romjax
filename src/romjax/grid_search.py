@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import os
 import shutil
 import subprocess
@@ -619,7 +620,10 @@ def orbax_metric(case_root: Path, window: int = 10, file: str = "loss.csv") -> f
     if loss_path.exists():
         values = np.atleast_2d(np.loadtxt(loss_path, delimiter=",", skiprows=1))
         if values.size and values.shape[1] >= 2:
-            return float(np.nanmean(values[-window:, 1]))
+            recent_values = values[-window:, 1]
+            if np.isnan(recent_values).all():
+                return float("nan")
+            return float(np.nanmean(recent_values))
 
     try:
         from orbax.checkpoint import v1 as ocp
@@ -806,17 +810,48 @@ class GridSearch(Routine):
         config_path.write_text(f"{override_tag}\n{yaml_body}", encoding="utf-8")
         return config_path
 
+    def _previous_manifest_cases(self) -> dict[str, Mapping[str, Any]]:
+        """Return case entries from the previous search manifest.
+
+        :return: manifest entries keyed by case name
+        """
+        manifest_path = self.root / "grid_search_manifest.yml"
+        if not manifest_path.is_file():
+            return {}
+
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, Mapping):
+            return {}
+        cases = manifest.get("cases")
+        if not isinstance(cases, Mapping):
+            return {}
+        return {str(name): case for name, case in cases.items() if isinstance(case, Mapping)}
+
     def _prepare_cases(self) -> tuple[list[_CaseSpec], dict[str, dict[str, Any]]]:
         """Create all case directories/configs and return execution specs plus manifest entries."""
         cases_dir = self.root / "cases"
+        cases_dir.mkdir(parents=True, exist_ok=True)
         specs: list[_CaseSpec] = []
         manifest_cases: dict[str, dict[str, Any]] = {}
+        previous_cases = self._previous_manifest_cases() if self.write_policy == "reuse" else {}
         for index, values in enumerate(self._case_values()):
             name = f"case_{index:04d}"
             case_root = cases_dir / name
-            reuse_existing = self.write_policy == "reuse" and case_root.exists() and any(case_root.iterdir())
+            previous_case = previous_cases.get(name)
+            if previous_case is not None and previous_case.get("retained") is not True:
+                manifest_cases[name] = dict(previous_case)
+                continue
+            reuse_existing = (
+                self.write_policy == "reuse"
+                and case_root.exists()
+                and any(case_root.iterdir())
+            )
             config_path = case_root / "case.yml" if reuse_existing else self._write_case_config(case_root, values)
             env = dict(self.child_env)
+            jax_env = self._jax_child_env()
+            if isinstance(self.executor, HybridExecutorConfig):
+                jax_env.pop("JAX_PLATFORMS", None)
+            env.update(jax_env)
             env.update(build_profile_env("train", case_root, os.environ))
             specs.append(
                 _CaseSpec(
@@ -844,9 +879,11 @@ class GridSearch(Routine):
             if result.exit_code != 0:
                 continue
             try:
-                ranked.append((result.name, float(metric_fn(result.root))))
+                metric = float(metric_fn(result.root))
             except Exception:
                 continue
+            if math.isfinite(metric):
+                ranked.append((result.name, metric))
         return sorted(ranked, key=lambda item: item[1])
 
     def _build_rolling_tracker(self) -> _RollingSaveTracker:
@@ -868,6 +905,9 @@ class GridSearch(Routine):
         try:
             metric = float(self.metric(result.root))
         except Exception:
+            tracker.reject(result)
+            return
+        if not math.isfinite(metric):
             tracker.reject(result)
             return
         scores[result.name] = metric

@@ -33,6 +33,35 @@ class DemoRoutine(Routine):
         return self.exit_code
 
 
+class RootRoutine(Routine):
+    """Routine fixture that records a generated case root."""
+
+    name: str
+    root: Path
+    value: str | None = None
+    observed: ClassVar[list[tuple[str, Path, str | None]]] = []
+
+    def run(self) -> int:
+        RootRoutine.observed.append((self.name, self.root, self.value))
+        return 0
+
+
+class EnvironmentRoutine(Routine):
+    """Routine fixture that records JAX environment passed to a worker process."""
+
+    root: Path
+
+    def run(self) -> int:
+        import os
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jax_env.txt").write_text(
+            f"{os.environ.get('JAX_PLATFORMS')}\n{os.environ.get('JAX_ENABLE_X64')}\n",
+            encoding="utf-8",
+        )
+        return 0
+
+
 def test_logger_config(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -430,3 +459,137 @@ def test_nested_composite_routines_run_child_before_parent_continues(tmp_path) -
 
     assert composite.run() == 0
     assert DemoRoutine.observed == ["child-one", "child-two", "parent-after"]
+
+
+def test_composite_routine_expands_base_overrides_and_case_root_templates(tmp_path: Path) -> None:
+    RootRoutine.observed = []
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.RootRoutine",
+                "name: '{{ case_root[-1] }}'",
+                f"root: {tmp_path.as_posix()}/runs/{{{{ case_root[:1] }}}}/{{{{ case_root[-1] }}}}",
+                "value: base",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: mode",
+                "    cases:",
+                "      - name: first",
+                "        value: {value: first}",
+                "      - name: second",
+                "        value: null",
+                "  - name: size",
+                "    cases:",
+                "      - name: small",
+                "        value: {extra: ignored}",
+                "      - name: large",
+                "        value: {value: large}",
+                "executor: {show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    composite = romjax.load(composite_path)
+
+    assert composite.run() == 0
+    assert [item[0] for item in RootRoutine.observed] == [
+        "size=small",
+        "size=large",
+        "size=small",
+        "size=large",
+    ]
+    assert [item[2] for item in RootRoutine.observed] == ["first", "large", "base", "large"]
+    root = tmp_path / "runs" / "mode=first" / "size=small"
+    resolved = romjax.load(root / "resolved.yml")
+    assert isinstance(resolved, RootRoutine)
+    assert resolved.root == root
+
+
+def test_composite_routine_process_executor_runs_expanded_yaml_cases(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.RootRoutine",
+                "name: worker",
+                f"root: {tmp_path.as_posix()}/{{{{ case_root }}}}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: mode",
+                "    cases: [{name: one, value: null}, {name: two, value: null}]",
+                "executor: {kind: process, max_workers: 2, show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert romjax.load(composite_path).run() == 0
+    assert (tmp_path / "mode=one" / "resolved.yml").exists()
+    assert (tmp_path / "mode=two" / "resolved.yml").exists()
+
+
+def test_composite_process_executor_propagates_parent_jax_options(tmp_path: Path) -> None:
+    child_path = tmp_path / "child.yml"
+    composite_path = tmp_path / "composite.yml"
+    child_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.EnvironmentRoutine",
+                f"root: {tmp_path / 'child'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "routine_config:",
+                "  jax_platforms: cpu",
+                "  jax_enable_x64: true",
+                "routines:",
+                "  - __parent__/child.yml",
+                "executor: {kind: process, max_workers: 1, show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert romjax.load(composite_path).run() == 0
+    assert (tmp_path / "child" / "jax_env.txt").read_text(encoding="utf-8") == "cpu\ntrue\n"
+
+
+def test_composite_routine_rejects_process_executor_with_direct_instances() -> None:
+    with pytest.raises(ValueError, match="requires YAML-backed"):
+        CompositeRoutine(routines=[DemoRoutine()], executor="process")
+
+
+def test_composite_routine_thread_executor_runs_legacy_children() -> None:
+    DemoRoutine.observed = []
+    composite = CompositeRoutine(
+        routines=[DemoRoutine(name="one"), DemoRoutine(name="two")],
+        executor={"kind": "thread", "max_workers": 2, "show_progress": False},
+    )
+
+    assert composite.run() == 0
+    assert set(DemoRoutine.observed) == {"one", "two"}

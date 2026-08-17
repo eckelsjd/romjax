@@ -764,23 +764,10 @@ class Train(Routine):
         if self.root is not None:
             self.root = self.root.resolve()
 
-        # If init params implements a 'sample' function, then initialize the parameter pytree.
         # Pass graph object to loss, test, and dataloader if requested
-        if self.graph is not None:
-            
-            self.graph.resolve_norms()
+        self.bind_graph(self.graph)    
 
-            for attr in ["loss", "test", "dataloader"]:
-                if hasattr(ele := getattr(self, attr), "graph"):
-                    if ele.graph is None:
-                        if isinstance(ele, GraphLoss):
-                            # Only set dataset names if we're using the built-in dataloader
-                            ele.bind_graph(self.graph, default_datasets=isinstance(self.dataloader, DataLoader))
-                        else:
-                            ele.graph = self.graph
-
-            self.init_params = pytree_resolve_refs(self.init_params, self.graph, raise_on_missing=False)
-
+        # If init params implements a 'sample' function, then initialize the parameter pytree.
         sample_fn = getattr(self.init_params, "sample", None)
         if callable(sample_fn):
             self.init_params = sample_fn(jax.random.key(self.init_seed))
@@ -883,6 +870,23 @@ class Train(Routine):
             else jnp.iinfo(jnp.int32).max,
             params,
         )
+
+    def bind_graph(self, graph: FunctionGraph | None):
+        self.graph = graph
+
+        if graph is not None:
+            self.graph.resolve_norms()
+            
+            for attr in ["loss", "test", "dataloader"]:
+                if hasattr(ele := getattr(self, attr), "graph"):
+                    if ele.graph is None:
+                        if isinstance(ele, GraphLoss):
+                            # Only set dataset names if we're using the built-in dataloader
+                            ele.bind_graph(self.graph, default_datasets=isinstance(self.dataloader, DataLoader))
+                        else:
+                            ele.graph = self.graph
+
+            self.init_params = pytree_resolve_refs(self.init_params, self.graph, raise_on_missing=False)
     
     def run(self) -> int:
         """For compatibility with Routine."""

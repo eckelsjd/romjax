@@ -1,13 +1,23 @@
 """Base routine classes."""
 
+import ast
+import os
+import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from importlib import import_module as _import_module
+from itertools import product
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Mapping
 
 import matplotlib
 import matplotlib.pyplot as plt
-from alive_progress import config_handler
+import yaml
+from alive_progress import alive_bar, config_handler
 from loguru import logger
 from pydantic import (
     BaseModel,
@@ -22,6 +32,7 @@ from pydantic import (
 
 from romjax.plotting import GridplotConfig
 from romjax.typing import DictModel, WriteStream, from_yaml
+from romjax.utils import _NullProgress
 
 __all__ = [
     "CompositeRoutine",
@@ -38,6 +49,8 @@ _LAZY_EXPORTS = {
     "Train": ("romjax.train", "Train"),
     "CompareTable": ("romjax.compare", "CompareTable")
 }
+
+_COMPOSITE_PROGRESS_ACTIVE: ContextVar[bool] = ContextVar("romjax_composite_progress_active", default=False)
 
 available = list(_LAZY_EXPORTS.keys())
 
@@ -233,133 +246,457 @@ class Routine(BaseModel, ABC):
     def run(self) -> int:
         raise NotImplementedError
 
+    def _jax_child_env(self) -> dict[str, str]:
+        """Return explicit routine JAX options as child-process environment variables.
+
+        :return: environment variables required to reproduce configured JAX options
+        """
+        if self.routine_config is None:
+            return {}
+
+        env: dict[str, str] = {}
+        if self.routine_config.jax_platforms is not None:
+            env["JAX_PLATFORMS"] = self.routine_config.jax_platforms
+        if self.routine_config.jax_enable_x64 is not None:
+            env["JAX_ENABLE_X64"] = str(self.routine_config.jax_enable_x64).lower()
+        return env
+
+
+class CompositeOverrideCase(BaseModel):
+    """One named configuration value in a composite override.
+
+    :param name: case name used in ``case_root``
+    :param value: arbitrary YAML value merged into the base configuration
+    """
+
+    name: str
+    value: Any = None
+
+
+class CompositeOverride(BaseModel):
+    """One dimension of a composite routine Cartesian product.
+
+    :param name: override dimension name
+    :param cases: named candidate values for this dimension
+    """
+
+    name: str
+    cases: tuple[CompositeOverrideCase, ...]
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def _coerce_cases(cls, value: Any) -> Any:
+        if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+            raise ValueError("Composite override cases must be a non-empty sequence.")
+        if not value:
+            raise ValueError("Composite override cases must be a non-empty sequence.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_case_names(self) -> "CompositeOverride":
+        if len({case.name for case in self.cases}) != len(self.cases):
+            raise ValueError(f"Composite override {self.name!r} has duplicate case names.")
+        return self
+
+
+@dataclass(frozen=True)
+class _CompositeCase:
+    """Prepared child routine input and its display label."""
+
+    label: str
+    value: Any
+
+
+@dataclass(frozen=True)
+class _CompositeCaseResult:
+    """Result of executing one prepared child routine."""
+
+    case: _CompositeCase
+    exit_code: int | None = None
+    error: Exception | None = None
+    routine_name: str | None = None
+    stage: Literal["validation", "run"] = "validation"
+
+
+def _load_composite_routine(value: Any) -> Routine:
+    """Load a routine from an already-resolved composite child value."""
+    import romjax
+
+    routine = romjax.load(value) if isinstance(value, romjax.YamlSource | str | Path | bytes) else value
+    if not isinstance(routine, Routine):
+        raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(routine).__name__}.")
+    return routine
+
+
+def _run_composite_case(case: _CompositeCase) -> _CompositeCaseResult:
+    """Run one child and write its resolved config when it owns a root directory."""
+    try:
+        routine = _load_composite_routine(case.value)
+    except Exception as exc:
+        return _CompositeCaseResult(case, error=exc)
+    try:
+        root = getattr(routine, "root", None)
+        if root is not None:
+            import romjax
+
+            root_path = Path(root)
+            root_path.mkdir(parents=True, exist_ok=True)
+            romjax.dump(routine, root_path / "resolved.yml", sort_keys=False)
+        return _CompositeCaseResult(
+            case,
+            exit_code=int(routine.run()),
+            routine_name=type(routine).__name__,
+            stage="run",
+        )
+    except Exception as exc:
+        return _CompositeCaseResult(case, error=exc, routine_name=type(routine).__name__, stage="run")
+
+
+def _configure_composite_process(jax_env: Mapping[str, str]) -> None:
+    """Apply parent routine JAX settings before a composite worker loads a child."""
+    os.environ.update(jax_env)
+
+
+class CompositeExecutorConfig(BaseModel, ABC):
+    """Abstract scheduler configuration for composite routine cases."""
+
+    show_progress: bool = True
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "CompositeExecutorConfig":
+        """Construct a concrete executor from YAML-friendly input.
+
+        :param value: executor name, mapping, or existing executor config
+        :return: normalized executor configuration
+        """
+        if isinstance(value, CompositeExecutorConfig):
+            return value
+        aliases = {
+            "serial": "serial",
+            "thread": "thread",
+            "threads": "thread",
+            "process": "process",
+            "processes": "process",
+        }
+        if isinstance(value, str):
+            value = {"kind": aliases.get(value, value)}
+        if not isinstance(value, Mapping):
+            raise ValueError("CompositeRoutine executor must be a string, mapping, or CompositeExecutorConfig.")
+        kind = aliases.get(str(value.get("kind", "serial")))
+        if kind == "serial":
+            return CompositeSerialExecutorConfig.model_validate(value)
+        if kind in {"thread", "process"}:
+            return CompositeConcurrentExecutorConfig.model_validate({**value, "kind": kind})
+        raise ValueError(f"Unknown CompositeRoutine executor: {value.get('kind')!r}.")
+
+    @contextmanager
+    def progress_context(self, total: int):
+        """Return the master progress-bar context."""
+        if not self.show_progress or _COMPOSITE_PROGRESS_ACTIVE.get():
+            yield _NullProgress()
+            return
+        token = _COMPOSITE_PROGRESS_ACTIVE.set(True)
+        try:
+            with alive_bar(total) as bar:
+                yield bar
+        finally:
+            _COMPOSITE_PROGRESS_ACTIVE.reset(token)
+
+    @abstractmethod
+    def run_cases(self, cases: Sequence[_CompositeCase], stop_on_failure: bool) -> list[_CompositeCaseResult]:
+        """Run prepared cases and return completed results."""
+        raise NotImplementedError
+
+
+class CompositeSerialExecutorConfig(CompositeExecutorConfig):
+    """Serial composite routine executor."""
+
+    kind: Literal["serial"] = "serial"
+
+    def run_cases(self, cases: Sequence[_CompositeCase], stop_on_failure: bool) -> list[_CompositeCaseResult]:
+        results: list[_CompositeCaseResult] = []
+        with self.progress_context(len(cases)) as bar:
+            for case in cases:
+                bar.text = case.label
+                result = _run_composite_case(case)
+                results.append(result)
+                bar()
+                if stop_on_failure and (result.error is not None or result.exit_code != 0):
+                    break
+        return results
+
+
+class CompositeConcurrentExecutorConfig(CompositeExecutorConfig):
+    """Thread- or process-based composite routine executor.
+
+    :param kind: concurrent backend kind
+    :param max_workers: worker count for the executor
+    """
+
+    kind: Literal["thread", "process"] = "process"
+    max_workers: int | None = Field(default=None, gt=0)
+
+    def _context(self, jax_env: Mapping[str, str]) -> ThreadPoolExecutor | ProcessPoolExecutor:
+        if self.kind == "thread":
+            return ThreadPoolExecutor(max_workers=self.max_workers)
+        return ProcessPoolExecutor(
+            self.max_workers,
+            initializer=_configure_composite_process,
+            initargs=(dict(jax_env),),
+        )
+
+    def run_cases(
+        self,
+        cases: Sequence[_CompositeCase],
+        stop_on_failure: bool,
+        jax_env: Mapping[str, str] | None = None,
+    ) -> list[_CompositeCaseResult]:
+        results: list[_CompositeCaseResult] = []
+        pending = iter(cases)
+        workers = self.max_workers or min(32, max(1, len(cases)))
+        with self.progress_context(len(cases)) as bar, self._context(jax_env or {}) as executor:
+            active: dict[Future[_CompositeCaseResult], _CompositeCase] = {}
+            for _ in range(min(workers, len(cases))):
+                case = next(pending, None)
+                if case is not None:
+                    active[executor.submit(_run_composite_case, case)] = case
+            stopped = False
+            while active:
+                future = next(as_completed(active))
+                case = active.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = _CompositeCaseResult(case, error=exc)
+                results.append(result)
+                bar.text = case.label
+                bar()
+                failed = result.error is not None or result.exit_code != 0
+                if stop_on_failure and failed:
+                    stopped = True
+                if not stopped:
+                    next_case = next(pending, None)
+                    if next_case is not None:
+                        active[executor.submit(_run_composite_case, next_case)] = next_case
+        return results
+
+
+_CASE_ROOT_PATTERN = re.compile(r"\{\{\s*case_root(?P<index>\s*\[[^\]]+\])?\s*\}\}")
+
 
 class CompositeRoutine(Routine):
-    """
-    Run a sequence of child routines.
+    """Run child routines directly or from a Cartesian product of YAML overrides.
 
-    :param routines: routines, inline routine objects, or YAML files resolving to routines
+    :param routines: legacy child routine specifications
+    :param base: base YAML source to merge in base/overrides mode
+    :param overrides: named override dimensions in base/overrides mode
+    :param executor: case scheduling backend
     :param failure_policy: handling for non-zero child exits or raised exceptions
     """
 
-    routines: list[Any]
+    routines: list[Any] | None = None
+    base: Any | None = None
+    overrides: tuple[CompositeOverride, ...] | None = None
+    executor: CompositeExecutorConfig = Field(default_factory=CompositeSerialExecutorConfig)
     failure_policy: Literal["stop", "continue", "force"] = "stop"
     _source_path: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
-    def _from_plain_list(cls, value):
+    def _from_plain_list(cls, value: Any) -> Any:
         """Allow direct validation from a list of routines."""
-        if isinstance(value, list | tuple):
-            return {"routines": value}
-        return value
+        return {"routines": value} if isinstance(value, list | tuple) else value
 
     @field_validator("routines", mode="before")
     @classmethod
-    def _validate_routines(cls, value):
-        """Normalize child routine inputs without validating them yet."""
-        if not isinstance(value, list | tuple):
-            value = [value]
+    def _validate_routines(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        return list(value) if isinstance(value, list | tuple) else [value]
 
-        return list(value)
+    @field_validator("executor", mode="before")
+    @classmethod
+    def _coerce_executor(cls, value: Any) -> CompositeExecutorConfig:
+        return CompositeExecutorConfig.from_dict(value)
 
     @model_validator(mode="after")
-    def _capture_source_path(self):
-        """Remember the YAML source path for runtime child resolution."""
+    def _validate_mode(self) -> "CompositeRoutine":
         import romjax
 
         object.__setattr__(self, "_source_path", romjax.YamlLoader.current_source_path())
+        has_legacy = self.routines is not None
+        has_expansion = self.base is not None or self.overrides is not None
+        if has_legacy == has_expansion:
+            raise ValueError("CompositeRoutine requires either routines or both base and overrides.")
+        if has_expansion and (self.base is None or not self.overrides):
+            raise ValueError("CompositeRoutine base/overrides mode requires both base and a non-empty overrides list.")
+        if self.overrides is not None and len({item.name for item in self.overrides}) != len(self.overrides):
+            raise ValueError("CompositeRoutine override names must be unique.")
+        if isinstance(self.executor, CompositeConcurrentExecutorConfig) and self.executor.kind == "process":
+            if self.routines is not None and any(isinstance(item, Routine) for item in self.routines):
+                raise ValueError("CompositeRoutine process executor requires YAML-backed routine specifications.")
         return self
 
-    def _validate_routine(self, value: Any) -> Routine:
-        """Validate one child routine specification.
-
-        :param value: routine instance or YAML path
-        :return: validated routine
-        """
-        if isinstance(value, Routine):
-            return value
-
+    def _resolve_child_spec(self, value: Any) -> Any:
+        """Resolve a legacy YAML path relative to this composite's source file."""
         import romjax
 
-        if isinstance(value, romjax.YamlSource):
-            value = romjax.load(value)
-        elif isinstance(value, str | Path | bytes):
-            if isinstance(value, str | Path):
-                source_path = self._source_path
-                if source_path is not None:
-                    stream = romjax.YamlLoader._resolve_override_path(str(value), source_path)
-                else:
-                    stream = romjax.YamlLoader.resolve_parent_path(value)
-            else:
-                stream = value
-            value = romjax.load(stream)
-
-        if not isinstance(value, Routine):
-            raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(value).__name__}.")
-
+        if isinstance(value, str | Path):
+            if self._source_path is not None:
+                return romjax.YamlLoader._resolve_override_path(str(value), self._source_path)
+            return romjax.YamlLoader.resolve_parent_path(value)
         return value
+
+    def _validate_routine(self, value: Any) -> Routine:
+        """Resolve and validate one legacy child routine specification.
+
+        :param value: routine instance or YAML-backed child specification
+        :return: validated child routine
+        """
+        return _load_composite_routine(self._resolve_child_spec(value))
+
+    @staticmethod
+    def _render_case_root(text: str, parts: tuple[str, ...]) -> str:
+        """Replace supported case-root templates in one YAML scalar."""
+        def integer(node: ast.expr | None) -> int | None:
+            if node is None:
+                return None
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                return node.value
+            if (
+                isinstance(node, ast.UnaryOp)
+                and isinstance(node.op, ast.USub)
+                and isinstance(node.operand, ast.Constant)
+                and isinstance(node.operand.value, int)
+            ):
+                return -node.operand.value
+            raise ValueError("case_root indices and slices only support integers.")
+
+        def replace(match: re.Match[str]) -> str:
+            index = match.group("index")
+            selected: str | tuple[str, ...] = parts
+            if index:
+                expression = ast.parse(f"value{index}", mode="eval").body
+                if not isinstance(expression, ast.Subscript) or not isinstance(expression.value, ast.Name):
+                    raise ValueError("Invalid case_root template expression.")
+                index_node = expression.slice
+                if not isinstance(index_node, ast.Slice):
+                    selected = parts[integer(index_node)]
+                elif isinstance(index_node, ast.Slice):
+                    bounds = (index_node.lower, index_node.upper, index_node.step)
+                    selected = parts[slice(*(integer(node) for node in bounds))]
+            return selected if isinstance(selected, str) else "/".join(selected)
+
+        return _CASE_ROOT_PATTERN.sub(replace, text)
+
+    def _render_node(self, node: yaml.Node, parts: tuple[str, ...]) -> yaml.Node:
+        """Return a copied YAML node with case-root templates rendered."""
+        import copy
+
+        result = copy.deepcopy(node)
+        def visit(current: yaml.Node) -> None:
+            if isinstance(current, yaml.ScalarNode) and isinstance(current.value, str):
+                current.value = self._render_case_root(current.value, parts)
+            elif isinstance(current, yaml.SequenceNode):
+                for item in current.value:
+                    visit(item)
+            elif isinstance(current, yaml.MappingNode):
+                for key, value in current.value:
+                    visit(key)
+                    visit(value)
+        visit(result)
+        return result
+
+    def _base_source(self) -> tuple[yaml.Node, Path | None]:
+        """Load the raw base node without constructing its routine."""
+        import romjax
+
+        if isinstance(self.base, romjax.YamlSource):
+            if self.base.node is None:
+                raise RoutineError("CompositeRoutine base source is empty.")
+            return self.base.node, self.base.source_path
+        if isinstance(self.base, str | Path):
+            path = romjax.YamlLoader._resolve_override_path(str(self.base), self._source_path)
+            node, source_path = romjax.YamlLoader._compose_resolved_node(path)
+            if node is None:
+                raise RoutineError("CompositeRoutine base source is empty.")
+            return node, source_path
+        raise ValueError("CompositeRoutine base must be a YAML path or YamlSource.")
+
+    def _expanded_cases(self) -> list[_CompositeCase]:
+        """Build merged YAML sources for every selected override combination."""
+        import romjax
+
+        base_node, base_path = self._base_source()
+        cases: list[_CompositeCase] = []
+        assert self.overrides is not None
+        for selected in product(*(item.cases for item in self.overrides)):
+            parts = tuple(f"{override.name}={case.name}" for override, case in zip(self.overrides, selected))
+            merged = self._render_node(base_node, parts)
+            merged = romjax.YamlLoader._resolve_parent_refs(merged, base_path)
+            for case in selected:
+                if case.value is None:
+                    continue
+                override_text = romjax.YamlLoader.dump(case.value, sort_keys=False)
+                override_node = yaml.compose(override_text, Loader=yaml.SafeLoader)
+                if override_node is not None:
+                    override_node = self._render_node(override_node, parts)
+                    override_node = romjax.YamlLoader._resolve_parent_refs(override_node, self._source_path)
+                    merged = romjax.YamlLoader._merge_nodes(merged, override_node)
+            cases.append(_CompositeCase("/".join(parts), romjax.YamlSource(merged, base_path)))
+        return cases
+
+    def _cases(self) -> list[_CompositeCase]:
+        """Return all child inputs in the selected composite mode."""
+        if self.routines is not None:
+            return [
+                _CompositeCase(f"child {index}", self._resolve_child_spec(value))
+                for index, value in enumerate(self.routines)
+            ]
+        return self._expanded_cases()
 
     @staticmethod
     def _failure_summary(failures: list[str]) -> str:
-        """Return a compact multi-line failure summary.
-
-        :param failures: collected failure descriptions
-        :return: formatted summary
-        """
         lines = ["CompositeRoutine failures:"]
         lines.extend(f"- {failure}" for failure in failures)
         return "\n".join(lines)
 
     def run(self) -> int:
-        """Run child routines sequentially."""
+        """Run all generated or explicitly supplied child routines."""
         failures: list[str] = []
         exit_code = 0
-
-        for index, routine_spec in enumerate(self.routines):
-            routine_label = f"child {index}"
-            try:
-                routine = self._validate_routine(routine_spec)
-            except Exception as exc:
+        cases = self._cases()
+        if isinstance(self.executor, CompositeConcurrentExecutorConfig):
+            results = self.executor.run_cases(
+                cases,
+                stop_on_failure=self.failure_policy == "stop",
+                jax_env=self._jax_child_env(),
+            )
+        else:
+            results = self.executor.run_cases(cases, stop_on_failure=self.failure_policy == "stop")
+        for result in results:
+            label = result.case.label
+            if result.error is not None:
                 if self.failure_policy != "force":
-                    raise
-
-                summary = f"{routine_label} failed validation with {type(exc).__name__}: {exc}"
-                failures.append(summary)
-                if exit_code == 0:
-                    exit_code = 1
+                    raise result.error
+                if result.stage == "validation":
+                    summary = f"{label} failed validation with {type(result.error).__name__}: {result.error}"
+                else:
+                    summary = f"{label} ({result.routine_name}) raised {type(result.error).__name__}: {result.error}"
                 logger.exception("CompositeRoutine {}", summary)
+                code = 1
+            elif result.exit_code == 0:
                 continue
-
-            routine_label = f"{routine_label} ({type(routine).__name__})"
-            try:
-                child_code = int(routine.run())
-            except Exception as exc:
-                if self.failure_policy != "force":
-                    raise
-
-                summary = f"{routine_label} raised {type(exc).__name__}: {exc}"
-                failures.append(summary)
-                if exit_code == 0:
-                    exit_code = 1
-                logger.exception("CompositeRoutine {}", summary)
-                continue
-
-            if child_code == 0:
-                continue
-
-            summary = f"{routine_label} exited with code {child_code}"
+            else:
+                summary = f"{label} ({result.routine_name}) exited with code {result.exit_code}"
+                code = result.exit_code or 1
             failures.append(summary)
             if exit_code == 0:
-                exit_code = child_code
-
+                exit_code = code
             if self.failure_policy == "stop":
-                logger.error(self._failure_summary(failures))
-                return child_code
-
+                break
         if failures:
             logger.error(self._failure_summary(failures))
-
         return exit_code
 
 
