@@ -5,6 +5,7 @@ outputs
 poisson_subspace_compare
 train
 ema_balancing
+split_latent
 *.pdf
 *.png
 *.npz

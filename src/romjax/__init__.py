@@ -61,6 +61,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
     "Affine": ("romjax.nn", "Affine"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
+    "SplitLinearProjection": ("romjax.nn", "SplitLinearProjection"),
     "ImplicitAffine": ("romjax.pde", "ImplicitAffine"),
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
@@ -114,7 +115,7 @@ if TYPE_CHECKING:
     from .graph import CompositeEdge, FunctionGraph, IdentityEdge
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
-    from .nn import Affine, LinearProjection
+    from .nn import Affine, LinearProjection, SplitLinearProjection
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
     from .pde import ImplicitAffine, ImplicitIterativeGalerkin, AliveProgressMeter, GridBoundaryInputs, IterativeSolver
     from .plotting import gridplot
