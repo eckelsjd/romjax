@@ -14,7 +14,7 @@ from romjax.model import (
     ImplicitModel,
     eqx_evaluate,
 )
-from romjax.nn import LinearProjection
+from romjax.nn import LinearProjection, SplitLinearProjection
 from romjax.tree import is_shape_dtype
 
 
@@ -444,6 +444,135 @@ def test_linear_projection_with_bias_supports_jit_grad_and_vmap() -> None:
     assert random_projection.bias is not None
     assert random_projection.bias.shape == (3,)
     assert LinearProjection(latent=2, dof=3, key=jax.random.PRNGKey(12)).bias is None
+
+
+def test_split_linear_projection_math_validation_and_transforms() -> None:
+    """Check split projections, affine offsets, and JAX transformations."""
+    module = SplitLinearProjection(
+        encoder_b=jnp.array([[1.0, 2.0, -1.0], [0.0, 1.0, 3.0]]),
+        encoder_u=jnp.array([[2.0, -1.0, 0.5]]),
+        decoder_b=jnp.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]),
+        decoder_u=jnp.array([[0.5, -2.0, 1.0]]),
+        encoder_b_bias=jnp.array([0.5, -1.0]),
+        encoder_u_bias=jnp.array([2.0]),
+        decoder_b_bias=jnp.array([1.5, -0.5]),
+        decoder_u_bias=jnp.array([-1.0]),
+    )
+    samples = jnp.array([[1.0, 2.0, 3.0], [2.0, 0.0, 1.0]])
+
+    expected_latent = jnp.concatenate(
+        (
+            samples @ module.encoder_b.T + module.encoder_b_bias,
+            samples @ module.encoder_u.T + module.encoder_u_bias,
+        ),
+        axis=-1,
+    )
+    expected_reconstruction = jnp.concatenate(
+        (
+            expected_latent @ module.decoder_b.T + module.decoder_b_bias,
+            expected_latent @ module.decoder_u.T + module.decoder_u_bias,
+        ),
+        axis=-1,
+    )
+    assert jnp.allclose(jax.jit(jax.vmap(module.reduce))(samples), expected_latent)
+    assert jnp.allclose(jax.jit(jax.vmap(module.reconstruct))(expected_latent), expected_reconstruction)
+
+    def loss(current: SplitLinearProjection) -> jax.Array:
+        return jnp.mean(jax.vmap(current.reconstruct)(jax.vmap(current.reduce)(samples)) ** 2)
+
+    value, gradients = jax.value_and_grad(jax.jit(loss))(module)
+    assert jnp.isfinite(value)
+    assert gradients.encoder_b.shape == module.encoder_b.shape
+    assert gradients.decoder_u.shape == module.decoder_u.shape
+    assert gradients.encoder_b_bias is not None
+
+    initialized = SplitLinearProjection(
+        input_size=3,
+        b_latent=2,
+        u_latent=1,
+        b_output=4,
+        u_output=5,
+        key=jax.random.key(0),
+        random_bias=True,
+    )
+    assert initialized.encoder_b.shape == (2, 3)
+    assert initialized.decoder_u.shape == (5, 3)
+    assert initialized.decoder_b_bias is not None
+
+    with pytest.raises(ValueError, match="all four matrices"):
+        SplitLinearProjection(encoder_b=jnp.ones((2, 3)))
+    with pytest.raises(ValueError, match="same input size"):
+        SplitLinearProjection(
+            encoder_b=jnp.ones((2, 3)),
+            encoder_u=jnp.ones((1, 4)),
+            decoder_b=jnp.ones((4, 3)),
+            decoder_u=jnp.ones((5, 3)),
+        )
+    with pytest.raises(ValueError, match="must match"):
+        SplitLinearProjection(
+            input_size=4,
+            encoder_b=jnp.ones((2, 3)),
+            encoder_u=jnp.ones((1, 3)),
+            decoder_b=jnp.ones((4, 3)),
+            decoder_u=jnp.ones((5, 3)),
+        )
+
+
+def test_split_linear_projection_filter_model_handles_unequal_field_shapes() -> None:
+    """Use flat gather/scatter templates to split and restore unequal fields."""
+    module = SplitLinearProjection(
+        input_size=10,
+        b_latent=2,
+        u_latent=3,
+        b_output=6,
+        u_output=4,
+        key=jax.random.key(1),
+    )
+    model = FilterModel(
+        source="full",
+        target="latent",
+        filters=[
+            {
+                "forward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [
+                        {"outer": ["full", "b"], "inner": ["b"]},
+                        {"outer": ["full", "u"], "inner": ["u"]},
+                    ],
+                    "output_routes": [
+                        {"inner": ["lb"], "outer": ["latent", "lb"]},
+                        {"inner": ["lu"], "outer": ["latent", "lu"]},
+                    ],
+                    "opts": {
+                        "gather": "flat",
+                        "method": "reduce",
+                        "scatter": "flat",
+                        "template": {"lb": {"shape": [2]}, "lu": {"shape": [3]}},
+                    },
+                },
+                "backward": {
+                    "callable": eqx_evaluate,
+                    "input_routes": [
+                        {"outer": ["latent", "lb"], "inner": ["lb"]},
+                        {"outer": ["latent", "lu"], "inner": ["lu"]},
+                    ],
+                    "output_routes": [
+                        {"inner": ["b"], "outer": ["full", "b"]},
+                        {"inner": ["u"], "outer": ["full", "u"]},
+                    ],
+                    "opts": {"gather": "flat", "method": "reconstruct", "scatter": "flat"},
+                },
+            }
+        ],
+    )
+    fields = {"full": {"b": jnp.arange(6.0).reshape(2, 3), "u": jnp.arange(4.0)}}
+
+    encoded, aux = model.forward_aux({**fields, "call_args": module})
+    assert encoded["latent"]["lb"].shape == (2,)
+    assert encoded["latent"]["lu"].shape == (3,)
+    decoded, _ = model.backward_aux({"latent": encoded["latent"], "call_args": module}, aux=aux)
+    assert decoded["full"]["b"].shape == (2, 3)
+    assert decoded["full"]["u"].shape == (4,)
 
 
 def test_filter_model_in_graph() -> None:

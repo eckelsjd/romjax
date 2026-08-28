@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key, PyTree
 
-__all__ = ["Affine", "LinearProjection"]
+__all__ = ["Affine", "LinearProjection", "SplitLinearProjection"]
 
 
 class Affine(eqx.Module):
@@ -29,7 +29,7 @@ class Affine(eqx.Module):
     inputs_rank: int = eqx.field(static=True)
     outputs_rank: int = eqx.field(static=True)
     jacobian_inputs: Literal["inputs", "outputs", "both"] = eqx.field(static=True)
-    identity_jac: bool = eqx.field(static=True)
+    identity_jac: bool | Literal["init"] = eqx.field(static=True)
     eps: float = eqx.field(static=True)
 
     def __init__(
@@ -37,7 +37,7 @@ class Affine(eqx.Module):
         inputs_rank: int | None = None,
         outputs_rank: int | None = None,
         key: Key | None = None,
-        identity_jac: bool = False,
+        identity_jac: bool | Literal["init"] = False,
         jacobian_inputs: Literal["inputs", "outputs", "both"] = "inputs",
         matrix_width_size: int | None = None,
         vector_width_size: int | None = None,
@@ -45,6 +45,7 @@ class Affine(eqx.Module):
         vector_depth: int = 2,
         activation: Callable = jax.nn.swish,
         eps: float = 0.0,
+        last_layer_var: float | None = None,
     ) -> None:
         """
         Initialize the affine residual MLPs.
@@ -52,7 +53,8 @@ class Affine(eqx.Module):
         :param inputs_rank: input vector dimension
         :param outputs_rank: output vector dimension
         :param key: JAX random key for the solution and optional Jacobian MLPs
-        :param identity_jac: use a fixed identity Jacobian with no Jacobian MLPs
+        :param identity_jac: use a fixed identity Jacobian with ``True``; use ``"init"`` to initialize learned
+            Jacobian factors at identity
         :param jacobian_inputs: values supplied to the Jacobian MLPs
         :param matrix_width_size: hidden width for the lower and upper MLPs
         :param vector_width_size: hidden width for the solution and diagonal MLPs
@@ -60,6 +62,7 @@ class Affine(eqx.Module):
         :param vector_depth: depth of the solution and diagonal MLPs
         :param activation: activation shared by all MLPs
         :param eps: optional nugget added to the diagonal of ``H``
+        :param last_layer_var: optional variance for normally initialized final Jacobian MLP layer weights
         """
         if inputs_rank is None or outputs_rank is None:
             raise ValueError("Affine requires inputs_rank and outputs_rank.")
@@ -69,10 +72,16 @@ class Affine(eqx.Module):
             raise ValueError("inputs_rank and outputs_rank must be positive.")
         if jacobian_inputs not in ("inputs", "outputs", "both"):
             raise ValueError("jacobian_inputs must be 'inputs', 'outputs', or 'both'.")
+        if identity_jac is not True and identity_jac is not False and identity_jac != "init":
+            raise ValueError("identity_jac must be True, False, or 'init'.")
         if matrix_depth < 0 or vector_depth < 0:
             raise ValueError("MLP depths must be nonnegative.")
         if eps < 0.0:
             raise ValueError("eps must be nonnegative.")
+        if last_layer_var is not None and last_layer_var < 0.0:
+            raise ValueError("last_layer_var must be nonnegative.")
+        if identity_jac == "init" and last_layer_var is None:
+            last_layer_var = 1e-3
 
         self.inputs_rank = inputs_rank
         self.outputs_rank = outputs_rank
@@ -102,6 +111,7 @@ class Affine(eqx.Module):
             width_size: int,
             depth: int,
             mlp_key: Key,
+            initialize_last_layer: bool = False,
         ) -> eqx.nn.MLP:
             module = eqx.nn.MLP(
                 in_size=in_size,
@@ -111,6 +121,11 @@ class Affine(eqx.Module):
                 activation=activation,
                 key=mlp_key,
             )
+            if initialize_last_layer and last_layer_var is not None:
+                weight_key = jax.random.split(mlp_key)[1]
+                last_weight = jax.random.normal(weight_key, module.layers[-1].weight.shape)
+                last_weight = last_weight * jnp.sqrt(jnp.asarray(last_layer_var, dtype=last_weight.dtype))
+                module = eqx.tree_at(lambda mlp: mlp.layers[-1].weight, module, last_weight)
             return module
 
         solution_key, lower_key, upper_key, diagonal_key = jax.random.split(key, 4)
@@ -121,7 +136,7 @@ class Affine(eqx.Module):
             depth=vector_depth,
             mlp_key=solution_key,
         )
-        if identity_jac:
+        if identity_jac is True:
             self.lower = None
             self.upper = None
             self.diagonal = None
@@ -133,6 +148,7 @@ class Affine(eqx.Module):
             width_size=matrix_width,
             depth=matrix_depth,
             mlp_key=lower_key,
+            initialize_last_layer=True,
         )
         self.upper = None if lower_size == 0 else make_mlp(
             in_size=jacobian_size,
@@ -140,6 +156,7 @@ class Affine(eqx.Module):
             width_size=matrix_width,
             depth=matrix_depth,
             mlp_key=upper_key,
+            initialize_last_layer=True,
         )
         self.diagonal = make_mlp(
             in_size=jacobian_size,
@@ -147,7 +164,25 @@ class Affine(eqx.Module):
             width_size=vector_width,
             depth=vector_depth,
             mlp_key=diagonal_key,
+            initialize_last_layer=True,
         )
+        if identity_jac == "init":
+            if self.lower is not None:
+                self.lower = eqx.tree_at(
+                    lambda mlp: mlp.layers[-1].bias,
+                    self.lower,
+                    jnp.zeros_like(self.lower.layers[-1].bias),
+                )
+                self.upper = eqx.tree_at(
+                    lambda mlp: mlp.layers[-1].bias,
+                    self.upper,
+                    jnp.zeros_like(self.upper.layers[-1].bias),
+                )
+            self.diagonal = eqx.tree_at(
+                lambda mlp: mlp.layers[-1].bias,
+                self.diagonal,
+                jnp.ones_like(self.diagonal.layers[-1].bias),
+            )
 
     def _vector(self, value: ArrayLike, rank: int, name: str) -> ArrayLike:
         values = jnp.asarray(value).reshape(-1)
@@ -169,20 +204,28 @@ class Affine(eqx.Module):
         matrix = jnp.zeros((self.outputs_rank, self.outputs_rank), dtype=values.dtype)
         return matrix.at[rows, cols].set(values)
 
-    def materialize(self, inputs: ArrayLike, outputs: ArrayLike | None = None) -> tuple[ArrayLike, ArrayLike]:
+    def materialize(
+        self, 
+        inputs: ArrayLike, 
+        outputs: ArrayLike | None | Literal["solution"] = None
+    ) -> tuple[ArrayLike, ArrayLike]:
         """Materialize ``H`` and ``g`` for one input/output pair.
 
         :param inputs: input vector, accepting a scalar when ``inputs_rank == 1``
-        :param outputs: output vector, required for output-dependent Jacobians
+        :param outputs: output vector, required for output-dependent Jacobians; use "solution" to materialize the 
+                        Jacobian `H` using the solution operator outputs `g`
         :return: ``(H, g)`` with shapes ``(outputs_rank, outputs_rank)`` and ``(outputs_rank,)``
         """
         input_values = self._vector(inputs, self.inputs_rank, "inputs")
-        if self.identity_jac:
+        if self.identity_jac is True:
             solution = self.solution(input_values)
             return jnp.eye(self.outputs_rank, dtype=solution.dtype), solution
 
-        jacobian_values = self._jacobian_values(input_values, outputs)
         solution = self.solution(input_values)
+        if outputs == "solution":
+            outputs = solution
+        jacobian_values = self._jacobian_values(input_values, outputs)
+        
         diagonal = self.diagonal(jacobian_values) + jnp.asarray(self.eps, dtype=solution.dtype)
         if self.outputs_rank == 1:
             matrix = diagonal.reshape(1, 1)
@@ -203,7 +246,7 @@ class Affine(eqx.Module):
         :param square: whether to square the log *before* summing (prevents total volume scaling and spread/condition)
         :return: sum of the log absolute values of the LDU diagonal
         """
-        if self.identity_jac:
+        if self.identity_jac is True:
             return jnp.asarray(0.0)
         if not isinstance(payload, Mapping) or 'inputs' not in payload or 'outputs' not in payload:
             raise TypeError("Affine.log_determinant payload must be a Mapping with 'inputs' and 'outputs'.")
@@ -311,6 +354,201 @@ class LinearProjection(eqx.Module):
         if self.bias is not None:
             values = values + jnp.asarray(self.bias)
         return values
+
+    def __call__(self, x: ArrayLike) -> ArrayLike:
+        """Alias for :meth:`reduce`."""
+        return self.reduce(x)
+
+
+class SplitLinearProjection(eqx.Module):
+    """Linear encoder-decoder with separate latent partitions for two output fields.
+
+    The encoder maps one flat full-state vector to the concatenated coordinates
+    ``(lb, lu)``. The decoder maps that full latent vector to concatenated
+    reconstructions ``(bhat, uhat)``. Tree gathering, latent splitting, and
+    reconstruction scattering are deliberately delegated to
+    :func:`romjax.model.eqx_evaluate`.
+    """
+
+    encoder_b: ArrayLike
+    encoder_u: ArrayLike
+    decoder_b: ArrayLike
+    decoder_u: ArrayLike
+    encoder_b_bias: ArrayLike | None
+    encoder_u_bias: ArrayLike | None
+    decoder_b_bias: ArrayLike | None
+    decoder_u_bias: ArrayLike | None
+    input_size: int = eqx.field(static=True)
+    b_latent: int = eqx.field(static=True)
+    u_latent: int = eqx.field(static=True)
+    b_output: int = eqx.field(static=True)
+    u_output: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        input_size: int | None = None,
+        b_latent: int | None = None,
+        u_latent: int | None = None,
+        b_output: int | None = None,
+        u_output: int | None = None,
+        key: Key | None = None,
+        encoder_b: ArrayLike | None = None,
+        encoder_u: ArrayLike | None = None,
+        decoder_b: ArrayLike | None = None,
+        decoder_u: ArrayLike | None = None,
+        encoder_b_bias: ArrayLike | None = None,
+        encoder_u_bias: ArrayLike | None = None,
+        decoder_b_bias: ArrayLike | None = None,
+        decoder_u_bias: ArrayLike | None = None,
+        random_bias: bool = False,
+        scale: float = 0.25,
+    ) -> None:
+        """
+        Initialize split encoder and decoder weights.
+
+        Supply either all four matrices explicitly or dimensions and ``key`` for
+        random initialization. Biases are optional affine offsets for their
+        corresponding maps.
+
+        :param input_size: shared full-state input dimension for both encoders
+        :param b_latent: dimension of the first latent partition
+        :param u_latent: dimension of the second latent partition
+        :param b_output: reconstruction size of the first output field
+        :param u_output: reconstruction size of the second output field
+        :param key: JAX random key for random initialization
+        :param encoder_b: first encoder matrix with shape ``(b_latent, input_size)``
+        :param encoder_u: second encoder matrix with shape ``(u_latent, input_size)``
+        :param decoder_b: first decoder matrix with shape ``(b_output, b_latent + u_latent)``
+        :param decoder_u: second decoder matrix with shape ``(u_output, b_latent + u_latent)``
+        :param encoder_b_bias: optional first encoder bias with shape ``(b_latent,)``
+        :param encoder_u_bias: optional second encoder bias with shape ``(u_latent,)``
+        :param decoder_b_bias: optional first decoder bias with shape ``(b_output,)``
+        :param decoder_u_bias: optional second decoder bias with shape ``(u_output,)``
+        :param random_bias: randomly initialize omitted biases in random-init mode
+        :param scale: random initialization scaling factor
+        """
+        matrices = (encoder_b, encoder_u, decoder_b, decoder_u)
+        bias_keys: tuple[Key | None, Key | None, Key | None, Key | None] = (None, None, None, None)
+        if any(matrix is not None for matrix in matrices):
+            if not all(matrix is not None for matrix in matrices):
+                raise ValueError("SplitLinearProjection requires all four matrices when using explicit weights.")
+            self.encoder_b = jnp.asarray(encoder_b)
+            self.encoder_u = jnp.asarray(encoder_u)
+            self.decoder_b = jnp.asarray(decoder_b)
+            self.decoder_u = jnp.asarray(decoder_u)
+            self._set_dimensions_from_matrices(input_size, b_latent, u_latent, b_output, u_output)
+        else:
+            dimensions = (input_size, b_latent, u_latent, b_output, u_output)
+            if key is None or any(dimension is None for dimension in dimensions):
+                raise ValueError(
+                    "SplitLinearProjection requires all dimensions and key when explicit matrices are not supplied."
+                )
+            if any(dimension < 1 for dimension in dimensions):
+                raise ValueError("SplitLinearProjection dimensions must be positive.")
+            self.input_size = input_size
+            self.b_latent = b_latent
+            self.u_latent = u_latent
+            self.b_output = b_output
+            self.u_output = u_output
+            encoder_b_key, encoder_u_key, decoder_b_key, decoder_u_key, *bias_keys = jax.random.split(key, 8)
+            latent_size = b_latent + u_latent
+            self.encoder_b = scale * jax.random.normal(encoder_b_key, (b_latent, input_size))
+            self.encoder_u = scale * jax.random.normal(encoder_u_key, (u_latent, input_size))
+            self.decoder_b = scale * jax.random.normal(decoder_b_key, (b_output, latent_size))
+            self.decoder_u = scale * jax.random.normal(decoder_u_key, (u_output, latent_size))
+
+        self.encoder_b_bias = self._bias(
+            encoder_b_bias, self.b_latent, "encoder_b_bias", random_bias, bias_keys[0], scale
+        )
+        self.encoder_u_bias = self._bias(
+            encoder_u_bias, self.u_latent, "encoder_u_bias", random_bias, bias_keys[1], scale
+        )
+        self.decoder_b_bias = self._bias(
+            decoder_b_bias, self.b_output, "decoder_b_bias", random_bias, bias_keys[2], scale
+        )
+        self.decoder_u_bias = self._bias(
+            decoder_u_bias, self.u_output, "decoder_u_bias", random_bias, bias_keys[3], scale
+        )
+
+    def _set_dimensions_from_matrices(
+        self,
+        input_size: int | None,
+        b_latent: int | None,
+        u_latent: int | None,
+        b_output: int | None,
+        u_output: int | None,
+    ) -> None:
+        """Validate explicit matrices and set their dimensions."""
+        matrices = (self.encoder_b, self.encoder_u, self.decoder_b, self.decoder_u)
+        if any(matrix.ndim != 2 for matrix in matrices):
+            raise ValueError("SplitLinearProjection matrices must all be two-dimensional.")
+        inferred = (
+            self.encoder_b.shape[1],
+            self.encoder_b.shape[0],
+            self.encoder_u.shape[0],
+            self.decoder_b.shape[0],
+            self.decoder_u.shape[0],
+        )
+        if self.encoder_u.shape[1] != inferred[0]:
+            raise ValueError("encoder_b and encoder_u must have the same input size.")
+        latent_size = inferred[1] + inferred[2]
+        if self.decoder_b.shape[1] != latent_size or self.decoder_u.shape[1] != latent_size:
+            raise ValueError("Decoder matrices must accept the concatenated latent size.")
+        supplied = (input_size, b_latent, u_latent, b_output, u_output)
+        if any(value is not None and value != expected for value, expected in zip(supplied, inferred)):
+            raise ValueError("Supplied dimensions must match the explicit matrix shapes.")
+        self.input_size, self.b_latent, self.u_latent, self.b_output, self.u_output = inferred
+
+    @staticmethod
+    def _bias(
+        bias: ArrayLike | None,
+        size: int,
+        name: str,
+        random_bias: bool,
+        key: Key | None,
+        scale: float,
+    ) -> ArrayLike | None:
+        """Validate one optional bias or initialize it in random-init mode."""
+        if bias is not None:
+            values = jnp.asarray(bias)
+            if values.shape != (size,):
+                raise ValueError(f"{name} must have shape {(size,)}, got shape {values.shape}.")
+            return values
+        if random_bias:
+            if key is None:
+                raise ValueError("random_bias requires random initialization with a key.")
+            return scale * jax.random.normal(key, (size,))
+        return None
+
+    def reduce(self, x: ArrayLike) -> ArrayLike:
+        """Encode full-space values as concatenated split latent coordinates.
+
+        :param x: full-space vector or batch with last axis ``input_size``
+        :return: concatenated coordinates with last axis ``b_latent + u_latent``
+        """
+        values = jnp.asarray(x)
+        lb = jnp.matmul(values, jnp.swapaxes(self.encoder_b, -1, -2))
+        lu = jnp.matmul(values, jnp.swapaxes(self.encoder_u, -1, -2))
+        if self.encoder_b_bias is not None:
+            lb = lb + self.encoder_b_bias
+        if self.encoder_u_bias is not None:
+            lu = lu + self.encoder_u_bias
+        return jnp.concatenate((lb, lu), axis=-1)
+
+    def reconstruct(self, z: ArrayLike) -> ArrayLike:
+        """Decode concatenated split latent coordinates into concatenated fields.
+
+        :param z: latent vector or batch with last axis ``b_latent + u_latent``
+        :return: concatenated reconstructions with last axis ``b_output + u_output``
+        """
+        values = jnp.asarray(z)
+        bhat = jnp.matmul(values, jnp.swapaxes(self.decoder_b, -1, -2))
+        uhat = jnp.matmul(values, jnp.swapaxes(self.decoder_u, -1, -2))
+        if self.decoder_b_bias is not None:
+            bhat = bhat + self.decoder_b_bias
+        if self.decoder_u_bias is not None:
+            uhat = uhat + self.decoder_u_bias
+        return jnp.concatenate((bhat, uhat), axis=-1)
 
     def __call__(self, x: ArrayLike) -> ArrayLike:
         """Alias for :meth:`reduce`."""

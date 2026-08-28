@@ -741,6 +741,31 @@ class LatentSamplerFactory(CallableModel):
     callable: Callable[[Compression], SamplerCallable] = _default_latent_sampler
 
 
+class AffineInitial(ForcingCallable):
+    """
+    Return an initial root find guess u0 = g(b) + H^-1(b, g(b)) r, 
+    associated with the Affine model F(b,u)=H(b,u)(u-g(b)).
+    """
+
+    solver: LinearSolver = Field(default_factory=lambda: lx.AutoLinearSolver(well_posed=True))
+
+    def callable(self, inputs: PyTree, outputs: PyTree) -> ArrayLike:
+        del outputs
+        inputs, module, residuals = inputs["inputs"], inputs["module"], inputs["residuals"]
+        matrix, solution = module.materialize(inputs, outputs="solution")
+
+        u0 = lx.linear_solve(
+            lx.MatrixLinearOperator(matrix),
+            residuals,
+            solver=self.solver,
+        ).value + solution
+
+        return u0
+
+
+FORCING_REGISTRY["affine"] = AffineInitial
+
+
 class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     """Invertible input-conditioned affine residual model.
 
@@ -952,7 +977,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         residual_values = self._value(residuals, "residuals")
 
         # Use solution operator explicitly
-        if affine.identity_jac:
+        if affine.identity_jac is True:
             _, solution = affine.materialize(values)
             return {"value": solution + residual_values}
 
@@ -977,8 +1002,13 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
             solver = IterativeSolver()
         if not isinstance(solver, IterativeSolver):
             raise TypeError("Output-dependent ImplicitAffine Jacobians require an IterativeSolver.")
-        
-        initial = jnp.broadcast_to(self.initial(inputs.get("initial", {}), {}), residual_values.shape)
+
+        initial_inputs = inputs.get("initial", {})
+        if isinstance(self.initial, AffineInitial):
+            initial_inputs["inputs"] = values
+            initial_inputs["module"] = affine
+            initial_inputs["residuals"] = residual_values
+        initial = jnp.broadcast_to(self.initial(initial_inputs, {}), residual_values.shape)
 
         def root_residual(output_values: ArrayLike, args: PyTree) -> ArrayLike:
             return self.evaluate(args["inputs"], {"value": output_values})["value"] - args["residuals"]["value"]
