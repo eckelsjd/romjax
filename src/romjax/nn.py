@@ -9,6 +9,59 @@ from jaxtyping import ArrayLike, Key, PyTree
 __all__ = ["Affine", "LinearProjection", "SplitLinearProjection"]
 
 
+class _TriangularMLP(eqx.Module):
+    """Wrap an MLP that parameterizes one strict triangular matrix factor."""
+
+    mlp: eqx.nn.MLP
+    outputs_rank: int = eqx.field(static=True)
+    jacobian_inputs: Literal["inputs", "outputs", "both"] = eqx.field(static=True)
+    inputs_rank: int = eqx.field(static=True)
+    lower: bool = eqx.field(static=True)
+
+    @property
+    def layers(self):
+        """Expose underlying layers for compatibility with :class:`equinox.nn.MLP`."""
+        return self.mlp.layers
+
+    def __call__(self, inputs: ArrayLike) -> ArrayLike:
+        """Evaluate the wrapped MLP."""
+        return self.mlp(inputs)
+
+    def tikhonov(self, payload: PyTree) -> ArrayLike:
+        """Regularize the materialized strict triangular entries for one training payload.
+
+        :param payload: mapping with ``inputs`` and ``outputs`` value payloads
+        :return: squared Frobenius norm of the materialized strict triangular matrix
+        """
+        if not isinstance(payload, Mapping) or "inputs" not in payload or "outputs" not in payload:
+            raise TypeError("Triangular Affine MLP tikhonov payload must be a Mapping with 'inputs' and 'outputs'.")
+
+        def payload_value(value: PyTree, name: str) -> ArrayLike:
+            if not isinstance(value, Mapping) or "value" not in value:
+                raise TypeError(f"Triangular Affine MLP tikhonov {name} must contain 'value'.")
+            return jnp.asarray(value["value"]).reshape(-1)
+
+        input_values = payload_value(payload["inputs"], "inputs")
+        output_values = payload_value(payload["outputs"], "outputs")
+        if input_values.shape != (self.inputs_rank,):
+            raise ValueError(f"inputs must have shape ({self.inputs_rank},); got {input_values.shape}.")
+        if output_values.shape != (self.outputs_rank,):
+            raise ValueError(f"outputs must have shape ({self.outputs_rank},); got {output_values.shape}.")
+        values = {
+            "inputs": input_values,
+            "outputs": output_values,
+            "both": jnp.concatenate((input_values, output_values)),
+        }[self.jacobian_inputs]
+        rows, cols = (
+            jnp.tril_indices(self.outputs_rank, -1)
+            if self.lower
+            else jnp.triu_indices(self.outputs_rank, 1)
+        )
+        matrix = jnp.zeros((self.outputs_rank, self.outputs_rank), dtype=values.dtype)
+        matrix = matrix.at[rows, cols].set(self.mlp(values))
+        return jnp.sum(jnp.square(matrix))
+
+
 class Affine(eqx.Module):
     """Input-conditioned affine residual operator.
 
@@ -23,8 +76,8 @@ class Affine(eqx.Module):
     """
 
     solution: eqx.nn.MLP | None
-    lower: eqx.nn.MLP | None
-    upper: eqx.nn.MLP | None
+    lower: _TriangularMLP | None
+    upper: _TriangularMLP | None
     diagonal: eqx.nn.MLP | None
     inputs_rank: int = eqx.field(static=True)
     outputs_rank: int = eqx.field(static=True)
@@ -142,21 +195,33 @@ class Affine(eqx.Module):
             self.diagonal = None
             return
 
-        self.lower = None if lower_size == 0 else make_mlp(
-            in_size=jacobian_size,
-            out_size=lower_size,
-            width_size=matrix_width,
-            depth=matrix_depth,
-            mlp_key=lower_key,
-            initialize_last_layer=True,
+        self.lower = None if lower_size == 0 else _TriangularMLP(
+            mlp=make_mlp(
+                in_size=jacobian_size,
+                out_size=lower_size,
+                width_size=matrix_width,
+                depth=matrix_depth,
+                mlp_key=lower_key,
+                initialize_last_layer=True,
+            ),
+            outputs_rank=outputs_rank,
+            jacobian_inputs=jacobian_inputs,
+            inputs_rank=inputs_rank,
+            lower=True,
         )
-        self.upper = None if lower_size == 0 else make_mlp(
-            in_size=jacobian_size,
-            out_size=lower_size,
-            width_size=matrix_width,
-            depth=matrix_depth,
-            mlp_key=upper_key,
-            initialize_last_layer=True,
+        self.upper = None if lower_size == 0 else _TriangularMLP(
+            mlp=make_mlp(
+                in_size=jacobian_size,
+                out_size=lower_size,
+                width_size=matrix_width,
+                depth=matrix_depth,
+                mlp_key=upper_key,
+                initialize_last_layer=True,
+            ),
+            outputs_rank=outputs_rank,
+            jacobian_inputs=jacobian_inputs,
+            inputs_rank=inputs_rank,
+            lower=False,
         )
         self.diagonal = make_mlp(
             in_size=jacobian_size,
@@ -169,14 +234,14 @@ class Affine(eqx.Module):
         if identity_jac == "init":
             if self.lower is not None:
                 self.lower = eqx.tree_at(
-                    lambda mlp: mlp.layers[-1].bias,
+                    lambda module: module.mlp.layers[-1].bias,
                     self.lower,
-                    jnp.zeros_like(self.lower.layers[-1].bias),
+                    jnp.zeros_like(self.lower.mlp.layers[-1].bias),
                 )
                 self.upper = eqx.tree_at(
-                    lambda mlp: mlp.layers[-1].bias,
+                    lambda module: module.mlp.layers[-1].bias,
                     self.upper,
-                    jnp.zeros_like(self.upper.layers[-1].bias),
+                    jnp.zeros_like(self.upper.mlp.layers[-1].bias),
                 )
             self.diagonal = eqx.tree_at(
                 lambda mlp: mlp.layers[-1].bias,
