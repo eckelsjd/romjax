@@ -11,6 +11,7 @@ from romjax.loss import (
     GraphLossTermGenerator,
     cyclic_path_error_terms,
     log_determinant_regularization,
+    tikhonov_regularization,
 )
 from romjax.model import SourceSampleable
 from romjax.nn import Affine
@@ -45,6 +46,19 @@ class AffinePayloadEdge(Edge):
         offset = x.get("call_args", {}).get("offset", 0.0)
         value = jnp.asarray(x["value"]) + offset
         return {"inputs": {"value": value}, "outputs": {"value": value + 0.5}}
+
+    def backward(self, x):
+        del x
+        raise NotImplementedError
+
+
+class VectorAffinePayloadEdge(Edge):
+    """Pack a scalar source value into a two-dimensional Affine payload."""
+
+    def forward(self, x):
+        offset = x.get("call_args", {}).get("offset", 0.0)
+        value = jnp.asarray(x["value"]) + offset
+        return {"inputs": {"value": value}, "outputs": {"value": jnp.asarray([value, value + 0.5])}}
 
     def backward(self, x):
         del x
@@ -104,6 +118,40 @@ def test_log_determinant_regularization_pushes_prefix_path() -> None:
         ref=("affine",),
     )
     assert jnp.allclose(identity, expected)
+
+
+def test_tikhonov_regularization_uses_triangular_affine_override() -> None:
+    affine = Affine(inputs_rank=1, outputs_rank=3, key=jax.random.key(12))
+    payload = {"inputs": {"value": jnp.asarray([0.25])}, "outputs": {"value": jnp.asarray([0.75, -0.25, 1.0])}}
+
+    assert affine.lower is not None
+    assert affine.upper is not None
+    jacobian_values = jnp.asarray([0.25])
+    lower_matrix = affine._triangular(affine.lower(jacobian_values), lower=True)
+    upper_matrix = affine._triangular(affine.upper(jacobian_values), lower=False)
+
+    lower_value = tikhonov_regularization({"lower": affine.lower}, payload, None, ref=("lower",))
+    upper_value = tikhonov_regularization({"upper": affine.upper}, payload, None, ref=("upper",))
+
+    assert jnp.allclose(lower_value, jnp.sum(jnp.square(lower_matrix)))
+    assert jnp.allclose(upper_value, jnp.sum(jnp.square(upper_matrix)))
+
+
+def test_tikhonov_regularization_pushes_prefix_path_for_override() -> None:
+    graph = FunctionGraph(
+        nodes={"source": Node(name="source"), "payload": Node(name="payload")},
+        edges={"pack": VectorAffinePayloadEdge(source="source", target="payload", name="pack")},
+    )
+    affine = Affine(inputs_rank=1, outputs_rank=2, key=jax.random.key(13))
+    assert affine.lower is not None
+    params = {"lower": affine.lower, "pack": {"call_args": {"offset": 1.0}}}
+    source_data = {"value": jnp.asarray(0.25)}
+    payload = graph.push_path(source_data, path=["pack"], edge_payload_patches=params)
+
+    expected = affine.lower.tikhonov(payload)
+    actual = tikhonov_regularization(params, source_data, graph, ref=("lower",), path=["pack"])
+
+    assert jnp.allclose(actual, expected)
 
 
 class TreeOffsetEdge(Edge):
@@ -287,6 +335,33 @@ def test_graph_loss_term_schedule_blocks_and_cosine_ramps() -> None:
 
     with pytest.raises(ValueError, match="positive ramp_duration"):
         GraphLoss(graph=four_node_cycle(), terms=[{"term": scheduled_constant_term, "ramp_start": 5}])
+
+
+def test_graph_loss_zero_weight_term_is_inactive_and_not_evaluated() -> None:
+    def unevaluated_term(params, single_data, graph) -> jax.Array:
+        del params, single_data, graph
+        raise AssertionError("zero-weight term must not be evaluated")
+
+    loss = GraphLoss(
+        graph=four_node_cycle(),
+        terms=[
+            {
+                "name": "disabled",
+                "term": unevaluated_term,
+                "batch_reduce": None,
+                "weight": 0.0,
+                "ramp_start": 5,
+                "ramp_duration": 10,
+            }
+        ],
+    )
+
+    term = term_by_name(loss, "disabled")
+    assert not term.is_enabled
+    assert not term.is_active_at(100)
+    assert not loss.has_scheduled_terms
+    assert loss.active_term_names(100) == ()
+    assert loss({}, {}, active_terms=("disabled",)) == pytest.approx(0.0)
 
 
 def test_cyclic_path_error_generator_yaml_and_train_deferred_binding() -> None:

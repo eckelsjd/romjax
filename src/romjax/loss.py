@@ -43,6 +43,7 @@ __all__ = [
     "cyclic_path_error_terms",
     "log_determinant_regularization",
     "path_error_loss",
+    "tikhonov_regularization",
 ]
 
 
@@ -122,10 +123,39 @@ def path_error_loss(
     )
 
 
-def tikhonov_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph, ref: list[str] = None):
-    del single_data, graph
-    params = params if ref is None else get_subtree(params, ref)
-    return pytree_square_norm(params)
+def tikhonov_regularization(
+    params: PyTree,
+    single_data: PyTree,
+    graph: FunctionGraph | None,
+    ref: TreePath | None = None,
+    path: Sequence[str | Edge] | None = None,
+) -> ArrayLike:
+    """Apply Tikhonov regularization to a referenced parameter tree or object.
+
+    If the referenced object provides ``tikhonov()``, that method is used,
+    allowing parameterized modules to regularize their materialized outputs
+    rather than their internal weights. Otherwise, the squared PyTree norm of
+    the referenced parameter tree is returned.
+
+    :param params: graph parameter pytree
+    :param single_data: single sample of training data
+    :param graph: graph used to transform data when ``path`` is configured
+    :param ref: optional path locating the parameter tree or overriding object
+    :param path: optional graph-edge path applied to ``single_data`` before method dispatch
+    :return: the Tikhonov regularization
+    """
+    target = params if ref is None else get_subtree(params, ref)
+    if target is None:
+        raise ValueError(f"Can't locate target for Tikhonov regularization via ref: '{ref}'")
+
+    tikhonov = getattr(target, "tikhonov", None)
+    if callable(tikhonov):
+        if path:
+            if graph is None:
+                raise ValueError("Tikhonov regularization requires a graph when path is configured.")
+            single_data = graph.push_path(single_data, path=path, edge_payload_patches=params)
+        return tikhonov(single_data)
+    return pytree_square_norm(target)
 
 
 def orthogonal_regularization(params: PyTree, single_data: PyTree, graph: FunctionGraph, ref: list[str] = None):
@@ -499,7 +529,7 @@ class GraphLossTerm(BaseModel):
     :param name: stable term name used for adaptive balancing, diagnostics, and plotting
     :param term: callable to apply to a single sample of data
     :param dataset: which dataset name to read data from
-    :param weight: scalar term weight
+    :param weight: scalar term weight; an exactly zero weight permanently disables evaluation of the term
     :param ramp_start: optimizer iteration at which cosine ramping begins; values less than or equal to zero disable
         the term permanently
     :param ramp_duration: positive number of iterations over which the effective term weight reaches ``weight``
@@ -574,9 +604,14 @@ class GraphLossTerm(BaseModel):
         """Whether this term has an explicit evaluation schedule."""
         return self.ramp_start is not None
 
+    @property
+    def is_enabled(self) -> bool:
+        """Whether this term can contribute to the loss."""
+        return self.weight != 0.0
+
     def is_active_at(self, iteration: int) -> bool:
         """Return whether this term should be evaluated at a host-side optimizer iteration."""
-        return self.ramp_start is None or (self.ramp_start > 0 and iteration >= self.ramp_start)
+        return self.is_enabled and (self.ramp_start is None or (self.ramp_start > 0 and iteration >= self.ramp_start))
 
     @staticmethod
     def _stack_sequence_batch(term_batch: Sequence[PyTree]) -> PyTree:
@@ -1211,7 +1246,7 @@ class GraphLoss(BaseModel):
     @property
     def has_scheduled_terms(self) -> bool:
         """Whether any concrete term requires an explicit optimizer iteration."""
-        return any(term.is_scheduled for term in self.terms if isinstance(term, GraphLossTerm))
+        return any(term.is_enabled and term.is_scheduled for term in self.terms if isinstance(term, GraphLossTerm))
 
     def active_term_names(self, iteration: int) -> tuple[str, ...]:
         """Return the concrete terms that should be evaluated at a host-side iteration.
@@ -1261,7 +1296,7 @@ class GraphLoss(BaseModel):
         values = []
         aux = None
         for name, term in zip(self._term_names, self.terms, strict=True):
-            if active_terms is not None and name not in active_terms:
+            if not term.is_enabled or (active_terms is not None and name not in active_terms):
                 values.append(jnp.asarray(0.0))
                 continue
             value, aux = term.raw_value(params, batch, self.graph, aux=aux, return_aux=True)
