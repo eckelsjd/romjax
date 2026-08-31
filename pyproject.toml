@@ -37,14 +37,13 @@ classifiers = [
 Repository = "https://github.com/eckelsjd/romjax.git"
 
 [project.scripts]
-task = "romjax.task_cli:main"
 romx = "romjax.romx_cli:main"
 
 [project.optional-dependencies]
-cu12 = [
+cuda12 = [
     "jax[cuda12]>=0.9.1",
 ]
-cu13 = [
+cuda13 = [
     "jax[cuda13]>=0.9.1",
 ]
 
