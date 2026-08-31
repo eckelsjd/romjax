@@ -1,14 +1,5 @@
 Keeping track of ideas, bugs, thoughts, etc.
 
-- finish objectives and poisson
-- get Galerkin ODE working (small problem, then Vlasov)
-- repeat galerkin training on Vlasov
-- implement Euler (conservative values, handle heat flux and stress terms)
-- Figure out coord/res transforms for Vlasov->Euler
-- possibly CNN/FNO autoencoder 
-- Train Vlasov/Euler graph
-- Routine for sampling knudsen, training surrogate for E(v)
-
 ## Testing
 - [ ] Need to consolidate test_train and test_vlasov to be quicker
 
@@ -42,12 +33,8 @@ Keeping track of ideas, bugs, thoughts, etc.
 ## Routines
 - [ ] ~~Routine dependencies and snakemake/makefile~~
 
-## Task CLI
-- [ ] [Issues with codex sandbox shell commands](https://github.com/openai/codex/issues/17525)
-
 ## Major design changes
 - [ ] Move heavy pydantic workflow to separate library (custom models, yaml loading, routines, cli, etc.)
-- [ ] Move agents workflow to separate libary or copier-numpy template
 - [ ] Move PDE/models to separate library (poisson, vlasov, euler)
 - [ ] Reorganize module layout and optimize public API (with good defaults, nice validation) for documentation tutorials/demos
 - [ ] Unit tests are getting pretty heavy -- breaking into multiple libraries and condensing may help
@@ -89,6 +76,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Future projects
 - Building surrogate for graph comm as a model error indicator (scalar or field)
+- Vlasov/Euler graph
 - Online adaptive time-stepping for time-based simulations
 - Can reformulate loss scaling as a PID controller
 - Public release:

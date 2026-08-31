@@ -7,48 +7,83 @@
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-%23FE5196?logo=conventionalcommits&logoColor=white)](https://conventionalcommits.org)
 ![Code Coverage](https://img.shields.io/badge/coverage-82%25-yellowgreen?logo=codecov)
 
-Reduced-order modeling in jax.
+Reduced-order modeling in jax. Compatible with the [jax ecosystem](https://docs.kidger.site/equinox/) for ML (equinox, optax, lineax, etc.)
 
 ## ⚙️ Installation
 ```shell
 git clone https://github.com/eckelsjd/romjax.git && cd romjax
-uv sync --all-groups # use --extra cu13 for gpu-support
+uv sync --all-groups  # use --extra cuda13 for gpu support
 ```
 
-## 🔬 Profiling
-The built-in harness uses `jax.profiler.trace(...)` and `StepTraceAnnotation` so you can inspect both Python
-orchestration and JAX-compiled execution in TensorBoard.
+## 📍 Quickstart
+Based on an [approach]() that abstracts the ROM training process as one of minimizing the path error in a graph.
+```python
+import jax.numpy as jnp
+import optax
 
-Enable tracing with CLI flags:
+import romjax as romx
 
-```shell
-uv run python -m romjax.romx_cli run \
-  --profile \
-  --profile-dir /tmp/romjax-traces \
-  --profile-label train-debug \
-  path/to/train.yml
+class FOM(romx.ExplicitModel):
+    theta: float = 1.0  # true parameter
+    def pushforward(self, inputs):
+        y = self.theta * inputs["x"]**2
+        return dict(y=y)
+  
+class ROM(romx.ExplicitModel):
+    def pushforward(self, inputs):
+      y = inputs["theta"] * inputs["x"]**2
+      return dict(y=y)
+
+# Graph-theoretic approach
+graph = romx.FunctionGraph(
+    edges=[
+        FOM(source="A", target="B"),                 #  A-->B
+        romx.IdentityEdge(source="A", target="C"),   #  |   |
+        romx.IdentityEdge(source="B", target="D"),   #  ⌄   ⌄
+        ROM(source="C", target="D"),                 #  C-->D
+    ]
+)
+
+# Residual minimization (i.e. least-squares || y - theta x^2 ||^2)
+loss = romx.GraphLoss([dict(
+    callable="path_error", path_a=["A->B", "B->D"], path_b=["A->C", "C->D"]
+)])
+
+# Training data
+def dataloader():
+    xtrain = jnp.linspace(0, 1, 15)
+    ytrain = 1.0 * xtrain ** 2
+    data = [
+        dict(inputs={"x": x}, outputs={"y": y}) for x, y in zip(xtrain, ytrain)
+    ]
+    while True:
+        yield data
+
+params = romx.Train(
+    graph=graph,
+    loss=loss,
+    dataloader=dataloader(),
+    optimizer=optax.adam(0.001),
+    init_params={"C->D": {"theta": jnp.asarray([0.0])}}
+)()
+
+print(params["C->D"]["theta"])  # 1.0
 ```
 
-The CLI sets `ROMJAX_PROFILE`, `ROMJAX_PROFILE_DIR`, and `ROMJAX_PROFILE_LABEL` for the launched routine so the
-same flags also enable `GridSearch` child traces.
+Obviously, this is a lot of extra work for plain least-squares, but the same setup can be used for a variety of more complicated problems with minimal additional configuration:
 
-For a direct `Train` run, the trace is written under `--profile-dir` if provided, otherwise under
-`<train_root>/profiles/`.
+- **Solution error** - optimize through a differentiable PDE solver
+- **Galerkin projection** - learn reduced-basis ODEs (or data-driven alternatives such as DMD)
+- **Deep learning** - train autoencoders, MLPs, and everything in between (with [equinox](https://docs.kidger.site/equinox/))
+- **Closure modeling** - tune physics-based closure model coefficients
+- **Residual learning** - exploit residual geometry with [non-converged solutions]()
 
-For `GridSearch`, the parent search is traced and each spawned training case gets its own trace directory under
-`<case_root>/profiles/` automatically. If `--profile-dir` is set on the parent CLI, child traces are written under a
-case-named subdirectory inside that root.
-
-Open the results with TensorBoard:
-
-```shell
-tensorboard --logdir /tmp/romjax-traces
-```
-
-If you want a host-side flame graph for Python overhead, run the parent process under `py-spy`. For allocation and
-copy-volume analysis, `Scalene` is the better follow-up tool.
+All of these diverse learning problems share the same fundamental graph structure as the simple least-squares problem.
 
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.
 
 <sup><sub>Made with the [copier-numpy](https://github.com/eckelsjd/copier-numpy.git) template.</sub></sup>
+
+## 📎 Citation
+TBA

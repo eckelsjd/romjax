@@ -1901,10 +1901,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-cu12 = [
+cuda12 = [
     { name = "jax", extra = ["cuda12"] },
 ]
-cu13 = [
+cuda13 = [
     { name = "jax", extra = ["cuda13"] },
 ]
 
@@ -1927,8 +1927,8 @@ requires-dist = [
     { name = "equinox", specifier = ">=0.13.6" },
     { name = "h5py", specifier = ">=3.14" },
     { name = "jax", specifier = ">=0.9.1" },
-    { name = "jax", extras = ["cuda12"], marker = "extra == 'cu12'", specifier = ">=0.9.1" },
-    { name = "jax", extras = ["cuda13"], marker = "extra == 'cu13'", specifier = ">=0.9.1" },
+    { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda12'", specifier = ">=0.9.1" },
+    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda13'", specifier = ">=0.9.1" },
     { name = "jaxtyping", specifier = ">=0.3.9" },
     { name = "lineax", specifier = ">=0.1.0" },
     { name = "loguru", specifier = ">=0.7.3" },
@@ -1941,7 +1941,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
-provides-extras = ["cu12", "cu13"]
+provides-extras = ["cuda12", "cuda13"]
 
 [package.metadata.requires-dev]
 dev = [

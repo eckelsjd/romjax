@@ -2076,7 +2076,9 @@ class DataGeneration(Routine):
 
             for base in self.bases:
                 datasets = self._base_datasets(base, values)
-                base_root = override_root / f"{self.base_name}={base.name}" if self.base_name is not None else base.name
+                base_root = override_root / (
+                    f"{self.base_name}={base.name}" if self.base_name is not None else base.name
+                )
                 for path, dataset in pytree_path_iter(
                     datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
                 ):

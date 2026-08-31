@@ -47,6 +47,7 @@ from romjax.typing import CallableModel, from_registry
 from romjax.utils import _NullProgress
 
 type WritePolicy = Literal["reuse", "overwrite", "error"]
+type ExitPolicy = Literal["all", "any", "ignore"]
 type _DeviceKind = Literal["cpu", "gpu"]
 
 _HYBRID_ENV_KEYS = frozenset(
@@ -692,6 +693,8 @@ class GridSearch(Routine):
     :param override: hyperparameter override specifications
     :param write_policy: behavior when root or case artifacts already exist
     :param save_policy: which completed cases to retain after ranking
+    :param exit_policy: ``any`` - raise if any child is non-zero, ``all`` - raise only when all children are non-zero,
+                        ``ignore`` - exit with 0 always if all cases complete
     :param metric: metric alias or callable used to rank successful cases
     :param executor: execution backend configuration
     :param case_root_path: path or paths to inject with the per-case root directory
@@ -705,6 +708,7 @@ class GridSearch(Routine):
     override: list[GridOverride]
     write_policy: WritePolicy = "reuse"
     save_policy: _SavePolicy = Field(default_factory=_SavePolicy)
+    exit_policy: ExitPolicy = "any"
     metric: MetricCallable = "orbax"
     executor: ExecutorConfig = Field(default_factory=SerialExecutorConfig)
     case_root_path: tuple[TreePath, ...] = (("root",),)
@@ -972,10 +976,13 @@ class GridSearch(Routine):
                     self._copy_best_case(ranked[0][0])
 
             exit_code = 0
+            any_child_passed = False
             for spec in specs:
                 result = result_by_name[spec.name]
                 if result.exit_code != 0 and exit_code == 0:
                     exit_code = result.exit_code
+                if not any_child_passed and result.exit_code == 0:
+                    any_child_passed = True
                 manifest_cases[spec.name].update(
                     {
                         "status": result.status,
@@ -1002,4 +1009,5 @@ class GridSearch(Routine):
                         "cases": manifest_cases,
                     }
                 )
-            return exit_code
+
+            return 0 if self.exit_policy == "ignore" or (self.exit_policy == "all" and any_child_passed) else exit_code
