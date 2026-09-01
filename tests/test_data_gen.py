@@ -660,17 +660,26 @@ def test_source_data_config_types(tmp_path):
     assert loader.datasets["source"].stack_batch is False
 
 
-def test_data_generation_expands_generic_base_configurations(tmp_path: Path) -> None:
+def test_data_generation_expands_base_overrides_cartesian_product(tmp_path: Path) -> None:
     graph = FunctionGraph(edges={"source": _ToySourceEdge(source="noise", target="source")})
     generation = DataGeneration(
         root=tmp_path,
-        bases=[
-            {"name": "inputs", "source": {"samples": 1, "seed": 0}},
-            {"name": "outputs", "source": {"samples": 1, "seed": 0}},
-        ],
+        base={"source": {"samples": 1, "seed": 0}},
         overrides=[
-            {"path": ["source", "samples"], "cases": [1, 2]},
-            {"path": ["source", "seed"], "cases": [0, 1]},
+            {
+                "name": "inputs",
+                "cases": [
+                    {"name": "1", "value": {"source": {"samples": 1}}},
+                    {"name": "2", "value": {"source": {"samples": 2}}},
+                ],
+            },
+            {
+                "name": "outputs",
+                "cases": [
+                    {"name": "0", "value": {"source": {"seed": 0}}},
+                    {"name": "1", "value": {"source": {"seed": 1}}},
+                ],
+            },
         ],
         graph=graph,
     )
@@ -679,19 +688,43 @@ def test_data_generation_expands_generic_base_configurations(tmp_path: Path) -> 
 
     for samples in (1, 2):
         for seed in (0, 1):
-            for base_name in ("inputs", "outputs"):
-                base_root = tmp_path / f"samples={samples}" / f"seed={seed}" / base_name
-                source_root = base_root / "source"
-                assert (source_root / f"seed_{seed}").exists()
-                assert (source_root / f"seed_{seed}" / "sample_0" / "source.h5").exists()
+            source_root = tmp_path / f"inputs={samples}" / f"outputs={seed}" / "source"
+            assert (source_root / f"seed_{seed}").exists()
+            assert (source_root / f"seed_{seed}" / "sample_0" / "source.h5").exists()
+
+
+def test_data_generation_expands_yaml_base_path_and_empty_base(tmp_path: Path) -> None:
+    graph = FunctionGraph(edges={"source": _ToySourceEdge(source="noise", target="source")})
+    base_path = tmp_path / "base.yml"
+    base_path.write_text("source: {samples: 1, seed: 0}\n", encoding="utf-8")
+
+    from_path = DataGeneration(
+        root=tmp_path / "from_path",
+        base=base_path.as_posix(),
+        overrides=[{"name": "case", "cases": [{"name": "one", "value": None}]}],
+        graph=graph,
+    )
+    empty_base = DataGeneration(
+        root=tmp_path / "empty_base",
+        overrides=[
+            {"name": "case", "cases": [{"name": "one", "value": {"source": {"samples": 1, "seed": 0}}}]}
+        ],
+        graph=graph,
+    )
+
+    assert from_path.run() == 0
+    assert empty_base.run() == 0
+    assert (tmp_path / "from_path" / "case=one" / "source" / "seed_0" / "sample_0" / "source.h5").exists()
+    assert (tmp_path / "empty_base" / "case=one" / "source" / "seed_0" / "sample_0" / "source.h5").exists()
 
 
 def test_data_generation_rejects_mixed_dataset_modes(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="both 'datasets' and 'bases'"):
+    with pytest.raises(ValueError, match="both 'datasets' and base/overrides"):
         DataGeneration(
             root=tmp_path,
             datasets={"source": {"samples": 1, "seed": 0}},
-            bases=[{"name": "source", "samples": 1, "seed": 0}],
+            base={"source": {"samples": 1, "seed": 0}},
+            overrides=[{"name": "source", "cases": [{"name": "one", "value": None}]}],
         )
 
 

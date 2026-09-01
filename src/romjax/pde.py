@@ -1003,7 +1003,7 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         if not isinstance(solver, IterativeSolver):
             raise TypeError("Output-dependent ImplicitAffine Jacobians require an IterativeSolver.")
 
-        initial_inputs = inputs.get("initial", {})
+        initial_inputs = dict(inputs.get("initial", {}))
         if isinstance(self.initial, AffineInitial):
             initial_inputs["inputs"] = values
             initial_inputs["module"] = affine
