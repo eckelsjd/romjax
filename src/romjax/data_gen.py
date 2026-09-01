@@ -14,6 +14,7 @@ import equinox as eqx
 import h5py
 import jax
 import numpy as np
+import yaml
 from alive_progress import alive_bar
 from jaxtyping import Key, PyTree
 from loguru import logger
@@ -33,19 +34,17 @@ from romjax.graph import Edge, FunctionGraph
 from romjax.model import ImplicitSampleable
 from romjax.norm import NormOperator, NormTree
 from romjax.rng import gen_keys
-from romjax.routine import Routine, RoutineError
+from romjax.routine import CompositeOverride, Routine, RoutineError
 from romjax.tree import (
     TreePath,
-    coerce_tree_path,
     coerce_tree_paths,
     get_subtree,
     pytree_iter,
-    pytree_merge,
     pytree_path_iter,
     pytree_stack,
     set_subtree,
 )
-from romjax.typing import CallableModel, DictModel, from_yaml
+from romjax.typing import CallableModel, from_yaml
 from romjax.utils import _NullProgress, load_h5, required_fields, save_h5
 
 __all__ = [
@@ -161,6 +160,7 @@ class GenDataConfig(BaseModel, ABC):
 
     format: SUPPORTED_FORMATS | None = None
     write_policy: SUPPORTED_POLICIES | None = None
+    show_progress: bool = True
 
     def _validate_format_and_policy(self, format, write_policy):
         """Make sure we have format and policy at runtime."""
@@ -484,7 +484,12 @@ class GenImplicitModel(GenGraph):
                 failed_cases += 1
             _log_sample_failure(sample_dir, message, exc)
 
-        with alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
+        ctxt = (
+            alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            if self.show_progress else _NullProgress()
+        )
+
+        with ctxt as bar:
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -768,8 +773,12 @@ class GenImplicitModel(GenGraph):
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
+        ctxt = (
+            alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            if self.show_progress else _NullProgress()
+        )
 
+        with ctxt as bar:
             if write_policy == 'error' and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -1025,7 +1034,12 @@ class GenSource(GenGraph):
                 failed_cases += 1
             _log_sample_failure(sample_dir, message, exc)
 
-        with alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
+        ctxt = (
+            alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            if self.show_progress else _NullProgress()
+        )
+
+        with ctxt as bar:
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -1088,8 +1102,12 @@ class GenSource(GenGraph):
         path = Path(path)
         model = self._edge_from_path(path)
 
-        with alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN) as bar:
+        ctxt = (
+            alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            if self.show_progress else _NullProgress()
+        )
 
+        with ctxt as bar:
             if write_policy == "error" and path.exists():
                 raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
@@ -1600,11 +1618,10 @@ class GenNorm(GenDataConfig):
             return
         yield from pytree_iter(loaded)
 
-    def _iter_samples(self, progress: bool = True) -> Generator[tuple[str, PyTree], None, None]:
+    def _iter_samples(self) -> Generator[tuple[str, PyTree], None, None]:
         ctxt = (
             alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN)
-            if progress
-            else _NullProgress()
+            if self.show_progress else _NullProgress()
         )
 
         with ctxt as bar:
@@ -1712,6 +1729,7 @@ class GenLatent(GenDataConfig):
     gather_template: Any | None = None
     norm: Any | None = None
     compression: Compression = Field(default_factory=lambda: SVD(energy_tol=0.999))
+    name_depth: int = 2
 
     @staticmethod
     def _iter_loaded_samples(loaded: PyTree) -> Generator[PyTree, None, None]:
@@ -1812,11 +1830,15 @@ class GenLatent(GenDataConfig):
             return normalized
         return norm(sample)
 
-    def _iter_samples(self, progress: bool = True) -> Generator[PyTree, None, None]:
+    def bar_text(self, path: Path):
+        return "/".join(path.parts[-self.name_depth:])
+
+    def _iter_samples(self, path: Path | None = None) -> Generator[PyTree, None, None]:
+        path = Path(path) / self.filename if path is not None else Path(self.filename)
+        
         ctxt = (
-            alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN)
-            if progress
-            else _NullProgress()
+            alive_bar(len(self.loader), title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            if self.show_progress else _NullProgress()
         )
 
         with ctxt as bar:
@@ -1930,84 +1952,14 @@ type GenDataPyTree = Annotated[PyTree, BeforeValidator(_validate_gendata_pytree)
 type LoadDataPyTree = Annotated[PyTree, BeforeValidator(_validate_loaddata_pytree)]
 
 
-class DataGenerationBase(DictModel):
-    """Named, arbitrary configuration used as one data-generation base case.
-
-    All fields other than ``name`` are intentionally unrestricted at this stage. They are validated as a
-    :class:`GenDataConfig` or dataset PyTree when the generation routine runs.
-
-    :param name: directory name for this base case
-    """
-
-    name: str
-
-    @model_validator(mode="after")
-    def _validate_name(self) -> "DataGenerationBase":
-        if not self.name or self.name in {".", ".."} or any(separator in self.name for separator in ("/", "\\")):
-            raise ValueError("Data-generation base names must be non-empty single path components.")
-        return self
-
-
-class DataGenerationOverride(BaseModel):
-    """One path and its candidate values for base configuration expansion.
-
-    :param path: path in a base configuration to override
-    :param cases: candidate values for the override path
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    path: TreePath
-    cases: tuple[Any, ...]
-
-    @classmethod
-    def _coerce_path(cls, value: Any) -> TreePath:
-        path = coerce_tree_path(value)
-        if not isinstance(path, tuple) or not all(isinstance(token, str | int) for token in path):
-            raise ValueError("Data-generation override paths must be sequences of string or integer tokens.")
-        if not path:
-            raise ValueError("Data-generation override paths cannot be empty.")
-        if any(isinstance(token, int) and token < 0 for token in path):
-            raise ValueError("Data-generation override paths do not support negative list indices.")
-        return path
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize(cls, value: Any) -> Any:
-        if not isinstance(value, Mapping):
-            raise ValueError("Data-generation overrides must be mappings with 'path' and 'cases'.")
-        normalized = dict(value)
-        normalized["path"] = cls._coerce_path(normalized.get("path"))
-        cases = normalized.get("cases")
-        if isinstance(cases, str | bytes) or not isinstance(cases, Sequence):
-            cases = [cases]
-        if not cases:
-            raise ValueError("Data-generation override cases must contain at least one value.")
-        normalized["cases"] = tuple(cases)
-        return normalized
-
-
-def _override_directory_name(override: DataGenerationOverride, value: Any) -> str:
-    """Return a readable, safe directory name for one override value."""
-    if isinstance(value, str | int | float | bool) or value is None:
-        rendered = str(value)
-    elif isinstance(value, Path):
-        rendered = value.as_posix()
-    else:
-        rendered = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
-    rendered = rendered.replace("/", "_").replace("\\", "_")
-    return f"{override.path[-1]}={rendered}"
-
-
 class DataGeneration(Routine):
     """
     File-based data generation routine.
 
     :ivar root: root directory for saving data
     :ivar datasets: pytree template for datasets to generate under root
-    :ivar bases: named arbitrary base configurations to expand under root
-    :ivar overrides: Cartesian-product overrides applied to each base configuration
-    :ivar base_name: Optional prefix for each base directory as "/base_name=base.name"
+    :ivar base: optional YAML configuration template or YAML path to expand
+    :ivar overrides: named Cartesian-product configuration overrides
     :ivar format: the data format to save samples. Only `h5` supported.
     :ivar write_policy: reuse existing data, overwrite existing data, or throw an error if existing data found
     :ivar graph: graph object or YAML path (optional, for graph-related datasets)
@@ -2015,31 +1967,31 @@ class DataGeneration(Routine):
 
     root: Path
     datasets: GenDataPyTree | None = None
-    bases: list[DataGenerationBase] = Field(default_factory=list)
-    overrides: list[DataGenerationOverride] = Field(default_factory=list)
-    base_name: str | None = None
+    base: Any | None = None
+    overrides: tuple[CompositeOverride, ...] | None = None
 
     format: SUPPORTED_FORMATS = "h5"
     write_policy: SUPPORTED_POLICIES = "reuse"
 
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
+    _source_path: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _bind_graph(self):
+        import romjax
+
+        object.__setattr__(self, "_source_path", romjax.YamlLoader.current_source_path())
         # Pass graph object to graph datasets
         if self.graph is not None and self.datasets is not None:
             self._bind_graph_to_datasets(self.datasets)
 
-        if self.bases and self.datasets is not None:
-            raise ValueError("DataGeneration cannot specify both 'datasets' and 'bases'.")
-        if self.overrides and not self.bases:
-            raise ValueError("DataGeneration overrides require at least one base configuration.")
-        if not self.datasets and not self.bases:
-            raise ValueError("DataGeneration requires either 'datasets' or at least one base configuration.")
-
-        names = [base.name for base in self.bases]
-        if len(names) != len(set(names)):
-            raise ValueError("Data-generation base names must be unique.")
+        has_expansion = self.base is not None or self.overrides is not None
+        if self.datasets is not None and has_expansion:
+            raise ValueError("DataGeneration cannot specify both 'datasets' and base/overrides expansion.")
+        if self.datasets is None and not self.overrides:
+            raise ValueError("DataGeneration requires either 'datasets' or a non-empty 'overrides' list.")
+        if self.overrides is not None and len({item.name for item in self.overrides}) != len(self.overrides):
+            raise ValueError("DataGeneration override names must be unique.")
 
         return self
 
@@ -2050,44 +2002,63 @@ class DataGeneration(Routine):
             if hasattr(ds, "graph") and ds.graph is None:
                 ds.graph = self.graph
 
-    def _base_datasets(self, base: DataGenerationBase, values: Sequence[Any]) -> PyTree:
-        """Validate one overridden base as a generic dataset PyTree."""
-        config = base.model_dump(mode="python")
-        for override, value in zip(self.overrides, values):
-            if override.path[0] == "name":
-                raise ValueError("Data-generation overrides cannot modify the reserved base 'name'.")
-            config = pytree_merge(config, set_subtree(None, override.path, value))
-        config.pop("name", None)
-        datasets = _validate_gendata_pytree(config)
-        self._bind_graph_to_datasets(datasets)
-        if not any(isinstance(leaf, GenDataConfig) for leaf in jax.tree.leaves(
-            datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
-        )):
-            raise ValueError(f"Base configuration {base.name!r} does not contain a supported data generator.")
-        return datasets
+    def _base_node(self) -> tuple[Any, Path | None]:
+        """Return the raw YAML node and source path for expansion.
 
-    def _run_base_cases(self) -> None:
-        """Generate every Cartesian-product base case."""
-        case_values = product(*(override.cases for override in self.overrides))
-        for values in case_values:
-            override_root = self.root
-            for override, value in zip(self.overrides, values):
-                override_root /= _override_directory_name(override, value)
+        :return: base node, or ``None`` for an empty base, and its source path
+        """
+        import romjax
 
-            for base in self.bases:
-                datasets = self._base_datasets(base, values)
-                base_root = override_root / (
-                    f"{self.base_name}={base.name}" if self.base_name is not None else base.name
+        if self.base is None:
+            return None, self._source_path
+        if isinstance(self.base, romjax.YamlSource):
+            return self.base.node, self.base.source_path
+        if isinstance(self.base, str | Path):
+            path = romjax.YamlLoader._resolve_override_path(str(self.base), self._source_path)
+            return romjax.YamlLoader._compose_resolved_node(path)
+        node = yaml.compose(romjax.YamlLoader.dump(self.base, sort_keys=False), Loader=yaml.SafeLoader)
+        return node, self._source_path
+
+    def _expanded_datasets(self) -> Iterator[tuple[Path, PyTree]]:
+        """Yield each merged configuration and its Cartesian-product output root.
+
+        :return: output root and validated dataset PyTree for each override combination
+        """
+        import romjax
+
+        base_node, base_path = self._base_node()
+        assert self.overrides is not None
+        for selected in product(*(item.cases for item in self.overrides)):
+            parts = tuple(f"{override.name}={case.name}" for override, case in zip(self.overrides, selected))
+            merged = romjax.YamlLoader._resolve_parent_refs(base_node, base_path)
+            for case in selected:
+                if case.value is None:
+                    continue
+                override_node = yaml.compose(
+                    romjax.YamlLoader.dump(case.value, sort_keys=False), Loader=yaml.SafeLoader
                 )
-                for path, dataset in pytree_path_iter(
-                    datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
-                ):
-                    dataset.generate(base_root / "/".join(path), format=self.format, write_policy=self.write_policy)
+                if override_node is not None:
+                    override_node = romjax.YamlLoader._resolve_parent_refs(override_node, self._source_path)
+                    merged = romjax.YamlLoader._merge_nodes(merged, override_node)
+
+            datasets = _validate_gendata_pytree(romjax.load(romjax.YamlSource(merged, base_path)))
+            self._bind_graph_to_datasets(datasets)
+            if not any(isinstance(leaf, GenDataConfig) for leaf in jax.tree.leaves(
+                datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
+            )):
+                raise ValueError("Expanded data-generation configuration does not contain a supported data generator.")
+            yield self.root.joinpath(*parts), datasets
+
+    def _run_expanded_cases(self) -> None:
+        """Generate every Cartesian-product data-generation case."""
+        for case_root, datasets in self._expanded_datasets():
+            for path, dataset in pytree_path_iter(datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
+                dataset.generate(case_root / "/".join(path), format=self.format, write_policy=self.write_policy)
 
     def run(self) -> int:
         """Generate all datasets."""
-        if self.bases:
-            self._run_base_cases()
+        if self.overrides:
+            self._run_expanded_cases()
             return 0
 
         assert self.datasets is not None
