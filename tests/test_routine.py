@@ -516,6 +516,41 @@ def test_composite_routine_expands_base_overrides_and_case_root_templates(tmp_pa
     assert resolved.root == root
 
 
+def test_composite_routine_renders_templates_after_case_overrides(tmp_path: Path) -> None:
+    RootRoutine.observed = []
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.RootRoutine",
+                "name: cost",
+                f"root: {tmp_path.as_posix()}/cost={{{{ extra.cost }}}}",
+                "extra: {cost: 128}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: cost",
+                "    cases:",
+                "      - name: '256'",
+                "        value: {extra: {cost: 256}}",
+                "executor: {show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert romjax.load(composite_path).run() == 0
+    assert RootRoutine.observed == [("cost", tmp_path / "cost=256", None)]
+
+
 def test_composite_routine_process_executor_runs_expanded_yaml_cases(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yml"
     composite_path = tmp_path / "composite.yml"

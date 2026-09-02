@@ -16,6 +16,7 @@ from inspect import getattr_static as _getattr_static
 from io import StringIO as _StringIO
 from os import PathLike as _PathLike
 from pathlib import Path as _Path
+from re import compile as _re_compile
 from types import BuiltinFunctionType as _BuiltinFunctionType
 from types import FunctionType as _FunctionType
 from typing import IO as _IO
@@ -29,6 +30,15 @@ from typing import Union as _Union
 import yaml as _yaml
 from pydantic import BaseModel as _BaseModel
 from pydantic.fields import PydanticUndefined as _PydanticUndefined
+
+
+_TEMPLATE_PATTERN = _re_compile(r"{{\s*(.*?)\s*}}")
+_INTEGER_PATTERN = _re_compile(r"[+-]?\d+")
+_FLOAT_PATTERN = _re_compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+|\d+\.\d*[eE][+-]?\d+)")
+
+
+class _TemplatePathError(ValueError):
+    """Raised internally when a template path cannot be resolved."""
 
 
 class YamlSource:
@@ -163,6 +173,8 @@ class YamlLoader(ConfigLoader):
     - Represent any root-level builtin `romjax` object with `!romx:SomeObject`
     - Supports basic Pydantic model_dump() to dictionary.
     - Supports !!python/name tag for functions and other importable names
+    - Supports ``{{ dotted.path }}`` references and ``{{ resolver.path: arg1, arg2 }}`` calls.
+      A complete template preserves the referenced or returned value's type; embedded templates interpolate text.
     """
     PYDANTIC_TAG = "!pd:"
     ROMX_TAG = "!romx:"
@@ -519,6 +531,203 @@ class YamlLoader(ConfigLoader):
         return copied
 
     @classmethod
+    def _template_location(cls, node: _yaml.Node, path: tuple[str, ...]) -> str:
+        """Return a human-readable location for a template node.
+
+        :param node: raw YAML node containing a template
+        :param path: dotted path to the node within its document
+        :return: diagnostic location text
+        """
+        location = ".".join(path) or "<root>"
+        if node.start_mark is None:
+            return location
+        return f"{location} (line {node.start_mark.line + 1}, column {node.start_mark.column + 1})"
+
+    @classmethod
+    def _template_path_node(cls, root: _yaml.Node, expression: str) -> tuple[_yaml.Node, tuple[str, ...]]:
+        """Find one dotted template path in a raw YAML document.
+
+        :param root: root YAML node used as template context
+        :param expression: dotted mapping path, with numeric sequence indexes
+        :return: referenced node and its path
+        :raises _TemplatePathError: if the expression does not identify a node
+        """
+        parts = expression.split(".")
+        if not expression or any(not part for part in parts):
+            raise _TemplatePathError(f"Invalid template path {expression!r}.")
+
+        current = root
+        resolved: list[str] = []
+        for part in parts:
+            if isinstance(current, _yaml.MappingNode):
+                value_node = next(
+                    (
+                        candidate
+                        for key_node, candidate in current.value
+                        if isinstance(key_node, _yaml.ScalarNode) and key_node.value == part
+                    ),
+                    None,
+                )
+                if value_node is None:
+                    raise _TemplatePathError(f"Template path {expression!r} does not exist.")
+                current = value_node
+            elif isinstance(current, _yaml.SequenceNode):
+                try:
+                    index = int(part)
+                except ValueError as error:
+                    raise _TemplatePathError(
+                        f"Template path {expression!r} uses non-numeric index {part!r}."
+                    ) from error
+                if index < 0 or index >= len(current.value):
+                    raise _TemplatePathError(f"Template path {expression!r} has an out-of-range index.")
+                current = current.value[index]
+            else:
+                raise _TemplatePathError(f"Template path {expression!r} cannot descend through a scalar value.")
+            resolved.append(part)
+        return current, tuple(resolved)
+
+    @classmethod
+    def _template_node_value(cls, node: _yaml.Node) -> _Any:
+        """Construct one fully rendered raw YAML node for template evaluation.
+
+        :param node: rendered node to construct
+        :return: Python value represented by ``node``
+        """
+        return _yaml.load(cls._node_to_yaml(node), Loader=cls.get_loader())
+
+    @classmethod
+    def _template_value_node(cls, value: _Any) -> _yaml.Node:
+        """Represent one resolver result as a raw YAML node.
+
+        :param value: resolver return value
+        :return: YAML node that reconstructs to ``value``
+        :raises ValueError: if the return value cannot be represented as YAML
+        """
+        node = _yaml.compose(cls.dump(value, sort_keys=False), Loader=_yaml.SafeLoader)
+        if node is None:
+            raise ValueError("A template resolver returned an empty YAML document.")
+        return node
+
+    @classmethod
+    def _coerce_template_argument(cls, value: str) -> _Any:
+        """Coerce the limited numeric literals allowed in resolver arguments.
+
+        :param value: unquoted, non-reference resolver argument
+        :return: an integer, float, or unchanged string
+        """
+        if _INTEGER_PATTERN.fullmatch(value):
+            return int(value)
+        if _FLOAT_PATTERN.fullmatch(value):
+            return float(value)
+        return value
+
+    @classmethod
+    def _render_templates(cls, node: _yaml.Node | None) -> _yaml.Node | None:
+        """Render basic references and resolver calls in one composed YAML document.
+
+        Rendering occurs on YAML nodes, after override composition and before Pydantic construction. This preserves
+        standalone reference types and lets inline nested overrides receive values from their declaring document.
+
+        :param node: composed YAML document to render
+        :return: rendered YAML document
+        :raises ValueError: if a template is malformed, circular, or cannot be resolved
+        """
+        if node is None:
+            return None
+
+        root = _deepcopy(node)
+        rendered: dict[int, _yaml.Node] = {}
+        rendering: set[int] = set()
+
+        def fail(message: str, current: _yaml.Node, path: tuple[str, ...]) -> ValueError:
+            return ValueError(f"{message} at {cls._template_location(current, path)}.")
+
+        def resolve_expression(expression: str, current: _yaml.Node, path: tuple[str, ...]) -> _yaml.Node:
+            expression = expression.strip()
+            resolver_path, separator, raw_arguments = expression.partition(":")
+            resolver_path = resolver_path.strip()
+            if not resolver_path:
+                raise fail(f"Invalid template expression {expression!r}", current, path)
+
+            if not separator:
+                try:
+                    referenced, referenced_path = cls._template_path_node(root, resolver_path)
+                except _TemplatePathError as error:
+                    raise fail(str(error), current, path) from error
+                return render_node(referenced, referenced_path)
+
+            try:
+                resolver_node, resolver_node_path = cls._template_path_node(root, resolver_path)
+            except _TemplatePathError as error:
+                raise fail(str(error), current, path) from error
+            resolver = cls._template_node_value(render_node(resolver_node, resolver_node_path))
+            if not callable(resolver):
+                raise fail(f"Template resolver {resolver_path!r} is not callable", current, path)
+
+            arguments: list[_Any] = []
+            if raw_arguments.strip():
+                for argument in raw_arguments.split(","):
+                    argument = argument.strip()
+                    if not argument:
+                        raise fail(f"Invalid empty argument in template expression {expression!r}", current, path)
+                    try:
+                        argument_node, argument_path = cls._template_path_node(root, argument)
+                    except _TemplatePathError:
+                        arguments.append(cls._coerce_template_argument(argument))
+                    else:
+                        arguments.append(cls._template_node_value(render_node(argument_node, argument_path)))
+            try:
+                return cls._template_value_node(resolver(*arguments))
+            except Exception as error:
+                raise fail(f"Template resolver {resolver_path!r} failed: {error}", current, path) from error
+
+        def render_scalar(current: _yaml.ScalarNode, path: tuple[str, ...]) -> _yaml.Node:
+            matches = list(_TEMPLATE_PATTERN.finditer(current.value))
+            if not matches:
+                return current
+            if len(matches) == 1 and matches[0].span() == (0, len(current.value)):
+                return resolve_expression(matches[0].group(1), current, path)
+
+            pieces: list[str] = []
+            position = 0
+            for match in matches:
+                pieces.append(current.value[position:match.start()])
+                value_node = resolve_expression(match.group(1), current, path)
+                pieces.append(str(cls._template_node_value(value_node)))
+                position = match.end()
+            pieces.append(current.value[position:])
+            return _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, "".join(pieces), style=current.style)
+
+        def render_node(current: _yaml.Node, path: tuple[str, ...]) -> _yaml.Node:
+            identifier = id(current)
+            if identifier in rendered:
+                return rendered[identifier]
+            if identifier in rendering:
+                raise fail("Circular template reference", current, path)
+            rendering.add(identifier)
+            try:
+                if isinstance(current, _yaml.ScalarNode):
+                    result = render_scalar(current, path)
+                elif isinstance(current, _yaml.SequenceNode):
+                    current.value = [render_node(item, path + (str(index),)) for index, item in enumerate(current.value)]
+                    result = current
+                elif isinstance(current, _yaml.MappingNode):
+                    pairs: list[tuple[_yaml.Node, _yaml.Node]] = []
+                    for key_node, value_node in current.value:
+                        value_path = path + (key_node.value,) if isinstance(key_node, _yaml.ScalarNode) else path
+                        pairs.append((key_node, render_node(value_node, value_path)))
+                    current.value = pairs
+                    result = current
+                else:
+                    result = current
+            finally:
+                rendering.remove(identifier)
+            rendered[identifier] = result
+            return result
+
+        return render_node(root, ())
+
+    @classmethod
     def _compose_resolved_node(cls, stream: _Stream) -> tuple[_yaml.Node | None, _Path | None]:
         """Compose YAML into a raw node after resolving any root-level overrides.
 
@@ -566,6 +775,7 @@ class YamlLoader(ConfigLoader):
             node, source_path = cls._compose_resolved_node(stream)
         token = cls._SOURCE_PATH.set(source_path)
         try:
+            node = cls._render_templates(node)
             return _yaml.load(cls._node_to_yaml(node), **kwargs)
         finally:
             cls._SOURCE_PATH.reset(token)

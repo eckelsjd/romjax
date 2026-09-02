@@ -16,6 +16,11 @@ def example_forcing(inputs: dict, outputs: dict):
     return int(inputs.get("value", 0))
 
 
+def template_join(left: str, right: str) -> str:
+    """Join two template resolver string arguments for loader tests."""
+    return f"{left}/{right}"
+
+
 class CustomModel(ImplicitModel):
     opts: dict[str, int]
     detail: str
@@ -171,6 +176,103 @@ def test_transport_builtin_outputs_sampler_load_and_dump() -> None:
     assert isinstance(solver.outputs_sampler, NearSolutionSampler)
     assert isinstance(solver.outputs_sampler.template["phi"], Distribution)
     _assert_round_trip(data)
+
+
+def test_yaml_templates_preserve_types_interpolate_and_call_resolvers() -> None:
+    data = YamlLoader.load(
+        """
+base:
+  value: 2
+  nested: {label: value}
+  items: [one, two]
+  add: !!python/name:operator.add
+  join: !!python/name:tests.test_loader.template_join
+other:
+  value: "{{ base.value }}"
+  nested: "{{ base.nested }}"
+  items: "{{ base.items }}"
+  path: "my/path/value={{ base.value }}"
+  total: "{{ base.add: base.value, 5 }}"
+  float_total: "{{ base.add: base.value, 2.5 }}"
+  joined: "{{ base.join: left, right }}"
+"""
+    )
+
+    assert data["other"] == {
+        "value": 2,
+        "nested": {"label": "value"},
+        "items": ["one", "two"],
+        "path": "my/path/value=2",
+        "total": 7,
+        "float_total": 4.5,
+        "joined": "left/right",
+    }
+    assert data["other"]["nested"] is data["base"]["nested"]
+    assert data["other"]["items"] is data["base"]["items"]
+
+
+def test_yaml_templates_render_after_overrides_and_in_nested_sources(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    child_path = tmp_path / "child.yml"
+    parent_path = tmp_path / "parent.yml"
+    base_path.write_text(
+        """
+base:
+  value: 2
+  op: !!python/name:operator.add
+other:
+  value: "{{ base.op: base.value, 5 }}"
+""",
+        encoding="utf-8",
+    )
+    override_path.write_text(
+        """
+!overrides:__parent__/base.yml
+base:
+  value: 4
+  op: !!python/name:operator.mul
+""",
+        encoding="utf-8",
+    )
+    child_path.write_text(
+        """
+extra:
+  cost: 128
+root: "path/to/cost={{ extra.cost }}"
+""",
+        encoding="utf-8",
+    )
+    parent_path.write_text(
+        """
+extra:
+  cost: 256
+routines:
+  - !overrides:__parent__/child.yml
+    extra:
+      cost: "{{ extra.cost }}"
+""",
+        encoding="utf-8",
+    )
+
+    assert YamlLoader.load(override_path)["other"]["value"] == 20
+    nested = YamlLoader.load(parent_path)["routines"][0]
+    assert isinstance(nested, YamlSource)
+    assert YamlLoader.load(nested) == {"extra": {"cost": 256}, "root": "path/to/cost=256"}
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "match"),
+    [
+        ('value: "{{ missing.value }}"', "does not exist"),
+        ('value: "{{ missing: 1 }}"', "does not exist"),
+        ('base: {value: 1}\nvalue: "{{ base.value: 1 }}"', "not callable"),
+        ('first: "{{ second }}"\nsecond: "{{ first }}"', "Circular template reference"),
+    ],
+)
+def test_yaml_templates_report_invalid_expressions(yaml_text: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        YamlLoader.load(yaml_text)
 
 
 def test_yaml_overrides_merge_mappings_sequences_and_missing_branches(tmp_path: Path) -> None:
