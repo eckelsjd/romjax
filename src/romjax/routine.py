@@ -269,6 +269,8 @@ class CompositeOverrideCase(BaseModel):
     :param value: arbitrary YAML value merged into the base configuration
     """
 
+    model_config = ConfigDict(coerce_numbers_to_str=True)
+
     name: str
     value: Any = None
 
@@ -279,6 +281,8 @@ class CompositeOverride(BaseModel):
     :param name: override dimension name
     :param cases: named candidate values for this dimension
     """
+
+    model_config = ConfigDict(coerce_numbers_to_str=True)
 
     name: str
     cases: tuple[CompositeOverrideCase, ...]
