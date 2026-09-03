@@ -338,6 +338,7 @@ class LinearProjection(eqx.Module):
 
     matrix: ArrayLike  # (r x N)
     bias: ArrayLike | None  # (N,)
+    skip_bias: bool = eqx.field(static=False)
 
     def __init__(
         self,
@@ -348,6 +349,7 @@ class LinearProjection(eqx.Module):
         bias: ArrayLike | None = None,
         random_bias: bool = False,
         scale: float = 0.25,
+        skip_bias: bool = False,
     ):
         """
         Initialize projection weights.
@@ -367,7 +369,10 @@ class LinearProjection(eqx.Module):
         :param bias: optional full-space offset with shape ``(dof,)``
         :param random_bias: whether to initialize an omitted bias randomly
         :param scale: random init scaling factor
+        :param skip_bias: if true, do not use the bias during evaluation (default false)
         """
+        self.skip_bias = skip_bias
+
         if matrix is not None:
             self.matrix = jnp.asarray(matrix)
             if self.matrix.ndim != 2:
@@ -404,7 +409,7 @@ class LinearProjection(eqx.Module):
         """
         matrix = jnp.asarray(self.matrix)
         values = jnp.asarray(x)
-        if self.bias is not None:
+        if self.bias is not None and not self.skip_bias:
             values = values - jnp.asarray(self.bias)
         return jnp.matmul(values, jnp.swapaxes(matrix, -1, -2))
 
@@ -416,7 +421,7 @@ class LinearProjection(eqx.Module):
         :return: reconstructed full coordinates with last axis ``n_full``
         """
         values = jnp.matmul(jnp.asarray(z), jnp.asarray(self.matrix))
-        if self.bias is not None:
+        if self.bias is not None and not self.skip_bias:
             values = values + jnp.asarray(self.bias)
         return values
 
