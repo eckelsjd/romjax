@@ -1381,8 +1381,21 @@ class GraphTest(GraphLoss):
         for _, ds_cfg in pytree_path_iter(self.loader.datasets, is_leaf=lambda leaf: isinstance(leaf, LoadDataConfig)):
             ds_cfg.max_epochs = 1   # Only load data once
 
-        self._batch_loss = eqx.filter_jit(lambda batch, params: super(GraphTest, self).__call__(batch, params))
+        self._compile_batch_loss()
         return self
+
+    def _compile_batch_loss(self) -> None:
+        """Compile the batch loss with this instance's current graph binding."""
+        self._batch_loss = eqx.filter_jit(lambda params, batch: GraphLoss.__call__(self, params, batch))
+
+    def bind_graph(self, graph: FunctionGraph, default_datasets: bool = False) -> None:
+        """Bind a graph and refresh the JIT closure that captures this instance.
+
+        :param graph: graph used by the test loss terms
+        :param default_datasets: whether to infer default graph datasets
+        """
+        super().bind_graph(graph, default_datasets=default_datasets)
+        self._compile_batch_loss()
 
     def __call__(self, params: Mapping[str, PyTree]) -> jax.Array:
         values = jnp.asarray([self._batch_loss(params, batch) for batch in self.loader])

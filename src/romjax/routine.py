@@ -47,7 +47,7 @@ _LAZY_EXPORTS = {
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
     "Train": ("romjax.train", "Train"),
-    "CompareTable": ("romjax.compare", "CompareTable")
+    "CompareMetric": ("romjax.compare", "CompareMetric")
 }
 
 _COMPOSITE_PROGRESS_ACTIVE: ContextVar[bool] = ContextVar("romjax_composite_progress_active", default=False)

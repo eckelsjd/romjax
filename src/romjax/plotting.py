@@ -27,7 +27,7 @@ from matplotlib.axes import Axes
 from matplotlib.cm import ScalarMappable
 from matplotlib.colorbar import Colorbar
 from matplotlib.figure import Figure
-from pydantic import Field, SkipValidation
+from pydantic import Field, SkipValidation, field_validator
 
 from romjax.typing import DictModel
 
@@ -163,7 +163,8 @@ class GridplotConfig(DictModel):
     :ivar subplot_size_in: the size of each subplot in inches (W, H)
     :ivar shape: the shape of the subplot grid. If None, the shape will be inferred
     :ivar title: for animations, an iterable to update the figure title (such as showing the time step)
-    :ivar save: name of file to save (use .gif or .mp4 for animations, use .pdf, .png, or similar for static)
+    :ivar savefig: keyword arguments passed to ``Figure.savefig``. ``fname`` is required and must be a string or path.
+                   Use .gif or .mp4 for animations, and .pdf, .png, or similar for static figures.
     :ivar adjust: catch-all func for applying changes before saving/animating. Call as adjust(fig, axs, artists, cbars)
     :ivar animate_opts: options for animating/saving movie. Defaults to 10 fps, 200 dpi, and blit=False with ffmpeg
     :ivar legend_kwargs: extra options for legends (same used for all subplots if applicable)
@@ -172,12 +173,14 @@ class GridplotConfig(DictModel):
     :ivar global_axis_opts: global overrides applied to all subplot options. See `AxisOptions`.
     :ivar global_plot_kwargs: global overrides applied to all subplot kwargs. See `PlotSpec`.
     :ivar subplots_kwargs: all extra arguments are passed to plt.subplots
+    :ivar tight_layout: extra arguments for fig.tight_layout
+    :ivar subplots_adjust: extra arguments for fig.subplots_adjust
     """
     scheme: Literal['white', 'dark'] | None = None
     subplot_size_in: tuple[float, float] | None = None
     shape: tuple[int, int] | None = None
     title: Iterable[str] | None = None
-    save: str | Path | None = None
+    savefig: dict[str, Any] | None = None
     adjust: Callable[[Figure, Axes, Iterable[Artist], list[list[Colorbar]]], None] | None = None
     animate_opts: AnimateOptions = Field(default_factory=AnimateOptions)
     legend_kwargs: dict = Field(default_factory=dict)
@@ -186,6 +189,23 @@ class GridplotConfig(DictModel):
     global_axis_opts: AxisOptions = Field(default_factory=AxisOptions)
     global_plot_kwargs: dict = Field(default_factory=dict)
     subplots_kwargs: dict = Field(default_factory=dict)
+    tight_layout: dict = Field(default_factory=dict)
+    subplots_adjust: dict = Field(default_factory=dict)
+
+    @field_validator("savefig")
+    @classmethod
+    def validate_savefig(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate arguments passed to matplotlib's save methods.
+
+        :param value: Save keyword arguments.
+        :return: The validated save keyword arguments.
+        :raises ValueError: If ``fname`` is absent or is not a string or path.
+        """
+        if value is None:
+            return None
+        if not isinstance(value.get("fname"), str | Path):
+            raise ValueError("savefig must contain 'fname' as a str or Path")
+        return value
 
     def fill_plot_grid(self, plots: PlotSpecs | list[PlotSpecs] | list[list[PlotSpecs]]) -> list[list[PlotSpecs]]:
         """
@@ -275,7 +295,7 @@ global_config = GridplotConfig(
     scheme="white", 
     subplot_size_in=(3, 2.5), 
     animate_opts=dict(blit=False, progress_callback="bar", fps=10, dpi=200, writer="ffmpeg"),
-    subplots_kwargs=dict(squeeze=False, layout="constrained")
+    subplots_kwargs=dict(squeeze=False, layout='tight')
 )
 
 
@@ -792,7 +812,12 @@ def gridplot(
                     title_str = None
    
             yield frame, title_str
-    
+
+    if cfg.tight_layout:
+        fig.tight_layout(**cfg.tight_layout)
+    if cfg.subplots_adjust:
+        fig.subplots_adjust(**cfg.subplots_adjust)
+
     if animate:
         for ax in axs.flatten():
             ax.set_position(ax.get_position().frozen())
@@ -805,23 +830,24 @@ def gridplot(
         ani = FuncAnimation(fig, _update, frames=_frames, init_func=lambda: all_artists_og, repeat=False, 
                             cache_frame_data=False, blit=blit, interval=interval)
 
-        if cfg.save is not None:
-            logger.debug(f"Saving animation to '{cfg.save}'")
-            save_kwargs = a_opts.get_save_kwargs()
+        if cfg.savefig is not None:
+            logger.debug(f"Saving animation to '{cfg.savefig['fname']}'")
+            save_kwargs = {key: value for key, value in cfg.savefig.items() if key != "fname"}
+            save_kwargs.update(a_opts.get_save_kwargs())
 
             if a_opts.progress_callback == "bar":
                 with alive_bar(a_opts["num_frames"]) as bar:
                     save_kwargs["progress_callback"] = partial(save_kwargs["progress_callback"], bar)
-                    ani.save(Path(cfg.save), **save_kwargs)
+                    ani.save(cfg.savefig["fname"], **save_kwargs)
             else:
-                ani.save(Path(cfg.save), **save_kwargs)
+                ani.save(cfg.savefig["fname"], **save_kwargs)
 
         return fig, axs, ani
     
     # Static figure
     else:
         _update(next(_frames()))
-        if cfg.save is not None:
-            fig.savefig(Path(cfg.save), bbox_inches='tight')
+        if cfg.savefig is not None:
+            fig.savefig(cfg.savefig["fname"], **{key: value for key, value in cfg.savefig.items() if key != "fname"})
     
         return fig, axs 
