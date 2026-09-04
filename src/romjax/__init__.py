@@ -107,7 +107,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
     "DataLoader": ("romjax.data_gen", "DataLoader"),
     "CompareOrbax": ("romjax.compare", "CompareOrbax"),
-    "CompareTable": ("romjax.compare", "CompareTable"),
+    "CompareMetric": ("romjax.compare", "CompareMetric"),
     "OrbaxRef": ("romjax.train", "OrbaxRef"),
     "resolve_orbax_params": ("romjax.train", "resolve_orbax_params"),
     "Train": ("romjax.train", "Train"),
@@ -127,7 +127,7 @@ if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
     from .compression import Compression
-    from .compare import CompareOrbax, CompareTable
+    from .compare import CompareMetric, CompareOrbax
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph, IdentityEdge
     from .grid_search import GridSearch

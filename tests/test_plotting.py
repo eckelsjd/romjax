@@ -31,10 +31,61 @@ def test_basic_gridplot(tmp_path):
         scheme='dark', 
         local_plot_kwargs={"my_plot": {"lw": 3}},
         animate_opts={"writer": "pillow", "dpi": 100, "fps": 15, "blit": False},
-        save=Path(tmp_path) / "sine.gif",
+        savefig={"fname": Path(tmp_path) / "sine.gif"},
     )
 
     assert (Path(tmp_path) / "sine.gif").exists()
+    plt.close(fig)
+
+
+def test_gridplot_savefig_forwards_static_figure_options(monkeypatch, tmp_path):
+    calls = []
+
+    def savefig(self, fname, **kwargs):
+        calls.append((self, fname, kwargs))
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", savefig)
+    fname = tmp_path / "plot.png"
+    fig, _ = gridplot(
+        PlotSpec(kind="line", data=(np.asarray([0.0, 1.0]), np.asarray([1.0, 2.0]))),
+        savefig={"fname": fname, "dpi": 300, "transparent": True},
+    )
+
+    assert calls == [(fig, fname, {"dpi": 300, "transparent": True})]
+    plt.close(fig)
+
+
+def test_gridplot_config_savefig_requires_path_or_string_fname():
+    assert GridplotConfig(savefig={"fname": "plot.png"}).savefig == {"fname": "plot.png"}
+
+    with pytest.raises(ValueError, match="fname"):
+        GridplotConfig(savefig={"fname": 1})
+
+
+def test_gridplot_savefig_merges_animation_options(monkeypatch, tmp_path):
+    calls = []
+
+    def save(self, fname, **kwargs):
+        self._draw_was_started = True
+        calls.append((fname, kwargs))
+
+    monkeypatch.setattr(plotting.FuncAnimation, "save", save)
+    fname = tmp_path / "plot.gif"
+    fig, _, _ = gridplot(
+        PlotSpec(
+            kind="line",
+            data=iter([(np.asarray([0.0]), np.asarray([1.0]))]),
+            opts={"animate": True},
+        ),
+        animate_opts={"writer": "pillow", "dpi": 72, "fps": 24},
+        savefig={"fname": fname, "dpi": 300, "transparent": True},
+    )
+
+    assert calls[0][0] == fname
+    assert calls[0][1]["dpi"] == 72
+    assert calls[0][1]["fps"] == 24
+    assert calls[0][1]["writer"] == "pillow"
+    assert calls[0][1]["transparent"] is True
     plt.close(fig)
 
 

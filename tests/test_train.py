@@ -1261,6 +1261,24 @@ def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     assert value == pytest.approx(expected)
 
 
+def test_graph_test_recompiles_after_deferred_graph_binding(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    """Deferred binding must not leave GraphTest's jitted closure with graph=None."""
+    data_root = tmp_path.resolve() / "deferred_graph_validation"
+    _write_graph_dataset(data_root, "toy", n_inputs=1, n_outputs=1)
+    test = GraphTest(
+        terms=[{"term": graph_batch_squared_error, "dataset": "toy"}],
+        loader=DataLoader(
+            root=data_root,
+            datasets={"toy": {"kind": "implicit", "batch_size": 1, "max_epochs": 1}},
+        ),
+    )
+
+    test.bind_graph(toy_graph, default_datasets=True)
+
+    assert test.graph is toy_graph
+    assert test({"toy": {"weight": jnp.array(0.0)}}) == pytest.approx(1.0)
+
+
 def test_load_train_from_yaml(tmp_path: Path) -> None:
     data_root = tmp_path.resolve() / "yaml_data"
     run_root = tmp_path.resolve() / "yaml_run"
