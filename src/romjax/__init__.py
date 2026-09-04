@@ -179,6 +179,7 @@ class YamlLoader(ConfigLoader):
     PYDANTIC_TAG = "!pd:"
     ROMX_TAG = "!romx:"
     OVERRIDES_TAG = "!overrides:"
+    YAML_SOURCE_TAG = "!romx:yaml-source"
     _SOURCE_PATH: _ContextVar[_Path | None] = _ContextVar("romjax_yaml_source_path", default=None)
 
     @classmethod
@@ -277,15 +278,38 @@ class YamlLoader(ConfigLoader):
             merged_node = cls._merge_nodes(base_node, override_node)
             return YamlSource(merged_node, source_path, tag_suffix)
 
+        def _construct_yaml_source(loader: _yaml.SafeLoader, node: _yaml.Node) -> YamlSource:
+            """Preserve an internally serialized source for deferred loading."""
+            if not isinstance(node, _yaml.MappingNode):
+                raise ValueError("Deferred YAML sources must contain a mapping payload.")
+            fields = {
+                key_node.value: value_node
+                for key_node, value_node in node.value
+                if isinstance(key_node, _yaml.ScalarNode)
+            }
+            source_node = fields.get("node")
+            if source_node is None:
+                raise ValueError("Deferred YAML sources must contain a 'node' payload.")
+            label_node = fields.get("label")
+            label = label_node.value if isinstance(label_node, _yaml.ScalarNode) else None
+            source_path_node = fields.get("source_path")
+            source_path = (
+                _Path(source_path_node.value)
+                if isinstance(source_path_node, _yaml.ScalarNode) and source_path_node.value
+                else cls.current_source_path()
+            )
+            return YamlSource(source_node, source_path, label)
+
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
         _Loader.add_multi_constructor(cls.PYDANTIC_TAG, _construct_base_model)
         _Loader.add_multi_constructor(cls.ROMX_TAG, _partial(_construct_base_model, default_module="romjax"))
         _Loader.add_multi_constructor(cls.OVERRIDES_TAG, _construct_overrides)
+        _Loader.add_constructor(cls.YAML_SOURCE_TAG, _construct_yaml_source)
         return _Loader
 
     @classmethod
-    def get_dumper(cls) -> _Type[_yaml.SafeDumper]:
+    def get_dumper(cls, *, preserve_yaml_sources: bool = False) -> _Type[_yaml.SafeDumper]:
         """Return a custom yaml dumper that handles callables and pydantic models."""
         class _Dumper(_yaml.SafeDumper):
             pass
@@ -308,7 +332,31 @@ class YamlLoader(ConfigLoader):
             return dumper.represent_mapping(tag, payload)
 
         def _represent_yaml_source(dumper: _yaml.SafeDumper, data: YamlSource) -> _yaml.Node:
-            return _deepcopy(data.node) if data.node is not None else dumper.represent_none(None)
+            if data.node is None:
+                return dumper.represent_none(None)
+            node = _deepcopy(data.node)
+            if preserve_yaml_sources:
+                key_node = _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, "node")
+                pairs: list[tuple[_yaml.Node, _yaml.Node]] = [(key_node, node)]
+                if data.label is not None:
+                    pairs.append(
+                        (
+                            _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, "label"),
+                            _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, data.label),
+                        )
+                    )
+                if data.source_path is not None:
+                    pairs.append(
+                        (
+                            _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, "source_path"),
+                            _yaml.ScalarNode(
+                                _yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG,
+                                data.source_path.as_posix(),
+                            ),
+                        )
+                    )
+                return _yaml.MappingNode(cls.YAML_SOURCE_TAG, pairs)
+            return node
 
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
@@ -706,7 +754,9 @@ class YamlLoader(ConfigLoader):
                 raise fail("Circular template reference", current, path)
             rendering.add(identifier)
             try:
-                if isinstance(current, _yaml.ScalarNode):
+                if current.tag == cls.YAML_SOURCE_TAG:
+                    result = current
+                elif isinstance(current, _yaml.ScalarNode):
                     result = render_scalar(current, path)
                 elif isinstance(current, _yaml.SequenceNode):
                     current.value = [render_node(item, path + (str(index),)) for index, item in enumerate(current.value)]
@@ -787,8 +837,9 @@ class YamlLoader(ConfigLoader):
         :param obj: the yaml configuration
         :param stream: A string, path, file-stream, byte-stream, or similar.
         """
+        preserve_yaml_sources = kwargs.pop("_preserve_yaml_sources", False)
         if "Dumper" not in kwargs:
-            kwargs["Dumper"] = cls.get_dumper()
+            kwargs["Dumper"] = cls.get_dumper(preserve_yaml_sources=preserve_yaml_sources)
 
         if stream is None:
             return _yaml.dump(obj, **kwargs)

@@ -16,7 +16,19 @@ from romjax.grid_search import (
     _yaml_path_text,
     orbax_metric,
 )
-from romjax.routine import RoutineError
+from romjax.routine import Routine, RoutineError
+
+
+class TemplateValueRoutine(Routine):
+    """Minimal subprocess routine that records its resolved template value."""
+
+    root: Path
+    resolved: int
+
+    def run(self) -> int:
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "resolved_value.txt").write_text(str(self.resolved), encoding="utf-8")
+        return 0
 
 
 def test_sparse_override_sets_mapping_and_sequence_paths() -> None:
@@ -129,6 +141,70 @@ executor: serial
     assert Path(loaded["root"]) == case_root
     assert loaded["value"] == "case"
     assert loaded["artifact"] == (tmp_path / "artifact.txt").resolve().as_posix()
+
+
+def test_composite_grid_search_defers_train_templates_until_case_overrides(tmp_path: Path) -> None:
+    train_path = tmp_path / "train.yml"
+    grid_path = tmp_path / "grid.yml"
+    parent_path = tmp_path / "parent.yml"
+    train_path.write_text(
+        "\n".join(
+            [
+                "!pd:tests.test_grid_search.TemplateValueRoutine",
+                "root: train",
+                "extra: {value: 0}",
+                'resolved: "{{ extra.value }}"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    grid_path.write_text(
+        f"""
+!romx:GridSearch
+root: {tmp_path / "grid"}
+base: unused.yml
+override: []
+write_policy: overwrite
+executor: {{show_progress: false}}
+""",
+        encoding="utf-8",
+    )
+    parent_path.write_text(
+        """
+!romx:CompositeRoutine
+base: __parent__/grid.yml
+overrides:
+  - name: values
+    cases:
+      - name: one-two-three
+        value:
+          base: !overrides:__parent__/train.yml
+            root: inherited-root
+          override:
+            - path: [extra, value]
+              cases: [1, 2, 3]
+executor: {show_progress: false}
+""",
+        encoding="utf-8",
+    )
+
+    composite = romjax.load(parent_path)
+    assert composite.run() == 0
+
+    search_root = tmp_path / "grid"
+    manifest = yaml.safe_load((search_root / "grid_search_manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["base"] == train_path.as_posix()
+    for index, value in enumerate((1, 2, 3)):
+        case_root = search_root / "cases" / f"case_{index:04d}"
+        assert (case_root / "resolved_value.txt").read_text(encoding="utf-8") == str(value)
+
+    reloaded = romjax.load(search_root / "resolved.yml")
+    assert isinstance(reloaded, GridSearch)
+    assert isinstance(reloaded.base, romjax.YamlSource)
+    assert reloaded.run() == 0
+    for index, value in enumerate((1, 2, 3)):
+        case_root = search_root / "cases" / f"case_{index:04d}"
+        assert (case_root / "resolved_value.txt").read_text(encoding="utf-8") == str(value)
 
 
 def test_grid_search_loads_inline_override(tmp_path: Path) -> None:
