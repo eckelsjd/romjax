@@ -76,6 +76,35 @@ loss:
     assert loaded["loss"]["terms"][1]["weight"] == 0.3
 
 
+def test_grid_search_writes_delete_markers(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    config_path = tmp_path / "grid.yml"
+    base_path.write_text("root: original\noptions: {keep: 1, remove: 2}\nitems: [1, 2, 3]\n", encoding="utf-8")
+    config_path.write_text(
+        f"""
+!romx:GridSearch
+root: {tmp_path / "grid"}
+base: __parent__/base.yml
+override:
+  - path: [options, remove]
+    cases: [!delete '']
+  - path: [items, 1]
+    cases: [!delete '']
+""",
+        encoding="utf-8",
+    )
+
+    search = romjax.load(config_path)
+    case_root = search.root / "cases" / "case_0000"
+    config = search._write_case_config(case_root, search._case_values()[0])
+
+    assert romjax.YamlLoader.load(config) == {
+        "root": str(case_root),
+        "options": {"keep": 1},
+        "items": [1, 3],
+    }
+
+
 def test_yaml_path_text_normalizes_windows_paths() -> None:
     path = PureWindowsPath(r"C:\Users\alice\grid\cases\case_0000")
 

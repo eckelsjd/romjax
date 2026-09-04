@@ -41,6 +41,13 @@ class _TemplatePathError(ValueError):
     """Raised internally when a template path cannot be resolved."""
 
 
+class _DeleteMarker:
+    """Internal sentinel for a ``!delete`` configuration override."""
+
+
+_DELETE = _DeleteMarker()
+
+
 class YamlSource:
     """In-memory YAML source produced by nested ``!overrides:`` tags.
 
@@ -173,12 +180,15 @@ class YamlLoader(ConfigLoader):
     - Represent any root-level builtin `romjax` object with `!romx:SomeObject`
     - Supports basic Pydantic model_dump() to dictionary.
     - Supports !!python/name tag for functions and other importable names
+    - Supports ``!delete`` within overrides to remove a mapping key or sequence item. In YAML flow collections,
+      write the empty tagged scalar as ``!delete ''`` so the tag is delimited.
     - Supports ``{{ dotted.path }}`` references and ``{{ resolver.path: arg1, arg2 }}`` calls.
       A complete template preserves the referenced or returned value's type; embedded templates interpolate text.
     """
     PYDANTIC_TAG = "!pd:"
     ROMX_TAG = "!romx:"
     OVERRIDES_TAG = "!overrides:"
+    DELETE_TAG = "!delete"
     YAML_SOURCE_TAG = "!romx:yaml-source"
     _SOURCE_PATH: _ContextVar[_Path | None] = _ContextVar("romjax_yaml_source_path", default=None)
 
@@ -300,11 +310,17 @@ class YamlLoader(ConfigLoader):
             )
             return YamlSource(source_node, source_path, label)
 
+        def _construct_delete(loader: _yaml.SafeLoader, node: _yaml.Node) -> _DeleteMarker:
+            """Construct the deferred deletion marker used by composite configurations."""
+            cls._validate_delete_node(node)
+            return _DELETE
+
         _Loader.add_constructor("tag:yaml.org,2002:python/name", _construct_python_name)
         _Loader.add_multi_constructor("tag:yaml.org,2002:python/name:", _construct_python_name_multi)
         _Loader.add_multi_constructor(cls.PYDANTIC_TAG, _construct_base_model)
         _Loader.add_multi_constructor(cls.ROMX_TAG, _partial(_construct_base_model, default_module="romjax"))
         _Loader.add_multi_constructor(cls.OVERRIDES_TAG, _construct_overrides)
+        _Loader.add_constructor(cls.DELETE_TAG, _construct_delete)
         _Loader.add_constructor(cls.YAML_SOURCE_TAG, _construct_yaml_source)
         return _Loader
 
@@ -358,10 +374,15 @@ class YamlLoader(ConfigLoader):
                 return _yaml.MappingNode(cls.YAML_SOURCE_TAG, pairs)
             return node
 
+        def _represent_delete(dumper: _yaml.SafeDumper, data: _DeleteMarker) -> _yaml.Node:
+            """Serialize the deferred deletion marker without converting it to text."""
+            return dumper.represent_scalar(cls.DELETE_TAG, "")
+
         _Dumper.add_representer(_FunctionType, _represent_python_name)
         _Dumper.add_representer(_BuiltinFunctionType, _represent_python_name)
         _Dumper.add_multi_representer(_Path, lambda dumper, data: dumper.represent_str(str(data)))
         _Dumper.add_representer(YamlSource, _represent_yaml_source)
+        _Dumper.add_representer(_DeleteMarker, _represent_delete)
         _Dumper.add_multi_representer(_BaseModel, _represent_base_model)
         return _Dumper
 
@@ -468,6 +489,28 @@ class YamlLoader(ConfigLoader):
         return isinstance(node, _yaml.ScalarNode) and node.tag == "tag:yaml.org,2002:null"
 
     @classmethod
+    def _is_delete_node(cls, node: _yaml.Node) -> bool:
+        """Return whether a raw YAML node is the deletion marker.
+
+        :param node: A raw YAML node.
+        :return: whether ``node`` is a valid bare ``!delete`` scalar.
+        """
+        if node.tag != cls.DELETE_TAG:
+            return False
+        cls._validate_delete_node(node)
+        return True
+
+    @classmethod
+    def _validate_delete_node(cls, node: _yaml.Node) -> None:
+        """Validate the syntax of a raw ``!delete`` YAML node.
+
+        :param node: A YAML node tagged as a deletion marker.
+        :raises ValueError: if the marker is not a bare scalar.
+        """
+        if not isinstance(node, _yaml.ScalarNode) or node.value:
+            raise ValueError("!delete must be a bare scalar marker.")
+
+    @classmethod
     def _copy_with_tag(cls, node: _yaml.Node, tag: str) -> _yaml.Node:
         """Return a deep copy of a YAML node with a replacement tag.
 
@@ -525,23 +568,35 @@ class YamlLoader(ConfigLoader):
                 key = (base_key.tag, base_key.value)
                 if key in override_pairs:
                     _, override_value = override_pairs.pop(key)
+                    if cls._is_delete_node(override_value):
+                        continue
                     merged_pairs.append((_deepcopy(base_key), cls._merge_nodes(base_value, override_value)))
                 else:
                     merged_pairs.append((_deepcopy(base_key), _deepcopy(base_value)))
 
             for override_key, override_value in override_pairs.values():
+                if cls._is_delete_node(override_value):
+                    raise ValueError(f"Cannot delete missing mapping key {override_key.value!r}.")
                 merged_pairs.append((_deepcopy(override_key), _deepcopy(override_value)))
 
             return _yaml.MappingNode(base.tag, merged_pairs, base.start_mark, base.end_mark, base.flow_style)
         if isinstance(base, _yaml.SequenceNode) and isinstance(override, _yaml.SequenceNode):
-            merged_items = [_deepcopy(item) for item in base.value]
+            merged_items: list[_yaml.Node] = []
             for index, override_item in enumerate(override.value):
-                if cls._is_null_node(override_item):
+                if cls._is_delete_node(override_item):
+                    if index >= len(base.value):
+                        raise ValueError(f"Cannot delete sequence item at index {index}; base sequence is too short.")
                     continue
-                if index < len(merged_items):
-                    merged_items[index] = cls._merge_nodes(merged_items[index], override_item)
+                if cls._is_null_node(override_item):
+                    if index < len(base.value):
+                        merged_items.append(_deepcopy(base.value[index]))
+                    continue
+                if index < len(base.value):
+                    merged_items.append(cls._merge_nodes(base.value[index], override_item))
                 else:
                     merged_items.append(_deepcopy(override_item))
+            if len(base.value) > len(override.value):
+                merged_items.extend(_deepcopy(item) for item in base.value[len(override.value):])
             return _yaml.SequenceNode(base.tag, merged_items, base.start_mark, base.end_mark, base.flow_style)
         return _deepcopy(override)
 

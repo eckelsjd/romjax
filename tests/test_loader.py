@@ -319,6 +319,49 @@ settings:
     }
 
 
+def test_yaml_overrides_delete_mapping_keys_and_sequence_items(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_path.write_text(
+        """
+settings:
+  retained: true
+  removed: false
+  items: [1, 2, 3]
+""",
+        encoding="utf-8",
+    )
+    override_path.write_text(
+        """
+!overrides:__parent__/base.yml
+settings:
+  removed: !delete
+  items: [null, !delete '', 4]
+""",
+        encoding="utf-8",
+    )
+
+    assert YamlLoader.load(override_path) == {"settings": {"retained": True, "items": [1, 4]}}
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ("settings: {missing: !delete ''}", "missing mapping key"),
+        ("settings: {items: [null, null, null, !delete '']}", "base sequence is too short"),
+        ("settings: {removed: !delete value}", "bare scalar"),
+    ],
+)
+def test_yaml_overrides_reject_invalid_delete_targets(tmp_path: Path, override: str, match: str) -> None:
+    base_path = tmp_path / "base.yml"
+    override_path = tmp_path / "override.yml"
+    base_path.write_text("settings: {removed: true, items: [1, 2, 3]}\n", encoding="utf-8")
+    override_path.write_text(f"!overrides:__parent__/base.yml\n{override}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        YamlLoader.load(override_path)
+
+
 def test_yaml_overrides_preserve_base_file_contents(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yml"
     override_path = tmp_path / "override.yml"

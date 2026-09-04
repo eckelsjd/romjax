@@ -423,6 +423,8 @@ class GridOverride(BaseModel):
         path = coerce_tree_path(value)
         if not isinstance(path, tuple) or not all(isinstance(token, str | int) for token in path):
             raise ValueError("Grid override path must be a sequence of string or integer tokens.")
+        if not path:
+            raise ValueError("Grid override paths cannot be empty.")
         if any(isinstance(token, int) and token < 0 for token in path):
             raise ValueError("Grid override paths do not support negative list indices.")
         return path

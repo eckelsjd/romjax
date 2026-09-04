@@ -39,6 +39,7 @@ class RootRoutine(Routine):
     name: str
     root: Path
     value: str | None = None
+    items: list[int] = []
     observed: ClassVar[list[tuple[str, Path, str | None]]] = []
 
     def run(self) -> int:
@@ -514,6 +515,113 @@ def test_composite_routine_expands_base_overrides_and_case_root_templates(tmp_pa
     resolved = romjax.load(root / "resolved.yml")
     assert isinstance(resolved, RootRoutine)
     assert resolved.root == root
+
+
+def test_composite_routine_preserves_delete_markers_in_case_values(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.RootRoutine",
+                "name: child",
+                f"root: {tmp_path / 'child'}",
+                "value: base",
+                "items: [1, 2, 3]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: edit",
+                "    cases:",
+                "      - name: deleted",
+                "        value:",
+                "          value: !delete",
+                    "          items: [null, !delete '', 4]",
+                "executor: {show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    case = romjax.load(composite_path)._expanded_cases()[0]
+    routine = romjax.load(case.value)
+
+    assert isinstance(routine, RootRoutine)
+    assert routine.value is None
+    assert routine.items == [1, 4]
+
+
+def test_composite_routine_can_delete_an_item_added_by_an_earlier_override(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                f"!pd:{MODULE_NAME}.RootRoutine",
+                "name: child",
+                f"root: {tmp_path / 'child'}",
+                "items: [1, 2, 3]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: add",
+                "    cases: [{name: item, value: {items: [null, null, null, 4]}}]",
+                "  - name: remove",
+                "    cases:",
+                "      - name: item",
+                "        value: {items: [null, null, null, !delete '']}",
+                "executor: {show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    case = romjax.load(composite_path)._expanded_cases()[0]
+    routine = romjax.load(case.value)
+
+    assert isinstance(routine, RootRoutine)
+    assert routine.items == [1, 2, 3]
+
+
+def test_composite_routine_rejects_root_delete_case(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yml"
+    composite_path = tmp_path / "composite.yml"
+    base_path.write_text(
+        f"!pd:{MODULE_NAME}.RootRoutine\nname: child\nroot: {tmp_path / 'child'}\n",
+        encoding="utf-8",
+    )
+    composite_path.write_text(
+        "\n".join(
+            [
+                "!romx:CompositeRoutine",
+                "base: __parent__/base.yml",
+                "overrides:",
+                "  - name: remove",
+                "    cases:",
+                "      - name: root",
+                "        value: !delete",
+                "executor: {show_progress: false}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="root configuration"):
+        romjax.load(composite_path)._expanded_cases()
 
 
 def test_composite_routine_renders_templates_after_case_overrides(tmp_path: Path) -> None:
