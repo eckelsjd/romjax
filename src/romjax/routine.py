@@ -345,7 +345,12 @@ def _run_composite_case(case: _CompositeCase) -> _CompositeCaseResult:
 
             root_path = Path(root)
             root_path.mkdir(parents=True, exist_ok=True)
-            romjax.dump(routine, root_path / "resolved.yml", sort_keys=False)
+            romjax.dump(
+                routine,
+                root_path / "resolved.yml",
+                sort_keys=False,
+                _preserve_yaml_sources=True,
+            )
         return _CompositeCaseResult(
             case,
             exit_code=int(routine.run()),
@@ -641,7 +646,11 @@ class CompositeRoutine(Routine):
             for case in selected:
                 if case.value is None:
                     continue
-                override_text = romjax.YamlLoader.dump(case.value, sort_keys=False)
+                override_text = romjax.YamlLoader.dump(
+                    case.value,
+                    sort_keys=False,
+                    _preserve_yaml_sources=True,
+                )
                 override_node = yaml.compose(override_text, Loader=yaml.SafeLoader)
                 if override_node is not None:
                     override_node = self._render_node(override_node, parts)

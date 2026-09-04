@@ -446,6 +446,8 @@ class _SavePolicy(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value
         if value == {}:
             return {"mode": "all"}
         if value == "all":
@@ -455,6 +457,8 @@ class _SavePolicy(BaseModel):
         if value == "rolling":
             return {"mode": "rolling", "count": 1}
         if isinstance(value, Mapping):
+            if set(value) <= {"mode", "count"} and "mode" in value:
+                return value
             if len(value) != 1:
                 raise ValueError("GridSearch save_policy mappings must have exactly one key: 'best' or 'rolling'.")
             key = next(iter(value))
@@ -591,6 +595,12 @@ def _manifest_value(value: Any) -> Any:
     """Return a YAML-safe manifest representation for an arbitrary override value."""
     if isinstance(value, str | int | float | bool) or value is None:
         return value
+    if isinstance(value, romjax.YamlSource):
+        if value.label is not None:
+            return value.label
+        if value.source_path is not None:
+            return _yaml_path_text(value.source_path)
+        return "<inline YAML source>"
     if isinstance(value, Path):
         return _yaml_path_text(value)
     if isinstance(value, Mapping):
@@ -1001,7 +1011,7 @@ class GridSearch(Routine):
                 self._write_manifest(
                     {
                         "root": _yaml_path_text(self.root),
-                        "base": _yaml_path_text(self.base),
+                        "base": _manifest_value(self.base),
                         "executor": self.executor.model_dump(),
                         "save_policy": self.save_policy.model_dump(),
                         "best": ranked[0][0] if ranked else None,
