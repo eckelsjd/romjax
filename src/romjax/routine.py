@@ -646,6 +646,8 @@ class CompositeRoutine(Routine):
             for case in selected:
                 if case.value is None:
                     continue
+                if isinstance(case.value, romjax._DeleteMarker):
+                    raise ValueError("CompositeRoutine override cases cannot delete the root configuration.")
                 override_text = romjax.YamlLoader.dump(
                     case.value,
                     sort_keys=False,
