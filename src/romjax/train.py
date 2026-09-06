@@ -708,7 +708,9 @@ class Train(Routine):
     :param init_params: PyTree of initial optimization parameters. Can specify as a callable to generate params.
     :param optimizer: Optax optimizer specification
 
-    :param test: function to compute a validation test score, callable as `test(params) -> float`
+    :param test: function to compute a validation test score, callable as `test(params) -> float | None`
+    :param test_failure_policy: handling for exceptions raised while evaluating ``test``; ``"raise"`` saves the
+        current state and raises, while ``"record_nan"`` logs the exception and continues with a missing score
     :param dataloader: Optionally load extra data for the loss function
     :param termination: stopping criteria
     :param diagnostics: configs for plotting and logging
@@ -731,7 +733,8 @@ class Train(Routine):
     optimizer: GradientTransformation
 
     # Optional
-    test: Callable[[PyTree], float] | None = None
+    test: Callable[[PyTree], float | None] | None = None
+    test_failure_policy: Literal["raise", "record_nan"] = "raise"
     dataloader: Iterator[Any] = Field(default_factory=BatchLoader)  # empty loading by default
     termination: TerminationConfig = Field(default_factory=TerminationConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
@@ -1476,10 +1479,38 @@ class Train(Routine):
                                     or curr_step >= self.termination.max_steps
                                 )
                             ):
-                                with profile_annotation("validation", env=os.environ):
-                                    test_score = float(test_fn(params))
+                                try:
+                                    with profile_annotation("validation", env=os.environ):
+                                        test_result = test_fn(params)
+                                    if test_result is None:
+                                        logger.warning(
+                                            f"Validation returned None at step {curr_step}; recording NaN test score."
+                                        )
+                                        test_score = float("nan")
+                                    else:
+                                        test_score = float(test_result)
+                                        if not np.isfinite(test_score):
+                                            logger.warning(
+                                                f"Validation returned non-finite value {test_score} at step "
+                                                f"{curr_step}; recording NaN test score."
+                                            )
+                                            test_score = float("nan")
+                                except Exception as exc:
+                                    if self.test_failure_policy == "raise":
+                                        logger.exception(
+                                            f"Exception encountered during validation at step {curr_step}. "
+                                            "Saving checkpoint..."
+                                        )
+                                        _save_final(metrics)
+                                        raise RoutineError("Test evaluation failure") from exc
+                                    logger.exception(
+                                        f"Exception encountered during validation at step {curr_step}; "
+                                        "recording NaN test score."
+                                    )
+                                    test_score = float("nan")
                                 test_hist.record(curr_step, test_score)
-                                metrics["test_score"] = test_score
+                                if np.isfinite(test_score):
+                                    metrics["test_score"] = test_score
 
                             if self.termination.grad_tol and grad_norm_device is not None:
                                 grad_norm = float(grad_norm_device)

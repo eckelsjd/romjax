@@ -39,6 +39,7 @@ from romjax.tree import (
     TreePath,
     coerce_tree_paths,
     get_subtree,
+    pytree_merge,
     pytree_iter,
     pytree_path_iter,
     pytree_stack,
@@ -151,6 +152,7 @@ def _log_sample_failure(sample_dir: Path, message: str, exc: BaseException) -> N
 
 type SUPPORTED_FORMATS = Literal["h5"]
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
+type SUPPORTED_CONDITIONS = Literal["ignore", "include", "merge"]
 
 
 class GenDataConfig(BaseModel, ABC):
@@ -854,7 +856,9 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     :param skip_output: decide whether to skip a particular output sample when loading
     :param load_solution: whether to include ``solution.h5`` and ``solution_residual.h5`` as an extra
         sample for each input (defaults to ``True``)
-    Output samples include ``conditions.h5`` as ``conditions`` when present.
+    :param conditions: how to load output ``conditions.h5`` files: ``"ignore"`` skips them,
+        ``"include"`` adds them as a separate ``conditions`` field, and ``"merge"`` merges them into
+        ``inputs`` with condition values overriding matching paths (defaults to ``"include"``)
     :param solution_only: whether to load only ``solution.h5`` and skip all output samples (defaults to ``False``)
     """
 
@@ -864,6 +868,7 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
     skip_input: Callable[[Path], bool] | None = None
     skip_output: Callable[[Path], bool] | None = None
     load_solution: bool = True
+    conditions: SUPPORTED_CONDITIONS = "include"
     solution_only: bool = False
 
     @model_validator(mode="after")
@@ -997,8 +1002,12 @@ class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
             sample["outputs"] = load_h5({}, output_file, jax=False)
 
         conditions_file = output_path / "conditions.h5"
-        if sample_kind == "output" and conditions_file.exists():
-            sample["conditions"] = load_h5({}, conditions_file, jax=False)
+        if self.conditions != "ignore" and sample_kind == "output" and conditions_file.exists():
+            loaded_conditions = load_h5({}, conditions_file, jax=False)
+            if self.conditions == "include":
+                sample["conditions"] = loaded_conditions
+            else:
+                sample["inputs"] = pytree_merge(sample.get("inputs"), loaded_conditions)
 
         residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
         residual_file = output_path / residual_name

@@ -112,7 +112,17 @@ def _get_graph():
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
+@pytest.mark.parametrize(
+    ("conditions", "expected_inputs", "has_conditions"),
+    [
+        ("ignore", 1.0, False),
+        ("include", 1.0, True),
+        ("merge", 4.0, False),
+    ],
+)
+def test_generate_implicit_persists_and_loads_conditions(
+    tmp_path, batch_size, conditions, expected_inputs, has_conditions
+):
     graph = FunctionGraph(
         edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")}
     )
@@ -140,9 +150,17 @@ def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
     assert len(output_refs) == 4
     for input_path, output_path, _ in output_refs:
         assert (output_path / "conditions.h5").exists()
-        sample = LoadImplicitModel().load_sample((input_path, output_path, "output"))
-        assert np.allclose(sample["conditions"]["x"], 4.0)
+        sample = LoadImplicitModel(conditions=conditions).load_sample((input_path, output_path, "output"))
+        assert np.allclose(sample["inputs"]["x"], expected_inputs)
+        assert ("conditions" in sample) is has_conditions
+        if has_conditions:
+            assert np.allclose(sample["conditions"]["x"], 4.0)
         assert np.allclose(sample["outputs"]["y"], 5.0)
+
+
+def test_load_implicit_model_conditions_default_is_include():
+    """Retain separate condition payloads unless a loading mode is requested."""
+    assert LoadImplicitModel().conditions == "include"
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

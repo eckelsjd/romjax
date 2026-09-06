@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 from pathlib import Path, PureWindowsPath
 
@@ -461,6 +462,18 @@ def test_default_orbax_metric_reads_loss_csv(tmp_path: Path) -> None:
     (tmp_path / "loss.csv").write_text("Iteration,Value\n0,3.0\n1,1.5\n2,2.0\n", encoding="utf-8")
 
     assert orbax_metric(tmp_path) == (3.0 + 1.5 + 2.0) / 3
+
+
+def test_orbax_metric_test_history_ignores_partial_nans(tmp_path: Path) -> None:
+    (tmp_path / "test.csv").write_text("Iteration,Value\n0,nan\n1,3.0\n2,1.0\n", encoding="utf-8")
+
+    assert orbax_metric(tmp_path, file="test.csv") == 2.0
+
+
+def test_orbax_metric_test_history_returns_nan_when_all_values_are_nan(tmp_path: Path) -> None:
+    (tmp_path / "test.csv").write_text("Iteration,Value\n0,nan\n1,nan\n", encoding="utf-8")
+
+    assert math.isnan(orbax_metric(tmp_path, file="test.csv"))
 
 
 def test_grid_search_run_writes_manifest_and_copies_best(tmp_path: Path, monkeypatch) -> None:
