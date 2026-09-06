@@ -53,6 +53,21 @@ def scalar_quadratic_test(params: dict[str, jax.Array]) -> jax.Array:
     return jnp.abs(params["w"] - 1.0)
 
 
+def none_test(params: dict[str, jax.Array]) -> None:
+    del params
+    return None
+
+
+def nan_test(params: dict[str, jax.Array]) -> jax.Array:
+    del params
+    return jnp.asarray(jnp.nan)
+
+
+def failing_test(params: dict[str, jax.Array]) -> jax.Array:
+    del params
+    raise RuntimeError("validation failed")
+
+
 def two_parameter_quadratic_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
     del batch
     return jnp.square(params["train"] - 1.0) + jnp.square(params["frozen"] - 1.0)
@@ -75,6 +90,11 @@ def graph_batch_absolute_error(params: dict, single_data: dict, graph: FunctionG
     del graph
     x = single_data["inputs"]["x"] if "inputs" in single_data else single_data["x"]
     return jnp.abs(params["toy"]["weight"] - x)
+
+
+def graph_batch_nan_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
+    del params, graph
+    return jnp.where(single_data["inputs"]["x"] > 1, jnp.nan, 0.0)
 
 
 def graph_batch_large_squared_error(params: dict, single_data: dict, graph: FunctionGraph) -> jax.Array:
@@ -226,6 +246,67 @@ class RepeatBatchLoader:
 
     def __next__(self):
         return self.batch
+
+
+@pytest.mark.parametrize("test", [none_test, nan_test])
+def test_train_records_unavailable_test_values_as_nan(tmp_path: Path, test) -> None:
+    root = tmp_path / "unavailable_test"
+    train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=test,
+        dataloader=RepeatBatchLoader({}),
+        termination=TerminationConfig(max_steps=2, test_tol=1.0),
+        diagnostics=DiagnosticsConfig(show_progress=False, test_interval=1),
+        root=root,
+    )
+
+    train()
+
+    steps, values = _history_csv(root / "test.csv")
+    assert steps.tolist() == [0, 1, 2]
+    assert np.isnan(values).all()
+
+
+def test_train_records_test_exception_as_nan_when_configured(tmp_path: Path) -> None:
+    root = tmp_path / "failed_test"
+    train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=failing_test,
+        test_failure_policy="record_nan",
+        dataloader=RepeatBatchLoader({}),
+        termination=TerminationConfig(max_steps=2),
+        diagnostics=DiagnosticsConfig(show_progress=False, test_interval=1),
+        root=root,
+    )
+
+    train()
+
+    steps, values = _history_csv(root / "test.csv")
+    assert steps.tolist() == [0, 1, 2]
+    assert np.isnan(values).all()
+
+
+def test_train_raises_for_test_exception_by_default(tmp_path: Path) -> None:
+    root = tmp_path / "raising_test"
+    train = Train(
+        loss=scalar_quadratic_loss,
+        init_params={"w": jnp.array(0.0)},
+        optimizer=optax.sgd(0.2),
+        test=failing_test,
+        dataloader=RepeatBatchLoader({}),
+        termination=TerminationConfig(max_steps=1),
+        diagnostics=DiagnosticsConfig(show_progress=False, test_interval=1),
+        root=root,
+    )
+
+    with pytest.raises(RoutineError, match="Test evaluation failure"):
+        train()
+
+    assert root.joinpath("test.csv").read_text(encoding="utf-8") == "Iteration,Value\n"
 
 
 def _history_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -1259,6 +1340,23 @@ def test_graph_validation(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     value = test({"toy": {"weight": jnp.array(0.0)}})
     expected = np.mean([np.mean((0.0 - np.array([1])) ** 2), np.mean((0.0 - np.array([1])) ** 2)])
     assert value == pytest.approx(expected)
+
+
+def test_graph_test_propagates_nan_from_a_batched_sample(tmp_path: Path, toy_graph: FunctionGraph) -> None:
+    data_root = tmp_path.resolve() / "graph_validation_nan"
+    _write_graph_dataset(data_root, "toy", n_inputs=2, n_outputs=1)
+    test = GraphTest(
+        terms=[{"term": graph_batch_nan_error, "dataset": "toy"}],
+        graph=toy_graph,
+        loader=DataLoader(
+            root=data_root,
+            datasets={"toy": {"kind": "implicit", "batch_size": 2, "max_epochs": 1}},
+        ),
+    )
+
+    value = test({"toy": {"weight": jnp.asarray(jnp.nan)}})
+
+    assert bool(jnp.isnan(value))
 
 
 def test_graph_test_recompiles_after_deferred_graph_binding(tmp_path: Path, toy_graph: FunctionGraph) -> None:

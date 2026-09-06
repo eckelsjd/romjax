@@ -137,6 +137,9 @@ class CompareCase(DictModel):
     :param template: optional template used to load an Orbax checkpoint
     :param graph: optional graph used to resolve the template and GraphTest metric
     :param base: optional named base specification
+    :param metric: callable metric to compare cases
+    :param hist: configs for plotting as a histogram
+    :param table: configs for printing as a table
     """
 
     name: str
