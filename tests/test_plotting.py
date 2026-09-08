@@ -160,6 +160,36 @@ def test_gridplot_hist_stepfilled_handles_list_artists():
     plt.close(fig)
 
 
+def test_gridplot_configures_subplot_and_figure_legends() -> None:
+    small = PlotSpec(
+        kind="line",
+        name="small",
+        data=(np.asarray([0.0, 1.0]), np.asarray([1.0, 2.0])),
+        opts={"legend": {"plot_names": ["small"], "kwargs": {"loc": "upper left"}}},
+        kwargs={"label": "Small"},
+    )
+    large = PlotSpec(
+        kind="line",
+        name="large",
+        data=(np.asarray([0.0, 1.0]), np.asarray([2.0, 3.0])),
+        opts={"legend": {"plot_names": ["large"], "kwargs": {"title": "Terms"}}},
+        kwargs={"label": "Large"},
+    )
+
+    fig, axes = gridplot(
+        (small, large),
+        legend={"plot_names": ["large", "small"], "kwargs": {"loc": "lower center"}},
+    )
+
+    axis_legend = axes[0, 0].get_legend()
+    assert [text.get_text() for text in axis_legend.get_texts()] == ["Small", "Large"]
+    assert axis_legend.get_title().get_text() == "Terms"
+    assert [text.get_text() for text in fig.legends[0].get_texts()] == ["Large", "Small"]
+    assert "leg_label" not in AxisOptions.model_fields
+    assert "legend_kwargs" not in GridplotConfig.model_fields
+    plt.close(fig)
+
+
 def test_global_override(monkeypatch):
     monkeypatch.setattr(
         plotting,

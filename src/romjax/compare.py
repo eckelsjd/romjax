@@ -52,7 +52,6 @@ class HistogramConfig(DictModel):
     """Global histogram figure configuration for :class:`CompareMetric`."""
 
     layout: list[list[tuple[str, ...]]] | None = None
-    legend: Mapping[str, Any] | None = None  # cases and opts for figure legend
 
     @field_validator("layout", mode="before")
     @classmethod
@@ -277,14 +276,12 @@ class CompareMetric(CompareOrbax):
         rows = len(layout)
         cols = max(len(row) for row in layout)
         plots: list[list[list[PlotSpec]]] = [[[] for _ in range(cols)] for _ in range(rows)]
-        legend_labels: dict[str, str] = {}
         for row, entries in enumerate(layout):
             for col, names in enumerate(entries):
                 for name in names:
                     case = self._resolved_cases[name]
                     if case.hist is None:
                         raise ValueError(f"Histogram layout references case {name!r} without a hist specification")
-                    legend_labels[name] = case.hist.opts.leg_label or name
                     plots[row][col].append(
                         PlotSpec(kind="hist", name=name, data=_metric_values(results[name]), **case.hist.model_dump())
                     )
@@ -297,26 +294,6 @@ class CompareMetric(CompareOrbax):
                     axis = axes[row, col]
                     axis.set_yticks([])
                     axis.tick_params(axis="y", left=False, labelleft=False)
-            if self.hist.legend is None:
-                return
-            names = self.hist.legend.get("cases", [])
-            opts = dict(self.hist.legend.get("opts", {}))
-            handles: list[Any] = []
-            labels: list[str] = []
-            for name in names:
-                label = legend_labels.get(name, name)
-                for axis in axes.flat:
-                    axis_handles, axis_labels = axis.get_legend_handles_labels()
-                    if label in axis_labels:
-                        handles.append(axis_handles[axis_labels.index(label)])
-                        labels.append(label)
-                        break
-            for axis in axes.flat:
-                legend = axis.get_legend()
-                if legend is not None:
-                    legend.remove()
-            fig.legend(handles, labels, **opts)
-
         return gridplot(
             [[tuple(cell) for cell in row] for row in plots],
             adjust=adjust,
