@@ -31,7 +31,10 @@ from pydantic import Field, SkipValidation, field_validator
 
 from romjax.typing import DictModel
 
-__all__ = ['gridplot', 'set_global', 'PlotSpec', 'AxisOptions', 'AnimateOptions', 'GridplotConfig', 'get_scheme']
+__all__ = [
+    'gridplot', 'set_global', 'PlotSpec', 'AxisOptions', 'AnimateOptions', 'LegendConfig', 'GridplotConfig',
+    'get_scheme'
+]
 
 
 def get_scheme(scheme: Literal['white', 'dark']):
@@ -89,6 +92,13 @@ class AnimateOptions(DictModel):
         return d
 
 
+class LegendConfig(DictModel):
+    """Select labelled plots and configure either an axis or figure legend."""
+
+    plot_names: list[PlotName] = Field(default_factory=list)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
 class AxisOptions(DictModel):
     """A few particular axis options common to all types of plots.
     
@@ -102,7 +112,7 @@ class AxisOptions(DictModel):
     :ivar ylim: limits for y-axis (defaults to autoscale if None)
     :ivar clim: limits for colorbar (if None, will not show a colorbar), can also set to 'auto'
     :ivar cbar_label: label for the colorbar (must set clim to show colorbar)
-    :ivar leg_label: label for legend (legend only shown if all artists on an axis have a label)
+    :ivar legend: optional legend configuration for this subplot
     :ivar ax_visible: whether to show axes, ticks, and spines (default True)
     :ivar animate: whether to animate data for this plot (default False)
     :ivar grid: options for showing axis grid
@@ -117,7 +127,7 @@ class AxisOptions(DictModel):
     ylim: tuple[float, float] | None = None
     clim: tuple[float, float] | Literal['auto'] | None = None
     cbar_label: str | None = None
-    leg_label: str | None = None
+    legend: LegendConfig | None = None
     ax_visible: bool | None = None
     animate: bool | None = None
     grid: dict | bool | None = None
@@ -167,7 +177,7 @@ class GridplotConfig(DictModel):
                    Use .gif or .mp4 for animations, and .pdf, .png, or similar for static figures.
     :ivar adjust: catch-all func for applying changes before saving/animating. Call as adjust(fig, axs, artists, cbars)
     :ivar animate_opts: options for animating/saving movie. Defaults to 10 fps, 200 dpi, and blit=False with ffmpeg
-    :ivar legend_kwargs: extra options for legends (same used for all subplots if applicable)
+    :ivar legend: optional figure-level legend configuration
     :ivar local_axis_opts: local overrides for plot options. Specify as plot.name->{ override_opts }. See `AxisOptions`.
     :ivar local_plot_kwargs: local ovverides for plot kwargs. Specify as plot.name->{ override_kwargs }. See `PlotSpec`.
     :ivar global_axis_opts: global overrides applied to all subplot options. See `AxisOptions`.
@@ -183,7 +193,7 @@ class GridplotConfig(DictModel):
     savefig: dict[str, Any] | None = None
     adjust: Callable[[Figure, Axes, Iterable[Artist], list[list[Colorbar]]], None] | None = None
     animate_opts: AnimateOptions = Field(default_factory=AnimateOptions)
-    legend_kwargs: dict = Field(default_factory=dict)
+    legend: LegendConfig | None = None
     local_axis_opts: dict[PlotName, AxisOptions] = Field(default_factory=dict)
     local_plot_kwargs: dict[PlotName, dict[str, Any]] = Field(default_factory=dict)
     global_axis_opts: AxisOptions = Field(default_factory=AxisOptions)
@@ -367,10 +377,11 @@ def gridplot(
         return data
  
     def _setup_plotting_area():
-        """Setup axis colors, ticks, spines, legend, etc. Return cbars, animate status, and legend(s) status"""
+        """Setup axis colors, ticks, spines, and labels."""
         animate = False
         cbars = [[None for _ in range(shape[1])] for _ in range(shape[0])]
-        legends = [[False for _ in range(shape[1])] for _ in range(shape[0])]
+        sharex = cfg.subplots_kwargs.get("sharex", False)
+        sharey = cfg.subplots_kwargs.get("sharey", False)
         for i, j, k, spec in _iter_plot_specs():
             if k > 0:  # Just set up each i,j axis once
                 continue
@@ -414,11 +425,12 @@ def gridplot(
                     grid = s.opts.grid
             ax_visible = any(s.opts.ax_visible or s.opts.ax_visible is None for s in plots[i][j])
             animate = animate or any(s.opts.animate for s in plots[i][j])
-            legends[i][j] = all(s.opts.leg_label is not None for s in plots[i][j])
+            labelbottom = ax_visible and (sharex not in (True, "all", "col") or i == shape[0] - 1)
+            labelleft = ax_visible and (sharey not in (True, "all", "row") or j == 0)
 
             ax.tick_params(axis='both', which='both', top=False, bottom=ax_visible, 
-                           left=ax_visible, right=False, direction='in', labelleft=ax_visible, 
-                           labelbottom=ax_visible, color=text_color, labelcolor=text_color)
+                           left=ax_visible, right=False, direction='in', labelleft=labelleft,
+                           labelbottom=labelbottom, color=text_color, labelcolor=text_color)
             ax.set_facecolor(bg_color)
             for spine in ['bottom', 'left', 'top', 'right']:
                 ax.spines[spine].set_visible(ax_visible)
@@ -450,9 +462,9 @@ def gridplot(
                 if plots[i][j] is None:
                     axs[i, j].axis('off')
 
-        return animate, cbars, legends
+        return animate, cbars
 
-    animate, cbars, legends = _setup_plotting_area()
+    animate, cbars = _setup_plotting_area()
 
     def _set_hist_bins(artist, bins) -> None:
         """Store histogram bins when the matplotlib artist type supports attributes."""
@@ -514,7 +526,7 @@ def gridplot(
             p = None
             match spec.kind.lower():
                 case "line":
-                    p, = ax.plot([], [], label=spec.opts.leg_label, **spec.kwargs)
+                    p, = ax.plot([], [], **spec.kwargs)
                 case "pcolor":
                     p = ax.pcolormesh(*_empty_structured_mesh(), **_get_kwargs())
                 case "contour":
@@ -525,7 +537,7 @@ def gridplot(
                     kwargs = copy.deepcopy(spec.kwargs)
                     if "bins" not in kwargs:
                         kwargs["bins"] = 10
-                    _, bin_edges, container = ax.hist([0.0, 1.0], label=spec.opts.leg_label, **kwargs)
+                    _, bin_edges, container = ax.hist([0.0, 1.0], **kwargs)
                     _set_hist_bins(container, bin_edges)
                     p = container
                 case "hist2d":
@@ -540,11 +552,6 @@ def gridplot(
             
             artists.append(p)
 
-            if legends[i][j]:
-                leg = dict(facecolor=bg_color, edgecolor=text_color, labelcolor=text_color, fancybox=True)
-                leg.update(cfg.legend_kwargs)
-                ax.legend(**leg)
-
         return artists
     
     all_artists_og = _draw_empty_plots()
@@ -554,6 +561,59 @@ def gridplot(
 
     if cfg.adjust is not None:
         cfg.adjust(fig, axs, all_artists, cbars)
+
+    def _named_handles() -> dict[PlotName, tuple[Artist, str]]:
+        """Return the first labelled artist configured for every plot name."""
+        handles: dict[PlotName, tuple[Artist, str]] = {}
+        for (_, _, _, spec), artist in zip(_iter_plot_specs(), all_artists, strict=True):
+            if spec.name is None or not hasattr(artist, "get_label"):
+                continue
+            label = artist.get_label()
+            if isinstance(label, str) and label and not label.startswith("_"):
+                handles.setdefault(spec.name, (artist, label))
+        return handles
+
+    def _configure_legends() -> None:
+        """Create configured subplot and figure legends without removing either."""
+        named_handles = _named_handles()
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                if plots[i][j] is None:
+                    continue
+                legend_configs = [spec.opts.legend for spec in plots[i][j] if spec.opts.legend is not None]
+                if not legend_configs:
+                    continue
+                plot_names = [name for legend in legend_configs for name in legend.plot_names]
+                kwargs: dict[str, Any] = {}
+                for legend in legend_configs:
+                    kwargs.update(legend.kwargs)
+                if plot_names:
+                    handles_and_labels = [named_handles[name] for name in plot_names if name in named_handles]
+                    axs[i, j].legend(
+                        [handle for handle, _ in handles_and_labels],
+                        [label for _, label in handles_and_labels],
+                        **kwargs,
+                    )
+                else:
+                    axs[i, j].legend(**kwargs)
+
+        if cfg.legend is None:
+            return
+        if cfg.legend.plot_names:
+            handles_and_labels = [
+                named_handles[name] for name in cfg.legend.plot_names if name in named_handles
+            ]
+            handles = [handle for handle, _ in handles_and_labels]
+            labels = [label for _, label in handles_and_labels]
+        else:
+            handles, labels = [], []
+            for axis in axs.flat:
+                axis_handles, axis_labels = axis.get_legend_handles_labels()
+                handles.extend(axis_handles)
+                labels.extend(axis_labels)
+        fig.legend(handles, labels, **cfg.legend.kwargs)
+
+    _configure_legends()
     
     def _update(frame_and_title: tuple[DataFrame, str | None]):
         """Update the plot with new data."""
@@ -666,8 +726,6 @@ def gridplot(
                     kwargs = _get_kwargs()
                     orientation = kwargs.get("orientation", "vertical")
                     stacked = kwargs.get("stacked", False)
-                    if spec.opts.leg_label is not None and "label" not in kwargs:
-                        kwargs["label"] = spec.opts.leg_label
 
                     if isinstance(data, tuple):
                         x = data[0]

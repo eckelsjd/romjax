@@ -193,7 +193,7 @@ def test_compare_metric_renders_histograms_with_case_overrides(monkeypatch: pyte
                 "name": "second",
                 "params": {"value": jnp.array(3.0)},
                 "metric": metric,
-                "hist": {"opts": {"leg_label": "Second"}, "kwargs": {"color": "crimson"}},
+                "hist": {"kwargs": {"color": "crimson", "label": "Second"}},
             },
         ],
     )
@@ -202,7 +202,7 @@ def test_compare_metric_renders_histograms_with_case_overrides(monkeypatch: pyte
     assert first.kwargs["bins"] == 4
     assert first.kwargs["alpha"] == 0.5
     assert second.kwargs["color"] == "crimson"
-    assert second.opts.leg_label == "Second"
+    assert second.kwargs["label"] == "Second"
 
 
 def test_compare_metric_without_root_prints_and_shows(

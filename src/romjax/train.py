@@ -1238,8 +1238,12 @@ class Train(Routine):
                                 {
                                     "data": ([], []),
                                     "name": f"raw_terms_{name}",
-                                    "opts": {"leg_label": name},
-                                    "kwargs": {"color": term_colors[name]} if term_colors else {},
+                                    "opts": (
+                                        {}
+                                        if self.diagnostics.shared_terms_legend
+                                        else {"legend": {"plot_names": [f"raw_terms_{name}"]}}
+                                    ),
+                                    "kwargs": {"label": name, **({"color": term_colors[name]} if term_colors else {})},
                                 },
                             )
                             for name in raw_plot_terms
@@ -1252,8 +1256,12 @@ class Train(Routine):
                                 {
                                     "data": ([], []),
                                     "name": f"scaled_terms_{name}",
-                                    "opts": {"leg_label": name},
-                                    "kwargs": {"color": term_colors[name]} if term_colors else {},
+                                    "opts": (
+                                        {}
+                                        if self.diagnostics.shared_terms_legend
+                                        else {"legend": {"plot_names": [f"scaled_terms_{name}"]}}
+                                    ),
+                                    "kwargs": {"label": name, **({"color": term_colors[name]} if term_colors else {})},
                                 },
                             )
                             for name in scaled_plot_terms
