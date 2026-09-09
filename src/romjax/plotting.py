@@ -26,6 +26,7 @@ from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.cm import ScalarMappable
 from matplotlib.colorbar import Colorbar
+from matplotlib.container import ErrorbarContainer
 from matplotlib.figure import Figure
 from pydantic import Field, SkipValidation, field_validator
 
@@ -150,12 +151,13 @@ class PlotSpec(DictModel):
         ```
     
     :ivar kind: the type of plot (see `SupportedPlots`)
-    :ivar data: the data to plot. For animations use an iterable over data to generate frame data.
+    :ivar data: the data to plot. Errorbars accept ``(x, y)``, ``(x, y, yerr)``, or
+        ``(x, y, xerr, yerr)``. For animations use an iterable over data to generate frame data.
     :ivar opts: extra specialized plot options (see `PlotOpts`)
     :ivar kwargs: extra kwargs passed directly to the matplotlib plotting routine (e.g. plot, contour, etc.)
     :ivar name: optional short name for specifying local option overrides
     """
-    kind: Literal["line", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
+    kind: Literal["line", "errorbar", "pcolor", "contour", "contourf", "hist", "hist2d"] # TODO: tri, quad
     data: Annotated[Any | Iterable[Any], SkipValidation] = Field(exclude=True)
     opts: AxisOptions = Field(default_factory=AxisOptions)
     kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -527,6 +529,8 @@ def gridplot(
             match spec.kind.lower():
                 case "line":
                     p, = ax.plot([], [], **spec.kwargs)
+                case "errorbar":
+                    p = ax.errorbar([], [], **spec.kwargs)
                 case "pcolor":
                     p = ax.pcolormesh(*_empty_structured_mesh(), **_get_kwargs())
                 case "contour":
@@ -562,15 +566,25 @@ def gridplot(
     if cfg.adjust is not None:
         cfg.adjust(fig, axs, all_artists, cbars)
 
-    def _named_handles() -> dict[PlotName, tuple[Artist, str]]:
+    def _artist_handle(artist: Artist | ErrorbarContainer) -> Artist | ErrorbarContainer | None:
+        """Return the legend-compatible handle for a plotted object."""
+        return artist
+
+    def _errorbar_artists(artist: ErrorbarContainer) -> list[Artist]:
+        """Flatten an errorbar container into artists suitable for animation blitting."""
+        line, caps, bars = artist.lines
+        return [item for item in (line, *caps, *bars) if item is not None]
+
+    def _named_handles() -> dict[PlotName, tuple[Artist | ErrorbarContainer, str]]:
         """Return the first labelled artist configured for every plot name."""
-        handles: dict[PlotName, tuple[Artist, str]] = {}
+        handles: dict[PlotName, tuple[Artist | ErrorbarContainer, str]] = {}
         for (_, _, _, spec), artist in zip(_iter_plot_specs(), all_artists, strict=True):
-            if spec.name is None or not hasattr(artist, "get_label"):
+            handle = _artist_handle(artist)
+            if spec.name is None or handle is None or not hasattr(handle, "get_label"):
                 continue
-            label = artist.get_label()
+            label = handle.get_label()
             if isinstance(label, str) and label and not label.startswith("_"):
-                handles.setdefault(spec.name, (artist, label))
+                handles.setdefault(spec.name, (handle, label))
         return handles
 
     def _configure_legends() -> None:
@@ -693,6 +707,14 @@ def gridplot(
                     else:
                         artist.set_ydata(data)   # [Y]
                     updated_artists.append(artist)
+
+                case "errorbar":
+                    if not isinstance(data, tuple) or not 2 <= len(data) <= 4:
+                        raise ValueError("errorbar expects (x, y), (x, y, yerr), or (x, y, xerr, yerr) data.")
+                    artist.remove()
+                    new_artist = ax.errorbar(*data, **_get_kwargs())
+                    all_artists[flat_idx] = new_artist
+                    updated_artists.extend(_errorbar_artists(new_artist))
 
                 case "pcolor":
                     _update_clim()
