@@ -190,6 +190,66 @@ def test_gridplot_configures_subplot_and_figure_legends() -> None:
     plt.close(fig)
 
 
+@pytest.mark.parametrize(
+    ("data", "expected_collections"),
+    [
+        ((np.asarray([0.0, 1.0]), np.asarray([1.0, 2.0])), 0),
+        ((np.asarray([0.0, 1.0]), np.asarray([1.0, 2.0]), np.asarray([0.1, 0.2])), 1),
+        (
+            (
+                np.asarray([0.0, 1.0]),
+                np.asarray([1.0, 2.0]),
+                np.asarray([0.1, 0.2]),
+                np.asarray([0.3, 0.4]),
+            ),
+            2,
+        ),
+    ],
+)
+def test_gridplot_errorbar_accepts_supported_data_tuples(data, expected_collections) -> None:
+    fig, axes = gridplot(PlotSpec(kind="errorbar", data=data, kwargs={"label": "Errors"}))
+
+    axis = axes[0, 0]
+    np.testing.assert_allclose(axis.lines[0].get_xdata(), data[0])
+    np.testing.assert_allclose(axis.lines[0].get_ydata(), data[1])
+    assert len(axis.collections) == expected_collections
+
+    plt.close(fig)
+
+
+def test_gridplot_errorbar_supports_named_legends_and_animation(tmp_path: Path) -> None:
+    frames = iter(
+        [
+            (np.asarray([0.0]), np.asarray([1.0]), np.asarray([[0.1], [0.2]])),
+            (np.asarray([0.0]), np.asarray([2.0]), np.asarray([[0.3], [0.4]])),
+        ]
+    )
+    fig, axes, animation = gridplot(
+        PlotSpec(
+            kind="errorbar",
+            name="errors",
+            data=frames,
+            opts={"animate": True},
+            kwargs={"label": "Errors", "capsize": 2},
+        ),
+        legend={"plot_names": ["errors"]},
+        animate_opts={"writer": "pillow", "fps": 2},
+        savefig={"fname": tmp_path / "errors.gif"},
+    )
+
+    assert animation is not None
+    assert [text.get_text() for text in fig.legends[0].get_texts()] == ["Errors"]
+    assert (tmp_path / "errors.gif").exists()
+    np.testing.assert_allclose(axes[0, 0].lines[0].get_ydata(), [2.0])
+
+    plt.close(fig)
+
+
+def test_gridplot_errorbar_rejects_invalid_data_tuple() -> None:
+    with pytest.raises(ValueError, match="errorbar expects"):
+        gridplot(PlotSpec(kind="errorbar", data=(np.asarray([0.0]),)))
+
+
 def test_global_override(monkeypatch):
     monkeypatch.setattr(
         plotting,
