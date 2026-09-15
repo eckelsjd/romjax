@@ -138,6 +138,7 @@ def weighted_sum(key: jaxtyping.Key, **config) -> ArrayLike:
 
 _distribution_registry = {
     "uniform": uniform,
+    "randint": jax.random.randint,
     "log_uniform": log_uniform,
     "normal": normal,
     "darcy": darcy,

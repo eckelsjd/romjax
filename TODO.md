@@ -2,6 +2,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 
 ## Testing
 - [ ] Need to consolidate test_train and test_vlasov to be quicker
+- [ ] pytest discovery is unnecessarily expensive
 
 ## Critical
 - [ ] Need a better way to evaluate ODE residual, especially in light of small time scales.

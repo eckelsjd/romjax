@@ -41,13 +41,13 @@ class AdvectionDiffusionInputs(TypedDict, total=False):
     :ivar diffusion: diffusion inputs
     :ivar velocity: velocity-field inputs
     :ivar boundary: boundary condition parameters
-    :ivar initial: initial-field parameters or a direct ``phi`` field
+    :ivar solver: iterative-solver runtime inputs, including ``initial`` and ``options``
     """
     forcing: dict
     diffusion: dict
     velocity: dict
     boundary: dict
-    initial: dict[str, Any]
+    solver: dict[str, Any]
 
 
 class AdvectionDiffusionOutputs(TypedDict):
@@ -292,8 +292,6 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
     boundary: AdvectionDiffusionForcing = Field(
         default_factory=lambda: IdentityInputs(inputs_default=homogeneous_boundary(ndim=2))
     )
-    initial: AdvectionDiffusionForcing = Field(default_factory=ConstantForcing)
-
     incompressible: bool = False
 
     inputs_sampler: SamplerCallable | None = None
@@ -317,11 +315,14 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
     ) -> AdvectionDiffusionInputs:
         """Merge grid coords into incoming inputs."""
         inputs = to_pytree(inputs)
-        for name in ("forcing", "diffusion", "velocity", "boundary", "initial"):
+        for name in ("forcing", "diffusion", "velocity", "boundary"):
             inputs.setdefault(name, {})
         coords = {"coords": self._jax_coords() if coords is None else coords}
-        for k in inputs:
-            inputs[k].update(coords)
+        for name in ("forcing", "diffusion", "velocity", "boundary"):
+            inputs[name].update(coords)
+        inputs.setdefault("solver", {})
+        inputs["solver"].setdefault("initial", {})
+        inputs["solver"]["initial"].update(coords)
         
         return inputs
 
@@ -331,12 +332,12 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
         :param inputs: resolved advection-diffusion inputs, including grid coordinates
         :return: initial scalar field on the grid
         """
-        initial_inputs = inputs.get("initial", {})
+        initial_inputs = inputs["solver"]["initial"]
         if self.field_name in initial_inputs:
             initial = initial_inputs[self.field_name]
         else:
-            initial = self.initial(initial_inputs, {})
-        return jnp.broadcast_to(jnp.asarray(initial), inputs["initial"]["coords"][0].shape)
+            initial = self.solver.initial(initial_inputs, {})
+        return jnp.broadcast_to(jnp.asarray(initial), initial_inputs["coords"][0].shape)
     
     def _compute_residual(
         self, inputs: AdvectionDiffusionInputs, outputs: AdvectionDiffusionOutputs
@@ -513,7 +514,13 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
             return residual[self.residual_name] - args['target']
         
         y0 = self._initial_field(args['inputs'])
-        solution = self.solver.root_find(residual_fn, y0, args, return_sol=return_sol)
+        solution = self.solver.root_find(
+            residual_fn,
+            y0,
+            args,
+            options=args["inputs"]["solver"].get("options"),
+            return_sol=return_sol,
+        )
 
         ret = solution if return_sol else {self.field_name: solution} 
         return ret

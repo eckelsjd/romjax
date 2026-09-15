@@ -1,9 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+import optimistix as optx
 import pytest
 
 from romjax import YamlLoader
@@ -214,13 +216,13 @@ def test_transport_initial_field_callable_and_runtime_override() -> None:
     """Transport initial fields use the configured callable or a direct runtime field."""
     model = AdvectionDiffusion2D(
         grid=UniformGrid(bounds=((0.0, 2.0), (-1.0, 1.0)), shape=(5, 4)),
-        initial={"callable": "constant", "inputs_default": {"const": 2.0}},
+        solver={"initial": {"callable": "constant", "inputs_default": {"const": 2.0}}},
     )
 
     resolved = model._merge_coords({})
     sample = model._initial_field(resolved)
     direct = jnp.arange(20, dtype=float).reshape(5, 4)
-    overridden = model._initial_field(model._merge_coords({"initial": {"phi": direct}}))
+    overridden = model._initial_field(model._merge_coords({"solver": {"initial": {"phi": direct}}}))
 
     assert sample.shape == (5, 4)
     assert jnp.all(sample == 2.0)
@@ -228,6 +230,25 @@ def test_transport_initial_field_callable_and_runtime_override() -> None:
 
     with pytest.raises(ValueError):
         AdvectionDiffusion2D(grid=model.grid, initial_guess=lambda coords: jnp.ones_like(coords[0]))
+
+
+def test_transport_merges_runtime_solver_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Transport passes runtime solver options over the configured option defaults."""
+    seen: dict[str, object] = {}
+
+    def root_find_spy(*args, **kwargs):
+        seen["options"] = kwargs["options"]
+        return SimpleNamespace(value=kwargs["y0"])
+
+    monkeypatch.setattr(optx, "root_find", root_find_spy)
+    model = AdvectionDiffusion2D(
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(2, 2)),
+        solver={"options": {"keep": 1, "step_seed": 1}},
+    )
+
+    model.solve({"solver": {"options": {"step_seed": 2}}})
+
+    assert seen["options"] == {"keep": 1, "step_seed": 2}
 
 
 def test_transport_evaluate_and_autodiff() -> None:
@@ -361,8 +382,8 @@ def get_laplace_solver() -> AdvectionDiffusion2D:
         solver={
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1, "atol": 1e-4}},
             "max_steps": 10,
+            "initial": {"callable": "constant", "inputs_default": {"const": 1.0}},
         },
-        initial={"callable": "constant", "inputs_default": {"const": 1.0}},
     )
 
 
@@ -408,8 +429,8 @@ def test_transport_manufactured_solve(show_plot: bool = False) -> None:
             "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1e2, "atol": dx_error * 1.5}},
             "max_steps": 15,
             "throw": False,
+            "initial": {"callable": "constant", "inputs_default": {"const": 1.0}},
         },
-        initial={"callable": "constant", "inputs_default": {"const": 1.0}},
         forcing="sinusoid",
     )
 
