@@ -58,6 +58,12 @@ def test_distribution() -> None:
     assert jnp.all(custom_samples >= 0.0)
     assert jnp.all(custom_samples < 3.0)
 
+    integer = Distribution(callable="randint", minval=2, maxval=5, shape=(8,), dtype=jnp.uint32)
+    integer_samples = integer.sample(jax.random.key(5))
+    assert integer_samples.dtype == jnp.uint32
+    assert jnp.all(integer_samples >= 2)
+    assert jnp.all(integer_samples < 5)
+
 
 def test_gen_keys(tmp_path: Path) -> None:
     pairs = list(gen_keys(2, path=tmp_path, seed=7))

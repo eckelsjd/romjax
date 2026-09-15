@@ -18,11 +18,14 @@ from romjax.pde import (
     ConstantForcing,
     ImplicitAffine,
     ImplicitIterativeGalerkin,
+    IterativeSolver,
     LatentSamplerFactory,
+    RandomNewton,
     SumForcing,
     UniformGrid,
     homogeneous_boundary,
 )
+from romjax.rng import Distribution
 from romjax.tree import pytree_merge
 
 
@@ -199,7 +202,7 @@ def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
         }
     )
 
-    inputs = {"b": jnp.array([1.0, 1.5]), "initial": {"outputs": 0.1 * jnp.ones(2)}}
+    inputs = {"b": jnp.array([1.0, 1.5]), "solver": {"initial": {"outputs": 0.1 * jnp.ones(2)}}}
     z_true = jnp.array([0.2, 0.4])
 
     target_payload = graph.push_path(
@@ -331,6 +334,131 @@ def test_implicit_affine_scalar_and_nonlinear_jacobian() -> None:
     values = jnp.asarray([0.0, 0.5, 1.0])
     assert jax.vmap(evaluate_scalar)(values).shape == (3, 1)
     assert jax.jit(evaluate_scalar)(jnp.asarray(0.2)).shape == (1,)
+
+
+def test_random_newton_runtime_seed_and_relative_perturbations() -> None:
+    """Random Newton options produce deterministic, seed-dependent scalar paths."""
+    step_size = Distribution(callable="uniform", minval=0.2, maxval=0.8)
+    randomized = IterativeSolver(
+        solver=RandomNewton(rtol=1.0, atol=1e-6, step_size=step_size),
+        max_steps=1,
+        throw=False,
+    )
+
+    residual = lambda y, _: y - 1.0
+    first = randomized.root_find(residual, jnp.asarray(0.0), options={"step_seed": jnp.asarray(7, dtype=jnp.uint32)})
+    repeated = randomized.root_find(
+        residual, jnp.asarray(0.0), options={"step_seed": jnp.asarray(7, dtype=jnp.uint32)}
+    )
+    second = randomized.root_find(residual, jnp.asarray(0.0), options={"step_seed": jnp.asarray(8, dtype=jnp.uint32)})
+
+    assert jnp.allclose(first, repeated)
+    assert not jnp.allclose(first, second)
+    assert jnp.isfinite(
+        jax.jit(
+            lambda seed: randomized.root_find(residual, jnp.asarray(0.0), options={"step_seed": seed})
+        )(jnp.asarray(9, dtype=jnp.uint32))
+    )
+
+    direction_solver = IterativeSolver(
+        solver=RandomNewton(
+            rtol=1.0,
+            atol=1e-6,
+            step_direction=Distribution.model_validate(2.0),
+            step_direction_scale=0.5,
+        ),
+        max_steps=1,
+        throw=False,
+    )
+    assert jnp.allclose(direction_solver.root_find(residual, jnp.asarray(0.0)), 0.5)
+
+    final_solver = IterativeSolver(
+        solver=RandomNewton(
+            rtol=1.0,
+            atol=1e-6,
+            final_perturb=Distribution.model_validate(2.0),
+            final_perturb_scale=0.25,
+        ),
+        max_steps=2,
+        throw=False,
+    )
+    assert jnp.allclose(final_solver.root_find(residual, jnp.asarray(0.0)), 1.25)
+
+
+def test_random_newton_accepts_yaml_friendly_distribution_config() -> None:
+    """Third-party solver specs construct RandomNewton and its distribution mappings."""
+    config = IterativeSolver.model_validate(
+        {
+            "solver": {
+                "name": "romjax.RandomNewton",
+                "kwargs": {
+                    "rtol": 1.0,
+                    "atol": 1e-6,
+                    "step_size": {"callable": "uniform", "minval": 0.2, "maxval": 0.8},
+                },
+            }
+        }
+    )
+
+    assert isinstance(config.solver, RandomNewton)
+    assert isinstance(config.solver.step_size, Distribution)
+    assert config.model_dump()["solver"]["kwargs"]["step_size"]["callable"] == "uniform"
+
+
+def test_random_newton_supports_broadcast_distribution_pytrees() -> None:
+    """RandomNewton preserves Optimistix PyTree states and validates distribution layouts."""
+    target = {"left": jnp.asarray([1.0, 2.0]), "right": jnp.asarray([-3.0])}
+    initial = jax.tree.map(jnp.zeros_like, target)
+
+    def residual(state, _):
+        return jax.tree.map(lambda value, expected: value - expected, state, target)
+
+    deterministic = IterativeSolver(solver=RandomNewton(rtol=1.0, atol=1e-6), max_steps=1, throw=False)
+    solved = deterministic.root_find(residual, initial)
+    assert jax.tree.all(jax.tree.map(jnp.allclose, solved, target))
+
+    randomized = IterativeSolver(
+        solver=RandomNewton(rtol=1.0, atol=1e-6, step_size=Distribution.model_validate(0.5)),
+        max_steps=1,
+        throw=False,
+    )
+    halfway = randomized.root_find(residual, initial)
+    assert jax.tree.all(jax.tree.map(lambda value, expected: jnp.allclose(value, 0.5 * expected), halfway, target))
+
+    incompatible = IterativeSolver(
+        solver=RandomNewton(
+            rtol=1.0,
+            atol=1e-6,
+            step_direction={"missing": {"callable": "dirac", "value": 1.0}},
+        ),
+        max_steps=1,
+        throw=False,
+    )
+    with pytest.raises(ValueError, match="state pytree structure"):
+        incompatible.root_find(residual, initial)
+
+
+def test_implicit_affine_passes_runtime_solver_options() -> None:
+    """Nonlinear affine solves merge runtime solver options into the root finder."""
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(12), jacobian_inputs="both", eps=1.0)
+    edge = ImplicitAffine(
+        solver=IterativeSolver(
+            solver=RandomNewton(
+                rtol=1.0,
+                atol=1e-6,
+                step_size=Distribution(callable="uniform", minval=0.2, maxval=0.8),
+            ),
+            max_steps=1,
+            throw=False,
+        )
+    )
+    inputs = {"value": jnp.asarray(0.3), "module": affine}
+    residuals = edge.evaluate(inputs, {"value": jnp.asarray(0.5)})
+
+    first = edge.solve({**inputs, "solver": {"options": {"step_seed": jnp.asarray(1, dtype=jnp.uint32)}}}, residuals)
+    second = edge.solve({**inputs, "solver": {"options": {"step_seed": jnp.asarray(2, dtype=jnp.uint32)}}}, residuals)
+
+    assert not jnp.allclose(first["value"], second["value"])
 
 
 def test_implicit_affine_collects_additional_input_arrays_deterministically() -> None:

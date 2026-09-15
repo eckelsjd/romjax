@@ -10,12 +10,15 @@ import equinox as eqx
 import equinox.internal as eqxi
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import lineax as lx
 import numpy as np
 import optimistix as optx
 from alive_progress import alive_bar
 from diffrax._progress_meter import _progress_meter_manager
+from equinox.internal import ω
 from jaxtyping import ArrayLike, Key, PyTree
+from optimistix._solver.newton_chord import _AbstractNewtonChord
 from pydantic import (
     AfterValidator,
     BeforeValidator,
@@ -33,13 +36,13 @@ from romjax.compression import Compression
 from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
-from romjax.rng import PyTreeSampler, SamplerCallable
+from romjax.rng import Distribution, DistributionPyTree, PyTreeSampler, SamplerCallable, validate_distribution_pytree
 from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge, set_subtree
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'ForcingCallable', 'RegisteredForcing', 'FORCING_REGISTRY', 'IdentityInputs', 'ConstantForcing',
-           'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'IterativeSolver',
+           'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'RandomNewton', 'IterativeSolver',
            'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
@@ -435,10 +438,220 @@ type AbstractAdjoint = Annotated[
 type DiffraxObject = ThirdPartyType(default_modules="diffrax")
 
 
+class RandomNewton(_AbstractNewtonChord):
+    """Newton root finder with reproducible stochastic update perturbations.
+
+    Distribution definitions are static solver configuration, while ``step_seed``
+    and the relative scales may be supplied through Optimistix ``options`` at solve
+    time. This keeps random trajectories configurable through JAX values without
+    rebuilding the solver object.
+
+    :param rtol: relative termination tolerance
+    :param atol: absolute termination tolerance
+    :param step_size: optional distribution for the multiplicative Newton step size
+    :param step_direction: optional distribution for an additive update direction
+    :param step_direction_scale: optional direction magnitude relative to the Newton update
+    :param final_perturb: optional distribution added to the terminated iterate
+    :param final_perturb_scale: optional final perturbation magnitude relative to the final iterate
+    :param step_seed: default seed, overridden by ``options["step_seed"]``
+    """
+
+    step_size: DistributionPyTree | None = eqx.field(static=True, default=None)
+    step_direction: DistributionPyTree | None = eqx.field(static=True, default=None)
+    step_direction_scale: PyTree | None = eqx.field(static=True, default=None)
+    final_perturb: DistributionPyTree | None = eqx.field(static=True, default=None)
+    final_perturb_scale: PyTree | None = eqx.field(static=True, default=None)
+    step_seed: int = eqx.field(static=True, default=0)
+
+    _is_newton = True
+
+    def __init__(
+        self,
+        rtol: float,
+        atol: float,
+        norm: Callable[[PyTree], ArrayLike] = optx.max_norm,
+        kappa: float = 1e-2,
+        linear_solver: lx.AbstractLinearSolver | None = None,
+        cauchy_termination: bool = True,
+        step_seed: int = 0,
+        step_size: DistributionPyTree | None = None,
+        step_direction: DistributionPyTree | None = None,
+        step_direction_scale: PyTree | None = None,
+        final_perturb: DistributionPyTree | None = None,
+        final_perturb_scale: PyTree | None = None,
+    ) -> None:
+        """Initialize the deterministic Newton settings and random distributions."""
+        self.rtol = rtol
+        self.atol = atol
+        self.norm = norm
+        self.kappa = kappa
+        self.linear_solver = lx.AutoLinearSolver(well_posed=None) if linear_solver is None else linear_solver
+        self.cauchy_termination = cauchy_termination
+        self.step_seed = step_seed
+        self.step_size = self._coerce_distribution(step_size)
+        self.step_direction = self._coerce_distribution(step_direction)
+        self.step_direction_scale = step_direction_scale
+        self.final_perturb = self._coerce_distribution(final_perturb)
+        self.final_perturb_scale = final_perturb_scale
+
+    @staticmethod
+    def _coerce_distribution(value: DistributionPyTree | None) -> DistributionPyTree | None:
+        """Validate a scalar distribution or a distribution pytree specification."""
+        return None if value is None else validate_distribution_pytree(value)
+
+    def _keys(self, options: dict[str, Any]) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Return independent random streams for update size, direction, and final noise."""
+        seed = jnp.asarray(options.get("step_seed", self.step_seed), dtype=jnp.uint32)
+        return tuple(jax.random.split(jax.random.key(seed), 3))
+
+    @staticmethod
+    def _is_tree_spec(value: Any) -> bool:
+        """Return whether a value is an explicit container rather than one broadcast scale."""
+        return isinstance(value, Mapping | tuple | list)
+
+    @staticmethod
+    def _broadcast_tree(template: PyTree, reference: PyTree) -> PyTree:
+        """Broadcast a scalar distribution or scale specification over a state pytree."""
+        if not RandomNewton._is_tree_spec(template) or isinstance(template, Distribution):
+            return jax.tree.map(lambda _: template, reference)
+        try:
+            return jax.tree.map(lambda value, _: value, template, reference)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RandomNewton configuration does not match the state pytree structure.") from exc
+
+    @staticmethod
+    def _sample_tree(template: DistributionPyTree, key: jax.Array) -> PyTree:
+        """Sample a validated distribution pytree with independent keys per leaf."""
+        leaves, treedef = jax.tree.flatten(template, is_leaf=lambda value: isinstance(value, Distribution))
+        if not all(isinstance(value, Distribution) for value in leaves):
+            raise TypeError("RandomNewton distributions must contain only Distribution leaves.")
+        keys = jax.random.split(key, len(leaves))
+        return jax.tree.unflatten(treedef, [value.sample(subkey) for value, subkey in zip(leaves, keys)])
+
+    def _distribution_for_state(self, distribution: DistributionPyTree, state: PyTree) -> DistributionPyTree:
+        """Expand a distribution specification to match a state pytree and validate leaf broadcasting."""
+        template = self._broadcast_tree(distribution, state)
+        sampled = self._sample_tree(template, jax.random.key(0))
+        try:
+            jax.tree.map(
+                lambda sample, value: jnp.broadcast_shapes(jnp.shape(sample), jnp.shape(value)), sampled, state
+            )
+        except (TypeError, ValueError) as exc:
+            message = "RandomNewton distribution samples must be broadcast-compatible with the state pytree."
+            raise ValueError(message) from exc
+        return template
+
+    def _relative_noise(self, noise: PyTree, reference: PyTree, scale: PyTree | None) -> PyTree:
+        """Scale noise globally or leafwise to a relative reference magnitude."""
+        if scale is None:
+            return noise
+        if not self._is_tree_spec(scale):
+            noise_norm = jnp.asarray(self.norm(noise))
+            reference_norm = jnp.asarray(self.norm(reference))
+            factor = jnp.where(noise_norm > 0, jnp.asarray(scale) * reference_norm / noise_norm, 0.0)
+            return jax.tree.map(lambda value: value * factor, noise)
+
+        scale_tree = self._broadcast_tree(scale, reference)
+
+        def scale_leaf(noise_leaf: ArrayLike, reference_leaf: ArrayLike, scale_leaf: ArrayLike) -> jax.Array:
+            noise_norm = jnp.asarray(self.norm(noise_leaf))
+            reference_norm = jnp.asarray(self.norm(reference_leaf))
+            factor = jnp.where(noise_norm > 0, jnp.asarray(scale_leaf) * reference_norm / noise_norm, 0.0)
+            return jnp.asarray(noise_leaf) * factor
+
+        return jax.tree.map(scale_leaf, noise, reference, scale_tree)
+
+    def init(
+        self,
+        fn: Callable,
+        y: PyTree,
+        args: PyTree,
+        options: dict[str, Any],
+        f_struct: PyTree[jax.ShapeDtypeStruct],
+        aux_struct: PyTree[jax.ShapeDtypeStruct],
+        tags: frozenset[object],
+    ) -> Any:
+        """Initialize the parent Newton state after validating random distribution shapes."""
+        for distribution in (self.step_size, self.step_direction, self.final_perturb):
+            if distribution is not None:
+                self._distribution_for_state(distribution, y)
+        return super().init(fn, y, args, options, f_struct, aux_struct, tags)
+
+    def step(
+        self,
+        fn: Callable,
+        y: PyTree,
+        args: PyTree,
+        options: dict[str, Any],
+        state: Any,
+        tags: frozenset[object],
+    ) -> tuple[PyTree, Any, Any]:
+        """Take one Newton step with optional randomized magnitude and direction."""
+        _, deterministic_state, aux = super().step(fn, y, args, options, state, tags)
+        deterministic_diff = deterministic_state.diff
+        size_key, direction_key, _ = self._keys(options)
+        step = deterministic_state.step - 1
+
+        alpha = jax.tree.map(lambda _: jnp.asarray(1.0), deterministic_diff)
+
+        direction = jax.tree.map(jnp.zeros_like, deterministic_diff)
+        if self.step_direction is not None:
+            template = self._distribution_for_state(self.step_direction, deterministic_diff)
+            sampled = self._sample_tree(template, jax.random.fold_in(direction_key, step))
+            direction_scale = options.get("step_direction_scale", self.step_direction_scale)
+            direction = self._relative_noise(sampled, deterministic_diff, direction_scale)
+
+        if self.step_size is not None:
+            template = self._distribution_for_state(self.step_size, deterministic_diff)
+            alpha = self._sample_tree(template, jax.random.fold_in(size_key, step))
+        random_diff = (alpha**ω * (deterministic_diff**ω + direction**ω)).ω
+        new_y = (y**ω - random_diff**ω).ω
+        lower = options.get("lower")
+        upper = options.get("upper")
+        if lower is not None:
+            new_y = jtu.tree_map(lambda value, bound: jnp.clip(value, min=bound), new_y, lower)
+        if upper is not None:
+            new_y = jtu.tree_map(lambda value, bound: jnp.clip(value, max=bound), new_y, upper)
+        random_diff = (y**ω - new_y**ω).ω
+
+        scale = (self.atol + self.rtol * ω(new_y).call(jnp.abs)).ω
+        with jax.numpy_dtype_promotion("standard"):
+            diffsize = self.norm((random_diff**ω / scale**ω).ω)
+        random_state = eqx.tree_at(
+            lambda value: (value.diff, value.diffsize),
+            deterministic_state,
+            (random_diff, jnp.asarray(diffsize, dtype=deterministic_state.diffsize.dtype)),
+        )
+        return new_y, random_state, aux
+
+    def postprocess(
+        self,
+        fn: Callable,
+        y: ArrayLike,
+        aux: Any,
+        args: PyTree,
+        options: dict[str, Any],
+        state: Any,
+        tags: frozenset[object],
+        result: Any,
+    ) -> tuple[PyTree, Any, dict[str, Any]]:
+        """Optionally perturb the final iterate after Optimistix terminates."""
+        del fn, args, tags, result
+        if self.final_perturb is None:
+            return y, aux, {}
+        _, _, perturb_key = self._keys(options)
+        template = self._distribution_for_state(self.final_perturb, y)
+        sampled = self._sample_tree(template, jax.random.fold_in(perturb_key, state.step))
+        perturb_scale = options.get("final_perturb_scale", self.final_perturb_scale)
+        perturbation = self._relative_noise(sampled, y, perturb_scale)
+        return (y**ω + perturbation**ω).ω, aux, {}
+
+
 class IterativeSolver(DictModel):
     """Configuration for optimistix iterative solvers. Only root find supported.
     
     :ivar solver: Optimistix nonlinear root finding solver (name+kwargs or instance), default is Newton
+    :ivar initial: configured initial guess forcing callable
     :ivar options: runtime options for the nonlinear solver
     :ivar max_steps: maximum number of solver steps
     :ivar adjoint: Optimistix adjoint method
@@ -448,6 +661,7 @@ class IterativeSolver(DictModel):
         default_factory=lambda: dict(name='optimistix.Newton', kwargs={'rtol': 1e-2, 'atol': 1e-4}), 
         validate_default=True
     )
+    initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     options: dict[str, Any] = Field(default_factory=dict)
     max_steps: PositiveInt = 100
     adjoint: AbstractAdjoint = Field(
@@ -461,6 +675,7 @@ class IterativeSolver(DictModel):
         fn: Callable[[ArrayLike, Any], ArrayLike], 
         y0: ArrayLike,
         args: Any | None = None,
+        options: Mapping[str, Any] | None = None,
         return_sol: bool = False
     ) -> ArrayLike | optx.Solution:
         """Small wrapper around optimistix root find.
@@ -470,15 +685,17 @@ class IterativeSolver(DictModel):
         :param fn: the objective function to find the root of, callable as `fn(y_k, Any) -> y_(k+1)`
         :param y0: the initial guess
         :param args: extra arguments for the objective function
+        :param options: runtime solver options merged over configured options
         :param return_sol: whether to return the solution object or just the result (default)
         :return: the solution object or the result
         """
+        runtime_options = pytree_merge(self.options, options or {})
         solution = optx.root_find(
             fn,
             solver=self.solver,
             y0=y0,
             args=args,
-            options=self.options,
+            options=runtime_options,
             max_steps=self.max_steps,
             adjoint=self.adjoint,
             throw=self.throw
@@ -786,7 +1003,6 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     inputs_rank: PositiveInt | None = None
     outputs_rank: PositiveInt | None = None
     additional_inputs: tuple[TreePath, ...] | None = None
-    initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     inputs_compression: Path | str | Compression | None = None
     outputs_compression: Path | str | Compression | None = None
     residuals_compression: Path | str | Compression | None = None
@@ -1003,17 +1219,25 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         if not isinstance(solver, IterativeSolver):
             raise TypeError("Output-dependent ImplicitAffine Jacobians require an IterativeSolver.")
 
-        initial_inputs = dict(inputs.get("initial", {}))
-        if isinstance(self.initial, AffineInitial):
+        solver_inputs = inputs.get("solver", {})
+        initial_inputs = dict(solver_inputs.get("initial", {}))
+        if isinstance(solver.initial, AffineInitial):
             initial_inputs["inputs"] = values
             initial_inputs["module"] = affine
             initial_inputs["residuals"] = residual_values
-        initial = jnp.broadcast_to(self.initial(initial_inputs, {}), residual_values.shape)
+        initial = jnp.broadcast_to(solver.initial(initial_inputs, {}), residual_values.shape)
 
         def root_residual(output_values: ArrayLike, args: PyTree) -> ArrayLike:
             return self.evaluate(args["inputs"], {"value": output_values})["value"] - args["residuals"]["value"]
 
-        return {"value": solver.root_find(root_residual, initial, {"inputs": inputs, "residuals": residuals})}
+        return {
+            "value": solver.root_find(
+                root_residual,
+                initial,
+                {"inputs": inputs, "residuals": residuals},
+                options=solver_inputs.get("options"),
+            )
+        }
 
     def sample_inputs(self, key: Key) -> PyTree:
         """Sample an input value payload."""
@@ -1061,7 +1285,6 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     """Galerkin ROM that solves any `ImplicitModel` via an iterative solver in latent space."""
 
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
-    initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
     rank: PositiveInt | None = None
     compression: Path | str | Compression | None = None
@@ -1145,20 +1368,22 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
                 args_residual = args_residual["latent"]
             return result_residual - args_residual
         
-        initial_inputs = {}
+        solver_inputs = {}
         if isinstance(x.get("inputs"), Mapping):
-            initial_inputs = x["inputs"].get("initial", {})
+            solver_inputs = x["inputs"].get("solver", {})
+        initial_inputs = solver_inputs.get("initial", {})
 
         if isinstance(initial_inputs, Mapping) and "outputs" in initial_inputs:
             initial = jnp.asarray(initial_inputs["outputs"])
         else:
-            initial = jnp.asarray(self.initial(initial_inputs, {}))
+            initial = jnp.asarray(self.solver.initial(initial_inputs, {}))
         initial = jnp.broadcast_to(initial, jnp.asarray(target_residual).shape)
 
         solution = self.solver.root_find(
             lambda z, args: residual_fn(z, args, aux, edge_payload_patches, composite_stack), 
             initial,
-            x, 
+            x,
+            options=solver_inputs.get("options"),
             return_sol=False
         )
 
