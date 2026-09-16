@@ -83,6 +83,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
     "IterativeSolver": ("romjax.pde", "IterativeSolver"),
+    "LinearSolver": ("romjax.pde", "LinearSolver"),
     "RandomNewton": ("romjax.pde", "RandomNewton"),
     "gridplot": ("romjax.plotting", "gridplot"),
     "AdvectionDiffusion2D": ("romjax.transport", "AdvectionDiffusion2D"),
@@ -141,6 +142,7 @@ if TYPE_CHECKING:
         ImplicitAffine,
         ImplicitIterativeGalerkin,
         IterativeSolver,
+        LinearSolver,
         RandomNewton,
     )
     from .plotting import gridplot

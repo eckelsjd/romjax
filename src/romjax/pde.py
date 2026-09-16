@@ -42,12 +42,12 @@ from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registr
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'ForcingCallable', 'RegisteredForcing', 'FORCING_REGISTRY', 'IdentityInputs', 'ConstantForcing',
-           'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'RandomNewton', 'IterativeSolver',
+           'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'RandomNewton', 'IterativeSolver', 'LinearSolver',
            'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
-type LinearSolver = Annotated[
+type AbstractLinearSolver = Annotated[
     ThirdPartyType(default_modules=lx.__name__),
     AfterValidator(partial(require_type, lx.AbstractLinearSolver)),
 ]
@@ -703,6 +703,57 @@ class IterativeSolver(DictModel):
         return solution if return_sol else solution.value
 
 
+class LinearSolver(DictModel):
+    """Configuration wrapper for Lineax linear solves.
+
+    :ivar solver: Lineax linear solver (name+kwargs or instance)
+    :ivar initial: configured initial guess forcing callable, passed as ``options["y0"]``
+    :ivar options: runtime options for the linear solver
+    :ivar throw: whether Lineax should raise on solver failure
+    """
+
+    solver: AbstractLinearSolver = Field(
+        default_factory=lambda: dict(name="lineax.AutoLinearSolver", kwargs={"well_posed": True}),
+        validate_default=True,
+    )
+    initial: RegisteredForcing = Field(default_factory=ConstantForcing)
+    options: dict[str, Any] = Field(default_factory=dict)
+    throw: bool = False
+
+    def linear_solve(
+        self,
+        operator: lx.AbstractLinearOperator,
+        vector: PyTree,
+        *,
+        y0: PyTree | None = None,
+        options: Mapping[str, Any] | None = None,
+        state: PyTree | None = None,
+        return_sol: bool = False,
+    ) -> PyTree | lx.Solution:
+        """Solve a linear system with configured Lineax settings.
+
+        :param operator: linear operator in ``A @ y = b``
+        :param vector: right-hand-side vector ``b``
+        :param y0: optional initial guess forwarded as ``options["y0"]``
+        :param options: runtime solver options merged over configured options
+        :param state: optional reusable Lineax solver state
+        :param return_sol: whether to return the Lineax solution object
+        :return: the solved value or complete Lineax solution
+        """
+        runtime_options = pytree_merge(self.options, options or {})
+        if y0 is not None:
+            runtime_options["y0"] = y0
+        kwargs: dict[str, Any] = {
+            "solver": self.solver,
+            "options": runtime_options,
+            "throw": self.throw,
+        }
+        if state is not None:
+            kwargs["state"] = state
+        solution = lx.linear_solve(operator, vector, **kwargs)
+        return solution if return_sol else solution.value
+
+
 class DiffraxSolver(DictModel):
     """Configuration wrapper for :mod:`diffrax` ODE solves.
 
@@ -964,7 +1015,7 @@ class AffineInitial(ForcingCallable):
     associated with the Affine model F(b,u)=H(b,u)(u-g(b)).
     """
 
-    solver: LinearSolver = Field(default_factory=lambda: lx.AutoLinearSolver(well_posed=True))
+    solver: AbstractLinearSolver = Field(default_factory=lambda: lx.AutoLinearSolver(well_posed=True))
 
     def callable(self, inputs: PyTree, outputs: PyTree) -> ArrayLike:
         del outputs
@@ -1191,41 +1242,53 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         """Solve the affine residual equation for output coordinates."""
         values, affine = self._affine_inputs(inputs)
         residual_values = self._value(residuals, "residuals")
+        solver_inputs = inputs.get("solver", {})
 
-        # Use solution operator explicitly
-        if affine.identity_jac is True:
+        def initial_for(solver: LinearSolver | IterativeSolver) -> jax.Array:
+            """Resolve the configured initial field for either solver wrapper."""
+            initial_inputs = dict(solver_inputs.get("initial", {}))
+            if isinstance(solver.initial, AffineInitial):
+                initial_inputs["inputs"] = values
+                initial_inputs["module"] = affine
+                initial_inputs["residuals"] = residual_values
+            return jnp.broadcast_to(solver.initial(initial_inputs, {}), residual_values.shape)
+
+        # Preserve the no-configuration shortcut, but honor an explicitly selected solver.
+        if affine.identity_jac is True and self.solver is None:
             _, solution = affine.materialize(values)
             return {"value": solution + residual_values}
 
-        # Linear solve for fixed inputs
-        if affine.jacobian_inputs == "inputs":
+        if isinstance(self.solver, LinearSolver) or (
+            self.solver is None and affine.jacobian_inputs == "inputs"
+        ):
+            if affine.jacobian_inputs in ("outputs", "both"):
+                raise TypeError("Output-dependent ImplicitAffine Jacobians require an IterativeSolver.")
             matrix, solution = affine.materialize(values)
-            solver = self.solver
-            if solver is None:
-                solver = lx.AutoLinearSolver(well_posed=True)
-            if not isinstance(solver, lx.AbstractLinearSolver):
-                raise TypeError("Input-only ImplicitAffine Jacobians require a lineax solver.")
-            output_values = lx.linear_solve(
-                lx.MatrixLinearOperator(matrix),
-                residual_values,
-                solver=solver,
-            ).value + solution
-            return {"value": output_values}
+            operator = lx.MatrixLinearOperator(matrix)
+            if isinstance(self.solver, LinearSolver):
+                output_values = self.solver.linear_solve(
+                    operator,
+                    residual_values,
+                    y0=initial_for(self.solver),
+                    options=solver_inputs.get("options"),
+                    state=solver_inputs.get("state"),
+                )
+            else:
+                output_values = lx.linear_solve(
+                    operator,
+                    residual_values,
+                    solver=lx.AutoLinearSolver(well_posed=True),
+                ).value
+            return {"value": output_values + solution}
 
-        # Nonlinear solve if H(b,u) in general
+        # Nonlinear solve if H(b, u) is output-dependent, or explicitly requested.
         solver = self.solver
         if solver is None:
             solver = IterativeSolver()
         if not isinstance(solver, IterativeSolver):
             raise TypeError("Output-dependent ImplicitAffine Jacobians require an IterativeSolver.")
 
-        solver_inputs = inputs.get("solver", {})
-        initial_inputs = dict(solver_inputs.get("initial", {}))
-        if isinstance(solver.initial, AffineInitial):
-            initial_inputs["inputs"] = values
-            initial_inputs["module"] = affine
-            initial_inputs["residuals"] = residual_values
-        initial = jnp.broadcast_to(solver.initial(initial_inputs, {}), residual_values.shape)
+        initial = initial_for(solver)
 
         def root_residual(output_values: ArrayLike, args: PyTree) -> ArrayLike:
             return self.evaluate(args["inputs"], {"value": output_values})["value"] - args["residuals"]["value"]
