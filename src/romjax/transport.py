@@ -5,6 +5,7 @@ from typing import Annotated, Any, TypedDict
 
 import jax
 import jax.numpy as jnp
+import lineax as lx
 import optimistix as optx
 from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BeforeValidator, ConfigDict, Field, field_validator
@@ -21,6 +22,7 @@ from romjax.pde import (
     ForcingCallable,
     IdentityInputs,
     IterativeSolver,
+    LinearSolver,
     UniformGrid,
     homogeneous_boundary,
 )
@@ -42,7 +44,7 @@ class AdvectionDiffusionInputs(TypedDict, total=False):
     :ivar diffusion: diffusion inputs
     :ivar velocity: velocity-field inputs
     :ivar boundary: boundary condition parameters
-    :ivar solver: iterative-solver runtime inputs, including ``initial`` and ``options``
+    :ivar solver: solver runtime inputs, including ``initial``, ``options``, and optional Lineax ``state``
     """
     forcing: dict
     diffusion: dict
@@ -246,7 +248,7 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
 
     grid: UniformGrid  # Required
 
-    solver: IterativeSolver = Field(default_factory=IterativeSolver)
+    solver: IterativeSolver | LinearSolver = Field(default_factory=IterativeSolver)
 
     # To satisfy criteria for being a graph edge
     source: Node = Node(name="advection_diffusion_in")
@@ -464,8 +466,12 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
         inputs: AdvectionDiffusionInputs | None = None,
         residuals: AdvectionDiffusionResiduals | None = None,
         return_sol: bool = False
-    ) -> AdvectionDiffusionOutputs | optx.Solution:
+    ) -> AdvectionDiffusionOutputs | optx.Solution | lx.Solution:
         """Solve the advection-diffusion equation for a target residual.
+
+        With a :class:`~romjax.pde.LinearSolver`, the assembled residual must
+        be affine in ``phi``. The solve uses its homogeneous part
+        ``R(phi) - R(0)`` as a matrix-free Lineax operator.
         
         :param inputs: parameters for forcing, diffusion, velocity, and boundary conditions
             (use defaults if None)
@@ -487,13 +493,29 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
             return residual[self.residual_name] - args['target']
         
         y0 = self._initial_field(args['inputs'])
-        solution = self.solver.root_find(
-            residual_fn,
-            y0,
-            args,
-            options=args["inputs"]["solver"].get("options"),
-            return_sol=return_sol,
-        )
+        if isinstance(self.solver, IterativeSolver):
+            solution = self.solver.root_find(
+                residual_fn,
+                y0,
+                args,
+                options=args["inputs"]["solver"].get("options"),
+                return_sol=return_sol,
+            )
+        else:
+            zero = jnp.zeros_like(target)
+            constant = residual_fn(zero, args)
+            operator = lx.FunctionLinearOperator(
+                lambda phi: residual_fn(phi, args) - constant,
+                jax.ShapeDtypeStruct(zero.shape, zero.dtype),
+            )
+            solution = self.solver.linear_solve(
+                operator,
+                -constant,
+                y0=y0,
+                options=args["inputs"]["solver"].get("options"),
+                state=args["inputs"]["solver"].get("state"),
+                return_sol=return_sol,
+            )
 
         ret = solution if return_sol else {self.field_name: solution} 
         return ret

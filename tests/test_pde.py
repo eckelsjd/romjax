@@ -1,8 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import diffrax
 import jax
 import jax.numpy as jnp
+import lineax as lx
 import numpy as np
 import pytest
 from pydantic import ValidationError
@@ -20,6 +22,7 @@ from romjax.pde import (
     ImplicitIterativeGalerkin,
     IterativeSolver,
     LatentSamplerFactory,
+    LinearSolver,
     RandomNewton,
     SumForcing,
     UniformGrid,
@@ -334,6 +337,76 @@ def test_implicit_affine_scalar_and_nonlinear_jacobian() -> None:
     values = jnp.asarray([0.0, 0.5, 1.0])
     assert jax.vmap(evaluate_scalar)(values).shape == (3, 1)
     assert jax.jit(evaluate_scalar)(jnp.asarray(0.2)).shape == (1,)
+
+
+def test_linear_solver_config_and_implicit_affine_initialization() -> None:
+    """Lineax solver configurations support YAML-friendly initial guesses."""
+    solver = LinearSolver.model_validate(
+        {
+            "solver": {"name": "lineax.GMRES", "kwargs": {"rtol": 1e-5, "atol": 1e-6}},
+            "initial": {"callable": "constant", "inputs_default": {"const": 0.25}},
+        }
+    )
+    assert isinstance(solver.solver, lx.GMRES)
+    assert solver.model_dump()["solver"]["name"] == "lineax.GMRES"
+
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(22), eps=1.0)
+    edge = ImplicitAffine(solver=solver)
+    inputs = {"value": jnp.asarray(0.3), "module": affine}
+    outputs = {"value": jnp.asarray(0.5)}
+    residuals = edge.evaluate(inputs, outputs)
+
+    assert jnp.allclose(edge.solve(inputs, residuals)["value"], outputs["value"], atol=1e-4)
+    assert jnp.allclose(
+        edge.solve({**inputs, "solver": {"initial": {"const": 0.75}}}, residuals)["value"],
+        outputs["value"],
+        atol=1e-4,
+    )
+
+
+def test_linear_solver_forwards_initial_guess_as_y0(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrapper forwards resolved initial fields through Lineax options."""
+    seen: dict[str, object] = {}
+
+    def linear_solve_spy(*args, **kwargs):
+        seen["options"] = kwargs["options"]
+        return SimpleNamespace(value=jnp.asarray([1.0]))
+
+    monkeypatch.setattr(lx, "linear_solve", linear_solve_spy)
+    solver = LinearSolver(solver={"name": "lineax.QR"}, options={"keep": 1})
+    result = solver.linear_solve(
+        lx.MatrixLinearOperator(jnp.eye(1)),
+        jnp.asarray([1.0]),
+        y0=jnp.asarray([0.25]),
+        options={"runtime": 2},
+    )
+
+    assert jnp.array_equal(result, jnp.asarray([1.0]))
+    assert seen["options"] == {"keep": 1, "runtime": 2, "y0": jnp.asarray([0.25])}
+
+
+def test_implicit_affine_solver_union_validates_plain_dictionaries() -> None:
+    """Pydantic selects the wrapper matching each third-party solver specification."""
+    linear = ImplicitAffine.model_validate({"solver": {"solver": {"name": "lineax.QR"}}})
+    iterative = ImplicitAffine.model_validate(
+        {"solver": {"solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1.0, "atol": 1e-4}}}}
+    )
+
+    assert isinstance(linear.solver, LinearSolver)
+    assert isinstance(iterative.solver, IterativeSolver)
+    with pytest.raises(ValidationError):
+        ImplicitAffine(solver=lx.QR())
+
+
+def test_implicit_affine_rejects_linear_solver_for_output_jacobian() -> None:
+    """Lineax solves are rejected when the affine matrix depends on outputs."""
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(23), jacobian_inputs="both", eps=1.0)
+    edge = ImplicitAffine(solver=LinearSolver(solver={"name": "lineax.QR"}))
+    inputs = {"value": jnp.asarray(0.3), "module": affine}
+    residuals = edge.evaluate(inputs, {"value": jnp.asarray(0.5)})
+
+    with pytest.raises(TypeError, match="Output-dependent"):
+        edge.solve(inputs, residuals)
 
 
 def test_random_newton_runtime_seed_and_relative_perturbations() -> None:

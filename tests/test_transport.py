@@ -14,6 +14,7 @@ from romjax.pde import (
     GaussianForcing,
     GridBoundaryInputs,
     IterativeSolver,
+    LinearSolver,
     SinusoidForcing,
     UniformGrid,
     homogeneous_boundary,
@@ -404,6 +405,41 @@ def test_laplace_solve() -> None:
     laplace = get_laplace_solver()
     out = laplace.solve()
     assert jnp.max(jnp.abs(out["phi"])) < 1e-4
+
+
+def test_transport_lineax_solve_uses_configured_and_runtime_initial_fields() -> None:
+    """Matrix-free Lineax transport solves accept the same initial-field payload as root finds."""
+    model = AdvectionDiffusion2D(
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(6, 6)),
+        solver={
+            "solver": {"name": "lineax.GMRES", "kwargs": {"rtol": 1e-5, "atol": 1e-6}},
+            "initial": {"callable": "constant", "inputs_default": {"const": 1.0}},
+        },
+    )
+    assert isinstance(model.solver, LinearSolver)
+
+    configured = model.solve({"forcing": {"const": 1.0}})
+    overridden = model.solve({"forcing": {"const": 1.0}, "solver": {"initial": {"const": 2.0}}})
+    target = jnp.full((6, 6), 0.25)
+    shifted = model.solve({"forcing": {"const": 1.0}}, {"phi_residual": target})
+
+    assert jnp.max(jnp.abs(model.evaluate({"forcing": {"const": 1.0}}, configured)["phi_residual"])) < 1e-4
+    assert jnp.max(jnp.abs(model.evaluate({"forcing": {"const": 1.0}}, overridden)["phi_residual"])) < 1e-4
+    assert jnp.allclose(model.evaluate({"forcing": {"const": 1.0}}, shifted)["phi_residual"], target, atol=1e-4)
+
+
+def test_transport_lineax_solve_jit_and_grad() -> None:
+    """The matrix-free linear transport path remains transform-compatible."""
+    model = AdvectionDiffusion2D(
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4)),
+        solver={"solver": {"name": "lineax.QR"}},
+    )
+
+    solve_sum = jax.jit(lambda amplitude: jnp.sum(model.solve({"forcing": {"const": amplitude}})["phi"]))
+    gradient = jax.grad(solve_sum)(jnp.asarray(0.5))
+
+    assert jnp.isfinite(solve_sum(jnp.asarray(0.5)))
+    assert jnp.isfinite(gradient)
 
 
 def test_laplace_solve_jit_and_grad() -> None:
