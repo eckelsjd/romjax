@@ -1,7 +1,7 @@
 """Finite-volume 2D advection-diffusion solver:  $nabla dot (phi v) - nabla dot (k nabla phi) = f(x,y)."""
 import functools
 from collections.abc import Mapping
-from typing import Annotated, Any, Callable, Literal, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,7 @@ from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, ImplicitSampleable
+from romjax.operators import UnaryOp
 from romjax.pde import (
     FORCING_REGISTRY,
     BoundarySpec,
@@ -67,84 +68,57 @@ class AdvectionDiffusionResiduals(TypedDict):
 
 
 class CubicForcing(ForcingCallable):
-    """State-dependent cubic forcing for reaction-diffusion problems."""
+    r"""Scaled polynomial forcing through cubic order.
 
-    normalize: bool = False
+    .. math::
+
+        F(x, y) = s\left[\operatorname{op}_\alpha(\alpha)
+            + \operatorname{op}_\beta(\beta)\phi
+            + \operatorname{op}_\gamma(\gamma)\phi^2
+            + \operatorname{op}_\delta(\delta)\phi^3\right].
+    """
+
+    alpha_op: UnaryOp | None = None
+    beta_op: UnaryOp | None = None
+    gamma_op: UnaryOp | None = None
+    delta_op: UnaryOp | None = None
 
     class Inputs(DictModel):
-        """Inputs for the cubic forcing function.
+        """Inputs for the scaled cubic forcing function.
 
-        :ivar q: constant or spatial volumetric source term
-        :ivar alpha: linear state coefficient
-        :ivar beta: quadratic state coefficient
-        :ivar gamma: cubic state coefficient
+        :ivar scale: global scale for all terms
+        :ivar alpha: constant coefficient
+        :ivar beta: linear state coefficient
+        :ivar gamma: quadratic state coefficient
+        :ivar delta: cubic state coefficient
         """
 
-        q: ArrayLike = 0.0
-        alpha: ArrayLike = -1.0
+        scale: ArrayLike = 1.0
+        alpha: ArrayLike = 1.0
         beta: ArrayLike = 0.0
-        gamma: ArrayLike = -1.0
+        gamma: ArrayLike = 0.0
+        delta: ArrayLike = 0.0
+
+    @field_validator("alpha_op", "beta_op", "gamma_op", "delta_op", mode="before")
+    @classmethod
+    def _validate_operator(cls, operator: Any) -> UnaryOp | None:
+        if operator is None or isinstance(operator, UnaryOp):
+            return operator
+        return UnaryOp(operator)
 
     def callable(self, inputs: Inputs, outputs: AdvectionDiffusionOutputs) -> ArrayLike:
-        r"""Evaluate a broadcastable cubic state-dependent forcing.
+        r"""Evaluate the scaled cubic polynomial forcing.
 
-        .. math::
-
-            f(\phi) = q + \alpha\phi + \beta\phi^2 + \gamma\phi^3.
-
-        :param inputs: volumetric and reaction coefficients
+        :param inputs: global scale and polynomial coefficients
         :param outputs: scalar potential containing ``phi``
-        :return: forcing field broadcastable to ``phi``; when ``normalize`` is true,
-            the ``q`` field is scaled to unit RMS before the reaction terms are added
+        :return: forcing field broadcastable to ``phi``
         """
         phi = jnp.asarray(outputs["phi"])
-        q = jnp.asarray(inputs["q"])
-        if self.normalize:
-            q_rms = jnp.sqrt(jnp.mean(jnp.square(q)))
-            q = jnp.where(q_rms > 0.0, q / q_rms, q)
-        return (
-            q
-            + jnp.asarray(inputs["alpha"]) * phi
-            + jnp.asarray(inputs["beta"]) * phi**2
-            + jnp.asarray(inputs["gamma"]) * phi**3
-        )
-
-
-class QuadraticDiffusion(ForcingCallable):
-
-    amplitude: Callable[[ArrayLike], ArrayLike] | Literal["exp"] | None = None
-
-    class Inputs(DictModel):
-        """Inputs for quadratic diffusion function.
-    
-        :ivar k0: the background diffusion field (2D)
-        :ivar alpha: the strength of the nonlinearity
-        """
-        k0: ArrayLike = 1.0
-        alpha: ArrayLike = 1.0
-    
-    @field_validator("amplitude", mode="before")
-    @classmethod
-    def _validate_amplitude(cls, amplitude):
-        if amplitude is None:
-            amplitude = lambda x: x
-        if amplitude == 'exp':
-            amplitude = jnp.exp
-        
-        return amplitude
-    
-    def callable(self, inputs: Inputs, outputs: AdvectionDiffusionOutputs) -> ArrayLike:
-        r"""Evaluate quadratic state-dependent diffusion.
-
-            $D(x,y) = amp(k_0) * (1 + \alpha \phi^2)$
-        
-        :param inputs: the input parameters
-        :param outputs: the scalar potential on the grid
-        :param amplitude: function to apply to k0 
-        :return: the diffusion field on the grid
-        """
-        phi = next(iter(outputs.values()))
-        return self.amplitude(inputs['k0']) * (1 + inputs['alpha'] * (phi * phi))
+        alpha = inputs["alpha"] if self.alpha_op is None else self.alpha_op(inputs["alpha"])
+        beta = inputs["beta"] if self.beta_op is None else self.beta_op(inputs["beta"])
+        gamma = inputs["gamma"] if self.gamma_op is None else self.gamma_op(inputs["gamma"])
+        delta = inputs["delta"] if self.delta_op is None else self.delta_op(inputs["delta"])
+        return inputs["scale"] * (alpha + beta * phi + gamma * phi**2 + delta * phi**3)
 
 
 class ConstantCoordinateVelocity(ForcingCallable):
@@ -174,7 +148,6 @@ class ConstantCoordinateVelocity(ForcingCallable):
 _forcing_registry = {
     **FORCING_REGISTRY,
     "cubic": CubicForcing,
-    "quadratic": QuadraticDiffusion,
     "const_coord": ConstantCoordinateVelocity,
 }
 
