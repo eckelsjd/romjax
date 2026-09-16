@@ -20,7 +20,7 @@ from romjax.pde import (
 )
 from romjax.plotting import gridplot
 from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
-from romjax.transport import AdvectionDiffusion2D, CubicForcing, PotentialVelocity, QuadraticDiffusion
+from romjax.transport import AdvectionDiffusion2D, CubicForcing, PotentialVelocity
 from romjax.typing import DictModel
 
 
@@ -55,52 +55,53 @@ def test_cubic_forcing_jit_and_grad() -> None:
     def evaluate(gamma: jax.Array) -> jax.Array:
         return jnp.sum(
             forcing(
-                {"q": jnp.array([[1.0, 2.0], [3.0, 4.0]]), "alpha": -1.0, "beta": 0.5, "gamma": gamma},
+                {"alpha": 1.0, "beta": -1.0, "gamma": 0.5, "delta": gamma},
                 {"phi": phi},
             )
         )
 
     value = jax.jit(evaluate)(-10.0)
     gradient = jax.grad(evaluate)(-10.0)
-    expected = jnp.sum(jnp.array([[1.0, 2.0], [3.0, 4.0]]) - phi + 0.5 * phi**2 - 10.0 * phi**3)
+    expected = jnp.sum(1.0 - phi + 0.5 * phi**2 - 10.0 * phi**3)
 
     assert jnp.allclose(value, expected)
     assert jnp.allclose(gradient, jnp.sum(phi**3))
 
 
-def test_cubic_forcing_normalizes_q_rms() -> None:
-    """Optional cubic normalization scales only the constant q field to unit RMS."""
-    q = jnp.array([[1.0, 2.0], [3.0, 4.0]])
-    forcing = CubicForcing(normalize=True)
-    normalized = forcing(
-        {"q": q, "alpha": 0.0, "beta": 0.0, "gamma": 0.0},
-        {"phi": jnp.zeros_like(q)},
-    )
-
-    assert jnp.allclose(jnp.sqrt(jnp.mean(normalized**2)), 1.0)
-
-
-def test_quadratic_diffusion_jit_vmap_and_grad() -> None:
+def test_cubic_forcing_jit_vmap_and_grad() -> None:
     phis = jnp.array([[0.0, 1.0, 2.0], [0.5, 1.5, 2.5]])
-    diffusion = QuadraticDiffusion()
+    forcing = CubicForcing()
 
     def k_fn(phi: jnp.ndarray) -> jnp.ndarray:
-        inputs = {"k0": 2.0, "alpha": 0.5}
-        return diffusion(inputs, {"phi": phi})
+        inputs = {"alpha": 2.0, "beta": 0.0, "gamma": 0.5, "delta": 0.0}
+        return forcing(inputs, {"phi": phi})
 
     vmap_out = jax.vmap(k_fn)(phis)
     jit_out = jax.jit(k_fn)(phis[0])
 
     def g(alpha: jnp.ndarray) -> jnp.ndarray:
-        inputs = {"k0": 2.0, "alpha": alpha}
-        return jnp.sum(diffusion(inputs, {"phi": phis[0]}))
+        inputs = {"alpha": 2.0, "beta": 0.0, "gamma": 0.0, "delta": alpha}
+        return jnp.sum(forcing(inputs, {"phi": phis[0]}))
 
     grad = jax.grad(g)(0.5)
 
     assert vmap_out.shape == phis.shape
     assert jnp.isfinite(vmap_out).all()
-    assert jnp.allclose(jnp.array([2, 3, 6]), jit_out)
-    assert jnp.allclose(jnp.array([10]), grad)
+    assert jnp.allclose(jnp.array([2, 2.5, 4]), jit_out)
+    assert jnp.allclose(jnp.array([9]), grad)
+
+
+def test_cubic_forcing_supports_separate_coefficient_operators_and_scale() -> None:
+    phi = jnp.array([[1.0, 2.0]])
+    forcing = CubicForcing(alpha_op="square", beta_op="exp", gamma_op="abs", delta_op="square")
+
+    result = forcing(
+        {"alpha": 2.0, "beta": 0.0, "gamma": -3.0, "delta": -2.0, "scale": 0.5},
+        {"phi": phi},
+    )
+    expected = 0.5 * (4.0 + jnp.exp(0.0) * phi + 3.0 * phi**2 + 4.0 * phi**3)
+
+    assert jnp.allclose(result, expected)
 
 
 def test_potential_velocity_is_jit_grad_compatible() -> None:
@@ -192,7 +193,7 @@ def test_transport_coercion() -> None:
     model = AdvectionDiffusion2D(
         grid={"shape": (2, 4), "bounds": [[0, 1], [1, 2]]},
         forcing={"callable": "gaussian", "inputs_default": {"A0": 0.0}},
-        diffusion={"callable": "quadratic", "inputs_default": {"alpha": 0.25}},
+        diffusion={"callable": "cubic", "inputs_default": {"alpha": 0.25}},
         boundary={
             "callable": "identity",
             "inputs_default": {
@@ -204,12 +205,12 @@ def test_transport_coercion() -> None:
     assert isinstance(model.solver, IterativeSolver)
     assert np.allclose(model.grid.spacing, (0.5, 0.25))
     assert isinstance(model.forcing, GaussianForcing)
-    assert isinstance(model.diffusion, QuadraticDiffusion)
+    assert isinstance(model.diffusion, CubicForcing)
     assert isinstance(model.forcing.inputs_default, DictModel)
     assert isinstance(model.diffusion.inputs_default, DictModel)
     assert model.boundary.inputs_default.boundary[0][1]["literally"] == "whatever"
     assert model.forcing.inputs_default["sigma"] == 1.0
-    assert model.diffusion.inputs_default["k0"] == 1.0
+    assert model.diffusion.inputs_default["alpha"] == 0.25
 
 
 def test_transport_initial_field_callable_and_runtime_override() -> None:
@@ -268,7 +269,7 @@ def test_transport_evaluate_and_autodiff() -> None:
     phi_exact = jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)
     manufactured = AdvectionDiffusion2D(grid=model.grid, solver=model.solver, forcing="sinusoid")
     inputs_exact = {
-        "diffusion": {"k0": 1.0, "alpha": 0.0},
+        "diffusion": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0},
         "boundary": homogeneous_boundary(ndim=2),
     }
     residual = manufactured.evaluate(inputs_exact, {"phi": phi_exact})["phi_residual"]
@@ -281,7 +282,7 @@ def test_transport_evaluate_and_autodiff() -> None:
             "mu_x": 0.5,
             "mu_y": 0.5,
         },
-        "diffusion": {"k0": 1.0, "alpha": 0.0},
+        "diffusion": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0},
         "boundary": homogeneous_boundary(ndim=2),
     }
     phi0 = jnp.ones_like(x)
@@ -481,9 +482,9 @@ def test_transport_sample_inputs() -> None:
     assert np.isclose(sample["forcing"]["mu_x"], sample_again["forcing"]["mu_x"])
     assert np.isclose(sample["forcing"]["A0"], sample_again["forcing"]["A0"])
     assert "diffusion" in sample
-    assert "k0" in sample["diffusion"]
-    assert sample["diffusion"]["k0"].shape == (8, 8)
-    assert np.allclose(np.asarray(sample["diffusion"]["k0"]), np.asarray(sample_again["diffusion"]["k0"]))
+    assert "alpha" in sample["diffusion"]
+    assert sample["diffusion"]["alpha"].shape == (8, 8)
+    assert np.allclose(np.asarray(sample["diffusion"]["alpha"]), np.asarray(sample_again["diffusion"]["alpha"]))
 
 
 def test_transport_outputs_sampler_validation_and_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
