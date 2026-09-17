@@ -528,9 +528,12 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
 
     def sample_conditions(self, key: Key) -> PyTree | None:
         """Produce one optional output-condition sample for the given key."""
-        if self.conditions_sampler is not None:
-            return self.conditions_sampler(key)
-        return None
+        sampler = self.resolve_conditions_sampler()
+
+        if sampler is None:
+            return None
+        
+        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
     
     def sample_outputs(
         self, 
@@ -566,3 +569,23 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
     
     def resolve_dof(self) -> int:
         return self.grid.coords[0].shape[0] * self.grid.coords[0].shape[1]  # Nx x Ny
+
+    def resolve_conditions_sampler(self) -> SamplerCallable | None:
+        """Hook runtime resolution to the conditions sampler."""
+        # I hate this, but here we are
+        if self.conditions_sampler is not None:
+            if hasattr(self.conditions_sampler, "resolve_conditions_sampler"):
+                # Allows deferred loading of compression artifacts outside of jit areas
+                self.conditions_sampler.resolve_conditions_sampler()
+            return self.conditions_sampler
+        return None
+
+    def resolve_outputs_sampler(self) -> SamplerCallable | None:
+        """Hook runtime resolution to the outputs sampler."""
+        # Also this
+        if self.outputs_sampler is not None:
+            if hasattr(self.outputs_sampler, "resolve_outputs_sampler"):
+                self.outputs_sampler.resolve_outputs_sampler()
+            return self.outputs_sampler
+        return None
+

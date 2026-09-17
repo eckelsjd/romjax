@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import equinox as eqx
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +18,103 @@ from romjax.nn import LinearProjection
 from romjax.tree import ShapeDtypePyTree, is_shape_dtype
 
 __all__ = ["Compression"]
+
+_ARTIFACT_VERSION = 1
+_CLASS_ATTR = "compression_class"
+_KIND_ATTR = "romjax_kind"
+_VALUE_ATTR = "value"
+_TEMPLATE_KIND = "shape_dtype"
+
+
+def _decode_h5_attr(value: Any) -> Any:
+    """Convert HDF5 scalar attributes to their Python representation."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _write_tree_node(parent: h5py.Group, name: str, value: Any) -> None:
+    """Write one typed PyTree node without relying on pickle serialization."""
+    if is_shape_dtype(value):
+        node = parent.create_dataset(name, data=np.zeros(value.shape, dtype=value.dtype))
+        node.attrs[_KIND_ATTR] = _TEMPLATE_KIND
+        return
+    if isinstance(value, (jax.Array, np.ndarray)):
+        node = parent.create_dataset(name, data=np.asarray(value))
+        node.attrs[_KIND_ATTR] = "array"
+        return
+
+    node = parent.create_group(name, track_order=True)
+    if value is None:
+        node.attrs[_KIND_ATTR] = "none"
+    elif isinstance(value, Mapping):
+        node.attrs[_KIND_ATTR] = "mapping"
+        for index, (key, item) in enumerate(value.items()):
+            entry = node.create_group(str(index), track_order=True)
+            _write_tree_node(entry, "key", key)
+            _write_tree_node(entry, "value", item)
+    elif isinstance(value, list):
+        node.attrs[_KIND_ATTR] = "list"
+        for index, item in enumerate(value):
+            _write_tree_node(node, str(index), item)
+    elif isinstance(value, tuple):
+        node.attrs[_KIND_ATTR] = "tuple"
+        for index, item in enumerate(value):
+            _write_tree_node(node, str(index), item)
+    elif isinstance(value, str):
+        node.attrs[_KIND_ATTR] = "str"
+        node.attrs[_VALUE_ATTR] = value
+    elif isinstance(value, bool):
+        node.attrs[_KIND_ATTR] = "bool"
+        node.attrs[_VALUE_ATTR] = value
+    elif isinstance(value, int):
+        node.attrs[_KIND_ATTR] = "int"
+        node.attrs[_VALUE_ATTR] = value
+    elif isinstance(value, float):
+        node.attrs[_KIND_ATTR] = "float"
+        node.attrs[_VALUE_ATTR] = value
+    elif isinstance(value, np.generic):
+        node.attrs[_KIND_ATTR] = "numpy_scalar"
+        node.attrs["dtype"] = value.dtype.str
+        node.attrs[_VALUE_ATTR] = value
+    else:
+        raise TypeError(f"Unsupported compression artifact value: {type(value).__name__}.")
+
+
+def _read_tree_node(node: h5py.Group | h5py.Dataset) -> Any:
+    """Read one typed PyTree node written by :func:`_write_tree_node`."""
+    kind = _decode_h5_attr(node.attrs.get(_KIND_ATTR))
+    if isinstance(node, h5py.Dataset):
+        if kind == _TEMPLATE_KIND:
+            return jax.ShapeDtypeStruct(node.shape, node.dtype)
+        if kind == "array":
+            return node[()]
+        raise ValueError(f"Unsupported compression dataset kind: {kind!r}.")
+
+    if kind == "none":
+        return None
+    if kind == "mapping":
+        return {
+            _read_tree_node(node[str(index)]["key"]): _read_tree_node(node[str(index)]["value"])
+            for index in range(len(node))
+        }
+    if kind == "list":
+        return [_read_tree_node(node[str(index)]) for index in range(len(node))]
+    if kind == "tuple":
+        return tuple(_read_tree_node(node[str(index)]) for index in range(len(node)))
+    if kind == "str":
+        return str(_decode_h5_attr(node.attrs[_VALUE_ATTR]))
+    if kind == "bool":
+        return bool(_decode_h5_attr(node.attrs[_VALUE_ATTR]))
+    if kind == "int":
+        return int(_decode_h5_attr(node.attrs[_VALUE_ATTR]))
+    if kind == "float":
+        return float(_decode_h5_attr(node.attrs[_VALUE_ATTR]))
+    if kind == "numpy_scalar":
+        return np.asarray(_decode_h5_attr(node.attrs[_VALUE_ATTR]), dtype=node.attrs["dtype"])[()]
+    raise ValueError(f"Unsupported compression group kind: {kind!r}.")
 
 
 class Compression(BaseModel, ABC):
@@ -113,23 +211,30 @@ class Compression(BaseModel, ABC):
         return resolved
 
     @classmethod
-    def load(cls, path: Path) -> "Compression":
-        """Load a persisted compression artifact."""
+    def load(cls, path: str | Path) -> "Compression":
+        """Load a persisted HDF5 compression artifact.
+
+        :param path: artifact file or directory containing ``compression.h5``.
+        :return: restored concrete compression instance.
+        """
         artifact_path = Path(path)
         if artifact_path.is_dir():
-            artifact_path = artifact_path / "compression.npz"
-        if artifact_path.suffix != ".npz":
+            artifact_path = artifact_path / "compression.h5"
+        if artifact_path.suffix != ".h5":
             raise ValueError(f"Unsupported compression artifact path: {artifact_path}")
 
-        with np.load(artifact_path, allow_pickle=True) as data:
-            payload = {key: data[key] for key in data.files}
+        with h5py.File(artifact_path, "r") as artifact:
+            if artifact.attrs.get("romjax_type") != "compression":
+                raise ValueError(f"Unsupported compression artifact: {artifact_path}")
+            if int(artifact.attrs.get("version", -1)) != _ARTIFACT_VERSION:
+                raise ValueError(f"Unsupported compression artifact version: {artifact_path}")
+            if "payload" not in artifact:
+                raise ValueError(f"Compression artifact {artifact_path} is missing its payload.")
+            class_spec = _decode_h5_attr(artifact.attrs.get(_CLASS_ATTR))
+            payload = _read_tree_node(artifact["payload"])
 
-        class_spec = payload.pop("__compression_class__", None)
-        if isinstance(class_spec, np.ndarray) and class_spec.shape == ():
-            class_spec = class_spec.item()
-        for key, value in list(payload.items()):
-            if isinstance(value, np.ndarray) and value.shape == ():
-                payload[key] = value.item()
+        if not isinstance(payload, dict):
+            raise ValueError(f"Compression artifact {artifact_path} payload must be a mapping.")
 
         target_cls: type[Compression]
         if cls is Compression:
@@ -147,25 +252,28 @@ class Compression(BaseModel, ABC):
 
         return target_cls.model_validate(payload)
 
-    def dump(self, path: Path) -> Path:
-        """Persist the compressor artifact."""
+    def dump(self, path: str | Path) -> Path:
+        """Persist the compressor as an HDF5 artifact.
+
+        :param path: target ``.h5`` artifact or directory.
+        :return: saved artifact path.
+        """
         artifact_path = Path(path)
         if artifact_path.is_dir() or artifact_path.suffix == "":
             artifact_path.mkdir(parents=True, exist_ok=True)
-            artifact_path = artifact_path / "compression.npz"
+            artifact_path = artifact_path / "compression.h5"
         else:
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        if artifact_path.suffix != ".h5":
+            raise ValueError(f"Unsupported compression artifact path: {artifact_path}")
 
         payload = self.model_dump()
-        payload["__compression_class__"] = self._class_spec(type(self))
-        arrays: dict[str, np.ndarray] = {}
-        for key, value in payload.items():
-            if value is None:
-                continue
-            arrays[key] = np.asarray(value)
-        save_path = artifact_path if artifact_path.suffix == ".npz" else artifact_path.with_suffix(".npz")
-        np.savez_compressed(save_path, **arrays)
-        return save_path
+        with h5py.File(artifact_path, "w", track_order=True) as artifact:
+            artifact.attrs["romjax_type"] = "compression"
+            artifact.attrs["version"] = _ARTIFACT_VERSION
+            artifact.attrs[_CLASS_ATTR] = self._class_spec(type(self))
+            _write_tree_node(artifact, "payload", payload)
+        return artifact_path
 
 
 class SVD(Compression):

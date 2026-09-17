@@ -39,8 +39,8 @@ from romjax.tree import (
     TreePath,
     coerce_tree_paths,
     get_subtree,
-    pytree_merge,
     pytree_iter,
+    pytree_merge,
     pytree_path_iter,
     pytree_stack,
     set_subtree,
@@ -501,6 +501,8 @@ class GenImplicitModel(GenGraph):
                 model.resolve_inputs_sampler()  # may need to load from a compression
             if hasattr(model, "resolve_outputs_sampler"):
                 model.resolve_outputs_sampler()
+            if hasattr(model, "resolve_conditions_sampler"):
+                model.resolve_conditions_sampler()
 
             sample_inputs = eqx.filter_jit(model.sample_inputs)
             solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") and not self.skip_solve else None
@@ -790,6 +792,8 @@ class GenImplicitModel(GenGraph):
                 model.resolve_inputs_sampler()  # may need to load from a compression
             if hasattr(model, "resolve_outputs_sampler"):
                 model.resolve_outputs_sampler()
+            if hasattr(model, "resolve_conditions_sampler"):
+                model.resolve_conditions_sampler()
 
             sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
             solve = (
@@ -1733,7 +1737,7 @@ class GenLatent(GenDataConfig):
     """Fit a latent-space compressor and emit the compression artifact."""
 
     loader: DataLoader
-    filename: str | Path = "compression.npz"
+    filename: str | Path = "compression.h5"
     gather_paths: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
     gather_template: Any | None = None
     norm: Any | None = None
@@ -1904,7 +1908,7 @@ def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
     if isinstance(template, Mapping):
         latent_fields = {"compression", "gather_paths", "gather_template"}
         filename = template.get("filename")
-        latent_filename = isinstance(filename, str | Path) and Path(filename).suffix == ".npz"
+        latent_filename = isinstance(filename, str | Path) and Path(filename).suffix == ".h5"
         if (any(field in template for field in latent_fields) or latent_filename) and all(
             field in template for field in required_fields(GenLatent)
         ):

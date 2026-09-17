@@ -893,12 +893,12 @@ def test_generate_galerkin_compression_from_transport_data(tmp_path: Path) -> No
             }
         },
     )
-    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
+    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.h5"
     generator = GenLatent(
         loader=loader,
         gather_paths=[("transport", "outputs", "phi")],
         compression=_DummyCompression(scale=2.0, rank=1),
-        filename="galerkin_compression.npz",
+        filename="galerkin_compression.h5",
     )
 
     generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
@@ -1025,12 +1025,12 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
             }
         },
     )
-    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.npz"
+    artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.h5"
     generator = GenLatent(
         loader=loader,
         gather_paths=[("transport", "outputs", "phi"), ("transport", "outputs", "psi")],
         compression=SVD(rank=1, center=False),
-        filename="galerkin_compression.npz",
+        filename="galerkin_compression.h5",
     )
 
     generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
@@ -1050,13 +1050,13 @@ def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> 
         root=tmp_path,
         datasets={"train": {"toy": {"kind": "implicit", "batch_size": 1, "load_solution": False, "max_epochs": 1}}},
     )
-    artifact_path = tmp_path / "train" / "compression" / "normalized_compression.npz"
+    artifact_path = tmp_path / "train" / "compression" / "normalized_compression.h5"
     generator = GenLatent(
         loader=loader,
         gather_paths=[("toy", "outputs", "y")],
         norm=NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 2.0}}}),
         compression=_DummyCompression(),
-        filename="normalized_compression.npz",
+        filename="normalized_compression.h5",
     )
 
     generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
@@ -1086,7 +1086,7 @@ def test_generate_latent_uses_dataset_specific_norms(tmp_path: Path) -> None:
         compression=_DummyCompression(),
     )
 
-    samples = list(generator._iter_samples(progress=False))
+    samples = list(generator._iter_samples())
 
     assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
     assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([0.0]))
@@ -1110,7 +1110,7 @@ def test_generate_latent_reuses_single_norm_for_all_datasets(tmp_path: Path) -> 
         compression=_DummyCompression(),
     )
 
-    samples = list(generator._iter_samples(progress=False))
+    samples = list(generator._iter_samples())
 
     assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
     assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([-1.0]))
@@ -1139,7 +1139,7 @@ def test_data_generation_config_keeps_normalized_genlatent_as_latent(tmp_path: P
                     "gather_paths": [("toy", "outputs", "y")],
                     "norm": {"toy": {"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 2.0}}}},
                     "compression": _DummyCompression(),
-                    "filename": "normalized_compression.npz",
+                    "filename": "normalized_compression.h5",
                 }
             }
         },
@@ -1149,8 +1149,8 @@ def test_data_generation_config_keeps_normalized_genlatent_as_latent(tmp_path: P
     assert isinstance(generation.datasets["artifacts"]["compression"], GenLatent)
     generation.run()
 
-    expected_artifact = tmp_path / "artifacts" / "compression" / "normalized_compression.npz"
-    unexpected_artifact = tmp_path / "artifacts" / "compression" / "toy_normalized_compression.npz"
+    expected_artifact = tmp_path / "artifacts" / "compression" / "normalized_compression.h5"
+    unexpected_artifact = tmp_path / "artifacts" / "compression" / "toy_normalized_compression.h5"
     assert expected_artifact.exists()
     assert not unexpected_artifact.exists()
 
