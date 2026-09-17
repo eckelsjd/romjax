@@ -244,7 +244,7 @@ def test_implicit_iterative_galerkin_matches_direct_implicit_solve() -> None:
 
 
 def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Path) -> None:
-    artifact_path = tmp_path / "dataset" / "train" / "galerkin_compression.npz"
+    artifact_path = tmp_path / "dataset" / "train" / "galerkin_compression.h5"
     compression = SVD(
         energy_tol=0.9,
         center=False,
@@ -286,8 +286,8 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
         latent_mean=np.zeros(2),
         latent_std=np.ones(2),
     )
-    inputs_path = tmp_path / "inputs.npz"
-    outputs_path = tmp_path / "outputs.npz"
+    inputs_path = tmp_path / "inputs.h5"
+    outputs_path = tmp_path / "outputs.h5"
     compression.dump(inputs_path)
     compression.dump(outputs_path)
     affine = Affine(inputs_rank=2, outputs_rank=2, key=jax.random.key(2), eps=1.0)
