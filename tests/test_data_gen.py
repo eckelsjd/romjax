@@ -896,7 +896,7 @@ def test_generate_galerkin_compression_from_transport_data(tmp_path: Path) -> No
     artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.h5"
     generator = GenLatent(
         loader=loader,
-        gather_paths=[("transport", "outputs", "phi")],
+        gather_paths=[("outputs", "phi")],
         compression=_DummyCompression(scale=2.0, rank=1),
         filename="galerkin_compression.h5",
     )
@@ -1028,7 +1028,7 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
     artifact_path = tmp_path / "train" / "compression" / "galerkin_compression.h5"
     generator = GenLatent(
         loader=loader,
-        gather_paths=[("transport", "outputs", "phi"), ("transport", "outputs", "psi")],
+        gather_paths=[("outputs", "phi"), ("outputs", "psi")],
         compression=SVD(rank=1, center=False),
         filename="galerkin_compression.h5",
     )
@@ -1040,8 +1040,8 @@ def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -
     assert compression.latent_size() == 1
     assert compression.template is not None
     reconstructed = compression.reconstruct(compression.compress(compression.template))
-    assert reconstructed["transport"]["outputs"]["phi"].shape == (2,)
-    assert reconstructed["transport"]["outputs"]["psi"].shape == (2,)
+    assert reconstructed["outputs"]["phi"].shape == (2,)
+    assert reconstructed["outputs"]["psi"].shape == (2,)
 
 
 def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> None:
@@ -1053,7 +1053,7 @@ def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> 
     artifact_path = tmp_path / "train" / "compression" / "normalized_compression.h5"
     generator = GenLatent(
         loader=loader,
-        gather_paths=[("toy", "outputs", "y")],
+        gather_paths=[("outputs", "y")],
         norm=NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 2.0}}}),
         compression=_DummyCompression(),
         filename="normalized_compression.h5",
@@ -1062,7 +1062,7 @@ def test_generate_latent_applies_norm_before_compression_fit(tmp_path: Path) -> 
     generator.generate(tmp_path / "train" / "compression", format="h5", write_policy="overwrite")
     compression = Compression.load(artifact_path)
 
-    assert jnp.allclose(compression.template["toy"]["outputs"]["y"], jnp.asarray([-0.5]))
+    assert jnp.allclose(compression.template["outputs"]["y"], jnp.asarray([-0.5]))
 
 
 def test_generate_latent_uses_dataset_specific_norms(tmp_path: Path) -> None:
@@ -1079,6 +1079,7 @@ def test_generate_latent_uses_dataset_specific_norms(tmp_path: Path) -> None:
     )
     generator = GenLatent(
         loader=loader,
+        dataset="toy",
         norm={
             "toy": NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 1.0}}}),
             "alt": NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 0.0, "std": 1.0}}}),
@@ -1088,8 +1089,8 @@ def test_generate_latent_uses_dataset_specific_norms(tmp_path: Path) -> None:
 
     samples = list(generator._iter_samples())
 
-    assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
-    assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([0.0]))
+    assert len(samples) == 1
+    assert jnp.allclose(samples[0]["outputs"]["y"], jnp.asarray([-1.0]))
 
 
 def test_generate_latent_reuses_single_norm_for_all_datasets(tmp_path: Path) -> None:
@@ -1106,14 +1107,15 @@ def test_generate_latent_reuses_single_norm_for_all_datasets(tmp_path: Path) -> 
     )
     generator = GenLatent(
         loader=loader,
+        dataset="toy",
         norm=NormTree(root={"outputs": {"y": {"callable": "zscore", "mean": 1.0, "std": 1.0}}}),
         compression=_DummyCompression(),
     )
 
     samples = list(generator._iter_samples())
 
-    assert jnp.allclose(samples[0]["toy"]["outputs"]["y"], jnp.asarray([-1.0]))
-    assert jnp.allclose(samples[1]["alt"]["outputs"]["y"], jnp.asarray([-1.0]))
+    assert len(samples) == 1
+    assert jnp.allclose(samples[0]["outputs"]["y"], jnp.asarray([-1.0]))
 
 
 def test_data_generation_config_keeps_normalized_genlatent_as_latent(tmp_path: Path) -> None:

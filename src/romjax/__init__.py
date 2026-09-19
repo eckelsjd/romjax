@@ -68,6 +68,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "random": ("romjax.rng", None),
     "tree": ("romjax.tree", None),
     "Compression": ("romjax.compression", "Compression"),
+    "SVD": ("romjax.compression", "SVD"),
+    "SplitLinearCompression": ("romjax.compression", "SplitLinearCompression"),
     "IdentityEdge": ("romjax.graph", "IdentityEdge"),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
@@ -92,6 +94,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "PyTreeSampler": ("romjax.rng", "PyTreeSampler"),
     "NearSolutionSampler": ("romjax.rng", "NearSolutionSampler"),
     "SolverSampler": ("romjax.rng", "SolverSampler"),
+    "CompressionSampler": ("romjax.rng", "CompressionSampler"),
     "TreeRef": ("romjax.tree", "TreeRef"),
     "UnaryOp": ("romjax.operators", "UnaryOp"),
     "BinaryOp": ("romjax.operators", "BinaryOp"),
@@ -128,7 +131,7 @@ __all__ = list(_LAZY_EXPORTS.keys())
 if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
-    from .compression import Compression
+    from .compression import Compression, SVD, SplitLinearCompression
     from .compare import CompareMetric, CompareOrbax
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph, IdentityEdge
@@ -148,7 +151,7 @@ if TYPE_CHECKING:
     from .plotting import gridplot
     from .transport import AdvectionDiffusion2D
     from .vlasov import Vlasov1D1V
-    from .rng import NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys
+    from .rng import CompressionSampler, NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
     from .operators import BinaryOp, UnaryOp
     from .train import BatchLoader, OrbaxRef, Train, resolve_orbax_params

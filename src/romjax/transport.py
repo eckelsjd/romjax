@@ -11,7 +11,7 @@ from jaxtyping import ArrayLike, Key, PyTree
 from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 
 from romjax.graph import Node
-from romjax.model import ImplicitModel, ImplicitSampleable
+from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.operators import UnaryOp
 from romjax.pde import (
     FORCING_REGISTRY,
@@ -243,7 +243,7 @@ type AdvectionDiffusionForcing = Annotated[
 ]
 
 
-class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
+class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
     model_config = ConfigDict(extra='forbid')
 
     grid: UniformGrid  # Required
@@ -272,6 +272,7 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
     inputs_sampler: SamplerCallable | None = None
     conditions_sampler: SamplerCallable | None = None
     outputs_sampler: SamplerCallable | None = None
+    source_sampler: SamplerCallable | None = None
 
     @field_validator("grid", mode="after")
     @classmethod
@@ -528,8 +529,7 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
 
     def sample_conditions(self, key: Key) -> PyTree | None:
         """Produce one optional output-condition sample for the given key."""
-        sampler = self.resolve_conditions_sampler()
-
+        sampler = self.conditions_sampler
         if sampler is None:
             return None
         
@@ -564,28 +564,17 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable):
             sampler_kwargs["solve"] = self.solve
         sample = self.outputs_sampler(key, **sampler_kwargs)
         if isinstance(sample, Mapping):
+            if len(sample) == 1 and "outputs" in sample:
+                sample = sample["outputs"]
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}
+
+    def sample_source(self, key: Key) -> PyTree:
+        """Produce one configured source sample."""
+        if self.source_sampler is None:
+            raise ValueError("AdvectionDiffusion2D source sampler is not configured.")
+        return self.source_sampler.sample(key) if hasattr(self.source_sampler, "sample") else self.source_sampler(key)
     
     def resolve_dof(self) -> int:
         return self.grid.coords[0].shape[0] * self.grid.coords[0].shape[1]  # Nx x Ny
-
-    def resolve_conditions_sampler(self) -> SamplerCallable | None:
-        """Hook runtime resolution to the conditions sampler."""
-        # I hate this, but here we are
-        if self.conditions_sampler is not None:
-            if hasattr(self.conditions_sampler, "resolve_conditions_sampler"):
-                # Allows deferred loading of compression artifacts outside of jit areas
-                self.conditions_sampler.resolve_conditions_sampler()
-            return self.conditions_sampler
-        return None
-
-    def resolve_outputs_sampler(self) -> SamplerCallable | None:
-        """Hook runtime resolution to the outputs sampler."""
-        # Also this
-        if self.outputs_sampler is not None:
-            if hasattr(self.outputs_sampler, "resolve_outputs_sampler"):
-                self.outputs_sampler.resolve_outputs_sampler()
-            return self.outputs_sampler
-        return None
 

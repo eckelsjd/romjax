@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from romjax.compression import SVD
+from romjax.compression import SVD, SplitLinearCompression
+from romjax.data_gen import GenSource
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
-from romjax.nn import Affine
+from romjax.nn import Affine, SplitLinearProjection
 from romjax.pde import (
     FORCING_REGISTRY,
     AliveProgressMeter,
@@ -21,15 +22,15 @@ from romjax.pde import (
     ImplicitAffine,
     ImplicitIterativeGalerkin,
     IterativeSolver,
-    LatentSamplerFactory,
     LinearSolver,
     RandomNewton,
     SumForcing,
     UniformGrid,
     homogeneous_boundary,
 )
-from romjax.rng import Distribution
+from romjax.rng import CompressionSampler, Distribution
 from romjax.tree import pytree_merge
+from romjax.utils import load_h5
 
 
 def test_sum_forcing_delegates_to_independently_configured_forcings() -> None:
@@ -261,16 +262,15 @@ def test_implicit_iterative_galerkin_defers_source_sampler_loading(tmp_path: Pat
         target="b",
         name="galerkin",
         path=["ab"],
-        compression=artifact_path,
-        source_sampler=LatentSamplerFactory(distribution="uniform"),
+        rank=2,
+        source_sampler=CompressionSampler(compression=artifact_path, distribution="uniform"),
     )
 
     assert edge.resolve_rank() == 2
-    edge.resolve_source_sampler()
     sample = edge.sample_source(jax.random.key(0))
-    assert sample["outputs"].shape == (2,)
-    assert jnp.all(sample["outputs"] >= jnp.asarray([-1.0, -2.0]))
-    assert jnp.all(sample["outputs"] <= jnp.asarray([1.0, 2.0]))
+    assert sample.shape == (2,)
+    assert jnp.all(sample >= jnp.asarray([-1.0, -2.0]))
+    assert jnp.all(sample <= jnp.asarray([1.0, 2.0]))
 
 
 def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
@@ -291,15 +291,21 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
     compression.dump(inputs_path)
     compression.dump(outputs_path)
     affine = Affine(inputs_rank=2, outputs_rank=2, key=jax.random.key(2), eps=1.0)
-    edge = ImplicitAffine(inputs_compression=inputs_path, outputs_compression=outputs_path)
+    latent_template = {"value": jax.ShapeDtypeStruct((2,), jnp.float32)}
+    edge = ImplicitAffine(
+        inputs_size=2,
+        outputs_size=2,
+        inputs_sampler=CompressionSampler(compression=inputs_path, template=latent_template),
+        outputs_sampler=CompressionSampler(compression=outputs_path, template=latent_template),
+    )
     inputs = jnp.asarray([0.3, -0.4])
     outputs = jnp.asarray([0.5, -0.2])
     runtime_inputs = {"value": inputs, "module": affine}
     output_payload = {"value": outputs}
     residuals = edge.evaluate(runtime_inputs, output_payload)
 
-    assert edge.resolve_inputs_rank() == 2
-    assert edge.resolve_outputs_rank() == 2
+    assert edge.resolve_inputs_size() == 2
+    assert edge.resolve_outputs_size() == 2
     assert jnp.allclose(edge.solve(runtime_inputs, residuals)["value"], outputs)
     assert jnp.allclose(
         edge.forward({"inputs": runtime_inputs, "outputs": output_payload})["residuals"]["value"],
@@ -309,9 +315,44 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
     assert edge.sample_outputs(jax.random.key(1))["value"].shape == (2,)
 
 
+def test_split_linear_compression_generates_implicit_source_dataset(tmp_path: Path) -> None:
+    template = {
+        "inputs": {"value": jax.ShapeDtypeStruct((1,), jnp.float32)},
+        "outputs": {"value": jax.ShapeDtypeStruct((1,), jnp.float32)},
+    }
+    projection = SplitLinearProjection(
+        encoder_b=jnp.eye(2)[:1], encoder_u=jnp.eye(2)[1:],
+        decoder_b=jnp.eye(2)[:1], decoder_u=jnp.eye(2)[1:],
+    )
+    compression = SplitLinearCompression(
+        encoder_b=np.asarray(projection.encoder_b), encoder_u=np.asarray(projection.encoder_u),
+        decoder_b=np.asarray(projection.decoder_b), decoder_u=np.asarray(projection.decoder_u),
+        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+        minval=-np.ones(2), maxval=np.ones(2), latent_mean=np.zeros(2), latent_std=np.ones(2),
+        template=template,
+    )
+    artifact_path = compression.dump(tmp_path / "compression.h5")
+    compression.save_orbax(tmp_path / "checkpoint")
+    edge = ImplicitAffine(
+        source="source", target="target", name="implicit", inputs_size=1, outputs_size=1,
+        source_sampler=CompressionSampler(compression=artifact_path, reconstruct=True),
+    )
+    graph = FunctionGraph(edges={"implicit": edge})
+    GenSource(graph=graph, samples=1, seed=0, show_progress=False).generate(
+        tmp_path / "implicit", format="h5", write_policy="overwrite"
+    )
+
+    source = load_h5({}, tmp_path / "implicit" / "seed_0" / "sample_0" / "source.h5", jax=True)
+    affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(8), eps=1.0)
+    residual = edge.evaluate({**source["inputs"], "module": affine}, source["outputs"])
+    assert source["inputs"]["value"].shape == (1,)
+    assert source["outputs"]["value"].shape == (1,)
+    assert residual["value"].shape == (1,)
+
+
 def test_implicit_affine_scalar_and_nonlinear_jacobian() -> None:
     affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(3), eps=1.0)
-    edge = ImplicitAffine(inputs_rank=1, outputs_rank=1)
+    edge = ImplicitAffine(inputs_size=1, outputs_size=1)
     inputs = {"value": jnp.asarray(0.3), "module": affine}
     outputs = {"value": jnp.asarray(0.5)}
     residuals = edge.evaluate(inputs, outputs)
@@ -596,32 +637,17 @@ def test_affine_identity_jacobian_skips_mlps() -> None:
 
 
 def test_implicit_rank_fields_take_priority_over_compression() -> None:
-    compression = SVD(
-        energy_tol=0.9,
-        center=False,
-        rank=2,
-        mean=np.zeros(3),
-        basis=np.eye(2, 3),
-        singular_values=np.ones(2),
-    )
-
-    affine = ImplicitAffine(
-        inputs_rank=3,
-        outputs_rank=4,
-        inputs_compression=compression,
-        outputs_compression=compression,
-    )
+    affine = ImplicitAffine(inputs_size=3, outputs_size=4)
     galerkin = ImplicitIterativeGalerkin(
         source="a",
         target="b",
         name="galerkin",
         path=["ab"],
         rank=5,
-        compression=compression,
     )
 
-    assert affine.resolve_inputs_rank() == 3
-    assert affine.resolve_outputs_rank() == 4
+    assert affine.resolve_inputs_size() == 3
+    assert affine.resolve_outputs_size() == 4
     assert galerkin.resolve_rank() == 5
 
 

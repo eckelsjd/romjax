@@ -10,16 +10,18 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jaxtyping
+import numpy as np
 from jax.typing import ArrayLike
-from pydantic import AfterValidator, BeforeValidator, Field, TypeAdapter, model_validator
+from pydantic import AfterValidator, BeforeValidator, Field, PrivateAttr, TypeAdapter, model_validator
 
+from romjax.compression import Compression
 from romjax.operators import UnaryOp
 from romjax.random_field import darcy, gaussian_wave_packets, kle
-from romjax.tree import pytree_merge
+from romjax.tree import ShapeDtypePyTree, is_shape_dtype, pytree_merge
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Distribution', 'SamplerCallable', 'DistributionCallable', 'DistributionPyTree', 'PyTreeSampler',
-           'NearSolutionSampler', 'SolverSampler', 'gen_keys']
+           'NearSolutionSampler', 'SolverSampler', 'CompressionSampler', 'gen_keys']
 
 
 type RelativeScale = tuple[UnaryOp, float]
@@ -233,6 +235,83 @@ class PyTreeSampler(SamplerCallable):
         return ret
 
     def sample(self, key: jaxtyping.Key):  # alias
+        return self(key)
+
+
+class CompressionSampler(SamplerCallable):
+    """Sample a compression artifact's latent space.
+
+    :param compression: preloaded compression or HDF5 artifact path.
+    :param distribution: latent distribution; ``"artifact"`` delegates to the artifact.
+    :param template: optional shape/dtype pytree for unpacking non-reconstructed latents.
+    :param reconstruct: whether to decode sampled coordinates through the compression artifact.
+    """
+
+    compression: Path | str | Compression
+    distribution: Literal["uniform", "normal", "artifact"] = "normal"
+    template: ShapeDtypePyTree | None = None
+    reconstruct: bool = False
+    _resolved_compression: Compression | None = PrivateAttr(default=None)
+
+    def resolve_compression(self) -> Compression:
+        """Load and cache the configured compression artifact outside JIT regions."""
+        if self._resolved_compression is not None:
+            return self._resolved_compression
+        artifact = self.compression
+        resolved = artifact if isinstance(artifact, Compression) else Compression.load(Path(artifact))
+        object.__setattr__(self, "_resolved_compression", resolved)
+        return resolved
+
+    def resolve_sampler(self) -> "CompressionSampler":
+        """Validate artifact statistics required by the configured distribution."""
+        compression = self.resolve_compression()
+        if self.distribution == "uniform" and compression.latent_bounds() is None:
+            raise ValueError("Uniform latent sampling requires compression latent bounds.")
+        if self.distribution == "normal" and compression.latent_normal() is None:
+            raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
+        return self
+
+    @staticmethod
+    def _unpack(vector: jaxtyping.PyTree, template: ShapeDtypePyTree | None) -> jaxtyping.PyTree:
+        """Restore one flat vector into a shape/dtype template."""
+        if template is None:
+            return vector
+        values = jnp.asarray(vector)
+        leaves, treedef = jax.tree.flatten(template)
+        offset = 0
+        unpacked: list[Any] = []
+        for leaf in leaves:
+            if not is_shape_dtype(leaf):
+                unpacked.append(leaf)
+                continue
+            size = int(np.prod(leaf.shape, dtype=int))
+            unpacked.append(jnp.asarray(values[offset : offset + size], dtype=leaf.dtype).reshape(leaf.shape))
+            offset += size
+        if offset != values.shape[-1]:
+            raise ValueError("Latent sample has an incompatible template size.")
+        return jax.tree.unflatten(treedef, unpacked)
+
+    def callable(self, key: jaxtyping.Key, **kwargs) -> jaxtyping.PyTree:
+        """Draw one configured latent sample."""
+        del kwargs  # compatible with outputs_sampler
+        compression = self.resolve_compression()
+        if self.distribution == "artifact":
+            latent = compression.sample(key)
+        elif self.distribution == "uniform":
+            minval, maxval = compression.latent_bounds() or (None, None)
+            if minval is None or maxval is None:
+                raise ValueError("Uniform latent sampling requires compression latent bounds.")
+            latent = uniform(key, shape=(compression.latent_size(),), minval=minval, maxval=maxval)
+        else:
+            normal_stats = compression.latent_normal()
+            if normal_stats is None:
+                raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
+            mean, std = normal_stats
+            latent = normal(key, shape=(compression.latent_size(),), mean=mean, std=std)
+        return compression.reconstruct(latent) if self.reconstruct else self._unpack(latent, self.template)
+
+    def sample(self, key: jaxtyping.Key) -> jaxtyping.PyTree:
+        """Alias for :meth:`__call__`."""
         return self(key)
 
 
