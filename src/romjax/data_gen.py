@@ -80,6 +80,18 @@ def _accepts_kwarg(fn: Callable, name: str) -> bool:
     )
 
 
+def _resolve_model_samplers(model: Any, roles: Sequence[str]) -> None:
+    """Resolve model and sampler-owned runtime state before entering JIT regions."""
+    for role in roles:
+        model_hook = getattr(model, f"resolve_{role}_sampler", None)
+        if callable(model_hook):
+            model_hook()
+        sampler = getattr(model, f"{role}_sampler", None)
+        sampler_hook = getattr(sampler, "resolve_sampler", None)
+        if callable(sampler_hook):
+            sampler_hook()
+
+
 def _has_custom_sample_conditions(model: Any) -> bool:
     """Return whether a model overrides the optional condition sampler."""
     if hasattr(model, "conditions_sampler") and getattr(model, "conditions_sampler") is None:
@@ -497,12 +509,7 @@ class GenImplicitModel(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            if hasattr(model, "resolve_inputs_sampler"):
-                model.resolve_inputs_sampler()  # may need to load from a compression
-            if hasattr(model, "resolve_outputs_sampler"):
-                model.resolve_outputs_sampler()
-            if hasattr(model, "resolve_conditions_sampler"):
-                model.resolve_conditions_sampler()
+            _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
 
             sample_inputs = eqx.filter_jit(model.sample_inputs)
             solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") and not self.skip_solve else None
@@ -788,12 +795,7 @@ class GenImplicitModel(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            if hasattr(model, "resolve_inputs_sampler"):
-                model.resolve_inputs_sampler()  # may need to load from a compression
-            if hasattr(model, "resolve_outputs_sampler"):
-                model.resolve_outputs_sampler()
-            if hasattr(model, "resolve_conditions_sampler"):
-                model.resolve_conditions_sampler()
+            _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
 
             sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
             solve = (
@@ -1058,8 +1060,7 @@ class GenSource(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            if hasattr(model, "resolve_source_sampler"):
-                model.resolve_source_sampler()  # may need to load from a compression
+            _resolve_model_samplers(model, ("source",))
 
             sample_source = eqx.filter_jit(model.sample_source)
             skip = (
@@ -1126,8 +1127,7 @@ class GenSource(GenGraph):
 
             path.mkdir(parents=True, exist_ok=True)
 
-            if hasattr(model, "resolve_source_sampler"):
-                model.resolve_source_sampler()  # may need to load from a compression
+            _resolve_model_samplers(model, ("source",))
 
             sample_source = eqx.filter_jit(eqx.filter_vmap(model.sample_source))
             skip = (
@@ -1737,6 +1737,7 @@ class GenLatent(GenDataConfig):
     """Fit a latent-space compressor and emit the compression artifact."""
 
     loader: DataLoader
+    dataset: str | None = None
     filename: str | Path = "compression.h5"
     gather_paths: Annotated[Sequence[TreePath], BeforeValidator(coerce_tree_paths)] = Field(default_factory=list)
     gather_template: Any | None = None
@@ -1832,15 +1833,9 @@ class GenLatent(GenDataConfig):
         return self.norm[dataset_name]
 
     def _apply_dataset_norm(self, sample: PyTree, dataset_name: str, norm: NormTree) -> PyTree:
-        """Apply one dataset's norm to either the wrapped payload or the nested dataset sample."""
-        resolved_root = norm.resolve_root()
-        if isinstance(sample, Mapping) and dataset_name in sample and isinstance(resolved_root, Mapping):
-            if dataset_name in resolved_root:
-                return norm(sample)
-
-            normalized = dict(sample)
-            normalized[dataset_name] = norm(sample[dataset_name])
-            return normalized
+        """Apply a selected dataset's normalization to one unwrapped sample."""
+        del dataset_name
+        norm.resolve_root()
         return norm(sample)
 
     def bar_text(self, path: Path):
@@ -1856,16 +1851,23 @@ class GenLatent(GenDataConfig):
 
         with ctxt as bar:
             bar.text("Loading compression samples...")
+            selected_name = self.dataset
             for batch in self.loader:
-                for dataset_name, loaded in batch.items():
-                    dataset_norm = self._dataset_norm(dataset_name)
+                names = tuple(batch)
+                if selected_name is None:
+                    if len(names) != 1:
+                        raise ValueError("GenLatent.dataset is required when the loader yields multiple datasets.")
+                    selected_name = names[0]
+                if selected_name not in batch:
+                    raise ValueError(f"GenLatent dataset {selected_name!r} is absent from a loader batch.")
+                dataset_norm = self._dataset_norm(selected_name)
+                if dataset_norm is not None:
+                    dataset_norm.resolve_root()
+                for sample in self._iter_loaded_samples(batch[selected_name]):
+                    selected = self._merge_selected_sample(sample)
                     if dataset_norm is not None:
-                        dataset_norm.resolve_root()
-                    for sample in self._iter_loaded_samples(loaded):
-                        selected = self._merge_selected_sample({dataset_name: sample})
-                        if dataset_norm is not None:
-                            selected = self._apply_dataset_norm(selected, dataset_name, dataset_norm)
-                        yield selected
+                        selected = self._apply_dataset_norm(selected, selected_name, dataset_norm)
+                    yield selected
                 bar()
 
     def generate(self, path, format=None, write_policy=None):
@@ -1880,6 +1882,8 @@ class GenLatent(GenDataConfig):
         
         samples = list(self._iter_samples())
         
+        if hasattr(self.compression, "show_progress"):
+            object.__setattr__(self.compression, "show_progress", self.show_progress)
         compression = self.compression.fit(samples)
         logger.debug(f"Compression finished. Latent space: {compression.latent_size()}")
 

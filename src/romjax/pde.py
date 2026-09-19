@@ -2,8 +2,7 @@
 from collections.abc import Mapping
 from enum import IntEnum
 from functools import partial
-from pathlib import Path
-from typing import Annotated, Any, Callable, Literal, cast
+from typing import Annotated, Any, Callable, cast
 
 import diffrax
 import equinox as eqx
@@ -26,24 +25,22 @@ from pydantic import (
     Field,
     PositiveFloat,
     PositiveInt,
-    PrivateAttr,
     field_serializer,
     field_validator,
     model_validator,
 )
 
-from romjax.compression import Compression
 from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
-from romjax.rng import Distribution, DistributionPyTree, PyTreeSampler, SamplerCallable, validate_distribution_pytree
-from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge, set_subtree
+from romjax.rng import Distribution, DistributionPyTree, SamplerCallable, validate_distribution_pytree
+from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
 __all__ = ['Coordinates', 'BoundaryType', 'BoundarySpec', 'GridBoundaryInputs', 'homogeneous_boundary', 'UniformGrid',
            'ForcingCallable', 'RegisteredForcing', 'FORCING_REGISTRY', 'IdentityInputs', 'ConstantForcing',
            'GaussianForcing', 'SinusoidForcing', 'SumForcing', 'RandomNewton', 'IterativeSolver', 'LinearSolver',
-           'LatentSamplerFactory', 'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
+           'ImplicitAffine', 'ImplicitIterativeGalerkin', 'DiffraxSolver', 'AliveProgressMeter']
 
 
 type Coordinates = tuple[ArrayLike, ...] | ArrayLike
@@ -962,53 +959,6 @@ class AliveProgressMeter(diffrax.AbstractProgressMeter[_AliveProgressMeterState]
         _progress_meter_manager.close(self._close_bar, state.meter_idx)
     
 
-def _default_latent_sampler(
-    compression: Compression, 
-    *, 
-    path: TreePath = ("outputs",),
-    distribution: Literal["uniform", "normal"] = "normal",
-) -> SamplerCallable:
-    """Build a uniform or normal latent sampler under the requested pytree path."""
-    minval, maxval = compression.latent_bounds()
-    latent_normal = compression.latent_normal()
-    latent_size = compression.latent_size()
-
-    if distribution == "uniform":
-        if minval is None or maxval is None:
-            raise ValueError("Uniform latent sampling requires compression latent bounds.")
-
-        sampler = {
-            "callable": "uniform",
-            "shape": [latent_size],
-            "minval": jnp.asarray(minval).tolist(),
-            "maxval": jnp.asarray(maxval).tolist(),
-        }     
-    
-    elif distribution == "normal":
-        if latent_normal is None:
-            raise ValueError("Normal latent sampling requires compression (mean, std)")
-        
-        mean, std = latent_normal
-        sampler = {
-            "callable": "normal",
-            "shape": [latent_size],
-            "mean": jnp.asarray(mean).tolist(),
-            "std": jnp.asarray(std).tolist(),
-        }
-    
-    else:
-        raise ValueError(f"Latent sampler distribution '{distribution}' not recognized.")
-    
-    template = set_subtree(None, path, sampler)
-    return PyTreeSampler(**template)
-
-
-class LatentSamplerFactory(CallableModel):
-    """Factory for building a source sampler from latent size and latent bounds."""
-
-    callable: Callable[[Compression], SamplerCallable] = _default_latent_sampler
-
-
 class AffineInitial(ForcingCallable):
     """
     Return an initial root find guess u0 = g(b) + H^-1(b, g(b)) r, 
@@ -1046,39 +996,17 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     an empty tuple collects all array leaves except the reserved ``value`` and
     ``module`` payloads.
 
-    Implicit sampling is for sampling inputs/outputs in latent space.
-    Source sampling is for sampling residuals in latent space.
+    Samplers are independent of the affine input and output dimensions.
     """
 
     solver: LinearSolver | IterativeSolver | None = None
-    inputs_rank: PositiveInt | None = None
-    outputs_rank: PositiveInt | None = None
+    inputs_size: PositiveInt | None = None
+    outputs_size: PositiveInt | None = None
     additional_inputs: tuple[TreePath, ...] | None = None
-    inputs_compression: Path | str | Compression | None = None
-    outputs_compression: Path | str | Compression | None = None
-    residuals_compression: Path | str | Compression | None = None
-    inputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
-        default_factory=lambda: LatentSamplerFactory(
-            callable=partial(_default_latent_sampler, path=("value",))
-        )
-    )
+    inputs_sampler: SamplerCallable | None = None
     conditions_sampler: SamplerCallable | None = None
-    outputs_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
-        default_factory=lambda: LatentSamplerFactory(
-            callable=partial(_default_latent_sampler, path=("value",))
-        )
-    )
-    residuals_sampler: LatentSamplerFactory | SamplerCallable | None = Field(
-        default_factory=lambda: LatentSamplerFactory(
-            callable=partial(_default_latent_sampler, path=("residuals", "value",))
-        )
-    )
-    _resolved_inputs_compression: Compression | None = PrivateAttr(default=None)
-    _resolved_outputs_compression: Compression | None = PrivateAttr(default=None)
-    _resolved_residuals_compression: Compression | None = PrivateAttr(default=None)
-    _resolved_inputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
-    _resolved_outputs_sampler: SamplerCallable | None = PrivateAttr(default=None)
-    _resolved_residuals_sampler: SamplerCallable | None = PrivateAttr(default=None)
+    outputs_sampler: SamplerCallable | None = None
+    source_sampler: SamplerCallable | None = None
 
     @field_validator("additional_inputs", mode="before")
     @classmethod
@@ -1088,80 +1016,13 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
             return tuple(value)
         return tuple(coerce_tree_paths(value))
 
-    def _resolve_compression(self, artifact: Path | str | Compression | None, cache_name: str) -> Compression | None:
-        cached = getattr(self, cache_name)
-        if cached is not None:
-            return cached
-        if isinstance(artifact, Compression):
-            object.__setattr__(self, cache_name, artifact)
-            return artifact
-        if isinstance(artifact, str | Path) and Path(artifact).exists():
-            compression = Compression.load(Path(artifact))
-            object.__setattr__(self, cache_name, compression)
-            return compression
-        return None
+    def resolve_inputs_size(self) -> int | None:
+        """Return the configured input vector size."""
+        return None if self.inputs_size is None else int(self.inputs_size)
 
-    def _resolve_sampler(
-        self,
-        sampler: LatentSamplerFactory | SamplerCallable | None,
-        compression: Compression | None,
-        cache_name: str,
-    ) -> SamplerCallable | None:
-        cached = getattr(self, cache_name)
-        if cached is not None:
-            return cached
-        if isinstance(sampler, SamplerCallable):
-            object.__setattr__(self, cache_name, sampler)
-            return sampler
-        if sampler is not None and compression is not None:
-            resolved = sampler(compression)
-            object.__setattr__(self, cache_name, resolved)
-            return resolved
-        return None
-
-    def resolve_inputs_compression(self) -> Compression | None:
-        """Resolve the input compression artifact."""
-        return self._resolve_compression(self.inputs_compression, "_resolved_inputs_compression")
-
-    def resolve_outputs_compression(self) -> Compression | None:
-        """Resolve the output compression artifact."""
-        return self._resolve_compression(self.outputs_compression, "_resolved_outputs_compression")
-
-    def resolve_residuals_compression(self) -> Compression | None:
-        """Resolve the output compression artifact."""
-        return self._resolve_compression(self.residuals_compression, "_resolved_residuals_compression")
-
-    def resolve_inputs_rank(self) -> int | None:
-        """Resolve the input rank from explicit configuration or compression."""
-        if self.inputs_rank is not None:
-            return int(self.inputs_rank)
-        compression = self.resolve_inputs_compression()
-        return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
-
-    def resolve_outputs_rank(self) -> int | None:
-        """Resolve the output rank from explicit configuration or compression."""
-        if self.outputs_rank is not None:
-            return int(self.outputs_rank)
-        compression = self.resolve_outputs_compression()
-        return None if compression is None or compression.latent_size() is None else int(compression.latent_size())
-
-    def resolve_inputs_sampler(self) -> SamplerCallable | None:
-        """Resolve the inputs sampler from explicit configuration or a compression artifact."""
-        return self._resolve_sampler(
-            self.inputs_sampler, self.resolve_inputs_compression(), "_resolved_inputs_sampler"
-        )
-
-    def resolve_outputs_sampler(self) -> SamplerCallable | None:
-        """Resolve the outputs sampler from explicit configuration or a compression artifact."""
-        return self._resolve_sampler(
-            self.outputs_sampler, self.resolve_outputs_compression(), "_resolved_outputs_sampler"
-        )
-
-    def resolve_source_sampler(self) -> SamplerCallable | None:
-        """Resolve the residuals sampler from explicit configuration or a compression artifact."""
-        return self._resolve_sampler(
-            self.residuals_sampler, self.resolve_residuals_compression(), "_resolved_residuals_sampler"
-        )
+    def resolve_outputs_size(self) -> int | None:
+        """Return the configured output vector size."""
+        return None if self.outputs_size is None else int(self.outputs_size)
 
     def _affine_inputs(self, inputs: PyTree) -> tuple[ArrayLike, Affine]:
         """Extract the augmented input value and runtime affine module."""
@@ -1304,12 +1165,9 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
 
     def sample_inputs(self, key: Key) -> PyTree:
         """Sample an input value payload."""
-        sampler = self.resolve_inputs_sampler()
-
-        if sampler is None:
+        if self.inputs_sampler is None:
             return None
-        
-        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
+        return self.inputs_sampler.sample(key) if hasattr(self.inputs_sampler, "sample") else self.inputs_sampler(key)
 
     def sample_conditions(self, key: Key) -> PyTree | None:
         """Produce one optional output-condition sample for the given key."""
@@ -1327,80 +1185,29 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         """Sample an output value payload, inputs/solution/conditions not used."""
         del inputs, solution, conditions
 
-        sampler = self.resolve_outputs_sampler()
-
-        if sampler is None:
+        if self.outputs_sampler is None:
             raise ValueError("ImplicitAffine output sampler could not be resolved.")
-
-        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
+        if hasattr(self.outputs_sampler, "sample"):
+            return self.outputs_sampler.sample(key)
+        return self.outputs_sampler(key)
 
     def sample_source(self, key: Key) -> PyTree:
-        """Use source sampler for sampling residuals in latent space."""
-        sampler = self.resolve_source_sampler()
-
-        if sampler is None:
+        """Sample one source payload."""
+        if self.source_sampler is None:
             raise ValueError("ImplicitAffine source sampler could not be resolved.")
-
-        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)
+        return self.source_sampler.sample(key) if hasattr(self.source_sampler, "sample") else self.source_sampler(key)
 
 
 class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
     """Galerkin ROM that solves any `ImplicitModel` via an iterative solver in latent space."""
 
     solver: IterativeSolver = Field(default_factory=IterativeSolver)
-    source_sampler: LatentSamplerFactory | SamplerCallable | None = Field(default_factory=LatentSamplerFactory)
+    source_sampler: SamplerCallable | None = None
     rank: PositiveInt | None = None
-    compression: Path | str | Compression | None = None
-    _resolved_source_sampler: SamplerCallable | None = PrivateAttr(default=None)
-    _resolved_compression: Compression | None = PrivateAttr(default=None)
-
-    def resolve_compression(self) -> Compression | None:
-        """Resolve the compression artifact from a preloaded object or a file path."""
-        if self._resolved_compression is not None:
-            return self._resolved_compression
-        
-        artifact = self.compression
-        if isinstance(artifact, Compression):
-            object.__setattr__(self, "_resolved_compression", artifact)
-            return artifact
-        
-        if isinstance(artifact, (str, Path)):
-            artifact_path = Path(artifact)
-            if artifact_path.exists():
-                compression = Compression.load(artifact_path)
-                object.__setattr__(self, "_resolved_compression", compression)
-                return compression
-            
-        return None
 
     def resolve_rank(self) -> int | None:
-        """Resolve the rank from explicit configuration or compression."""
-        if self.rank is not None:
-            return int(self.rank)
-        compression = self.resolve_compression()
-        rank = None if compression is None else compression.latent_size()
-        return None if rank is None else int(rank)
-
-    def resolve_source_sampler(self) -> SamplerCallable | None:
-        """Resolve the source sampler from explicit configuration or a compression artifact."""
-        if self._resolved_source_sampler is not None:
-            return self._resolved_source_sampler
-
-        sampler = self.source_sampler
-        if isinstance(sampler, SamplerCallable):
-            object.__setattr__(self, "_resolved_source_sampler", sampler)
-            return sampler
-
-        compression = self.resolve_compression()
-        if compression is None:
-            return None
-
-        if sampler is not None:
-            sampler = sampler(compression)
-            object.__setattr__(self, "_resolved_source_sampler", sampler)
-            return sampler
-
-        return None
+        """Return the configured latent solve rank."""
+        return None if self.rank is None else int(self.rank)
 
     # Override default composite edge behavior by solving in latent space directly
     def backward_aux(
@@ -1459,10 +1266,7 @@ class ImplicitIterativeGalerkin(CompositeEdge, SourceSampleable):
         return ret, aux
 
     def sample_source(self, key: Key) -> PyTree:
-        sampler = self._resolved_source_sampler
-        if sampler is not None:
-            if hasattr(sampler, "sample"):
-                return sampler.sample(key)
-            return sampler(key)
-        else:
+        sampler = self.source_sampler
+        if sampler is None:
             raise ValueError("Source sampler has not been resolved yet.")
+        return sampler.sample(key) if hasattr(sampler, "sample") else sampler(key)

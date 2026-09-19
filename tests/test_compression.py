@@ -1,14 +1,17 @@
 from pathlib import Path
 
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from pydantic import TypeAdapter
 
-from romjax.compression import SVD, Compression
-from romjax.nn import LinearProjection
-from romjax.train import resolve_orbax_params
+from romjax.compression import SVD, Compression, SplitLinearCompression
+from romjax.nn import LinearProjection, SplitLinearProjection
+from romjax.rng import CompressionSampler
+from romjax.train import TerminationConfig, Train, resolve_orbax_params
 
 
 def _sample_pytree() -> list[dict[str, dict[str, jnp.ndarray]]]:
@@ -93,6 +96,72 @@ def test_svd_h5_round_trip_preserves_all_fields_and_templates(tmp_path: Path) ->
     assert reloaded.template["items"][1] is None
     assert reloaded.template["pair"] == ("yes", False)
     assert reloaded.orbax_template == orbax_template
+    with h5py.File(artifact_path, "r") as artifact:
+        assert "basis" in artifact
+        assert "mean" in artifact
+        assert "payload" not in artifact
+
+
+def test_compression_sampler_unpacks_and_reconstructs(tmp_path: Path) -> None:
+    compression = SVD(rank=2, center=False).fit(_sample_pytree())
+    artifact_path = compression.dump(tmp_path / "compression.h5")
+    template = {"latent": jax.ShapeDtypeStruct((2,), jnp.float32)}
+    sampler = CompressionSampler(compression=artifact_path, distribution="uniform", template=template)
+
+    sampler.resolve_sampler()
+    sample = sampler.sample(jax.random.key(3))
+    assert sample["latent"].shape == (2,)
+
+    reconstructed = CompressionSampler(compression=artifact_path, reconstruct=True).sample(jax.random.key(3))
+    assert reconstructed["state"]["x"].shape == (2,)
+
+
+def test_split_linear_compression_round_trip_and_artifact(tmp_path: Path) -> None:
+    template = {
+        "inputs": {"b": jax.ShapeDtypeStruct((1,), jnp.float32)},
+        "outputs": {"u": jax.ShapeDtypeStruct((1,), jnp.float32)},
+    }
+    projection = SplitLinearProjection(
+        encoder_b=jnp.asarray([[1.0, 0.0]]),
+        encoder_u=jnp.asarray([[0.0, 1.0]]),
+        decoder_b=jnp.asarray([[1.0, 0.0]]),
+        decoder_u=jnp.asarray([[0.0, 1.0]]),
+    )
+    compression = SplitLinearCompression(
+        encoder_b=np.asarray(projection.encoder_b), encoder_u=np.asarray(projection.encoder_u),
+        decoder_b=np.asarray(projection.decoder_b), decoder_u=np.asarray(projection.decoder_u),
+        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+        minval=np.asarray([-1.0, -1.0]), maxval=np.asarray([1.0, 1.0]),
+        latent_mean=np.zeros(2), latent_std=np.ones(2), template=template,
+    )
+    sample = {"inputs": {"b": jnp.asarray([0.25])}, "outputs": {"u": jnp.asarray([-0.5])}}
+    assert jax.tree.all(jax.tree.map(jnp.allclose, compression.reconstruct(compression.compress(sample)), sample))
+
+    reloaded = Compression.load(compression.dump(tmp_path / "split.h5"))
+    assert isinstance(reloaded, SplitLinearCompression)
+    assert reloaded.reconstruct(reloaded.compress(sample))["outputs"]["u"].shape == (1,)
+
+
+def test_split_linear_compression_fits_configured_train() -> None:
+    samples = [
+        {"inputs": {"b": jnp.asarray([0.0])}, "outputs": {"u": jnp.asarray([1.0])}},
+        {"inputs": {"b": jnp.asarray([1.0])}, "outputs": {"u": jnp.asarray([0.0])}},
+    ]
+    projection = SplitLinearProjection(
+        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1, key=jax.random.key(4)
+    )
+    train = Train(
+        loss=lambda _params, _batch: jnp.asarray(0.0),
+        init_params=projection,
+        optimizer=optax.sgd(0.01),
+        termination=TerminationConfig(max_steps=2),
+    )
+
+    compression = SplitLinearCompression(train=train, show_progress=False).fit(samples)
+
+    assert compression.template is not None
+    assert compression.latent_size() == 2
+    assert compression.reconstruct(compression.compress(samples[0]))["inputs"]["b"].shape == (1,)
 
 
 def test_compression_rejects_npz_artifacts(tmp_path: Path) -> None:
