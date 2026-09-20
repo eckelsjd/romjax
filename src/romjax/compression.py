@@ -199,6 +199,20 @@ class Compression(BaseModel, ABC):
         del key
         raise NotImplementedError(f"{type(self).__name__} does not define artifact sampling.")
 
+    @staticmethod
+    def _empirical_covariance(samples: jax.Array) -> jax.Array:
+        """Return the unbiased empirical covariance of row-wise samples.
+
+        A single sample has zero covariance, which is preferable to propagating
+        undefined values into a persisted artifact.
+
+        :param samples: array with shape ``(n_samples, n_features)``.
+        :return: covariance array with shape ``(n_features, n_features)``.
+        """
+        centered = samples - jnp.mean(samples, axis=0, keepdims=True)
+        denominator = max(samples.shape[0] - 1, 1)
+        return centered.T @ centered / denominator
+
     @abstractmethod
     def fit(self, samples: Sequence[PyTree]) -> "Compression":
         """Fit the compressor to a sequence of single-sample pytrees."""
@@ -310,6 +324,7 @@ class SVD(Compression):
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
     latent_std: np.ndarray | None = None
+    latent_covariance: np.ndarray | None = None
     template: ShapeDtypePyTree | None = None  # for samples
     orbax_template: PyTree | None = None
 
@@ -384,6 +399,7 @@ class SVD(Compression):
         maxval = jnp.max(latent, axis=0)
         latent_mean = jnp.mean(latent, axis=0)
         latent_std = jnp.std(latent, axis=0)
+        latent_covariance = self._empirical_covariance(latent)
 
         return type(self)(
             energy_tol=self.energy_tol,
@@ -396,6 +412,7 @@ class SVD(Compression):
             maxval=np.asarray(maxval),
             latent_mean=np.asarray(latent_mean),
             latent_std=np.asarray(latent_std),
+            latent_covariance=np.asarray(latent_covariance),
             template=self.template if self.template is not None else samples[0],
             orbax_template=self.orbax_template,
         )
@@ -501,6 +518,7 @@ class SplitLinearCompression(Compression):
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
     latent_std: np.ndarray | None = None
+    latent_covariance: np.ndarray | None = None
     template: ShapeDtypePyTree | None = None
     orbax_template: PyTree | None = None
     show_progress: bool = Field(default=True, exclude=True)
@@ -605,6 +623,7 @@ class SplitLinearCompression(Compression):
             b_output=trained.b_output, u_output=trained.u_output,
             minval=np.asarray(jnp.min(latent, axis=0)), maxval=np.asarray(jnp.max(latent, axis=0)),
             latent_mean=np.asarray(jnp.mean(latent, axis=0)), latent_std=np.asarray(jnp.std(latent, axis=0)),
+            latent_covariance=np.asarray(self._empirical_covariance(latent)),
             template=template, orbax_template=self.orbax_template,
         )
 

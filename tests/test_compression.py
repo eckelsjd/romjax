@@ -38,6 +38,9 @@ def test_svd_fit_compress_reconstruct() -> None:
     assert bounds[0].shape == (2,)
     assert bounds[1].shape == (2,)
     assert jnp.all(bounds[0] <= bounds[1])
+    assert compression.latent_covariance is not None
+    latent_samples = np.asarray([compression.compress(sample) for sample in samples])
+    np.testing.assert_allclose(compression.latent_covariance, np.cov(latent_samples.T), atol=1e-7)
 
 
 def test_compression_registry_and_round_trip(tmp_path: Path) -> None:
@@ -75,6 +78,7 @@ def test_svd_h5_round_trip_preserves_all_fields_and_templates(tmp_path: Path) ->
         maxval=np.asarray([2.0]),
         latent_mean=np.asarray([0.25]),
         latent_std=np.asarray([0.75]),
+        latent_covariance=np.asarray([[0.5625]]),
         template=template,
         orbax_template=orbax_template,
     )
@@ -86,7 +90,9 @@ def test_svd_h5_round_trip_preserves_all_fields_and_templates(tmp_path: Path) ->
     assert reloaded.energy_tol == compression.energy_tol
     assert reloaded.center is compression.center
     assert reloaded.rank == compression.rank
-    for field in ("mean", "basis", "singular_values", "minval", "maxval", "latent_mean", "latent_std"):
+    for field in (
+        "mean", "basis", "singular_values", "minval", "maxval", "latent_mean", "latent_std", "latent_covariance"
+    ):
         np.testing.assert_array_equal(getattr(reloaded, field), getattr(compression, field))
     assert isinstance(reloaded.template["state"]["x"], jax.ShapeDtypeStruct)
     assert reloaded.template["state"]["x"] == jax.ShapeDtypeStruct((2,), jnp.float32)
@@ -116,6 +122,27 @@ def test_compression_sampler_unpacks_and_reconstructs(tmp_path: Path) -> None:
     assert reconstructed["state"]["x"].shape == (2,)
 
 
+def test_compression_sampler_normal_uses_joint_covariance_by_default() -> None:
+    compression = SplitLinearCompression(
+        encoder_b=np.asarray([[1.0, 0.0]]), encoder_u=np.asarray([[0.0, 1.0]]),
+        decoder_b=np.asarray([[1.0, 0.0]]), decoder_u=np.asarray([[0.0, 1.0]]),
+        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+        latent_mean=np.asarray([1.0, -2.0]), latent_std=np.asarray([2.0, 3.0]),
+        latent_covariance=np.asarray([[4.0, 3.0], [3.0, 9.0]]),
+    )
+    key = jax.random.key(8)
+
+    joint = CompressionSampler(compression=compression).sample(key)
+    marginal = CompressionSampler(compression=compression, marginal=True).sample(key)
+
+    np.testing.assert_allclose(
+        joint,
+        jax.random.multivariate_normal(key, compression.latent_mean, compression.latent_covariance, method="svd"),
+    )
+    expected_marginal = jax.random.normal(key, (2,)) * compression.latent_std + compression.latent_mean
+    np.testing.assert_allclose(marginal, expected_marginal)
+
+
 def test_split_linear_compression_round_trip_and_artifact(tmp_path: Path) -> None:
     template = {
         "inputs": {"b": jax.ShapeDtypeStruct((1,), jnp.float32)},
@@ -132,7 +159,7 @@ def test_split_linear_compression_round_trip_and_artifact(tmp_path: Path) -> Non
         decoder_b=np.asarray(projection.decoder_b), decoder_u=np.asarray(projection.decoder_u),
         input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
         minval=np.asarray([-1.0, -1.0]), maxval=np.asarray([1.0, 1.0]),
-        latent_mean=np.zeros(2), latent_std=np.ones(2), template=template,
+        latent_mean=np.zeros(2), latent_std=np.ones(2), latent_covariance=np.eye(2), template=template,
     )
     sample = {"inputs": {"b": jnp.asarray([0.25])}, "outputs": {"u": jnp.asarray([-0.5])}}
     assert jax.tree.all(jax.tree.map(jnp.allclose, compression.reconstruct(compression.compress(sample)), sample))
@@ -161,6 +188,8 @@ def test_split_linear_compression_fits_configured_train() -> None:
 
     assert compression.template is not None
     assert compression.latent_size() == 2
+    assert compression.latent_covariance is not None
+    assert compression.latent_covariance.shape == (2, 2)
     assert compression.reconstruct(compression.compress(samples[0]))["inputs"]["b"].shape == (1,)
 
 

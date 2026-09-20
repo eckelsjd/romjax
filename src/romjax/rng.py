@@ -243,12 +243,15 @@ class CompressionSampler(SamplerCallable):
 
     :param compression: preloaded compression or HDF5 artifact path.
     :param distribution: latent distribution; ``"artifact"`` delegates to the artifact.
+    :param marginal: use independent marginal normal variances instead of the
+        artifact's joint empirical covariance for ``"normal"`` sampling.
     :param template: optional shape/dtype pytree for unpacking non-reconstructed latents.
     :param reconstruct: whether to decode sampled coordinates through the compression artifact.
     """
 
     compression: Path | str | Compression
     distribution: Literal["uniform", "normal", "artifact"] = "normal"
+    marginal: bool = False
     template: ShapeDtypePyTree | None = None
     reconstruct: bool = False
     _resolved_compression: Compression | None = PrivateAttr(default=None)
@@ -267,8 +270,9 @@ class CompressionSampler(SamplerCallable):
         compression = self.resolve_compression()
         if self.distribution == "uniform" and compression.latent_bounds() is None:
             raise ValueError("Uniform latent sampling requires compression latent bounds.")
-        if self.distribution == "normal" and compression.latent_normal() is None:
-            raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
+        if self.distribution == "normal":
+            if compression.latent_normal() is None:
+                raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
         return self
 
     @staticmethod
@@ -307,7 +311,11 @@ class CompressionSampler(SamplerCallable):
             if normal_stats is None:
                 raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
             mean, std = normal_stats
-            latent = normal(key, shape=(compression.latent_size(),), mean=mean, std=std)
+            covariance = getattr(compression, "latent_covariance", None)
+            if self.marginal or covariance is None:
+                latent = normal(key, shape=(compression.latent_size(),), mean=mean, std=std)
+            else:
+                latent = jax.random.multivariate_normal(key, mean, jnp.asarray(covariance), method="svd")
         return compression.reconstruct(latent) if self.reconstruct else self._unpack(latent, self.template)
 
     def sample(self, key: jaxtyping.Key) -> jaxtyping.PyTree:
