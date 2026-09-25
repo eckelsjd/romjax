@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
 from orbax.checkpoint import v1 as ocp
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PositiveInt, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, NonNegativeFloat, PositiveInt, model_validator
 from pydantic_core import core_schema
 
 from romjax.nn import LinearProjection, SplitLinearProjection
@@ -25,6 +25,36 @@ _CLASS_ATTR = "compression_class"
 _KIND_ATTR = "romjax_kind"
 _VALUE_ATTR = "value"
 _TEMPLATE_KIND = "shape_dtype"
+
+
+def _split_linear_mse(params: SplitLinearProjection, batch: jax.Array) -> jax.Array:
+    """Return the mean squared reconstruction error for a split projection.
+
+    :param params: split projection being optimized.
+    :param batch: batch of flattened full-state vectors.
+    :return: mean squared reconstruction error.
+    """
+    reconstructed = jax.vmap(params.reconstruct)(jax.vmap(params.reduce)(batch))
+    return jnp.mean(jnp.square(reconstructed - batch))
+
+
+def _coerce_split_linear_train(value: Any) -> Any:
+    """Validate mapping-based split-compression training configuration.
+
+    The reconstruction loss and loader are supplied here so a compact YAML
+    configuration only needs to describe the optimizer, parameters, and stopping
+    behavior.  ``fit`` replaces the loader with the vectors it gathers.
+    """
+    value = from_yaml(value)
+    if not isinstance(value, Mapping):
+        return value
+
+    from romjax.train import BatchLoader, Train
+
+    config = dict(value)
+    config.setdefault("loss", _split_linear_mse)
+    config.setdefault("dataloader", BatchLoader())
+    return Train.model_validate(config)
 
 
 def _decode_h5_attr(value: Any) -> Any:
@@ -500,7 +530,9 @@ class SplitLinearCompression(Compression):
     ``u_output`` segment.
     """
 
-    train: Annotated[Any | None, BeforeValidator(from_yaml)] = Field(default=None, exclude=True)
+    train: Annotated[Any | None, BeforeValidator(_coerce_split_linear_train)] = Field(default=None, exclude=True)
+    orthogonal_reg: NonNegativeFloat | None = Field(default=None, exclude=True)
+    test: bool = Field(default=False, exclude=True)
     encoder_b: np.ndarray | None = None
     encoder_u: np.ndarray | None = None
     decoder_b: np.ndarray | None = None
@@ -522,6 +554,28 @@ class SplitLinearCompression(Compression):
     template: ShapeDtypePyTree | None = None
     orbax_template: PyTree | None = None
     show_progress: bool = Field(default=True, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _extract_train_options(cls, value: Any) -> Any:
+        """Lift split-compression-only options out of a mapping train config.
+
+        ``orthogonal_reg`` and ``test`` are artifacts options rather than
+        :class:`Train` fields, but placing them under ``train`` keeps YAML
+        configurations cohesive. Top-level values take precedence when both are
+        supplied.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        config = dict(value)
+        train_config = config.get("train")
+        if isinstance(train_config, Mapping):
+            train_config = dict(train_config)
+            for name in ("orthogonal_reg", "test"):
+                if name in train_config:
+                    config.setdefault(name, train_config.pop(name))
+            config["train"] = train_config
+        return config
 
     def _projection(self) -> SplitLinearProjection:
         """Rebuild the projection module from persisted matrices."""
@@ -600,14 +654,38 @@ class SplitLinearCompression(Compression):
         if initial.b_output + initial.u_output != vectors.shape[-1]:
             raise ValueError("SplitLinearProjection decoder output sizes must match the gathered sample size.")
 
-        def reconstruction_loss(params: SplitLinearProjection, batch: jax.Array) -> jax.Array:
-            reconstructed = jax.vmap(params.reconstruct)(jax.vmap(params.reduce)(batch))
-            return jnp.mean(jnp.square(reconstructed - batch))
-
         routine = self.train.model_copy(deep=True)
-        object.__setattr__(routine, "loss", reconstruction_loss)
+        if self.orthogonal_reg is None:
+            loss = _split_linear_mse
+        else:
+            from romjax.loss import orthogonal_regularization
+
+            weight = jnp.asarray(self.orthogonal_reg)
+
+            def loss(params: SplitLinearProjection, batch: jax.Array) -> jax.Array:
+                penalty = sum(
+                    orthogonal_regularization(params, batch, None, [matrix_name])
+                    for matrix_name in ("encoder_b", "encoder_u")
+                    # for matrix_name in ("encoder_b", "encoder_u", "decoder_b", "decoder_u")
+                )
+                return _split_linear_mse(params, batch) + weight * penalty
+
+        object.__setattr__(routine, "loss", loss)
         object.__setattr__(routine, "dataloader", BatchLoader(data=vectors, max_epochs=None))
         object.__setattr__(routine.diagnostics, "show_progress", self.show_progress)
+        if self.test:
+            def reconstruction_test(params: SplitLinearProjection) -> jax.Array:
+                reconstructed = jax.vmap(params.reconstruct)(jax.vmap(params.reduce)(vectors))
+                denominator = jnp.linalg.norm(vectors)
+                return jnp.where(
+                    denominator > 0,
+                    jnp.linalg.norm(reconstructed - vectors) / denominator,
+                    jnp.asarray(0.0, dtype=vectors.dtype),
+                )
+
+            object.__setattr__(routine, "test", reconstruction_test)
+            if routine.diagnostics.test_interval is None:
+                object.__setattr__(routine.diagnostics, "test_interval", 1)
         trained = routine()
         if not isinstance(trained, SplitLinearProjection):
             raise TypeError("SplitLinearCompression training did not return a SplitLinearProjection.")

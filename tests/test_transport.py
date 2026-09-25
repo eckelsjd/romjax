@@ -105,6 +105,31 @@ def test_cubic_forcing_supports_separate_coefficient_operators_and_scale() -> No
     assert jnp.allclose(result, expected)
 
 
+def test_cubic_forcing_supports_affine_coefficient_operators() -> None:
+    phi = jnp.array([[0.5, 1.5]])
+    beta = jnp.array([[-1.0, 1.0]])
+    forcing = CubicForcing(
+        beta_op={
+            "op": "tanh",
+            "input_scale": 1.5,
+            "output_scale": 0.75,
+            "output_offset": 1.0,
+        }
+    )
+
+    def evaluate(beta_field: jax.Array) -> jax.Array:
+        return forcing(
+            {"alpha": -1.0, "beta": beta_field, "scale": -1.0},
+            {"phi": phi},
+        )
+
+    coefficient = 1.0 + 0.75 * jnp.tanh(1.5 * beta)
+    expected = 1.0 - coefficient * phi
+
+    assert jnp.allclose(jax.jit(evaluate)(beta), expected)
+    assert jnp.isfinite(jax.jacfwd(evaluate)(beta)).all()
+
+
 def test_potential_velocity_is_jit_grad_compatible() -> None:
     """Streamfunction velocity has zero discrete divergence and supports JAX transforms."""
     forcing = PotentialVelocity()

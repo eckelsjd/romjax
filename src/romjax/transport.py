@@ -12,7 +12,7 @@ from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 
 from romjax.graph import Node
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
-from romjax.operators import UnaryOp
+from romjax.operators import AffineUnaryOp
 from romjax.pde import (
     FORCING_REGISTRY,
     BoundarySpec,
@@ -80,10 +80,10 @@ class CubicForcing(ForcingCallable):
             + \operatorname{op}_\delta(\delta)\phi^3\right].
     """
 
-    alpha_op: UnaryOp | None = None
-    beta_op: UnaryOp | None = None
-    gamma_op: UnaryOp | None = None
-    delta_op: UnaryOp | None = None
+    alpha_op: AffineUnaryOp | None = None
+    beta_op: AffineUnaryOp | None = None
+    gamma_op: AffineUnaryOp | None = None
+    delta_op: AffineUnaryOp | None = None
 
     class Inputs(DictModel):
         """Inputs for the scaled cubic forcing function.
@@ -103,10 +103,10 @@ class CubicForcing(ForcingCallable):
 
     @field_validator("alpha_op", "beta_op", "gamma_op", "delta_op", mode="before")
     @classmethod
-    def _validate_operator(cls, operator: Any) -> UnaryOp | None:
-        if operator is None or isinstance(operator, UnaryOp):
+    def _validate_operator(cls, operator: Any) -> AffineUnaryOp | None:
+        if operator is None or isinstance(operator, AffineUnaryOp):
             return operator
-        return UnaryOp(operator)
+        return AffineUnaryOp(operator)
 
     def callable(self, inputs: Inputs, outputs: AdvectionDiffusionOutputs) -> ArrayLike:
         r"""Evaluate the scaled cubic polynomial forcing.
@@ -573,8 +573,13 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
         """Produce one configured source sample."""
         if self.source_sampler is None:
             raise ValueError("AdvectionDiffusion2D source sampler is not configured.")
-        return self.source_sampler.sample(key) if hasattr(self.source_sampler, "sample") else self.source_sampler(key)
+        sample = self.source_sampler.sample(key) if hasattr(self.source_sampler, "sample") else self.source_sampler(key)
+
+        if "residuals" not in sample:
+            if "inputs" in sample and "outputs" in sample:
+                sample["residuals"] = self.evaluate(sample["inputs"], sample["outputs"])
+
+        return sample
     
     def resolve_dof(self) -> int:
         return self.grid.coords[0].shape[0] * self.grid.coords[0].shape[1]  # Nx x Ny
-

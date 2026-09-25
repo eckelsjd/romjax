@@ -97,6 +97,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CompressionSampler": ("romjax.rng", "CompressionSampler"),
     "TreeRef": ("romjax.tree", "TreeRef"),
     "UnaryOp": ("romjax.operators", "UnaryOp"),
+    "AffineUnaryOp": ("romjax.operators", "AffineUnaryOp"),
     "BinaryOp": ("romjax.operators", "BinaryOp"),
     "DictModel": ("romjax.typing", "DictModel"),
     "ListModel": ("romjax.typing", "ListModel"),
@@ -153,7 +154,7 @@ if TYPE_CHECKING:
     from .vlasov import Vlasov1D1V
     from .rng import CompressionSampler, NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys
     from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
-    from .operators import BinaryOp, UnaryOp
+    from .operators import AffineUnaryOp, BinaryOp, UnaryOp
     from .train import BatchLoader, OrbaxRef, Train, resolve_orbax_params
     from .tree import TreeRef
     from .typing import CallableModel, DictModel, ListModel, ThirdPartyType, from_yaml

@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 from romjax.compression import SVD, Compression, SplitLinearCompression
 from romjax.nn import LinearProjection, SplitLinearProjection
 from romjax.rng import CompressionSampler
-from romjax.train import TerminationConfig, Train, resolve_orbax_params
+from romjax.train import BatchLoader, TerminationConfig, Train, resolve_orbax_params
 
 
 def _sample_pytree() -> list[dict[str, dict[str, jnp.ndarray]]]:
@@ -191,6 +191,52 @@ def test_split_linear_compression_fits_configured_train() -> None:
     assert compression.latent_covariance is not None
     assert compression.latent_covariance.shape == (2, 2)
     assert compression.reconstruct(compression.compress(samples[0]))["inputs"]["b"].shape == (1,)
+
+
+def test_split_linear_compression_train_mapping_adds_defaults_and_diagnostics(monkeypatch) -> None:
+    """Mapping configs supply reconstruction training defaults and split-only options."""
+    samples = [
+        {"inputs": {"b": jnp.asarray([1.0])}, "outputs": {"u": jnp.asarray([0.0])}},
+        {"inputs": {"b": jnp.asarray([0.0])}, "outputs": {"u": jnp.asarray([1.0])}},
+    ]
+    projection = SplitLinearProjection(
+        encoder_b=jnp.asarray([[2.0, 0.0]]),
+        encoder_u=jnp.asarray([[0.0, 2.0]]),
+        decoder_b=jnp.asarray([[2.0, 0.0]]),
+        decoder_u=jnp.asarray([[0.0, 2.0]]),
+    )
+    compression = SplitLinearCompression(
+        train={
+            "init_params": projection,
+            "optimizer": optax.sgd(0.01),
+            "termination": {"max_steps": 1},
+            "orthogonal_reg": 0.5,
+            "test": True,
+        },
+        show_progress=False,
+    )
+    assert isinstance(compression.train, Train)
+    assert callable(compression.train.loss)
+    assert isinstance(compression.train.dataloader, BatchLoader)
+    assert compression.orthogonal_reg == 0.5
+    assert compression.test is True
+
+    captured = {}
+
+    def fake_train(routine):
+        captured["routine"] = routine
+        return routine.init_params
+
+    monkeypatch.setattr(Train, "__call__", fake_train)
+    compression.fit(samples)
+
+    routine = captured["routine"]
+    vectors = routine.dataloader.data
+    mse = jnp.mean(jnp.square(jax.vmap(projection.reconstruct)(jax.vmap(projection.reduce)(vectors)) - vectors))
+    # All four matrices are non-orthogonal, so each contributes to the penalty.
+    assert jnp.allclose(routine.loss(projection, vectors) - mse, 18.0)
+    assert routine.diagnostics.test_interval == 1
+    assert jnp.allclose(routine.test(projection), 3.0)
 
 
 def test_compression_rejects_npz_artifacts(tmp_path: Path) -> None:
