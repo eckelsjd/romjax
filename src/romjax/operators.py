@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 
 from romjax.tree import TreePath, coerce_tree_paths, pytree_path_iter
 
-__all__ = ["UnaryOp", "BinaryOp"]
+__all__ = ["UnaryOp", "AffineUnaryOp", "BinaryOp"]
 
 type UnaryCallable = Callable[[PyTree], PyTree]
 type BinaryCallable = Callable[[PyTree, PyTree], PyTree]
@@ -310,6 +310,66 @@ class UnaryOp(BaseModel):
 
     def __call__(self, x: PyTree, *, ignore: Any = None) -> PyTree:
         return self._evaluate(x, ignore=ignore)
+
+
+class AffineUnaryOp(BaseModel):
+    r"""Apply affine input/output transformations around a unary array operator.
+
+    The configured transformation is
+
+    .. math::
+
+        y = b_{out} + a_{out} f(a_{in} x + b_{in}).
+
+    Plain unary specifications remain supported, so ``AffineUnaryOp("exp")`` is
+    equivalent to ``UnaryOp("exp")`` with identity affine transformations.
+
+    :param op: unary operation applied after the input affine transformation
+    :param input_scale: multiplicative scale applied to the input
+    :param input_offset: additive offset applied to the scaled input
+    :param output_scale: multiplicative scale applied to the operator output
+    :param output_offset: additive offset applied to the scaled operator output
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    op: UnaryOp
+    input_scale: ArrayLike = 1.0
+    input_offset: ArrayLike = 0.0
+    output_scale: ArrayLike = 1.0
+    output_offset: ArrayLike = 0.0
+
+    def __init__(
+        self,
+        value: str | UnaryCallable | Mapping[str, Any] | UnaryOp | "AffineUnaryOp" | None = None,
+        /,
+        **data: Any,
+    ) -> None:
+        if value is not None:
+            if isinstance(value, AffineUnaryOp):
+                data = {**value.model_dump(), **data}
+            elif isinstance(value, Mapping) and "op" in value:
+                data = {**dict(value), **data}
+            else:
+                data = {"op": value, **data}
+        super().__init__(**data)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_plain_value(cls, value: Any) -> Any:
+        if isinstance(value, AffineUnaryOp):
+            return value.model_dump()
+        if isinstance(value, Mapping) and "op" in value:
+            return value
+        if isinstance(value, str) or callable(value) or isinstance(value, UnaryOp | Mapping):
+            return {"op": value}
+        return value
+
+    def __call__(self, x: ArrayLike) -> ArrayLike:
+        """Evaluate the configured affine unary transformation."""
+        transformed = jnp.asarray(self.input_scale) * jnp.asarray(x) + jnp.asarray(self.input_offset)
+        result = self.op(transformed)
+        return jnp.asarray(self.output_scale) * jnp.asarray(result) + jnp.asarray(self.output_offset)
 
 
 class BinaryOp(BaseModel):

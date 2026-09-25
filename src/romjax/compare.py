@@ -195,7 +195,7 @@ class CompareOrbax(Routine):
         if callable(sample):
             template = sample(jax.random.key(0))
         case.template = template
-        case.params = resolve_orbax_params(case.params, template)
+        case.params = pytree_resolve_refs(resolve_orbax_params(case.params, template))
         return case
 
     @property

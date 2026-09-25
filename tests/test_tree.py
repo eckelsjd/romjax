@@ -5,7 +5,7 @@ import pytest
 from pydantic import TypeAdapter
 
 from romjax import YamlLoader
-from romjax.operators import BinaryOp, UnaryOp
+from romjax.operators import AffineUnaryOp, BinaryOp, UnaryOp
 from romjax.tree import (
     ShapeDtypePyTree,
     TreeRef,
@@ -291,6 +291,36 @@ def test_unary_op_yaml_round_trip(tmp_path):
     assert jnp.allclose(reloaded["string_op"](jnp.array([-1.0, 3.0])), 3.0)
     assert jnp.allclose(reloaded["callable_op"](jnp.array([1.0, 2.0])), 4.0)
     assert jnp.allclose(reloaded["structured_op"]({"x": jnp.array([2.0]), "skip": jnp.array([100.0])}), 4.0)
+
+
+def test_affine_unary_op_jax_transforms_and_yaml_round_trip(tmp_path):
+    operator = AffineUnaryOp(
+        op="tanh",
+        input_scale=1.5,
+        input_offset=-0.25,
+        output_scale=0.75,
+        output_offset=1.0,
+    )
+    values = jnp.array([-1.0, 0.0, 1.0])
+    expected = 1.0 + 0.75 * jnp.tanh(1.5 * values - 0.25)
+
+    assert jnp.allclose(jax.jit(operator)(values), expected)
+    assert jnp.allclose(jax.vmap(operator)(values), expected)
+    assert jnp.allclose(jax.grad(lambda value: operator(value))(0.5), 1.125 / jnp.cosh(0.5) ** 2)
+
+    path = tmp_path / "affine_unary.yml"
+    YamlLoader.dump({"operator": operator}, path)
+    reloaded = YamlLoader.load(path)["operator"]
+
+    assert isinstance(reloaded, AffineUnaryOp)
+    assert jnp.allclose(reloaded(values), expected)
+
+
+def test_affine_unary_op_accepts_legacy_unary_specs():
+    values = jnp.array([-1.0, 0.0, 1.0])
+
+    assert jnp.allclose(AffineUnaryOp("exp")(values), jnp.exp(values))
+    assert jnp.allclose(AffineUnaryOp(UnaryOp("square"))(values), values**2)
 
 
 def test_binary_op_yaml_round_trip(tmp_path):

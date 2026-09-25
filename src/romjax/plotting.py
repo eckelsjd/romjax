@@ -201,7 +201,7 @@ class GridplotConfig(DictModel):
     global_axis_opts: AxisOptions = Field(default_factory=AxisOptions)
     global_plot_kwargs: dict = Field(default_factory=dict)
     subplots_kwargs: dict = Field(default_factory=dict)
-    tight_layout: dict = Field(default_factory=dict)
+    tight_layout: dict | bool = Field(default_factory=dict)
     subplots_adjust: dict = Field(default_factory=dict)
 
     @field_validator("savefig")
@@ -307,7 +307,8 @@ global_config = GridplotConfig(
     scheme="white", 
     subplot_size_in=(3, 2.5), 
     animate_opts=dict(blit=False, progress_callback="bar", fps=10, dpi=200, writer="ffmpeg"),
-    subplots_kwargs=dict(squeeze=False, layout='tight')
+    subplots_kwargs=dict(squeeze=False),
+    tight_layout=True,
 )
 
 
@@ -741,6 +742,7 @@ def gridplot(
                     _update_clim()
                     artist.remove()
                     new_artist = ax.contourf(*data, **_get_kwargs())
+                    new_artist.set_edgecolor('face')
                     all_artists[flat_idx] = new_artist
                     updated_artists.append(new_artist)
                 
@@ -894,7 +896,7 @@ def gridplot(
             yield frame, title_str
 
     if cfg.tight_layout:
-        fig.tight_layout(**cfg.tight_layout)
+        fig.tight_layout(**(cfg.tight_layout if isinstance(cfg.tight_layout, Mapping) else {}))
     if cfg.subplots_adjust:
         fig.subplots_adjust(**cfg.subplots_adjust)
 
