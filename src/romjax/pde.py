@@ -25,6 +25,7 @@ from pydantic import (
     Field,
     PositiveFloat,
     PositiveInt,
+    SerializeAsAny,
     field_serializer,
     field_validator,
     model_validator,
@@ -33,6 +34,7 @@ from pydantic import (
 from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
+from romjax.preconditioner import LinearSystemStructure, RegisteredLinearPreconditioner
 from romjax.rng import Distribution, DistributionPyTree, SamplerCallable, validate_distribution_pytree
 from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
@@ -705,6 +707,7 @@ class LinearSolver(DictModel):
 
     :ivar solver: Lineax linear solver (name+kwargs or instance)
     :ivar initial: configured initial guess forcing callable, passed as ``options["y0"]``
+    :ivar preconditioner: optional recipe built from each current operator and right-hand side
     :ivar options: runtime options for the linear solver
     :ivar throw: whether Lineax should raise on solver failure
     """
@@ -714,6 +717,7 @@ class LinearSolver(DictModel):
         validate_default=True,
     )
     initial: RegisteredForcing = Field(default_factory=ConstantForcing)
+    preconditioner: SerializeAsAny[RegisteredLinearPreconditioner] | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     throw: bool = False
 
@@ -725,6 +729,7 @@ class LinearSolver(DictModel):
         y0: PyTree | None = None,
         options: Mapping[str, Any] | None = None,
         state: PyTree | None = None,
+        structure: LinearSystemStructure | None = None,
         return_sol: bool = False,
     ) -> PyTree | lx.Solution:
         """Solve a linear system with configured Lineax settings.
@@ -732,12 +737,20 @@ class LinearSolver(DictModel):
         :param operator: linear operator in ``A @ y = b``
         :param vector: right-hand-side vector ``b``
         :param y0: optional initial guess forwarded as ``options["y0"]``
-        :param options: runtime solver options merged over configured options
+        :param options: runtime solver options merged over configured options; an explicit concrete
+            ``options["preconditioner"]`` takes precedence over the configured recipe
         :param state: optional reusable Lineax solver state
+        :param structure: optional model-provided metadata used to construct a configured preconditioner
         :param return_sol: whether to return the Lineax solution object
         :return: the solved value or complete Lineax solution
         """
         runtime_options = pytree_merge(self.options, options or {})
+        if "preconditioner" not in runtime_options and self.preconditioner is not None:
+            runtime_options["preconditioner"] = self.preconditioner.build(
+                operator,
+                vector,
+                structure=structure,
+            )
         if y0 is not None:
             runtime_options["y0"] = y0
         kwargs: dict[str, Any] = {

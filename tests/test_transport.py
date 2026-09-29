@@ -467,6 +467,26 @@ def test_transport_lineax_solve_jit_and_grad() -> None:
     assert jnp.isfinite(gradient)
 
 
+def test_transport_configured_block_jacobi_is_jittable() -> None:
+    """A transport solve constructs its configured preconditioner from the current operator."""
+    model = AdvectionDiffusion2D(
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4)),
+        solver={
+            "solver": {
+                "name": "lineax.GMRES",
+                "kwargs": {"rtol": 1e-5, "atol": 1e-6, "max_steps": 20, "restart": 5},
+            },
+            "preconditioner": {"name": "five_point_block_jacobi", "block_shape": [2, 2]},
+        },
+    )
+
+    solve = jax.jit(lambda amplitude: model.solve({"forcing": {"const": amplitude}})["phi"])
+    solution = solve(jnp.asarray(1.0))
+    residual = model.evaluate({"forcing": {"const": 1.0}}, {"phi": solution})["phi_residual"]
+
+    assert jnp.max(jnp.abs(residual)) < 1e-4
+
+
 def test_laplace_solve_jit_and_grad() -> None:
     laplace = get_laplace_solver()
 

@@ -26,6 +26,7 @@ from romjax.pde import (
     UniformGrid,
     homogeneous_boundary,
 )
+from romjax.preconditioner import FivePointStencilStructure
 from romjax.rng import SamplerCallable, SolverSampler
 from romjax.tree import to_pytree
 from romjax.typing import DictModel, from_registry
@@ -515,11 +516,31 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
                 y0=y0,
                 options=args["inputs"]["solver"].get("options"),
                 state=args["inputs"]["solver"].get("state"),
+                structure=FivePointStencilStructure(
+                    shape=zero.shape,
+                    periodic_axes=self._periodic_axes(args["inputs"], y0),
+                ),
                 return_sol=return_sol,
             )
 
         ret = solution if return_sol else {self.field_name: solution} 
         return ret
+
+    def _periodic_axes(
+        self,
+        inputs: AdvectionDiffusionInputs,
+        field: jax.Array,
+    ) -> tuple[bool, bool]:
+        """Return whether either boundary is periodic along each grid axis."""
+        xbds, ybds = self.boundary(inputs["boundary"], {self.field_name: field})["boundary"]
+
+        def is_periodic(spec: BoundarySpec) -> bool:
+            boundary_type = spec["type"]
+            if isinstance(boundary_type, str):
+                boundary_type = BoundaryType[boundary_type]
+            return boundary_type == BoundaryType.periodic
+
+        return (any(is_periodic(spec) for spec in xbds), any(is_periodic(spec) for spec in ybds))
     
     def sample_inputs(self, key: Key) -> AdvectionDiffusionInputs:
         """Produce one sample of inputs for the given key."""
