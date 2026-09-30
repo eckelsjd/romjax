@@ -8,10 +8,13 @@ import optax
 import pytest
 from pydantic import TypeAdapter
 
-from romjax.compression import SVD, Compression, SplitLinearCompression
-from romjax.nn import LinearProjection, SplitLinearProjection
-from romjax.rng import CompressionSampler
+from romjax.compression import SVD, BlockLinearCompression, Compression
+from romjax.graph import FunctionGraph
+from romjax.nn import BlockLinearAutoencoder, LinearProjection
+from romjax.pde import ImplicitAffine
+from romjax.rng import CompressionSampler, PyTreeSampler
 from romjax.train import BatchLoader, TerminationConfig, Train, resolve_orbax_params
+from romjax.tree import TreeRef
 
 
 def _sample_pytree() -> list[dict[str, dict[str, jnp.ndarray]]]:
@@ -123,10 +126,8 @@ def test_compression_sampler_unpacks_and_reconstructs(tmp_path: Path) -> None:
 
 
 def test_compression_sampler_normal_uses_joint_covariance_by_default() -> None:
-    compression = SplitLinearCompression(
-        encoder_b=np.asarray([[1.0, 0.0]]), encoder_u=np.asarray([[0.0, 1.0]]),
-        decoder_b=np.asarray([[1.0, 0.0]]), decoder_u=np.asarray([[0.0, 1.0]]),
-        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+    compression = BlockLinearCompression(
+        input_sizes=(1, 1), latent_sizes=(1, 1),
         latent_mean=np.asarray([1.0, -2.0]), latent_std=np.asarray([2.0, 3.0]),
         latent_covariance=np.asarray([[4.0, 3.0], [3.0, 9.0]]),
     )
@@ -143,40 +144,44 @@ def test_compression_sampler_normal_uses_joint_covariance_by_default() -> None:
     np.testing.assert_allclose(marginal, expected_marginal)
 
 
-def test_split_linear_compression_round_trip_and_artifact(tmp_path: Path) -> None:
+def test_block_linear_compression_round_trip_and_artifact(tmp_path: Path) -> None:
     template = {
         "inputs": {"b": jax.ShapeDtypeStruct((1,), jnp.float32)},
         "outputs": {"u": jax.ShapeDtypeStruct((1,), jnp.float32)},
     }
-    projection = SplitLinearProjection(
-        encoder_b=jnp.asarray([[1.0, 0.0]]),
-        encoder_u=jnp.asarray([[0.0, 1.0]]),
-        decoder_b=jnp.asarray([[1.0, 0.0]]),
-        decoder_u=jnp.asarray([[0.0, 1.0]]),
+    projection = BlockLinearAutoencoder(
+        input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
+        encoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
+        decoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
     )
-    compression = SplitLinearCompression(
-        encoder_b=np.asarray(projection.encoder_b), encoder_u=np.asarray(projection.encoder_u),
-        decoder_b=np.asarray(projection.decoder_b), decoder_u=np.asarray(projection.decoder_u),
-        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+    compression = BlockLinearCompression(
+        encoder_blocks=tuple(
+            tuple(None if block is None else np.asarray(block) for block in row)
+            for row in projection.encoder_blocks
+        ),
+        decoder_blocks=tuple(
+            tuple(None if block is None else np.asarray(block) for block in row)
+            for row in projection.decoder_blocks
+        ),
+        input_sizes=projection.input_sizes, latent_sizes=projection.latent_sizes, diagonal=True,
         minval=np.asarray([-1.0, -1.0]), maxval=np.asarray([1.0, 1.0]),
         latent_mean=np.zeros(2), latent_std=np.ones(2), latent_covariance=np.eye(2), template=template,
     )
     sample = {"inputs": {"b": jnp.asarray([0.25])}, "outputs": {"u": jnp.asarray([-0.5])}}
     assert jax.tree.all(jax.tree.map(jnp.allclose, compression.reconstruct(compression.compress(sample)), sample))
 
-    reloaded = Compression.load(compression.dump(tmp_path / "split.h5"))
-    assert isinstance(reloaded, SplitLinearCompression)
+    reloaded = Compression.load(compression.dump(tmp_path / "block.h5"))
+    assert isinstance(reloaded, BlockLinearCompression)
+    assert reloaded.encoder_blocks[0][1] is None
     assert reloaded.reconstruct(reloaded.compress(sample))["outputs"]["u"].shape == (1,)
 
 
-def test_split_linear_compression_fits_configured_train() -> None:
+def test_block_linear_compression_fits_configured_train() -> None:
     samples = [
         {"inputs": {"b": jnp.asarray([0.0])}, "outputs": {"u": jnp.asarray([1.0])}},
         {"inputs": {"b": jnp.asarray([1.0])}, "outputs": {"u": jnp.asarray([0.0])}},
     ]
-    projection = SplitLinearProjection(
-        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1, key=jax.random.key(4)
-    )
+    projection = BlockLinearAutoencoder(input_sizes=[1, 1], latent_sizes=[1, 1], key=jax.random.key(4))
     train = Train(
         loss=lambda _params, _batch: jnp.asarray(0.0),
         init_params=projection,
@@ -184,7 +189,7 @@ def test_split_linear_compression_fits_configured_train() -> None:
         termination=TerminationConfig(max_steps=2),
     )
 
-    compression = SplitLinearCompression(train=train, show_progress=False).fit(samples)
+    compression = BlockLinearCompression(train=train, show_progress=False).fit(samples)
 
     assert compression.template is not None
     assert compression.latent_size() == 2
@@ -193,19 +198,144 @@ def test_split_linear_compression_fits_configured_train() -> None:
     assert compression.reconstruct(compression.compress(samples[0]))["inputs"]["b"].shape == (1,)
 
 
-def test_split_linear_compression_train_mapping_adds_defaults_and_diagnostics(monkeypatch) -> None:
-    """Mapping configs supply reconstruction training defaults and split-only options."""
+def test_block_linear_compression_fits_diagonal_centered_pods(tmp_path: Path) -> None:
+    vectors = jnp.asarray(
+        [
+            [0.0, 1.0, 2.0, 1.0, -1.0],
+            [1.0, 2.0, 0.0, 2.0, 1.0],
+            [2.0, 0.0, 1.0, -1.0, 2.0],
+            [3.0, 1.0, -1.0, 0.0, 1.0],
+        ]
+    )
+    samples = [{"first": row[:2], "second": row[2:]} for row in vectors]
+    initial = BlockLinearAutoencoder(
+        input_sizes=[2, 3], latent_sizes=[1, 2], key=jax.random.key(2),
+        bias=jnp.zeros(5), diagonal=True,
+    )
+
+    compression = BlockLinearCompression(
+        fit_mode="pod", init_params=initial, show_progress=False,
+    ).fit(samples)
+    projection = compression._projection()
+
+    expected_chunks = []
+    for chunk, rank in ((vectors[:, :2], 1), (vectors[:, 2:], 2)):
+        pod = SVD(rank=rank, center=True).fit(list(chunk))
+        basis = jnp.asarray(pod.basis)
+        mean = jnp.asarray(pod.mean)
+        expected_chunks.append((chunk - mean) @ basis.T @ basis + mean)
+    expected = jnp.concatenate(expected_chunks, axis=1)
+    actual = projection.reconstruct(projection.reduce(vectors))
+
+    assert compression.diagonal is True
+    assert compression.encoder_blocks[0][1] is None
+    assert compression.decoder_blocks[1][0] is None
+    np.testing.assert_allclose(compression.bias, jnp.mean(vectors, axis=0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    reloaded = Compression.load(compression.dump(tmp_path / "pod_blocks.h5"))
+    np.testing.assert_allclose(reloaded.bias, compression.bias)
+    np.testing.assert_allclose(reloaded.encoder_blocks[1][1], compression.encoder_blocks[1][1])
+
+
+def test_block_linear_compression_fits_joint_uncentered_pod() -> None:
+    vectors = jnp.asarray(
+        [[1.0, 0.0, 2.0, -1.0], [0.0, 2.0, 1.0, 1.0], [2.0, 1.0, 0.0, 3.0]]
+    )
+    initial = BlockLinearAutoencoder(
+        input_sizes=[2, 2], latent_sizes=[1, 1], key=jax.random.key(3), bias=None,
+    )
+    compression = BlockLinearCompression(fit_mode="pod", init_params=initial).fit(list(vectors))
+    projection = compression._projection()
+    pod = SVD(rank=2, center=False).fit(list(vectors))
+
+    basis = jnp.asarray(pod.basis)
+    expected = vectors @ basis.T @ basis
+    actual = projection.reconstruct(projection.reduce(vectors))
+    assert compression.bias is None
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    for i in range(2):
+        for j in range(2):
+            np.testing.assert_allclose(projection.decoder_blocks[i][j], projection.encoder_blocks[j][i].T)
+
+
+def test_block_linear_compression_pod_initializes_train(monkeypatch) -> None:
+    vectors = jnp.asarray([[0.0, 1.0], [1.0, 0.0], [2.0, 2.0]])
+    initial = BlockLinearAutoencoder(
+        input_sizes=[1, 1], latent_sizes=[1, 1], key=jax.random.key(7), bias=jnp.zeros(2),
+    )
+    train = Train(
+        loss=lambda _params, _batch: jnp.asarray(0.0), init_params=initial,
+        optimizer=optax.sgd(0.01), termination=TerminationConfig(max_steps=1),
+    )
+    captured = {}
+
+    def fake_train(routine):
+        captured["params"] = routine.init_params
+        return routine.init_params
+
+    monkeypatch.setattr(Train, "__call__", fake_train)
+    compression = BlockLinearCompression(
+        fit_mode="pod_then_train", train=train, show_progress=False,
+    ).fit(list(vectors))
+
+    assert captured["params"] is not initial
+    np.testing.assert_allclose(captured["params"].bias, jnp.mean(vectors, axis=0))
+    np.testing.assert_allclose(compression.bias, jnp.mean(vectors, axis=0))
+
+
+def test_block_linear_compression_pod_resolves_sampler_tree_refs() -> None:
+    graph = FunctionGraph(
+        edges={"model": ImplicitAffine(source="a", target="b", inputs_size=2, outputs_size=2)}
+    )
+    sampler = PyTreeSampler(
+        template={
+            "name": "BlockLinearAutoencoder",
+            "kwargs": {
+                "input_sizes": [
+                    TreeRef(path=("edges", "model", "inputs_size")),
+                    TreeRef(path=("edges", "model", "outputs_size")),
+                ],
+                "latent_sizes": [1, 1],
+                "diagonal": True,
+            },
+        }
+    )
+    samples = [jnp.arange(4.0), jnp.arange(4.0) + 1.0]
+
+    compression = BlockLinearCompression(
+        fit_mode="pod", init_params=sampler, init_seed=9, graph=graph,
+    ).fit(samples)
+
+    assert compression.input_sizes == (2, 2)
+    assert compression.latent_sizes == (1, 1)
+
+
+def test_block_linear_compression_pod_rejects_rank_shortfall_and_conflicts() -> None:
+    initial = BlockLinearAutoencoder(input_sizes=[2], latent_sizes=[2], key=jax.random.key(1))
+    with pytest.raises(ValueError, match="POD rank 2 exceeds"):
+        BlockLinearCompression(fit_mode="pod", init_params=initial).fit([jnp.ones(2)])
+
+    train = Train(
+        loss=lambda _params, _batch: jnp.asarray(0.0), init_params=initial,
+        optimizer=optax.sgd(0.01), termination=TerminationConfig(max_steps=1),
+    )
+    with pytest.raises(ValueError, match="accepts top-level init_params"):
+        BlockLinearCompression(fit_mode="pod", init_params=initial, train=train).fit([jnp.ones(2), jnp.zeros(2)])
+
+
+def test_block_linear_compression_train_mapping_adds_defaults_and_diagnostics(monkeypatch) -> None:
+    """Mapping configs supply reconstruction training defaults and block-only options."""
     samples = [
         {"inputs": {"b": jnp.asarray([1.0])}, "outputs": {"u": jnp.asarray([0.0])}},
         {"inputs": {"b": jnp.asarray([0.0])}, "outputs": {"u": jnp.asarray([1.0])}},
     ]
-    projection = SplitLinearProjection(
-        encoder_b=jnp.asarray([[2.0, 0.0]]),
-        encoder_u=jnp.asarray([[0.0, 2.0]]),
-        decoder_b=jnp.asarray([[2.0, 0.0]]),
-        decoder_u=jnp.asarray([[0.0, 2.0]]),
+    projection = BlockLinearAutoencoder(
+        input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
+        encoder_blocks=((jnp.asarray([[2.0]]), None), (None, jnp.asarray([[2.0]]))),
+        decoder_blocks=((jnp.asarray([[2.0]]), None), (None, jnp.asarray([[2.0]]))),
     )
-    compression = SplitLinearCompression(
+    compression = BlockLinearCompression(
         train={
             "init_params": projection,
             "optimizer": optax.sgd(0.01),
@@ -233,8 +363,8 @@ def test_split_linear_compression_train_mapping_adds_defaults_and_diagnostics(mo
     routine = captured["routine"]
     vectors = routine.dataloader.data
     mse = jnp.mean(jnp.square(jax.vmap(projection.reconstruct)(jax.vmap(projection.reduce)(vectors)) - vectors))
-    # All four matrices are non-orthogonal, so each contributes to the penalty.
-    assert jnp.allclose(routine.loss(projection, vectors) - mse, 18.0)
+    # The two encoder rows each have a Gram diagonal of four.
+    assert jnp.allclose(routine.loss(projection, vectors) - mse, 9.0)
     assert routine.diagnostics.test_interval == 1
     assert jnp.allclose(routine.test(projection), 3.0)
 
@@ -253,6 +383,11 @@ def test_compression_type_adapter_accepts_registry_dict() -> None:
 
     assert isinstance(compression, SVD)
     assert compression.energy_tol == 0.99
+
+    block = TypeAdapter(Compression).validate_python(
+        {"kind": "block_linear", "input_sizes": [1, 1], "latent_sizes": [1, 1]}
+    )
+    assert isinstance(block, BlockLinearCompression)
 
 
 def test_svd_requires_rank_or_energy_tol() -> None:

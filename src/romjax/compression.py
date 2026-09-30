@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Annotated, Any, Mapping, Sequence
+from typing import Annotated, Any, Literal, Mapping, Sequence
 
 import equinox as eqx
 import h5py
@@ -14,11 +14,12 @@ from orbax.checkpoint import v1 as ocp
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, NonNegativeFloat, PositiveInt, model_validator
 from pydantic_core import core_schema
 
-from romjax.nn import LinearProjection, SplitLinearProjection
+from romjax.graph import FunctionGraph
+from romjax.nn import BlockLinearAutoencoder, LinearProjection
 from romjax.tree import ShapeDtypePyTree, is_shape_dtype
 from romjax.typing import from_yaml
 
-__all__ = ["Compression", "SVD", "SplitLinearCompression"]
+__all__ = ["BlockLinearCompression", "Compression", "SVD"]
 
 _ARTIFACT_VERSION = 2
 _CLASS_ATTR = "compression_class"
@@ -27,10 +28,10 @@ _VALUE_ATTR = "value"
 _TEMPLATE_KIND = "shape_dtype"
 
 
-def _split_linear_mse(params: SplitLinearProjection, batch: jax.Array) -> jax.Array:
-    """Return the mean squared reconstruction error for a split projection.
+def _block_linear_mse(params: BlockLinearAutoencoder, batch: jax.Array) -> jax.Array:
+    """Return mean squared reconstruction error for a block autoencoder.
 
-    :param params: split projection being optimized.
+    :param params: block autoencoder being optimized.
     :param batch: batch of flattened full-state vectors.
     :return: mean squared reconstruction error.
     """
@@ -38,8 +39,8 @@ def _split_linear_mse(params: SplitLinearProjection, batch: jax.Array) -> jax.Ar
     return jnp.mean(jnp.square(reconstructed - batch))
 
 
-def _coerce_split_linear_train(value: Any) -> Any:
-    """Validate mapping-based split-compression training configuration.
+def _coerce_block_linear_train(value: Any) -> Any:
+    """Validate mapping-based block-compression training configuration.
 
     The reconstruction loss and loader are supplied here so a compact YAML
     configuration only needs to describe the optimizer, parameters, and stopping
@@ -52,7 +53,7 @@ def _coerce_split_linear_train(value: Any) -> Any:
     from romjax.train import BatchLoader, Train
 
     config = dict(value)
-    config.setdefault("loss", _split_linear_mse)
+    config.setdefault("loss", _block_linear_mse)
     config.setdefault("dataloader", BatchLoader())
     return Train.model_validate(config)
 
@@ -174,8 +175,8 @@ class Compression(BaseModel, ABC):
             raise ValueError("Must specify compression 'kind'")
         if name == "svd":
             return SVD(**opts)
-        if name == "split_linear":
-            return SplitLinearCompression(**opts)
+        if name == "block_linear":
+            return BlockLinearCompression(**opts)
         raise ValueError(f"Compression '{name}' not recognized.")
 
     @classmethod
@@ -522,30 +523,34 @@ class SVD(Compression):
         return jnp.asarray(self.latent_mean), jnp.asarray(self.latent_std)
 
 
-class SplitLinearCompression(Compression):
-    """Persisted trainable compression backed by :class:`SplitLinearProjection`.
+class BlockLinearCompression(Compression):
+    """Persisted trainable compression backed by :class:`BlockLinearAutoencoder`.
 
     The saved template determines how the concatenated decoder result is unpacked.
-    Its array leaves must occupy the decoder's ``b_output`` segment followed by its
-    ``u_output`` segment.
+    The configured input partition sizes are independent of the template's PyTree
+    leaf boundaries, but their sum must match its flattened array size.
+
+    :param fit_mode: ``"train"`` for gradient fitting, ``"pod"`` for direct POD
+        fitting, or ``"pod_then_train"`` for POD initialization followed by training
+    :param init_params: autoencoder or sampler used by POD-only fitting
+    :param init_seed: deterministic sampler seed used by POD-only fitting
+    :param graph: optional reference tree for resolving POD-only initializer references
+    :param train: training routine used by train and POD-then-train modes
     """
 
-    train: Annotated[Any | None, BeforeValidator(_coerce_split_linear_train)] = Field(default=None, exclude=True)
+    fit_mode: Literal["train", "pod", "pod_then_train"] = Field(default="train", exclude=True)
+    init_params: Annotated[Any | None, BeforeValidator(from_yaml)] = Field(default=None, exclude=True)
+    init_seed: int = Field(default=0, exclude=True)
+    graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = Field(default=None, exclude=True)
+    train: Annotated[Any | None, BeforeValidator(_coerce_block_linear_train)] = Field(default=None, exclude=True)
     orthogonal_reg: NonNegativeFloat | None = Field(default=None, exclude=True)
     test: bool = Field(default=False, exclude=True)
-    encoder_b: np.ndarray | None = None
-    encoder_u: np.ndarray | None = None
-    decoder_b: np.ndarray | None = None
-    decoder_u: np.ndarray | None = None
-    encoder_b_bias: np.ndarray | None = None
-    encoder_u_bias: np.ndarray | None = None
-    decoder_b_bias: np.ndarray | None = None
-    decoder_u_bias: np.ndarray | None = None
-    input_size: PositiveInt | None = None
-    b_latent: PositiveInt | None = None
-    u_latent: PositiveInt | None = None
-    b_output: PositiveInt | None = None
-    u_output: PositiveInt | None = None
+    encoder_blocks: tuple[tuple[np.ndarray | None, ...], ...] | None = None
+    decoder_blocks: tuple[tuple[np.ndarray | None, ...], ...] | None = None
+    bias: np.ndarray | None = None
+    input_sizes: tuple[PositiveInt, ...] | None = None
+    latent_sizes: tuple[PositiveInt, ...] | None = None
+    diagonal: bool = False
     minval: np.ndarray | None = None
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
@@ -555,10 +560,27 @@ class SplitLinearCompression(Compression):
     orbax_template: PyTree | None = None
     show_progress: bool = Field(default=True, exclude=True)
 
+    @model_validator(mode="after")
+    def _validate_block_configuration(self) -> "BlockLinearCompression":
+        """Validate persisted block metadata when model parameters are present."""
+        if (self.encoder_blocks is None) != (self.decoder_blocks is None):
+            raise ValueError("encoder_blocks and decoder_blocks must be supplied together.")
+        if (self.input_sizes is None) != (self.latent_sizes is None):
+            raise ValueError("input_sizes and latent_sizes must be supplied together.")
+        if self.input_sizes is not None and len(self.input_sizes) != len(self.latent_sizes):
+            raise ValueError("input_sizes and latent_sizes must contain the same number of partitions.")
+        if self.bias is not None and self.input_sizes is None:
+            raise ValueError("bias requires input_sizes and latent_sizes.")
+        if self.encoder_blocks is not None:
+            if self.input_sizes is None:
+                raise ValueError("Persisted blocks require input_sizes and latent_sizes.")
+            self._projection()
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _extract_train_options(cls, value: Any) -> Any:
-        """Lift split-compression-only options out of a mapping train config.
+        """Lift block-compression-only options out of a mapping train config.
 
         ``orthogonal_reg`` and ``test`` are artifacts options rather than
         :class:`Train` fields, but placing them under ``train`` keeps YAML
@@ -577,20 +599,111 @@ class SplitLinearCompression(Compression):
             config["train"] = train_config
         return config
 
-    def _projection(self) -> SplitLinearProjection:
-        """Rebuild the projection module from persisted matrices."""
-        matrices = (self.encoder_b, self.encoder_u, self.decoder_b, self.decoder_u)
-        if any(matrix is None for matrix in matrices):
-            raise ValueError("SplitLinearCompression must be fitted before use.")
-        return SplitLinearProjection(
-            encoder_b=self.encoder_b,
-            encoder_u=self.encoder_u,
-            decoder_b=self.decoder_b,
-            decoder_u=self.decoder_u,
-            encoder_b_bias=self.encoder_b_bias,
-            encoder_u_bias=self.encoder_u_bias,
-            decoder_b_bias=self.decoder_b_bias,
-            decoder_u_bias=self.decoder_u_bias,
+    def _projection(self) -> BlockLinearAutoencoder:
+        """Rebuild the autoencoder from persisted block matrices."""
+        if self.encoder_blocks is None or self.decoder_blocks is None:
+            raise ValueError("BlockLinearCompression must be fitted before use.")
+        if self.input_sizes is None or self.latent_sizes is None:
+            raise ValueError("BlockLinearCompression is missing partition sizes.")
+        return BlockLinearAutoencoder(
+            input_sizes=self.input_sizes,
+            latent_sizes=self.latent_sizes,
+            encoder_blocks=self.encoder_blocks,
+            decoder_blocks=self.decoder_blocks,
+            bias=self.bias,
+            diagonal=self.diagonal,
+        )
+
+    def _resolve_initial_module(self) -> BlockLinearAutoencoder:
+        """Resolve the autoencoder template selected by the configured fit mode."""
+        from romjax.train import Train, _resolve_init_params
+
+        if self.fit_mode == "pod":
+            if self.train is not None:
+                raise ValueError("fit_mode='pod' accepts top-level init_params and no train configuration.")
+            if self.init_params is None:
+                raise ValueError("fit_mode='pod' requires top-level init_params.")
+            initial = _resolve_init_params(
+                self.init_params,
+                graph=self.graph,
+                init_seed=self.init_seed,
+            )
+        else:
+            if self.init_params is not None or self.graph is not None or self.init_seed != 0:
+                raise ValueError(
+                    f"fit_mode={self.fit_mode!r} uses init_params, graph, and init_seed from the Train configuration."
+                )
+            if not isinstance(self.train, Train):
+                raise TypeError(f"fit_mode={self.fit_mode!r} requires a configured Train instance.")
+            initial = self.train.init_params
+
+        if not isinstance(initial, BlockLinearAutoencoder):
+            raise TypeError("BlockLinearCompression init_params must resolve to a BlockLinearAutoencoder.")
+        return initial
+
+    @staticmethod
+    def _check_pod_rank(samples: jax.Array, rank: int, name: str) -> None:
+        """Require enough sample and feature dimensions for a requested POD rank."""
+        supported = min(samples.shape)
+        if rank > supported:
+            raise ValueError(f"{name} POD rank {rank} exceeds the supported rank {supported}.")
+
+    def _pod_initialize(
+        self, initial: BlockLinearAutoencoder, vectors: jax.Array
+    ) -> BlockLinearAutoencoder:
+        """Replace active blocks with joint or chunk-wise POD bases."""
+        center = initial.bias is not None
+        count = len(initial.input_sizes)
+        input_offsets = np.cumsum((0, *initial.input_sizes))
+        latent_offsets = np.cumsum((0, *initial.latent_sizes))
+
+        if initial.diagonal:
+            encoder: list[list[jax.Array | None]] = [[None] * count for _ in range(count)]
+            decoder: list[list[jax.Array | None]] = [[None] * count for _ in range(count)]
+            means: list[jax.Array] = []
+            for index, (input_size, latent_size) in enumerate(zip(initial.input_sizes, initial.latent_sizes)):
+                chunk = vectors[:, input_offsets[index] : input_offsets[index + 1]]
+                self._check_pod_rank(chunk, latent_size, f"Block {index}")
+                pod = SVD(rank=latent_size, center=center).fit(list(chunk))
+                basis = jnp.asarray(pod.basis)
+                encoder[index][index] = basis
+                decoder[index][index] = basis.T
+                if center:
+                    means.append(jnp.asarray(pod.mean))
+            bias = jnp.concatenate(means) if center else None
+        else:
+            self._check_pod_rank(vectors, initial.latent_size, "Joint")
+            pod = SVD(rank=initial.latent_size, center=center).fit(list(vectors))
+            basis = jnp.asarray(pod.basis)
+            encoder = [
+                [
+                    basis[
+                        latent_offsets[i] : latent_offsets[i + 1],
+                        input_offsets[j] : input_offsets[j + 1],
+                    ]
+                    for j in range(count)
+                ]
+                for i in range(count)
+            ]
+            decoder = [
+                [
+                    basis[
+                        latent_offsets[j] : latent_offsets[j + 1],
+                        input_offsets[i] : input_offsets[i + 1],
+                    ].T
+                    for j in range(count)
+                ]
+                for i in range(count)
+            ]
+            bias = jnp.asarray(pod.mean) if center else None
+
+        return BlockLinearAutoencoder(
+            input_sizes=initial.input_sizes,
+            latent_sizes=initial.latent_sizes,
+            encoder_blocks=tuple(tuple(row) for row in encoder),
+            decoder_blocks=tuple(tuple(row) for row in decoder),
+            bias=bias,
+            diagonal=initial.diagonal,
         )
 
     def _flatten_sample(self, sample: PyTree) -> jax.Array:
@@ -603,14 +716,14 @@ class SplitLinearCompression(Compression):
         sample_leaves, sample_treedef = jax.tree.flatten(sample)
         template_leaves, template_treedef = jax.tree.flatten(template)
         if sample_treedef != template_treedef:
-            raise ValueError("Sample pytree structure does not match the SplitLinearCompression template.")
+            raise ValueError("Sample pytree structure does not match the BlockLinearCompression template.")
         leaves: list[jax.Array] = []
         for leaf, shape in zip(sample_leaves, template_leaves):
             if not is_shape_dtype(shape):
                 continue
             value = jnp.zeros(shape.shape, shape.dtype) if is_shape_dtype(leaf) else jnp.asarray(leaf)
             if value.shape != shape.shape or value.dtype != shape.dtype:
-                raise ValueError("Sample array does not match the SplitLinearCompression template.")
+                raise ValueError("Sample array does not match the BlockLinearCompression template.")
             leaves.append(jnp.ravel(value))
         return jnp.concatenate(leaves) if leaves else jnp.asarray([], dtype=jnp.float32)
 
@@ -630,75 +743,90 @@ class SplitLinearCompression(Compression):
             restored.append(jnp.asarray(vector[offset : offset + size], dtype=leaf.dtype).reshape(leaf.shape))
             offset += size
         if offset != vector.shape[-1]:
-            raise ValueError("SplitLinear reconstruction produced a vector with an incompatible template size.")
+            raise ValueError("BlockLinear reconstruction produced a vector with an incompatible template size.")
         return jax.tree.unflatten(treedef, restored)
 
-    def fit(self, samples: Sequence[PyTree]) -> "SplitLinearCompression":
-        """Train a split linear projection against mean reconstruction error."""
+    def fit(self, samples: Sequence[PyTree]) -> "BlockLinearCompression":
+        """Fit a block autoencoder with POD, gradient training, or both."""
         if not samples:
             raise ValueError("No samples were loaded for latent-space fitting.")
-        from romjax.train import BatchLoader, Train
+        from romjax.train import BatchLoader
 
-        if not isinstance(self.train, Train):
-            raise TypeError("SplitLinearCompression.train must be a configured Train instance.")
         template = self.template if self.template is not None else jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) if eqx.is_array_like(leaf) else leaf,
             samples[0],
         )
         vectors = jnp.stack([self._flatten_sample(sample) for sample in samples])
-        initial = self.train.init_params
-        if not isinstance(initial, SplitLinearProjection):
-            raise TypeError("SplitLinearCompression.train.init_params must be a SplitLinearProjection.")
+        initial = self._resolve_initial_module()
         if initial.input_size != vectors.shape[-1]:
-            raise ValueError("SplitLinearProjection input_size must match the gathered sample size.")
-        if initial.b_output + initial.u_output != vectors.shape[-1]:
-            raise ValueError("SplitLinearProjection decoder output sizes must match the gathered sample size.")
+            raise ValueError("BlockLinearAutoencoder input size must match the gathered sample size.")
+        if self.fit_mode in {"pod", "pod_then_train"}:
+            initial = self._pod_initialize(initial, vectors)
 
-        routine = self.train.model_copy(deep=True)
-        if self.orthogonal_reg is None:
-            loss = _split_linear_mse
+        if self.fit_mode == "pod":
+            trained = initial
         else:
-            from romjax.loss import orthogonal_regularization
+            routine = self.train.model_copy(deep=True)
+            object.__setattr__(routine, "init_params", initial)
+            if self.orthogonal_reg is None:
+                loss = _block_linear_mse
+            else:
+                weight = jnp.asarray(self.orthogonal_reg)
 
-            weight = jnp.asarray(self.orthogonal_reg)
+                def loss(params: BlockLinearAutoencoder, batch: jax.Array) -> jax.Array:
+                    # This imposes EE^T=I_(sum rank) on the entire encoder,
+                    # which makes all latent spaces mutually orthogonal.
+                    gram_rows: list[jax.Array] = []
+                    for i, row_i in enumerate(params.encoder_blocks):
+                        blocks: list[jax.Array] = []
+                        for k, row_k in enumerate(params.encoder_blocks):
+                            gram_block = None
+                            for block_i, block_k in zip(row_i, row_k):
+                                if block_i is None or block_k is None:
+                                    continue
+                                product = block_i @ block_k.T
+                                gram_block = product if gram_block is None else gram_block + product
+                            if gram_block is None:
+                                gram_block = jnp.zeros(
+                                    (params.latent_sizes[i], params.latent_sizes[k]), dtype=batch.dtype
+                                )
+                            blocks.append(gram_block)
+                        gram_rows.append(jnp.concatenate(blocks, axis=1))
+                    gram = jnp.concatenate(gram_rows, axis=0)
+                    penalty = jnp.sum(jnp.square(gram - jnp.eye(params.latent_size, dtype=gram.dtype)))
+                    return _block_linear_mse(params, batch) + weight * penalty
 
-            def loss(params: SplitLinearProjection, batch: jax.Array) -> jax.Array:
-                penalty = sum(
-                    orthogonal_regularization(params, batch, None, [matrix_name])
-                    for matrix_name in ("encoder_b", "encoder_u")
-                    # for matrix_name in ("encoder_b", "encoder_u", "decoder_b", "decoder_u")
-                )
-                return _split_linear_mse(params, batch) + weight * penalty
+            object.__setattr__(routine, "loss", loss)
+            object.__setattr__(routine, "dataloader", BatchLoader(data=vectors, max_epochs=None))
+            object.__setattr__(routine.diagnostics, "show_progress", self.show_progress)
+            if self.test:
+                def reconstruction_test(params: BlockLinearAutoencoder) -> jax.Array:
+                    reconstructed = jax.vmap(params.reconstruct)(jax.vmap(params.reduce)(vectors))
+                    denominator = jnp.linalg.norm(vectors)
+                    return jnp.where(
+                        denominator > 0,
+                        jnp.linalg.norm(reconstructed - vectors) / denominator,
+                        jnp.asarray(0.0, dtype=vectors.dtype),
+                    )
 
-        object.__setattr__(routine, "loss", loss)
-        object.__setattr__(routine, "dataloader", BatchLoader(data=vectors, max_epochs=None))
-        object.__setattr__(routine.diagnostics, "show_progress", self.show_progress)
-        if self.test:
-            def reconstruction_test(params: SplitLinearProjection) -> jax.Array:
-                reconstructed = jax.vmap(params.reconstruct)(jax.vmap(params.reduce)(vectors))
-                denominator = jnp.linalg.norm(vectors)
-                return jnp.where(
-                    denominator > 0,
-                    jnp.linalg.norm(reconstructed - vectors) / denominator,
-                    jnp.asarray(0.0, dtype=vectors.dtype),
-                )
-
-            object.__setattr__(routine, "test", reconstruction_test)
-            if routine.diagnostics.test_interval is None:
-                object.__setattr__(routine.diagnostics, "test_interval", 1)
-        trained = routine()
-        if not isinstance(trained, SplitLinearProjection):
-            raise TypeError("SplitLinearCompression training did not return a SplitLinearProjection.")
+                object.__setattr__(routine, "test", reconstruction_test)
+                if routine.diagnostics.test_interval is None:
+                    object.__setattr__(routine.diagnostics, "test_interval", 1)
+            trained = routine()
+        if not isinstance(trained, BlockLinearAutoencoder):
+            raise TypeError("BlockLinearCompression training did not return a BlockLinearAutoencoder.")
         latent = jax.vmap(trained.reduce)(vectors)
         return type(self)(
-            encoder_b=np.asarray(trained.encoder_b), encoder_u=np.asarray(trained.encoder_u),
-            decoder_b=np.asarray(trained.decoder_b), decoder_u=np.asarray(trained.decoder_u),
-            encoder_b_bias=None if trained.encoder_b_bias is None else np.asarray(trained.encoder_b_bias),
-            encoder_u_bias=None if trained.encoder_u_bias is None else np.asarray(trained.encoder_u_bias),
-            decoder_b_bias=None if trained.decoder_b_bias is None else np.asarray(trained.decoder_b_bias),
-            decoder_u_bias=None if trained.decoder_u_bias is None else np.asarray(trained.decoder_u_bias),
-            input_size=trained.input_size, b_latent=trained.b_latent, u_latent=trained.u_latent,
-            b_output=trained.b_output, u_output=trained.u_output,
+            encoder_blocks=tuple(
+                tuple(None if block is None else np.asarray(block) for block in row)
+                for row in trained.encoder_blocks
+            ),
+            decoder_blocks=tuple(
+                tuple(None if block is None else np.asarray(block) for block in row)
+                for row in trained.decoder_blocks
+            ),
+            bias=None if trained.bias is None else np.asarray(trained.bias),
+            input_sizes=trained.input_sizes, latent_sizes=trained.latent_sizes, diagonal=trained.diagonal,
             minval=np.asarray(jnp.min(latent, axis=0)), maxval=np.asarray(jnp.max(latent, axis=0)),
             latent_mean=np.asarray(jnp.mean(latent, axis=0)), latent_std=np.asarray(jnp.std(latent, axis=0)),
             latent_covariance=np.asarray(self._empirical_covariance(latent)),
@@ -706,7 +834,7 @@ class SplitLinearCompression(Compression):
         )
 
     def compress(self, sample: PyTree) -> jax.Array:
-        """Encode one sample pytree into concatenated split latent coordinates."""
+        """Encode one sample pytree into concatenated block latent coordinates."""
         return self._projection().reduce(self._flatten_sample(sample))
 
     def reconstruct(self, latent: PyTree) -> PyTree:
@@ -714,10 +842,10 @@ class SplitLinearCompression(Compression):
         return self._unflatten(self._projection().reconstruct(jnp.asarray(latent)), self.template)
 
     def latent_size(self) -> int:
-        """Return the total split latent dimension."""
-        if self.b_latent is None or self.u_latent is None:
-            raise ValueError("SplitLinearCompression does not define a latent size.")
-        return int(self.b_latent + self.u_latent)
+        """Return the total block latent dimension."""
+        if self.latent_sizes is None:
+            raise ValueError("BlockLinearCompression does not define a latent size.")
+        return sum(self.latent_sizes)
 
     def latent_bounds(self) -> tuple[jax.Array, jax.Array] | None:
         """Return fitted latent bounds."""
@@ -732,7 +860,7 @@ class SplitLinearCompression(Compression):
         return jnp.asarray(self.latent_mean), jnp.asarray(self.latent_std)
 
     def save_orbax(self, path: str | Path) -> None:
-        """Save the trained split projection through Orbax."""
+        """Save the trained block autoencoder through Orbax."""
         projection = self._projection()
         template = projection if self.orbax_template is None else jax.tree.map(
             lambda value: projection if value is None else value,

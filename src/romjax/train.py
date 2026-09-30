@@ -322,6 +322,35 @@ def resolve_orbax_params(params: PyTree, template: PyTree | None = None) -> PyTr
     return params
 
 
+def _resolve_init_params(
+    init_params: PyTree,
+    *,
+    graph: FunctionGraph | None = None,
+    init_seed: int = 0,
+    load_orbax: PyTree | None = None,
+) -> PyTree:
+    """Resolve references, sample an initializer, and apply an Orbax warm start.
+
+    :param init_params: concrete parameter tree or object implementing ``sample(key)``
+    :param graph: optional reference tree used to resolve :class:`TreeRef` leaves
+    :param init_seed: deterministic seed passed to a sampled initializer
+    :param load_orbax: optional direct or nested Orbax parameter override
+    :return: concrete initialized parameter tree
+    """
+    if graph is not None:
+        init_params = pytree_resolve_refs(init_params, graph, raise_on_missing=False)
+
+    sample_fn = getattr(init_params, "sample", None)
+    if callable(sample_fn):
+        init_params = sample_fn(jax.random.key(init_seed))
+
+    if graph is not None:
+        init_params = pytree_resolve_refs(init_params, graph, raise_on_missing=False)
+    if load_orbax is not None:
+        init_params = resolve_orbax_params(load_orbax, init_params)
+    return init_params
+
+
 class CheckpointerConfig(BaseModel):
     """
     Orbax-policy checkpoint configuration for :class:`GraphTrain`.
@@ -770,13 +799,12 @@ class Train(Routine):
         # Pass graph object to loss, test, and dataloader if requested
         self.bind_graph(self.graph)    
 
-        # If init params implements a 'sample' function, then initialize the parameter pytree.
-        sample_fn = getattr(self.init_params, "sample", None)
-        if callable(sample_fn):
-            self.init_params = sample_fn(jax.random.key(self.init_seed))
-
-        if self.load_orbax is not None:
-            self.init_params = resolve_orbax_params(self.load_orbax, self.init_params)
+        self.init_params = _resolve_init_params(
+            self.init_params,
+            graph=self.graph,
+            init_seed=self.init_seed,
+            load_orbax=self.load_orbax,
+        )
         
         # Start dataloader from current training step if applicable
         if self.root is not None and hasattr(self.dataloader, "set_iterator"):

@@ -210,6 +210,10 @@ class PyTreeSampler(SamplerCallable):
         if runtime_template:
             runtime_template = validate_distribution_pytree(runtime_template)
         template = pytree_merge(runtime_template, self.template)
+        if isinstance(template, Distribution):
+            if kwargs:
+                raise TypeError("Root-distribution PyTreeSampler does not accept runtime keyword overlays.")
+            return template.sample(key)
         callable_fn = type(self).model_fields["callable"].default
         return callable_fn(self, key, **kwargs, **template)
     

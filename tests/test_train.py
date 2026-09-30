@@ -16,7 +16,6 @@ from orbax.checkpoint import v1 as ocp
 from pydantic import ValidationError
 
 from romjax import YamlLoader
-from romjax.compression import SVD
 from romjax.data_gen import DataLoader, LoadImplicitModel, LoadSource
 from romjax.graph import Edge, FunctionGraph, IdentityEdge, Node
 from romjax.loss import GraphLoss, GraphTest
@@ -1448,33 +1447,16 @@ train: !romx:Train
 
 
 def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: Path) -> None:
-    compression = SVD(
-        energy_tol=0.9,
-        center=False,
-        rank=3,
-        mean=np.asarray([0.0, 0.0, 0.0, 0.0]),
-        basis=np.asarray(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ]
-        ),
-        singular_values=np.asarray([3.0, 2.0, 1.0]),
-        minval=np.asarray([-1.0, -1.0, -1.0]),
-        maxval=np.asarray([1.0, 1.0, 1.0]),
-    )
-
     graph = FunctionGraph(
         edges={
             "ab": IdentityEdge(source="a", target="b", name="ab"),
             "bc": IdentityEdge(source="b", target="c", name="bc"),
             "galerkin": ImplicitIterativeGalerkin(
                 source="a",
-                target="c",
-                name="galerkin",
-                path=["ab", "bc"],
-                compression=compression,
+                    target="c",
+                    name="galerkin",
+                    path=["ab", "bc"],
+                    rank=3,
             ),
         }
     )
@@ -1485,7 +1467,7 @@ def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: 
                 "module": {
                     "name": "LinearProjection",
                     "kwargs": {
-                        "latent": TreeRef(path=("edges", "galerkin", "compression", "rank")),
+                            "latent": TreeRef(path=("edges", "galerkin", "rank")),
                         "dof": 4,
                     },
                 }

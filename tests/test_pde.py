@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from romjax.compression import SVD, SplitLinearCompression
+from romjax.compression import SVD, BlockLinearCompression
 from romjax.data_gen import GenSource
 from romjax.graph import Edge, FunctionGraph, Node
 from romjax.model import ImplicitModel
-from romjax.nn import Affine, SplitLinearProjection
+from romjax.nn import Affine, BlockLinearAutoencoder
 from romjax.pde import (
     FORCING_REGISTRY,
     AliveProgressMeter,
@@ -315,19 +315,26 @@ def test_implicit_affine_residual_inverse_and_sampling(tmp_path: Path) -> None:
     assert edge.sample_outputs(jax.random.key(1))["value"].shape == (2,)
 
 
-def test_split_linear_compression_generates_implicit_source_dataset(tmp_path: Path) -> None:
+def test_block_linear_compression_generates_implicit_source_dataset(tmp_path: Path) -> None:
     template = {
         "inputs": {"value": jax.ShapeDtypeStruct((1,), jnp.float32)},
         "outputs": {"value": jax.ShapeDtypeStruct((1,), jnp.float32)},
     }
-    projection = SplitLinearProjection(
-        encoder_b=jnp.eye(2)[:1], encoder_u=jnp.eye(2)[1:],
-        decoder_b=jnp.eye(2)[:1], decoder_u=jnp.eye(2)[1:],
+    projection = BlockLinearAutoencoder(
+        input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
+        encoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
+        decoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
     )
-    compression = SplitLinearCompression(
-        encoder_b=np.asarray(projection.encoder_b), encoder_u=np.asarray(projection.encoder_u),
-        decoder_b=np.asarray(projection.decoder_b), decoder_u=np.asarray(projection.decoder_u),
-        input_size=2, b_latent=1, u_latent=1, b_output=1, u_output=1,
+    compression = BlockLinearCompression(
+        encoder_blocks=tuple(
+            tuple(None if block is None else np.asarray(block) for block in row)
+            for row in projection.encoder_blocks
+        ),
+        decoder_blocks=tuple(
+            tuple(None if block is None else np.asarray(block) for block in row)
+            for row in projection.decoder_blocks
+        ),
+        input_sizes=(1, 1), latent_sizes=(1, 1), diagonal=True,
         minval=-np.ones(2), maxval=np.ones(2), latent_mean=np.zeros(2), latent_std=np.ones(2),
         template=template,
     )
