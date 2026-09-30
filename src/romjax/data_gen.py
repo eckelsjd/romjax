@@ -55,7 +55,6 @@ __all__ = [
     "LoadDataConfig",
 ]
 
-_BAR_TITLE_LEN = 20
 _FAILURE_MARKER = ".romjax_failed"
 
 
@@ -499,7 +498,7 @@ class GenImplicitModel(GenGraph):
             _log_sample_failure(sample_dir, message, exc)
 
         ctxt = (
-            alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            alive_bar(self.input_samples, title=self.bar_text(path))
             if self.show_progress else _NullProgress()
         )
 
@@ -785,7 +784,7 @@ class GenImplicitModel(GenGraph):
         model = self._edge_from_path(path)
 
         ctxt = (
-            alive_bar(self.input_samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            alive_bar(self.input_samples, title=self.bar_text(path))
             if self.show_progress else _NullProgress()
         )
 
@@ -1050,7 +1049,7 @@ class GenSource(GenGraph):
             _log_sample_failure(sample_dir, message, exc)
 
         ctxt = (
-            alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            alive_bar(self.samples, title=self.bar_text(path))
             if self.show_progress else _NullProgress()
         )
 
@@ -1117,7 +1116,7 @@ class GenSource(GenGraph):
         model = self._edge_from_path(path)
 
         ctxt = (
-            alive_bar(self.samples, title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            alive_bar(self.samples, title=self.bar_text(path))
             if self.show_progress else _NullProgress()
         )
 
@@ -1633,7 +1632,7 @@ class GenNorm(GenDataConfig):
 
     def _iter_samples(self) -> Generator[tuple[str, PyTree], None, None]:
         ctxt = (
-            alive_bar(len(self.loader), title=self.filename, title_length=_BAR_TITLE_LEN)
+            alive_bar(len(self.loader), title=self.filename)
             if self.show_progress else _NullProgress()
         )
 
@@ -1842,10 +1841,11 @@ class GenLatent(GenDataConfig):
         return "/".join(path.parts[-self.name_depth:])
 
     def _iter_samples(self, path: Path | None = None) -> Generator[PyTree, None, None]:
-        path = Path(path) / self.filename if path is not None else Path(self.filename)
+        if path is None:
+            path = Path(self.filename)
         
         ctxt = (
-            alive_bar(len(self.loader), title=self.bar_text(path), title_length=_BAR_TITLE_LEN)
+            alive_bar(len(self.loader), title=self.bar_text(path))
             if self.show_progress else _NullProgress()
         )
 
@@ -1880,7 +1880,7 @@ class GenLatent(GenDataConfig):
         if write_policy == "reuse" and artifact_path.exists():
             return
         
-        samples = list(self._iter_samples())
+        samples = list(self._iter_samples(artifact_path))
         
         if hasattr(self.compression, "show_progress"):
             object.__setattr__(self.compression, "show_progress", self.show_progress)

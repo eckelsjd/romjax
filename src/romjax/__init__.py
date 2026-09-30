@@ -69,7 +69,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "tree": ("romjax.tree", None),
     "Compression": ("romjax.compression", "Compression"),
     "SVD": ("romjax.compression", "SVD"),
-    "SplitLinearCompression": ("romjax.compression", "SplitLinearCompression"),
+    "BlockLinearCompression": ("romjax.compression", "BlockLinearCompression"),
     "IdentityEdge": ("romjax.graph", "IdentityEdge"),
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
@@ -80,7 +80,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "eqx_evaluate": ("romjax.model", "eqx_evaluate"),
     "Affine": ("romjax.nn", "Affine"),
     "LinearProjection": ("romjax.nn", "LinearProjection"),
-    "SplitLinearProjection": ("romjax.nn", "SplitLinearProjection"),
+    "BlockLinearAutoencoder": ("romjax.nn", "BlockLinearAutoencoder"),
     "ImplicitAffine": ("romjax.pde", "ImplicitAffine"),
     "ImplicitIterativeGalerkin": ("romjax.pde", "ImplicitIterativeGalerkin"),
     "AliveProgressMeter": ("romjax.pde", "AliveProgressMeter"),
@@ -132,13 +132,13 @@ __all__ = list(_LAZY_EXPORTS.keys())
 if TYPE_CHECKING:
     from . import rng as random
     from . import tree as tree
-    from .compression import Compression, SVD, SplitLinearCompression
+    from .compression import BlockLinearCompression, Compression, SVD
     from .compare import CompareMetric, CompareOrbax
     from .data_gen import DataGeneration, DataLoader
     from .graph import CompositeEdge, FunctionGraph, IdentityEdge
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
-    from .nn import Affine, LinearProjection, SplitLinearProjection
+    from .nn import Affine, BlockLinearAutoencoder, LinearProjection
     from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
     from .pde import (
         AliveProgressMeter,

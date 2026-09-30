@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Callable, Literal
 
 import equinox as eqx
@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import ArrayLike, Key, PyTree
 
-__all__ = ["Affine", "LinearProjection", "SplitLinearProjection"]
+__all__ = ["Affine", "BlockLinearAutoencoder", "LinearProjection"]
 
 
 class _TriangularMLP(eqx.Module):
@@ -338,7 +338,7 @@ class LinearProjection(eqx.Module):
 
     matrix: ArrayLike  # (r x N)
     bias: ArrayLike | None  # (N,)
-    skip_bias: bool = eqx.field(static=False)
+    skip_bias: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -430,195 +430,207 @@ class LinearProjection(eqx.Module):
         return self.reduce(x)
 
 
-class SplitLinearProjection(eqx.Module):
-    """Linear encoder-decoder with separate latent partitions for two output fields.
+class BlockLinearAutoencoder(eqx.Module):
+    """Linear autoencoder represented by corresponding input and latent blocks.
 
-    The encoder maps one flat full-state vector to the concatenated coordinates
-    ``(lb, lu)``. The decoder maps that full latent vector to concatenated
-    reconstructions ``(bhat, uhat)``. Tree gathering, latent splitting, and
-    reconstruction scattering are deliberately delegated to
-    :func:`romjax.model.eqx_evaluate`.
+    The encoder block ``(i, j)`` maps input partition ``j`` to latent partition
+    ``i``. The decoder block ``(i, j)`` maps latent partition ``j`` back to input
+    partition ``i``. In diagonal mode, off-diagonal blocks are stored as ``None``
+    and do not participate in evaluation.
     """
 
-    encoder_b: ArrayLike
-    encoder_u: ArrayLike
-    decoder_b: ArrayLike
-    decoder_u: ArrayLike
-    encoder_b_bias: ArrayLike | None
-    encoder_u_bias: ArrayLike | None
-    decoder_b_bias: ArrayLike | None
-    decoder_u_bias: ArrayLike | None
-    input_size: int = eqx.field(static=True)
-    b_latent: int = eqx.field(static=True)
-    u_latent: int = eqx.field(static=True)
-    b_output: int = eqx.field(static=True)
-    u_output: int = eqx.field(static=True)
+    encoder_blocks: tuple[tuple[ArrayLike | None, ...], ...]
+    decoder_blocks: tuple[tuple[ArrayLike | None, ...], ...]
+    bias: ArrayLike | None
+    input_sizes: tuple[int, ...] = eqx.field(static=True)
+    latent_sizes: tuple[int, ...] = eqx.field(static=True)
+    diagonal: bool = eqx.field(static=True)
 
     def __init__(
         self,
-        input_size: int | None = None,
-        b_latent: int | None = None,
-        u_latent: int | None = None,
-        b_output: int | None = None,
-        u_output: int | None = None,
+        input_sizes: Sequence[int],
+        latent_sizes: Sequence[int],
         key: Key | None = None,
-        encoder_b: ArrayLike | None = None,
-        encoder_u: ArrayLike | None = None,
-        decoder_b: ArrayLike | None = None,
-        decoder_u: ArrayLike | None = None,
-        encoder_b_bias: ArrayLike | None = None,
-        encoder_u_bias: ArrayLike | None = None,
-        decoder_b_bias: ArrayLike | None = None,
-        decoder_u_bias: ArrayLike | None = None,
+        encoder_blocks: Sequence[Sequence[ArrayLike | None]] | None = None,
+        decoder_blocks: Sequence[Sequence[ArrayLike | None]] | None = None,
+        bias: ArrayLike | None = None,
         random_bias: bool = False,
+        diagonal: bool = False,
         scale: float = 0.25,
     ) -> None:
-        """
-        Initialize split encoder and decoder weights.
+        """Initialize block encoder and decoder weights.
 
-        Supply either all four matrices explicitly or dimensions and ``key`` for
-        random initialization. Biases are optional affine offsets for their
-        corresponding maps.
+        Supply both block grids explicitly, or provide ``key`` to initialize all
+        active blocks randomly. ``input_sizes`` and ``latent_sizes`` are segment
+        lengths, not cumulative split indices.
 
-        :param input_size: shared full-state input dimension for both encoders
-        :param b_latent: dimension of the first latent partition
-        :param u_latent: dimension of the second latent partition
-        :param b_output: reconstruction size of the first output field
-        :param u_output: reconstruction size of the second output field
-        :param key: JAX random key for random initialization
-        :param encoder_b: first encoder matrix with shape ``(b_latent, input_size)``
-        :param encoder_u: second encoder matrix with shape ``(u_latent, input_size)``
-        :param decoder_b: first decoder matrix with shape ``(b_output, b_latent + u_latent)``
-        :param decoder_u: second decoder matrix with shape ``(u_output, b_latent + u_latent)``
-        :param encoder_b_bias: optional first encoder bias with shape ``(b_latent,)``
-        :param encoder_u_bias: optional second encoder bias with shape ``(u_latent,)``
-        :param decoder_b_bias: optional first decoder bias with shape ``(b_output,)``
-        :param decoder_u_bias: optional second decoder bias with shape ``(u_output,)``
-        :param random_bias: randomly initialize omitted biases in random-init mode
+        :param input_sizes: sizes of the full-space vector partitions
+        :param latent_sizes: sizes of the corresponding latent partitions
+        :param key: JAX random key used for random initialization
+        :param encoder_blocks: block grid with shapes ``(latent_sizes[i], input_sizes[j])``
+        :param decoder_blocks: block grid with shapes ``(input_sizes[i], latent_sizes[j])``
+        :param bias: optional full-space centering vector
+        :param random_bias: randomly initialize an omitted bias using ``key``
+        :param diagonal: omit and skip every off-diagonal block
         :param scale: random initialization scaling factor
         """
-        matrices = (encoder_b, encoder_u, decoder_b, decoder_u)
-        bias_keys: tuple[Key | None, Key | None, Key | None, Key | None] = (None, None, None, None)
-        if any(matrix is not None for matrix in matrices):
-            if not all(matrix is not None for matrix in matrices):
-                raise ValueError("SplitLinearProjection requires all four matrices when using explicit weights.")
-            self.encoder_b = jnp.asarray(encoder_b)
-            self.encoder_u = jnp.asarray(encoder_u)
-            self.decoder_b = jnp.asarray(decoder_b)
-            self.decoder_u = jnp.asarray(decoder_u)
-            self._set_dimensions_from_matrices(input_size, b_latent, u_latent, b_output, u_output)
+        self.input_sizes = tuple(int(size) for size in input_sizes)
+        self.latent_sizes = tuple(int(size) for size in latent_sizes)
+        self.diagonal = diagonal
+        self._validate_sizes()
+
+        if (encoder_blocks is None) != (decoder_blocks is None):
+            raise ValueError("encoder_blocks and decoder_blocks must be supplied together.")
+        if encoder_blocks is None:
+            if key is None:
+                raise ValueError("Random block initialization requires a key.")
+            self.encoder_blocks, self.decoder_blocks, bias_key = self._random_blocks(key, scale)
         else:
-            dimensions = (input_size, b_latent, u_latent, b_output, u_output)
-            if key is None or any(dimension is None for dimension in dimensions):
-                raise ValueError(
-                    "SplitLinearProjection requires all dimensions and key when explicit matrices are not supplied."
-                )
-            if any(dimension < 1 for dimension in dimensions):
-                raise ValueError("SplitLinearProjection dimensions must be positive.")
-            self.input_size = input_size
-            self.b_latent = b_latent
-            self.u_latent = u_latent
-            self.b_output = b_output
-            self.u_output = u_output
-            encoder_b_key, encoder_u_key, decoder_b_key, decoder_u_key, *bias_keys = jax.random.split(key, 8)
-            latent_size = b_latent + u_latent
-            self.encoder_b = scale * jax.random.normal(encoder_b_key, (b_latent, input_size))
-            self.encoder_u = scale * jax.random.normal(encoder_u_key, (u_latent, input_size))
-            self.decoder_b = scale * jax.random.normal(decoder_b_key, (b_output, latent_size))
-            self.decoder_u = scale * jax.random.normal(decoder_u_key, (u_output, latent_size))
+            self.encoder_blocks = self._validate_blocks(encoder_blocks, encoder=True)
+            self.decoder_blocks = self._validate_blocks(decoder_blocks, encoder=False)
+            bias_key = key
 
-        self.encoder_b_bias = self._bias(
-            encoder_b_bias, self.b_latent, "encoder_b_bias", random_bias, bias_keys[0], scale
-        )
-        self.encoder_u_bias = self._bias(
-            encoder_u_bias, self.u_latent, "encoder_u_bias", random_bias, bias_keys[1], scale
-        )
-        self.decoder_b_bias = self._bias(
-            decoder_b_bias, self.b_output, "decoder_b_bias", random_bias, bias_keys[2], scale
-        )
-        self.decoder_u_bias = self._bias(
-            decoder_u_bias, self.u_output, "decoder_u_bias", random_bias, bias_keys[3], scale
-        )
+        if bias is not None:
+            self.bias = jnp.asarray(bias)
+            if self.bias.shape != (self.input_size,):
+                raise ValueError(f"bias must have shape {(self.input_size,)}, got shape {self.bias.shape}.")
+        elif random_bias:
+            if bias_key is None:
+                raise ValueError("random_bias requires a key.")
+            self.bias = scale * jax.random.normal(bias_key, (self.input_size,))
+        else:
+            self.bias = None
 
-    def _set_dimensions_from_matrices(
+    @property
+    def input_size(self) -> int:
+        """Return the total full-space dimension."""
+        return sum(self.input_sizes)
+
+    @property
+    def latent_size(self) -> int:
+        """Return the total latent dimension."""
+        return sum(self.latent_sizes)
+
+    def _validate_sizes(self) -> None:
+        """Validate static partition metadata."""
+        if not self.input_sizes or not self.latent_sizes:
+            raise ValueError("input_sizes and latent_sizes must be non-empty.")
+        if len(self.input_sizes) != len(self.latent_sizes):
+            raise ValueError("input_sizes and latent_sizes must contain the same number of partitions.")
+        if any(size < 1 for size in (*self.input_sizes, *self.latent_sizes)):
+            raise ValueError("Block partition sizes must be positive.")
+
+    def _random_blocks(
+        self, key: Key, scale: float
+    ) -> tuple[
+        tuple[tuple[ArrayLike | None, ...], ...],
+        tuple[tuple[ArrayLike | None, ...], ...],
+        Key,
+    ]:
+        """Initialize active blocks and return a remaining bias key."""
+        count = len(self.input_sizes)
+        active_count = count if self.diagonal else count * count
+        keys = iter(jax.random.split(key, 2 * active_count + 1))
+        encoder = tuple(
+            tuple(
+                scale * jax.random.normal(next(keys), (self.latent_sizes[i], self.input_sizes[j]))
+                if not self.diagonal or i == j else None
+                for j in range(count)
+            )
+            for i in range(count)
+        )
+        decoder = tuple(
+            tuple(
+                scale * jax.random.normal(next(keys), (self.input_sizes[i], self.latent_sizes[j]))
+                if not self.diagonal or i == j else None
+                for j in range(count)
+            )
+            for i in range(count)
+        )
+        return encoder, decoder, next(keys)
+
+    def _validate_blocks(
         self,
-        input_size: int | None,
-        b_latent: int | None,
-        u_latent: int | None,
-        b_output: int | None,
-        u_output: int | None,
-    ) -> None:
-        """Validate explicit matrices and set their dimensions."""
-        matrices = (self.encoder_b, self.encoder_u, self.decoder_b, self.decoder_u)
-        if any(matrix.ndim != 2 for matrix in matrices):
-            raise ValueError("SplitLinearProjection matrices must all be two-dimensional.")
-        inferred = (
-            self.encoder_b.shape[1],
-            self.encoder_b.shape[0],
-            self.encoder_u.shape[0],
-            self.decoder_b.shape[0],
-            self.decoder_u.shape[0],
-        )
-        if self.encoder_u.shape[1] != inferred[0]:
-            raise ValueError("encoder_b and encoder_u must have the same input size.")
-        latent_size = inferred[1] + inferred[2]
-        if self.decoder_b.shape[1] != latent_size or self.decoder_u.shape[1] != latent_size:
-            raise ValueError("Decoder matrices must accept the concatenated latent size.")
-        supplied = (input_size, b_latent, u_latent, b_output, u_output)
-        if any(value is not None and value != expected for value, expected in zip(supplied, inferred)):
-            raise ValueError("Supplied dimensions must match the explicit matrix shapes.")
-        self.input_size, self.b_latent, self.u_latent, self.b_output, self.u_output = inferred
+        blocks: Sequence[Sequence[ArrayLike | None]],
+        *,
+        encoder: bool,
+    ) -> tuple[tuple[ArrayLike | None, ...], ...]:
+        """Validate and normalize one square block grid."""
+        count = len(self.input_sizes)
+        if len(blocks) != count or any(len(row) != count for row in blocks):
+            raise ValueError(f"Block grids must have shape {(count, count)}.")
+        normalized: list[tuple[ArrayLike | None, ...]] = []
+        for i, row in enumerate(blocks):
+            normalized_row: list[ArrayLike | None] = []
+            for j, block in enumerate(row):
+                active = not self.diagonal or i == j
+                if not active:
+                    if block is not None:
+                        raise ValueError("Off-diagonal blocks must be None when diagonal=True.")
+                    normalized_row.append(None)
+                    continue
+                if block is None:
+                    raise ValueError("Every active block must be supplied.")
+                values = jnp.asarray(block)
+                expected = (
+                    (self.latent_sizes[i], self.input_sizes[j])
+                    if encoder else (self.input_sizes[i], self.latent_sizes[j])
+                )
+                if values.shape != expected:
+                    kind = "encoder" if encoder else "decoder"
+                    raise ValueError(f"{kind}_blocks[{i}][{j}] must have shape {expected}, got {values.shape}.")
+                normalized_row.append(values)
+            normalized.append(tuple(normalized_row))
+        return tuple(normalized)
 
     @staticmethod
-    def _bias(
-        bias: ArrayLike | None,
-        size: int,
-        name: str,
-        random_bias: bool,
-        key: Key | None,
-        scale: float,
-    ) -> ArrayLike | None:
-        """Validate one optional bias or initialize it in random-init mode."""
-        if bias is not None:
-            values = jnp.asarray(bias)
-            if values.shape != (size,):
-                raise ValueError(f"{name} must have shape {(size,)}, got shape {values.shape}.")
-            return values
-        if random_bias:
-            if key is None:
-                raise ValueError("random_bias requires random initialization with a key.")
-            return scale * jax.random.normal(key, (size,))
-        return None
+    def _apply_blocks(
+        blocks: tuple[tuple[ArrayLike | None, ...], ...], values: tuple[jax.Array, ...]
+    ) -> jax.Array:
+        """Apply one block matrix to partitioned values without materializing it."""
+        outputs: list[jax.Array] = []
+        for row in blocks:
+            result = None
+            for block, value in zip(row, values):
+                if block is None:
+                    continue
+                contribution = jnp.matmul(value, jnp.swapaxes(jnp.asarray(block), -1, -2))
+                result = contribution if result is None else result + contribution
+            if result is None:  # pragma: no cover - constructor validation prevents this
+                raise ValueError("Each block row must contain at least one active block.")
+            outputs.append(result)
+        return jnp.concatenate(outputs, axis=-1)
 
     def reduce(self, x: ArrayLike) -> ArrayLike:
-        """Encode full-space values as concatenated split latent coordinates.
+        """Encode full-space values into concatenated latent coordinates.
 
-        :param x: full-space vector or batch with last axis ``input_size``
-        :return: concatenated coordinates with last axis ``b_latent + u_latent``
+        :param x: full-space vector or batch with last axis ``sum(input_sizes)``
+        :return: latent coordinates with last axis ``sum(latent_sizes)``
         """
         values = jnp.asarray(x)
-        lb = jnp.matmul(values, jnp.swapaxes(self.encoder_b, -1, -2))
-        lu = jnp.matmul(values, jnp.swapaxes(self.encoder_u, -1, -2))
-        if self.encoder_b_bias is not None:
-            lb = lb + self.encoder_b_bias
-        if self.encoder_u_bias is not None:
-            lu = lu + self.encoder_u_bias
-        return jnp.concatenate((lb, lu), axis=-1)
+        if values.ndim == 0 or values.shape[-1] != self.input_size:
+            raise ValueError(f"x must have last-axis size {self.input_size}, got shape {values.shape}.")
+        if self.bias is not None:
+            values = values - jnp.asarray(self.bias)
+        split_indices = tuple(sum(self.input_sizes[:index]) for index in range(1, len(self.input_sizes)))
+        partitions = tuple(jnp.split(values, split_indices, axis=-1))
+        return self._apply_blocks(self.encoder_blocks, partitions)
 
     def reconstruct(self, z: ArrayLike) -> ArrayLike:
-        """Decode concatenated split latent coordinates into concatenated fields.
+        """Decode latent coordinates into the concatenated full-space vector.
 
-        :param z: latent vector or batch with last axis ``b_latent + u_latent``
-        :return: concatenated reconstructions with last axis ``b_output + u_output``
+        :param z: latent vector or batch with last axis ``sum(latent_sizes)``
+        :return: reconstruction with last axis ``sum(input_sizes)``
         """
         values = jnp.asarray(z)
-        bhat = jnp.matmul(values, jnp.swapaxes(self.decoder_b, -1, -2))
-        uhat = jnp.matmul(values, jnp.swapaxes(self.decoder_u, -1, -2))
-        if self.decoder_b_bias is not None:
-            bhat = bhat + self.decoder_b_bias
-        if self.decoder_u_bias is not None:
-            uhat = uhat + self.decoder_u_bias
-        return jnp.concatenate((bhat, uhat), axis=-1)
+        if values.ndim == 0 or values.shape[-1] != self.latent_size:
+            raise ValueError(f"z must have last-axis size {self.latent_size}, got shape {values.shape}.")
+        split_indices = tuple(sum(self.latent_sizes[:index]) for index in range(1, len(self.latent_sizes)))
+        partitions = tuple(jnp.split(values, split_indices, axis=-1))
+        reconstructed = self._apply_blocks(self.decoder_blocks, partitions)
+        if self.bias is not None:
+            reconstructed = reconstructed + jnp.asarray(self.bias)
+        return reconstructed
 
     def __call__(self, x: ArrayLike) -> ArrayLike:
         """Alias for :meth:`reduce`."""

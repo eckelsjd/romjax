@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from romjax.nn import LinearProjection
 from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys, log_uniform
 
 
@@ -119,6 +120,19 @@ def test_pytree_sampler() -> None:
     passthrough_sampler = PyTreeSampler(template={"phi": 1.0})
     passthrough_sample = passthrough_sampler.sample(key)
     assert passthrough_sample["phi"] == 1.0
+
+
+def test_pytree_sampler_supports_root_module_distribution() -> None:
+    sampler = PyTreeSampler(
+        template={"name": "LinearProjection", "kwargs": {"latent": 2, "dof": 3}}
+    )
+
+    first = sampler.sample(jax.random.key(4))
+    second = sampler.sample(jax.random.key(4))
+
+    assert isinstance(first, LinearProjection)
+    assert first.matrix.shape == (2, 3)
+    np.testing.assert_allclose(first.matrix, second.matrix)
 
 
 def test_pytree_sampler_allows_inline_distribution_kwargs() -> None:

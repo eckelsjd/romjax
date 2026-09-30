@@ -14,7 +14,7 @@ from romjax.model import (
     ImplicitModel,
     eqx_evaluate,
 )
-from romjax.nn import LinearProjection, SplitLinearProjection
+from romjax.nn import BlockLinearAutoencoder, LinearProjection
 from romjax.tree import is_shape_dtype
 
 
@@ -446,88 +446,84 @@ def test_linear_projection_with_bias_supports_jit_grad_and_vmap() -> None:
     assert LinearProjection(latent=2, dof=3, key=jax.random.PRNGKey(12)).bias is None
 
 
-def test_split_linear_projection_math_validation_and_transforms() -> None:
-    """Check split projections, affine offsets, and JAX transformations."""
-    module = SplitLinearProjection(
-        encoder_b=jnp.array([[1.0, 2.0, -1.0], [0.0, 1.0, 3.0]]),
-        encoder_u=jnp.array([[2.0, -1.0, 0.5]]),
-        decoder_b=jnp.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]),
-        decoder_u=jnp.array([[0.5, -2.0, 1.0]]),
-        encoder_b_bias=jnp.array([0.5, -1.0]),
-        encoder_u_bias=jnp.array([2.0]),
-        decoder_b_bias=jnp.array([1.5, -0.5]),
-        decoder_u_bias=jnp.array([-1.0]),
+def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
+    """Check coupled block algebra, centering, validation, and JAX transformations."""
+    encoder_blocks = (
+        (jnp.array([[1.0, 2.0]]), jnp.array([[-1.0]])),
+        (jnp.array([[0.0, 1.0], [2.0, -1.0]]), jnp.array([[3.0], [0.5]])),
+    )
+    decoder_blocks = (
+        (jnp.array([[1.0], [-1.0]]), jnp.array([[2.0, 3.0], [0.5, 2.0]])),
+        (jnp.array([[0.5]]), jnp.array([[-2.0, 1.0]])),
+    )
+    bias = jnp.array([0.5, -1.0, 2.0])
+    module = BlockLinearAutoencoder(
+        input_sizes=[2, 1], latent_sizes=[1, 2], encoder_blocks=encoder_blocks,
+        decoder_blocks=decoder_blocks, bias=bias,
     )
     samples = jnp.array([[1.0, 2.0, 3.0], [2.0, 0.0, 1.0]])
-
+    centered = samples - bias
+    x0, x1 = centered[:, :2], centered[:, 2:]
     expected_latent = jnp.concatenate(
-        (
-            samples @ module.encoder_b.T + module.encoder_b_bias,
-            samples @ module.encoder_u.T + module.encoder_u_bias,
-        ),
+        (x0 @ encoder_blocks[0][0].T + x1 @ encoder_blocks[0][1].T,
+         x0 @ encoder_blocks[1][0].T + x1 @ encoder_blocks[1][1].T),
         axis=-1,
     )
+    z0, z1 = expected_latent[:, :1], expected_latent[:, 1:]
     expected_reconstruction = jnp.concatenate(
-        (
-            expected_latent @ module.decoder_b.T + module.decoder_b_bias,
-            expected_latent @ module.decoder_u.T + module.decoder_u_bias,
-        ),
+        (z0 @ decoder_blocks[0][0].T + z1 @ decoder_blocks[0][1].T,
+         z0 @ decoder_blocks[1][0].T + z1 @ decoder_blocks[1][1].T),
         axis=-1,
-    )
+    ) + bias
     assert jnp.allclose(jax.jit(jax.vmap(module.reduce))(samples), expected_latent)
     assert jnp.allclose(jax.jit(jax.vmap(module.reconstruct))(expected_latent), expected_reconstruction)
 
-    def loss(current: SplitLinearProjection) -> jax.Array:
+    def loss(current: BlockLinearAutoencoder) -> jax.Array:
         return jnp.mean(jax.vmap(current.reconstruct)(jax.vmap(current.reduce)(samples)) ** 2)
 
     value, gradients = jax.value_and_grad(jax.jit(loss))(module)
     assert jnp.isfinite(value)
-    assert gradients.encoder_b.shape == module.encoder_b.shape
-    assert gradients.decoder_u.shape == module.decoder_u.shape
-    assert gradients.encoder_b_bias is not None
+    assert gradients.encoder_blocks[0][1].shape == module.encoder_blocks[0][1].shape
+    assert gradients.decoder_blocks[1][0].shape == module.decoder_blocks[1][0].shape
+    assert gradients.bias is not None
 
-    initialized = SplitLinearProjection(
-        input_size=3,
-        b_latent=2,
-        u_latent=1,
-        b_output=4,
-        u_output=5,
-        key=jax.random.key(0),
-        random_bias=True,
+    initialized = BlockLinearAutoencoder(
+        input_sizes=[3, 5], latent_sizes=[2, 1], key=jax.random.key(0), random_bias=True, diagonal=True,
     )
-    assert initialized.encoder_b.shape == (2, 3)
-    assert initialized.decoder_u.shape == (5, 3)
-    assert initialized.decoder_b_bias is not None
+    assert initialized.encoder_blocks[0][0].shape == (2, 3)
+    assert initialized.decoder_blocks[1][1].shape == (5, 1)
+    assert initialized.encoder_blocks[0][1] is None
+    assert initialized.decoder_blocks[1][0] is None
+    assert initialized.bias is not None
+    assert len(jax.tree.leaves(initialized)) == 5
 
-    with pytest.raises(ValueError, match="all four matrices"):
-        SplitLinearProjection(encoder_b=jnp.ones((2, 3)))
-    with pytest.raises(ValueError, match="same input size"):
-        SplitLinearProjection(
-            encoder_b=jnp.ones((2, 3)),
-            encoder_u=jnp.ones((1, 4)),
-            decoder_b=jnp.ones((4, 3)),
-            decoder_u=jnp.ones((5, 3)),
+    identity = BlockLinearAutoencoder(
+        input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
+        encoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
+        decoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
+    )
+    assert identity.bias is None
+    assert jnp.allclose(identity.reconstruct(identity.reduce(samples[:, :2])), samples[:, :2])
+
+    with pytest.raises(ValueError, match="supplied together"):
+        BlockLinearAutoencoder(
+            input_sizes=[2], latent_sizes=[1], encoder_blocks=((jnp.ones((1, 2)),),)
         )
-    with pytest.raises(ValueError, match="must match"):
-        SplitLinearProjection(
-            input_size=4,
-            encoder_b=jnp.ones((2, 3)),
-            encoder_u=jnp.ones((1, 3)),
-            decoder_b=jnp.ones((4, 3)),
-            decoder_u=jnp.ones((5, 3)),
+    with pytest.raises(ValueError, match="same number"):
+        BlockLinearAutoencoder(input_sizes=[2], latent_sizes=[1, 1], key=jax.random.key(1))
+    with pytest.raises(ValueError, match="bias must have shape"):
+        BlockLinearAutoencoder(input_sizes=[2], latent_sizes=[1], key=jax.random.key(1), bias=jnp.ones(3))
+    with pytest.raises(ValueError, match="Off-diagonal"):
+        BlockLinearAutoencoder(
+            input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
+            encoder_blocks=((jnp.ones((1, 1)), jnp.ones((1, 1))), (None, jnp.ones((1, 1)))),
+            decoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
         )
 
 
-def test_split_linear_projection_filter_model_handles_unequal_field_shapes() -> None:
+def test_block_linear_autoencoder_filter_model_handles_unequal_field_shapes() -> None:
     """Use flat gather/scatter templates to split and restore unequal fields."""
-    module = SplitLinearProjection(
-        input_size=10,
-        b_latent=2,
-        u_latent=3,
-        b_output=6,
-        u_output=4,
-        key=jax.random.key(1),
-    )
+    module = BlockLinearAutoencoder(input_sizes=[6, 4], latent_sizes=[2, 3], key=jax.random.key(1))
     model = FilterModel(
         source="full",
         target="latent",
