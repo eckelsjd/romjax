@@ -252,13 +252,12 @@ class ProjectionAutoencoder(Protocol):
         """
         ...
 
-
 class ProjectionRegularization(BaseModel):
     """Constrain a referenced autoencoder to define a projection.
 
-    The constraint hierarchy is cumulative: oblique projection requires
-    :math:`ED=I`; orthogonal projection additionally requires :math:`DE` to be
-    symmetric; and POD additionally requires :math:`D=E^T`.
+    Oblique projection requires :math:`ED=I`; orthogonal projection additionally
+    requires :math:`DE` to be symmetric; and POD enforces :math:`D=E^T` instead
+    of the symmetry condition, since the transpose condition already implies it.
 
     :param ref: parameter-tree path locating an object implementing
         :class:`ProjectionAutoencoder`
@@ -296,13 +295,39 @@ class ProjectionRegularization(BaseModel):
         self._validate_matrices(encoder, decoder)
 
         latent_identity = jnp.eye(encoder.shape[0], dtype=jnp.result_type(encoder, decoder))
-        value = jnp.mean(jnp.square(encoder @ decoder - latent_identity))
-        if self.mode in ("orthogonal", "pod"):
-            full_projection = decoder @ encoder
-            value = value + jnp.mean(jnp.square(full_projection - full_projection.T))
+        value = jnp.sum(jnp.square(encoder @ decoder - latent_identity)) / encoder.shape[0]
+        if self.mode == "orthogonal":
+            value = value + self._full_projection_symmetry_penalty(encoder, decoder)
         if self.mode == "pod":
-            value = value + jnp.mean(jnp.square(decoder - encoder.T))
+            value = value + jnp.sum(jnp.square(decoder - encoder.T)) / encoder.shape[0]
         return value
+
+    @staticmethod
+    def _full_projection_symmetry_penalty(encoder: jax.Array, decoder: jax.Array) -> jax.Array:
+        r"""Return the mean squared antisymmetry of ``decoder @ encoder``.
+
+        This uses the trace identity
+
+        .. math::
+
+           \lVert DE - (DE)^T \rVert_F^2 =
+           2\left[\operatorname{tr}((D^T D)(E E^T)) - \operatorname{tr}((ED)^2)\right],
+
+        so it operates only on latent-space matrices. Materializing ``DE``
+        would create a dense full-space square matrix and dominated CPU runtime
+        when the number of degrees of freedom is large.
+
+        :param encoder: encoder matrix ``E`` with shape ``(r, n)``
+        :param decoder: decoder matrix ``D`` with shape ``(n, r)``
+        :return: mean squared antisymmetry of the full-space projection
+        """
+        decoder_gram = decoder.T @ decoder
+        encoder_gram = encoder @ encoder.T
+        latent_projection = encoder @ decoder
+        squared_norm = 2 * (
+            jnp.trace(decoder_gram @ encoder_gram) - jnp.trace(latent_projection @ latent_projection)
+        )
+        return squared_norm / encoder.shape[0]
 
     @staticmethod
     def _validate_matrices(encoder: jax.Array, decoder: jax.Array) -> None:
