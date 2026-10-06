@@ -88,7 +88,7 @@ def cli(argv: list[str] | None = None) -> int:
                     Path(routine.root).mkdir(exist_ok=True, parents=True)
                     src = Path(args.config)
                     dest = routine.root / Path(args.config).name
-                    if src != dest:
+                    if src.resolve() != dest.resolve():
                         shutil.copy(src, dest)
             
             return routine.run()

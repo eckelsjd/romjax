@@ -196,13 +196,32 @@ def test_projection_regularization_constraint_hierarchy() -> None:
 
     assert oblique == pytest.approx(0.0)
     assert orthogonal == pytest.approx(symmetry)
-    assert pod == pytest.approx(symmetry + transpose)
+    assert pod == pytest.approx(transpose)
 
     orthonormal_encoder = jnp.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     pod_params = {"autoencoder": MatrixAutoencoder(orthonormal_encoder, orthonormal_encoder.T)}
     assert ProjectionRegularization(ref="autoencoder", mode="pod")(
         pod_params, jnp.zeros(3), None
     ) == pytest.approx(0.0)
+
+
+def test_projection_regularization_uses_latent_space_symmetry_penalty() -> None:
+    """Avoid materializing the dense full-space projection in orthogonal mode."""
+    encoder = jax.random.normal(jax.random.key(0), (3, 11))
+    decoder = jax.random.normal(jax.random.key(1), (11, 3))
+    full_projection = decoder @ encoder
+    expected = jnp.mean(jnp.square(full_projection - full_projection.T))
+    actual = ProjectionRegularization._full_projection_symmetry_penalty(encoder, decoder)
+
+    assert actual == pytest.approx(expected)
+    jaxpr = jax.make_jaxpr(ProjectionRegularization._full_projection_symmetry_penalty)(encoder, decoder)
+    output_shapes = [
+        variable.aval.shape
+        for equation in jaxpr.jaxpr.eqns
+        for variable in equation.outvars
+        if hasattr(variable.aval, "shape")
+    ]
+    assert (11, 11) not in output_shapes
 
 
 def test_projection_regularization_graph_loss_without_batch_reduction_calls_once() -> None:
