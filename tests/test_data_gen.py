@@ -15,6 +15,7 @@ from romjax.data_gen import (
     GenLatent,
     GenNorm,
     GenSource,
+    GenSymlink,
     LoadImplicitModel,
     LoadSource,
 )
@@ -22,6 +23,7 @@ from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.norm import NormTree
 from romjax.rng import CompressionSampler
+from romjax.routine import RoutineError
 from romjax.utils import load_h5, save_h5
 
 
@@ -746,6 +748,97 @@ def test_custom_dataset_config_leaf(tmp_path):
 
     assert (tmp_path / "custom" / "ok.txt").exists()
     assert custom.last_call == (str(tmp_path / "custom"), "h5", "overwrite")
+
+
+def test_symlink_dataset_config_resolves_source_from_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "existing" / "dataset"
+    source.mkdir(parents=True)
+    (source / "sample.h5").touch()
+
+    generation = DataGeneration(
+        root=tmp_path / "generated",
+        datasets={"linked": {"symlink": "existing/dataset"}},
+    )
+
+    assert isinstance(generation.datasets["linked"], GenSymlink)
+    assert generation.run() == 0
+
+    destination = tmp_path / "generated" / "linked"
+    assert destination.is_symlink()
+    assert destination.resolve() == source
+    assert destination.readlink() == Path("../existing/dataset")
+
+
+def test_symlink_dataset_config_supports_absolute_artifact_path(tmp_path):
+    source = tmp_path / "existing.h5"
+    source.touch()
+    destination = tmp_path / "generated" / "linked.h5"
+
+    GenSymlink(symlink=source).generate(destination, format="h5", write_policy="overwrite")
+
+    assert destination.is_symlink()
+    assert destination.readlink() == source
+
+
+def test_symlink_dataset_config_requires_existing_source(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / "generated" / "linked"
+
+    with pytest.raises(RoutineError, match=str(tmp_path / "missing")):
+        GenSymlink(symlink="missing").generate(destination, format="h5", write_policy="overwrite")
+
+
+def test_symlink_dataset_config_write_policies(tmp_path):
+    first_source = tmp_path / "first"
+    second_source = tmp_path / "second"
+    first_source.mkdir()
+    second_source.mkdir()
+    destination = tmp_path / "linked"
+    destination.symlink_to(first_source, target_is_directory=True)
+    generator = GenSymlink(symlink=second_source)
+
+    generator.generate(destination, format="h5", write_policy="reuse")
+    assert destination.resolve() == first_source
+
+    with pytest.raises(RoutineError, match="policy='error'"):
+        generator.generate(destination, format="h5", write_policy="error")
+
+    generator.generate(destination, format="h5", write_policy="overwrite")
+    assert destination.resolve() == second_source
+
+
+@pytest.mark.parametrize("destination_kind", ["file", "directory"])
+def test_symlink_dataset_config_does_not_overwrite_real_destination(tmp_path, destination_kind):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    if destination_kind == "file":
+        destination.write_text("keep", encoding="utf-8")
+    else:
+        destination.mkdir()
+
+    with pytest.raises(RoutineError, match="Refusing to overwrite non-symlink"):
+        GenSymlink(symlink=source).generate(destination, format="h5", write_policy="overwrite")
+
+    assert destination.exists()
+    assert not destination.is_symlink()
+    if destination_kind == "file":
+        assert destination.read_text(encoding="utf-8") == "keep"
+
+
+def test_symlink_dataset_config_handles_dangling_destination(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "linked"
+    destination.symlink_to(tmp_path / "missing", target_is_directory=True)
+    generator = GenSymlink(symlink=source)
+
+    with pytest.raises(RoutineError, match="policy='error'"):
+        generator.generate(destination, format="h5", write_policy="error")
+
+    generator.generate(destination, format="h5", write_policy="overwrite")
+    assert destination.resolve() == source
 
 
 def test_source_data_config_types(tmp_path):

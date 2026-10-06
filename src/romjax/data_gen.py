@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -52,6 +53,7 @@ __all__ = [
     "DataGeneration",
     "DataLoader",
     "GenDataConfig",
+    "GenSymlink",
     "LoadDataConfig",
 ]
 
@@ -196,6 +198,59 @@ class GenDataConfig(BaseModel, ABC):
     ) -> None:
         """Generate data at the provided path using the specified format and write_policy."""
         raise NotImplementedError
+
+
+class GenSymlink(GenDataConfig):
+    """Create a symbolic link to an existing dataset or artifact.
+
+    Relative source paths are interpreted from the working directory when
+    :meth:`generate` is called.
+
+    :param symlink: existing file or directory to use as the link target
+    """
+
+    symlink: Path
+
+    def generate(
+        self,
+        path: Path,
+        format: SUPPORTED_FORMATS | None = None,
+        write_policy: SUPPORTED_POLICIES | None = None,
+    ) -> None:
+        """Create the configured symbolic link at ``path``.
+
+        :param path: destination of the symbolic link
+        :param format: inherited data format, unused except for configuration validation
+        :param write_policy: behavior when the destination already exists
+        :raises RoutineError: if the source is missing or the destination conflicts with the write policy
+        """
+        _, write_policy = self._validate_format_and_policy(format, write_policy)
+
+        configured_source = self.symlink
+        source = configured_source if configured_source.is_absolute() else Path.cwd() / configured_source
+        try:
+            source = source.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise RoutineError(f"Symlink source does not exist: {source.absolute()}") from exc
+
+        destination = Path(path).absolute()
+        destination_exists = destination.exists() or destination.is_symlink()
+        if destination_exists:
+            if write_policy == "reuse":
+                return
+            if write_policy == "error":
+                raise RoutineError(f"Dataset already exists at {destination} and policy='error'")
+            if not destination.is_symlink():
+                raise RoutineError(
+                    f"Refusing to overwrite non-symlink destination at {destination}"
+                )
+            destination.unlink()
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        link_target = source
+        if not configured_source.is_absolute():
+            link_target = Path(os.path.relpath(source, start=destination.parent.resolve()))
+        destination.symlink_to(link_target, target_is_directory=source.is_dir())
 
 
 class GenGraph(GenDataConfig, ABC):
@@ -1910,6 +1965,8 @@ class GenLatent(GenDataConfig):
 def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
     """Validate every leaf in a pytree-like template as a :class:`GenDataConfig`. Leave anything else untouched."""
     if isinstance(template, Mapping):
+        if all(field in template for field in required_fields(GenSymlink)):
+            return GenSymlink(**template)
         latent_fields = {"compression", "gather_paths", "gather_template"}
         filename = template.get("filename")
         latent_filename = isinstance(filename, str | Path) and Path(filename).suffix == ".h5"
