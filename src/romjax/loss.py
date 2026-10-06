@@ -1,7 +1,7 @@
 """Loss functions for graphs."""
 import functools
 from inspect import Parameter, signature
-from typing import Annotated, Any, Callable, Literal, Mapping, Sequence
+from typing import Annotated, Any, Callable, Literal, Mapping, Protocol, Sequence
 
 import equinox as eqx
 import jax
@@ -25,6 +25,7 @@ from romjax.model import ImplicitSampleable, SourceSampleable
 from romjax.operators import BinaryOp, UnaryOp
 from romjax.tree import (
     TreePath,
+    coerce_tree_path,
     coerce_tree_paths,
     get_subtree,
     pytree_path_iter,
@@ -40,6 +41,8 @@ __all__ = [
     "GraphLossTerm",
     "GraphLossTermGenerator",
     "GraphTest",
+    "ProjectionAutoencoder",
+    "ProjectionRegularization",
     "cyclic_path_error_terms",
     "log_determinant_regularization",
     "path_error_loss",
@@ -49,7 +52,7 @@ __all__ = [
 
 _GRAPH_PATH_PAYLOAD_CACHE = "graph_path_payloads"
 _LOSS_TERM_GENERATOR_REGISTRY: dict[str, Callable[..., Sequence["GraphLossTerm"]]] = {}
-_LOSS_REGISTRY: dict[str, Callable[[PyTree, PyTree, FunctionGraph], ArrayLike]] = {}
+_LOSS_REGISTRY: dict[str, Callable[..., Any]] = {}
 
 
 type _PathPayloadCacheKey = tuple[str, str, tuple[str, ...]]
@@ -233,12 +236,96 @@ def log_determinant_regularization(
         return jnp.square(value) if square else value
 
 
+class ProjectionAutoencoder(Protocol):
+    """Structural interface for autoencoders used by projection regularization.
+
+    Linear autoencoders may ignore ``data``. Nonlinear autoencoders should return
+    the encoder Jacobian at the supplied sample and the decoder Jacobian at its
+    encoded value.
+    """
+
+    def projection_matrices(self, data: PyTree) -> tuple[ArrayLike, ArrayLike]:
+        """Return encoder and decoder matrices with shapes ``(r, n)`` and ``(n, r)``.
+
+        :param data: one sample, or the complete batch when batch reduction is disabled
+        :return: encoder matrix ``E`` and decoder matrix ``D``
+        """
+        ...
+
+
+class ProjectionRegularization(BaseModel):
+    """Constrain a referenced autoencoder to define a projection.
+
+    The constraint hierarchy is cumulative: oblique projection requires
+    :math:`ED=I`; orthogonal projection additionally requires :math:`DE` to be
+    symmetric; and POD additionally requires :math:`D=E^T`.
+
+    :param ref: parameter-tree path locating an object implementing
+        :class:`ProjectionAutoencoder`
+    :param mode: strongest projection constraint to apply
+    :param path: optional graph path applied to data before evaluating local matrices
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    ref: Annotated[TreePath, BeforeValidator(coerce_tree_path)]
+    mode: Literal["oblique", "orthogonal", "pod"] = "oblique"
+    path: Sequence[str | Edge] | None = None
+
+    def __call__(self, params: PyTree, data: PyTree, graph: FunctionGraph | None) -> ArrayLike:
+        """Evaluate the configured projection constraint.
+
+        :param params: graph parameter pytree
+        :param data: one sample, or the complete batch when ``batch_reduce`` is ``None``
+        :param graph: graph used to transform data when ``path`` is configured
+        :return: scalar projection regularization
+        """
+        target = get_subtree(params, self.ref)
+        if target is None:
+            raise ValueError(f"Can't locate autoencoder for projection regularization via ref: '{self.ref}'")
+
+        if self.path:
+            if graph is None:
+                raise ValueError("Projection regularization requires a graph when path is configured.")
+            data = graph.push_path(data, path=self.path, edge_payload_patches=params)
+
+        projection_matrices = getattr(target, "projection_matrices", None)
+        if not callable(projection_matrices):
+            raise TypeError("Projection regularization target must implement projection_matrices(data).")
+        encoder, decoder = (jnp.asarray(matrix) for matrix in projection_matrices(data))
+        self._validate_matrices(encoder, decoder)
+
+        latent_identity = jnp.eye(encoder.shape[0], dtype=jnp.result_type(encoder, decoder))
+        value = jnp.mean(jnp.square(encoder @ decoder - latent_identity))
+        if self.mode in ("orthogonal", "pod"):
+            full_projection = decoder @ encoder
+            value = value + jnp.mean(jnp.square(full_projection - full_projection.T))
+        if self.mode == "pod":
+            value = value + jnp.mean(jnp.square(decoder - encoder.T))
+        return value
+
+    @staticmethod
+    def _validate_matrices(encoder: jax.Array, decoder: jax.Array) -> None:
+        """Validate encoder and decoder matrix ranks and dimensions."""
+        if encoder.ndim != 2 or decoder.ndim != 2:
+            raise ValueError(
+                "projection_matrices must return rank-two encoder and decoder matrices; "
+                f"got shapes {encoder.shape} and {decoder.shape}."
+            )
+        if encoder.shape != (decoder.shape[1], decoder.shape[0]):
+            raise ValueError(
+                "projection_matrices must return encoder (latent, full) and decoder (full, latent) matrices; "
+                f"got shapes {encoder.shape} and {decoder.shape}."
+            )
+
+
 _LOSS_REGISTRY.update({
     "path_error": path_error_loss,
     "tikhonov": tikhonov_regularization,
     "orthogonal": orthogonal_regularization,
     "symmetric": symmetric_regularization,
     "log_determinant": log_determinant_regularization,
+    "projection": ProjectionRegularization,
 })
 
 
