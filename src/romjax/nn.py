@@ -605,6 +605,42 @@ class BlockLinearAutoencoder(eqx.Module):
             outputs.append(result)
         return jnp.concatenate(outputs, axis=-1)
 
+    @staticmethod
+    def _materialize_blocks(
+        blocks: tuple[tuple[ArrayLike | None, ...], ...],
+        row_sizes: tuple[int, ...],
+        column_sizes: tuple[int, ...],
+    ) -> jax.Array:
+        """Materialize a block grid, replacing inactive blocks with zeros."""
+        active = [jnp.asarray(block) for row in blocks for block in row if block is not None]
+        dtype = jnp.result_type(*active)
+        rows = tuple(
+            jnp.concatenate(
+                tuple(
+                    jnp.zeros((row_sizes[i], column_sizes[j]), dtype=dtype)
+                    if block is None else jnp.asarray(block)
+                    for j, block in enumerate(row)
+                ),
+                axis=1,
+            )
+            for i, row in enumerate(blocks)
+        )
+        return jnp.concatenate(rows, axis=0)
+
+    def projection_matrices(self, data: PyTree) -> tuple[ArrayLike, ArrayLike]:
+        """Return dense encoder and decoder matrices for projection constraints.
+
+        The matrices are independent of the supplied data because this
+        autoencoder is linear after centering.
+
+        :param data: unused sample or batch supplied by the loss workflow
+        :return: encoder matrix ``E`` and decoder matrix ``D``
+        """
+        del data
+        encoder = self._materialize_blocks(self.encoder_blocks, self.latent_sizes, self.input_sizes)
+        decoder = self._materialize_blocks(self.decoder_blocks, self.input_sizes, self.latent_sizes)
+        return encoder, decoder
+
     def reduce(self, x: ArrayLike) -> ArrayLike:
         """Encode full-space values into concatenated latent coordinates.
 

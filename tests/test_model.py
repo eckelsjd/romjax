@@ -8,6 +8,7 @@ import pytest
 
 from romjax import YamlLoader
 from romjax.graph import FunctionGraph, Node
+from romjax.loss import ProjectionRegularization
 from romjax.model import (
     ExplicitModel,
     FilterModel,
@@ -487,6 +488,22 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
     assert gradients.decoder_blocks[1][0].shape == module.decoder_blocks[1][0].shape
     assert gradients.bias is not None
 
+    encoder_matrix, decoder_matrix = module.projection_matrices(samples)
+    expected_encoder_matrix = jnp.block([list(row) for row in encoder_blocks])
+    expected_decoder_matrix = jnp.block([list(row) for row in decoder_blocks])
+    assert jnp.allclose(encoder_matrix, expected_encoder_matrix)
+    assert jnp.allclose(decoder_matrix, expected_decoder_matrix)
+    assert jnp.allclose(module.reduce(samples), (samples - bias) @ encoder_matrix.T)
+    assert jnp.allclose(module.reconstruct(expected_latent), expected_latent @ decoder_matrix.T + bias)
+
+    regularization = ProjectionRegularization(ref=("autoencoder",), mode="pod")
+    regularization_value, regularization_gradients = jax.value_and_grad(
+        jax.jit(lambda current: regularization({"autoencoder": current}, samples, None))
+    )(module)
+    assert jnp.isfinite(regularization_value)
+    assert regularization_gradients.encoder_blocks[0][1].shape == encoder_blocks[0][1].shape
+    assert regularization_gradients.decoder_blocks[1][0].shape == decoder_blocks[1][0].shape
+
     initialized = BlockLinearAutoencoder(
         input_sizes=[3, 5], latent_sizes=[2, 1], key=jax.random.key(0), random_bias=True, diagonal=True,
     )
@@ -496,6 +513,13 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
     assert initialized.decoder_blocks[1][0] is None
     assert initialized.bias is not None
     assert len(jax.tree.leaves(initialized)) == 5
+    diagonal_encoder, diagonal_decoder = initialized.projection_matrices(samples)
+    assert diagonal_encoder.shape == (3, 8)
+    assert diagonal_decoder.shape == (8, 3)
+    assert jnp.allclose(diagonal_encoder[:2, 3:], 0.0)
+    assert jnp.allclose(diagonal_encoder[2:, :3], 0.0)
+    assert jnp.allclose(diagonal_decoder[:3, 2:], 0.0)
+    assert jnp.allclose(diagonal_decoder[3:, :2], 0.0)
 
     identity = BlockLinearAutoencoder(
         input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from pydantic import ValidationError
 
 from romjax import YamlLoader
 from romjax.graph import Edge, FunctionGraph, Node
@@ -9,6 +10,7 @@ from romjax.loss import (
     GraphLoss,
     GraphLossTerm,
     GraphLossTermGenerator,
+    ProjectionRegularization,
     cyclic_path_error_terms,
     log_determinant_regularization,
     tikhonov_regularization,
@@ -16,6 +18,30 @@ from romjax.loss import (
 from romjax.model import SourceSampleable
 from romjax.nn import Affine
 from romjax.train import Train
+
+
+class MatrixAutoencoder:
+    """Minimal projection-matrix provider used by regularization tests."""
+
+    def __init__(self, encoder: jax.Array, decoder: jax.Array) -> None:
+        self.encoder = encoder
+        self.decoder = decoder
+        self.calls = 0
+        self.last_data_shape: tuple[int, ...] | None = None
+
+    def projection_matrices(self, data):
+        self.calls += 1
+        self.last_data_shape = data.shape
+        return self.encoder, self.decoder
+
+
+class SampleDependentAutoencoder:
+    """Projection provider whose encoder Jacobian varies with each sample."""
+
+    def projection_matrices(self, data):
+        encoder = jnp.asarray([[data[0], 0.0]])
+        decoder = jnp.asarray([[1.0], [0.0]])
+        return encoder, decoder
 
 
 class OffsetEdge(Edge):
@@ -152,6 +178,88 @@ def test_tikhonov_regularization_pushes_prefix_path_for_override() -> None:
     actual = tikhonov_regularization(params, source_data, graph, ref=("lower",), path=["pack"])
 
     assert jnp.allclose(actual, expected)
+
+
+def test_projection_regularization_constraint_hierarchy() -> None:
+    encoder = jnp.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    decoder = jnp.asarray([[1.0, 0.0], [0.0, 0.5], [1.0, 1.0]])
+    params = {"autoencoder": MatrixAutoencoder(encoder, decoder)}
+
+    oblique = ProjectionRegularization(ref=("autoencoder",), mode="oblique")(params, jnp.zeros(3), None)
+    full_projection = decoder @ encoder
+    symmetry = jnp.mean(jnp.square(full_projection - full_projection.T))
+    transpose = jnp.mean(jnp.square(decoder - encoder.T))
+    orthogonal = ProjectionRegularization(ref=("autoencoder",), mode="orthogonal")(
+        params, jnp.zeros(3), None
+    )
+    pod = ProjectionRegularization(ref=("autoencoder",), mode="pod")(params, jnp.zeros(3), None)
+
+    assert oblique == pytest.approx(0.0)
+    assert orthogonal == pytest.approx(symmetry)
+    assert pod == pytest.approx(symmetry + transpose)
+
+    orthonormal_encoder = jnp.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    pod_params = {"autoencoder": MatrixAutoencoder(orthonormal_encoder, orthonormal_encoder.T)}
+    assert ProjectionRegularization(ref="autoencoder", mode="pod")(
+        pod_params, jnp.zeros(3), None
+    ) == pytest.approx(0.0)
+
+
+def test_projection_regularization_graph_loss_without_batch_reduction_calls_once() -> None:
+    autoencoder = MatrixAutoencoder(jnp.asarray([[1.0, 0.0]]), jnp.asarray([[1.0], [0.0]]))
+    batch = jnp.arange(10.0).reshape(5, 2)
+    loss = GraphLoss(
+        terms=[
+            {
+                "term": {"callable": "projection", "ref": ["autoencoder"], "mode": "pod"},
+                "batch_reduce": None,
+            }
+        ]
+    )
+
+    assert loss({"autoencoder": autoencoder}, batch) == pytest.approx(0.0)
+    assert autoencoder.calls == 1
+    assert autoencoder.last_data_shape == batch.shape
+
+
+def test_projection_regularization_graph_loss_maps_sample_dependent_matrices() -> None:
+    batch = jnp.asarray([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    loss = GraphLoss(
+        terms=[{"term": {"callable": "projection", "ref": ["autoencoder"]}, "batch_reduce": "mean"}]
+    )
+
+    expected = jnp.mean(jnp.square(batch[:, 0] - 1.0))
+    actual = loss({"autoencoder": SampleDependentAutoencoder()}, batch)
+    assert actual == pytest.approx(expected)
+
+
+def test_projection_regularization_yaml_validation_and_errors() -> None:
+    loss = YamlLoader.load(
+        """
+!romx:GraphLoss
+terms:
+  - term: {callable: projection, ref: [autoencoder], mode: orthogonal}
+    batch_reduce: null
+"""
+    )
+    regularization = loss.terms[0].term.callable
+    assert isinstance(regularization, ProjectionRegularization)
+    assert regularization.ref == ("autoencoder",)
+
+    with pytest.raises(ValidationError, match="Input should be 'oblique', 'orthogonal' or 'pod'"):
+        ProjectionRegularization(ref=("autoencoder",), mode="invalid")
+    with pytest.raises(ValueError, match="Can't locate autoencoder"):
+        ProjectionRegularization(ref=("missing",))({}, jnp.zeros(2), None)
+    with pytest.raises(TypeError, match="projection_matrices"):
+        ProjectionRegularization(ref=("array",))({"array": jnp.eye(2)}, jnp.zeros(2), None)
+    with pytest.raises(ValueError, match="rank-two"):
+        ProjectionRegularization(ref=("autoencoder",))(
+            {"autoencoder": MatrixAutoencoder(jnp.ones(2), jnp.ones((2, 1)))}, jnp.zeros(2), None
+        )
+    with pytest.raises(ValueError, match=r"encoder \(latent, full\)"):
+        ProjectionRegularization(ref=("autoencoder",))(
+            {"autoencoder": MatrixAutoencoder(jnp.ones((2, 3)), jnp.ones((2, 3)))}, jnp.zeros(3), None
+        )
 
 
 class TreeOffsetEdge(Edge):

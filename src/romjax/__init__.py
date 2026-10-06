@@ -123,6 +123,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "GraphLossTerm": ("romjax.loss", "GraphLossTerm"),
     "GraphLossTermGenerator": ("romjax.loss", "GraphLossTermGenerator"),
     "GraphTest": ("romjax.loss", "GraphTest"),
+    "ProjectionAutoencoder": ("romjax.loss", "ProjectionAutoencoder"),
+    "ProjectionRegularization": ("romjax.loss", "ProjectionRegularization"),
     "GridBoundaryInputs": ("romjax.pde", "GridBoundaryInputs")
 }
 
@@ -139,7 +141,15 @@ if TYPE_CHECKING:
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
     from .nn import Affine, BlockLinearAutoencoder, LinearProjection
-    from .loss import CyclicPathError, GraphLoss, GraphLossTerm, GraphLossTermGenerator, GraphTest
+    from .loss import (
+        CyclicPathError,
+        GraphLoss,
+        GraphLossTerm,
+        GraphLossTermGenerator,
+        GraphTest,
+        ProjectionAutoencoder,
+        ProjectionRegularization,
+    )
     from .pde import (
         AliveProgressMeter,
         GridBoundaryInputs,
