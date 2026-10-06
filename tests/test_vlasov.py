@@ -2,6 +2,7 @@ import diffrax
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from romjax import YamlLoader
 from romjax.graph import FunctionGraph
@@ -189,7 +190,7 @@ def test_vlasov_evaluate_uses_supplied_potential_for_vdf_residual() -> None:
     assert not jnp.allclose(residual_zero["fields"]["vdf"], residual_ramp["fields"]["vdf"])
 
 
-def test_vlasov_sampling_and_function_graph_integration() -> None:
+def test_vlasov_sampling_and_function_graph_integration(monkeypatch: pytest.MonkeyPatch) -> None:
     model = small_vlasov(
         inputs_sampler=PyTreeSampler(
             template={
@@ -215,6 +216,14 @@ def test_vlasov_sampling_and_function_graph_integration() -> None:
     graph = FunctionGraph(edges={"vlasov": model})
     pushed = graph.push_path({"inputs": inputs, "outputs": solution}, path=["vlasov"], start="vlasov_in")
     pulled = graph.push_path(pushed, path=["vlasov"], start="vlasov_out")
+
+    def unexpected_solve(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("sample_outputs must not solve implicitly")
+
+    monkeypatch.setattr(Vlasov1D1V, "solve", unexpected_solve)
+    with pytest.raises(ValueError, match="requires a reference solution"):
+        model.sample_outputs(key, inputs=inputs)
 
     assert "alpha" in inputs["initial"]
     assert sample["fields"]["vdf"].shape == (4, 6, 3)

@@ -445,6 +445,7 @@ class BlockLinearAutoencoder(eqx.Module):
     input_sizes: tuple[int, ...] = eqx.field(static=True)
     latent_sizes: tuple[int, ...] = eqx.field(static=True)
     diagonal: bool = eqx.field(static=True)
+    ignore_nan: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -456,6 +457,7 @@ class BlockLinearAutoencoder(eqx.Module):
         bias: ArrayLike | None = None,
         random_bias: bool = False,
         diagonal: bool = False,
+        ignore_nan: bool = False,
         scale: float = 0.25,
     ) -> None:
         """Initialize block encoder and decoder weights.
@@ -472,11 +474,13 @@ class BlockLinearAutoencoder(eqx.Module):
         :param bias: optional full-space centering vector
         :param random_bias: randomly initialize an omitted bias using ``key``
         :param diagonal: omit and skip every off-diagonal block
+        :param ignore_nan: omit NaN input components from every encoder contribution
         :param scale: random initialization scaling factor
         """
         self.input_sizes = tuple(int(size) for size in input_sizes)
         self.latent_sizes = tuple(int(size) for size in latent_sizes)
         self.diagonal = diagonal
+        self.ignore_nan = ignore_nan
         self._validate_sizes()
 
         if (encoder_blocks is None) != (decoder_blocks is None):
@@ -612,6 +616,8 @@ class BlockLinearAutoencoder(eqx.Module):
             raise ValueError(f"x must have last-axis size {self.input_size}, got shape {values.shape}.")
         if self.bias is not None:
             values = values - jnp.asarray(self.bias)
+        if self.ignore_nan:
+            values = jnp.where(jnp.isnan(values), jnp.zeros_like(values), values)
         split_indices = tuple(sum(self.input_sizes[:index]) for index in range(1, len(self.input_sizes)))
         partitions = tuple(jnp.split(values, split_indices, axis=-1))
         return self._apply_blocks(self.encoder_blocks, partitions)

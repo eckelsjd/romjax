@@ -880,11 +880,9 @@ class Vlasov1D1V(ImplicitModel, ImplicitSampleable):
         solution: VlasovOutputs | None = None,
         conditions: PyTree | None = None,
     ) -> VlasovOutputs:
-        """Produce one sample of outputs for the given key."""
+        """Produce one output sample without implicitly solving a missing reference solution."""
         if self.outputs_sampler is None:
             return {}
-        if solution is None:
-            solution = self.solve(inputs)
         sampler_kwargs = {"inputs": inputs, "solution": solution}
         if conditions is not None:
             sampler_kwargs["conditions"] = conditions
@@ -892,6 +890,8 @@ class Vlasov1D1V(ImplicitModel, ImplicitSampleable):
             sampler_kwargs["solve"] = self.solve
         sample = self.outputs_sampler(key, **sampler_kwargs)
         if isinstance(sample, Mapping):
+            if "outputs" in sample:
+                sample = sample["outputs"]
             return {"fields": sample["fields"]} if "fields" in sample else {"fields": sample}
         return {"fields": {"vdf": jnp.asarray(sample)}}
 

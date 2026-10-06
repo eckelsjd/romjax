@@ -568,15 +568,12 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
         
         :param key: the random key
         :param inputs: optionally condition on inputs
-        :param solution: for efficiency, optionally condition on the precomputed solution of solve(inputs)=0
+        :param solution: optional precomputed solution; output sampling never solves implicitly
         :param conditions: optional pre-sampled output noise or solver-condition pytree
         :return: the outputs sample
         """
         if self.outputs_sampler is None:
             return {}
-
-        if solution is None:
-            solution = self.solve(inputs)
 
         sampler_kwargs = {"inputs": inputs, "solution": solution}
         if conditions is not None:
@@ -584,8 +581,9 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
         if isinstance(self.outputs_sampler, SolverSampler):
             sampler_kwargs["solve"] = self.solve
         sample = self.outputs_sampler(key, **sampler_kwargs)
+
         if isinstance(sample, Mapping):
-            if len(sample) == 1 and "outputs" in sample:
+            if "outputs" in sample:  # p(out | in) conditional sampling may return inputs -- only extract the outputs
                 sample = sample["outputs"]
             return {self.field_name: jnp.asarray(sample[self.field_name])}
         return {self.field_name: jnp.asarray(sample)}

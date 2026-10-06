@@ -61,7 +61,8 @@ class ImplicitSampleable(ABC):
 
         :param key: random key
         :param inputs: optional conditioning inputs
-        :param solution: optional precomputed solution of ``solve(inputs)=0``
+        :param solution: optional precomputed solution of ``solve(inputs)=0``; implementations must not solve it
+            implicitly during output sampling
         :param conditions: optional sampled output conditions
         :return: sampled outputs
         """

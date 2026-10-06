@@ -12,6 +12,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] How to handle config for controller/solver states for diffrax solver restarts -- probably downstream user will have some sort of loop and their own save format
 - [ ] Limited to uniform time-grids for ODEs -- can't handle multiple time-scales. The best fix is likely to allow fields to carry their coordinates with them (e.g. the non-uniform time grid), then somehow encode this everywhere in the FunctionGraph, e.g. via neural operators. Hm. But the main issue is just when calling evaluate() -- fd gradients of a numerical solution are not good for sharp changes.
 - [ ] Other loss states like batch norm -- we're already handling loss state with EMA scales, just unify into a single "loss state" and allow for other things
+- [ ] Inferring missing information (e.g. solution data) when compressing/conditioning latent space samples.
 
 ## Backburner
 - [ ] Refactor all these loose private methods into a more structured OO design (especially GenNorm and GraphLoss)
@@ -23,7 +24,7 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Would be good to copy the entire resolved yaml config to routine root dirs, (after resolving all the overrides)
 - [ ] All the annoying `resolve` methods you need to call on a graph after construction (norms, refs, compression, etc.)
 - [ ] Norm is incredibly convoluted
-- [ ] Possible to abstract the compression/latent-sampler resolution for any model that wants it, then keep the model itself independent (affine and galerkin should both be implicit models)
+- [ ] Compression artifacts/generation/sampling is getting hard to maintain and reason about. May need a larger refactor for extensions with diffusion models and conditional sampling. Also a lot of redundancy with generic training -- we're essentially forcing an offline training step into a data generation routine. Could maybe separate into its own routine.
 
 ## Serialization
 - [ ] from_registry items back to string
@@ -56,7 +57,6 @@ Keeping track of ideas, bugs, thoughts, etc.
 - [ ] Norm artifacts and resolution/config
 
 ## Profiling
-- [ ] Make sure the expensive part of data generation is the model evaluation
 - [ ] Check performance of vlasov
 
 ## Optimizations

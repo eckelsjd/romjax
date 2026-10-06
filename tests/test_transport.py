@@ -9,6 +9,7 @@ import optimistix as optx
 import pytest
 
 from romjax import YamlLoader
+from romjax.compression import BlockLinearCompression
 from romjax.pde import (
     BoundarySpec,
     GaussianForcing,
@@ -20,7 +21,7 @@ from romjax.pde import (
     homogeneous_boundary,
 )
 from romjax.plotting import gridplot
-from romjax.rng import Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
+from romjax.rng import CompressionSampler, Distribution, NearSolutionSampler, PyTreeSampler, gen_keys
 from romjax.transport import AdvectionDiffusion2D, CubicForcing, PotentialVelocity
 from romjax.typing import DictModel
 
@@ -586,24 +587,65 @@ def test_transport_outputs_sampler_validation_and_sampling(monkeypatch: pytest.M
     assert jnp.allclose(sample_a["phi"], sample_b["phi"])
 
     calls = {"count": 0}
-    solved = {"phi": 2.0 * jnp.ones(model.grid.shape)}
 
     def solve_spy(self, inputs=None, residuals=None, return_sol=False):
         del inputs, residuals, return_sol
         calls["count"] += 1
-        return solved
+        raise AssertionError("sample_outputs must not solve implicitly")
 
     monkeypatch.setattr(AdvectionDiffusion2D, "solve", solve_spy)
 
     provided = {"phi": jnp.ones(model.grid.shape)}
     sample_with_solution = model.sample_outputs(jax.random.key(0), solution=provided)
     assert calls["count"] == 0
-    assert not jnp.allclose(sample_with_solution["phi"], solved["phi"])
+    assert sample_with_solution["phi"].shape == model.grid.shape
 
-    sample_without_solution = model.sample_outputs(jax.random.key(0))
-    assert calls["count"] == 1
-    assert sample_without_solution["phi"].shape == model.grid.shape
-    assert jnp.isfinite(sample_without_solution["phi"]).all()
+    with pytest.raises(ValueError, match="requires a reference solution"):
+        model.sample_outputs(jax.random.key(0))
+    assert calls["count"] == 0
+
+
+def test_transport_compression_sampler_can_fill_a_skipped_solution(monkeypatch: pytest.MonkeyPatch) -> None:
+    grid_shape = (6, 6)
+    size = 1 + int(np.prod(grid_shape))
+    template = {
+        "inputs": {"x": jax.ShapeDtypeStruct((1,), jnp.float32)},
+        "outputs": {"phi": jax.ShapeDtypeStruct(grid_shape, jnp.float32)},
+    }
+    identity_input = np.ones((1, 1), dtype=np.float32)
+    identity_output = np.eye(size - 1, dtype=np.float32)
+    blocks = ((identity_input, None), (None, identity_output))
+    compression = BlockLinearCompression(
+        encoder_blocks=blocks,
+        decoder_blocks=blocks,
+        input_sizes=(1, size - 1),
+        latent_sizes=(1, size - 1),
+        diagonal=True,
+        ignore_nan=True,
+        minval=-np.ones(size, dtype=np.float32),
+        maxval=np.ones(size, dtype=np.float32),
+        latent_mean=np.zeros(size, dtype=np.float32),
+        latent_std=np.ones(size, dtype=np.float32),
+        template=template,
+    )
+    model = get_small_transport(
+        outputs_sampler=CompressionSampler(
+            compression=compression,
+            distribution="uniform",
+            reconstruct=True,
+            conditioning={"blocks": [0], "missing": "nan"},
+        )
+    )
+
+    def unexpected_solve(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("CompressionSampler must not implicitly solve a skipped solution")
+
+    monkeypatch.setattr(AdvectionDiffusion2D, "solve", unexpected_solve)
+    sample = model.sample_outputs(jax.random.key(3), inputs={"x": jnp.asarray([0.25], dtype=jnp.float32)})
+
+    assert sample["phi"].shape == grid_shape
+    assert jnp.isfinite(sample["phi"]).all()
 
 
 def test_transport_sample_outputs_custom_callable_support() -> None:

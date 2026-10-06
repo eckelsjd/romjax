@@ -242,6 +242,22 @@ class PyTreeSampler(SamplerCallable):
         return self(key)
 
 
+class CompressionConditioning(DictModel):
+    """Configuration for selecting and populating fixed latent coordinates.
+
+    Selector fields such as ``indices`` and artifact-specific ``blocks`` are
+    retained as extra fields and forwarded to :meth:`Compression.condition_indices`.
+    """
+
+    missing: Literal["error", "nan"] = "error"
+    indices: tuple[int, ...] | None = None
+    blocks: tuple[int, ...] | None = None
+
+    def selector_options(self) -> dict[str, Any]:
+        """Return artifact selector options without sampler-owned policy fields."""
+        return self.model_dump(exclude={"missing"}, exclude_none=True)
+
+
 class CompressionSampler(SamplerCallable):
     """Sample a compression artifact's latent space.
 
@@ -251,6 +267,7 @@ class CompressionSampler(SamplerCallable):
         artifact's joint empirical covariance for ``"normal"`` sampling.
     :param template: optional shape/dtype pytree for unpacking non-reconstructed latents.
     :param reconstruct: whether to decode sampled coordinates through the compression artifact.
+    :param conditioning: optional latent selector and missing-template policy.
     """
 
     compression: Path | str | Compression
@@ -258,7 +275,9 @@ class CompressionSampler(SamplerCallable):
     marginal: bool = False
     template: ShapeDtypePyTree | None = None
     reconstruct: bool = False
+    conditioning: CompressionConditioning | None = None
     _resolved_compression: Compression | None = PrivateAttr(default=None)
+    _condition_indices: tuple[int, ...] | None = PrivateAttr(default=None)
 
     def resolve_compression(self) -> Compression:
         """Load and cache the configured compression artifact outside JIT regions."""
@@ -277,6 +296,11 @@ class CompressionSampler(SamplerCallable):
         if self.distribution == "normal":
             if compression.latent_normal() is None:
                 raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
+        if self.conditioning is not None:
+            if self.distribution == "artifact":
+                raise ValueError("Artifact-defined latent sampling does not support conditioning.")
+            indices = compression.condition_indices(**self.conditioning.selector_options())
+            object.__setattr__(self, "_condition_indices", indices)
         return self
 
     @staticmethod
@@ -299,32 +323,159 @@ class CompressionSampler(SamplerCallable):
             raise ValueError("Latent sample has an incompatible template size.")
         return jax.tree.unflatten(treedef, unpacked)
 
-    def callable(self, key: jaxtyping.Key, **kwargs) -> jaxtyping.PyTree:
-        """Draw one configured latent sample."""
-        del kwargs  # compatible with outputs_sampler
+    def _conditioning_latent(
+        self,
+        compression: Compression,
+        *,
+        inputs: jaxtyping.PyTree | None,
+        solution: jaxtyping.PyTree | None,
+        conditions: jaxtyping.PyTree | None,
+    ) -> jax.Array:
+        """Encode runtime context into the latent vector supplying fixed values."""
+        assembled: dict[str, Any] = {}
+        if inputs is not None:
+            assembled["inputs"] = inputs
+        if solution is not None:
+            assembled["outputs"] = solution
+        if conditions is not None:
+            if not isinstance(conditions, Mapping):
+                raise TypeError("CompressionSampler conditions must be a mapping rooted at inputs/outputs.")
+            invalid_roots = tuple(key for key in conditions if key not in {"inputs", "outputs"})
+            if invalid_roots:
+                raise ValueError(
+                    "CompressionSampler conditions must be rooted at inputs/outputs; "
+                    f"got roots {invalid_roots}."
+                )
+            assembled = pytree_merge(assembled, conditions)
+        assert self.conditioning is not None
+        gathered = compression.gather_conditioning_sample(assembled, missing=self.conditioning.missing)
+        return jnp.asarray(compression.compress(gathered))
+
+    @staticmethod
+    def _scatter_conditioned(
+        conditioned: jax.Array,
+        sampled: jax.Array,
+        condition_indices: tuple[int, ...],
+        sample_indices: tuple[int, ...],
+    ) -> jax.Array:
+        """Assemble conditioned and sampled partitions in canonical latent order."""
+        dtype = jnp.result_type(conditioned, sampled)
+        latent = jnp.empty((len(condition_indices) + len(sample_indices),), dtype=dtype)
+        latent = latent.at[jnp.asarray(condition_indices, dtype=jnp.int32)].set(conditioned)
+        if not sample_indices:
+            return latent
+        return latent.at[jnp.asarray(sample_indices, dtype=jnp.int32)].set(sampled)
+
+    def _conditional_normal(
+        self,
+        key: jaxtyping.Key,
+        compression: Compression,
+        observed: jax.Array,
+        condition_indices: tuple[int, ...],
+        sample_indices: tuple[int, ...],
+    ) -> jax.Array:
+        """Draw from a marginal or joint Gaussian conditioned on observed coordinates."""
+        mean, std = compression.latent_normal() or (None, None)
+        if mean is None or std is None:  # pragma: no cover - guarded by resolve_sampler
+            raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
+        mean = jnp.asarray(mean)
+        std = jnp.asarray(std)
+        condition_array = jnp.asarray(condition_indices, dtype=jnp.int32)
+        sample_array = jnp.asarray(sample_indices, dtype=jnp.int32)
+        conditioned = observed[condition_array]
+        if not sample_indices:
+            return self._scatter_conditioned(conditioned, jnp.asarray([], dtype=mean.dtype), condition_indices, ())
+
+        covariance = getattr(compression, "latent_covariance", None)
+        if self.marginal or covariance is None:
+            sampled = normal(key, shape=(len(sample_indices),), mean=mean[sample_array], std=std[sample_array])
+        else:
+            covariance = jnp.asarray(covariance)
+            sigma_cc = covariance[jnp.ix_(condition_array, condition_array)]
+            sigma_uc = covariance[jnp.ix_(sample_array, condition_array)]
+            sigma_uu = covariance[jnp.ix_(sample_array, sample_array)]
+            gain = sigma_uc @ jnp.linalg.pinv(sigma_cc, hermitian=True)
+            conditional_mean = mean[sample_array] + gain @ (conditioned - mean[condition_array])
+            conditional_covariance = sigma_uu - gain @ sigma_uc.T
+            conditional_covariance = 0.5 * (conditional_covariance + conditional_covariance.T)
+            sampled = jax.random.multivariate_normal(
+                key, conditional_mean, conditional_covariance, method="svd"
+            )
+        return self._scatter_conditioned(conditioned, sampled, condition_indices, sample_indices)
+
+    def callable(
+        self,
+        key: jaxtyping.Key,
+        inputs: jaxtyping.PyTree | None = None,
+        solution: jaxtyping.PyTree | None = None,
+        conditions: jaxtyping.PyTree | None = None,
+        **kwargs: Any,
+    ) -> jaxtyping.PyTree:
+        """Draw one configured latent sample, optionally conditioned on runtime context."""
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected CompressionSampler runtime options: {names}.")
         compression = self.resolve_compression()
+        if self.conditioning is not None and self._condition_indices is None:
+            self.resolve_sampler()
+        condition_indices = self._condition_indices
+        observed = None
+        sample_indices: tuple[int, ...] = tuple(range(compression.latent_size()))
+        if condition_indices is not None:
+            observed = self._conditioning_latent(
+                compression, inputs=inputs, solution=solution, conditions=conditions
+            )
+            selected = set(condition_indices)
+            sample_indices = tuple(index for index in sample_indices if index not in selected)
+
         if self.distribution == "artifact":
             latent = compression.sample(key)
         elif self.distribution == "uniform":
             minval, maxval = compression.latent_bounds() or (None, None)
             if minval is None or maxval is None:
                 raise ValueError("Uniform latent sampling requires compression latent bounds.")
-            latent = uniform(key, shape=(compression.latent_size(),), minval=minval, maxval=maxval)
+            if condition_indices is None:
+                latent = uniform(key, shape=(compression.latent_size(),), minval=minval, maxval=maxval)
+            else:
+                assert observed is not None
+                index_array = jnp.asarray(sample_indices, dtype=jnp.int32)
+                sampled = (
+                    uniform(
+                        key,
+                        shape=(len(sample_indices),),
+                        minval=jnp.asarray(minval)[index_array],
+                        maxval=jnp.asarray(maxval)[index_array],
+                    )
+                    if sample_indices
+                    else jnp.asarray([], dtype=observed.dtype)
+                )
+                latent = self._scatter_conditioned(
+                    observed[jnp.asarray(condition_indices, dtype=jnp.int32)],
+                    sampled,
+                    condition_indices,
+                    sample_indices,
+                )
         else:
             normal_stats = compression.latent_normal()
             if normal_stats is None:
                 raise ValueError("Normal latent sampling requires compression latent mean and standard deviation.")
-            mean, std = normal_stats
-            covariance = getattr(compression, "latent_covariance", None)
-            if self.marginal or covariance is None:
-                latent = normal(key, shape=(compression.latent_size(),), mean=mean, std=std)
+            if condition_indices is not None:
+                assert observed is not None
+                latent = self._conditional_normal(
+                    key, compression, observed, condition_indices, sample_indices
+                )
             else:
-                latent = jax.random.multivariate_normal(key, mean, jnp.asarray(covariance), method="svd")
+                mean, std = normal_stats
+                covariance = getattr(compression, "latent_covariance", None)
+                if self.marginal or covariance is None:
+                    latent = normal(key, shape=(compression.latent_size(),), mean=mean, std=std)
+                else:
+                    latent = jax.random.multivariate_normal(key, mean, jnp.asarray(covariance), method="svd")
         return compression.reconstruct(latent) if self.reconstruct else self._unpack(latent, self.template)
 
-    def sample(self, key: jaxtyping.Key) -> jaxtyping.PyTree:
+    def sample(self, key: jaxtyping.Key, **kwargs: Any) -> jaxtyping.PyTree:
         """Alias for :meth:`__call__`."""
-        return self(key)
+        return self(key, **kwargs)
 
 
 class SolverSampler(SamplerCallable):
@@ -420,7 +571,10 @@ class NearSolutionSampler(PyTreeSampler):
         """
         del inputs
         if solution is None:
-            raise ValueError("NearSolutionSampler requires a reference solution.")
+            raise ValueError(
+                "NearSolutionSampler requires a reference solution; compute it explicitly or enable solving "
+                "in the calling data-generation workflow."
+            )
         
         noise = conditions
         if noise is None:
