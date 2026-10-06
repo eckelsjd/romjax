@@ -231,6 +231,95 @@ class Compression(BaseModel, ABC):
         raise NotImplementedError(f"{type(self).__name__} does not define artifact sampling.")
 
     @staticmethod
+    def _validate_condition_indices(indices: Sequence[int], latent_size: int) -> tuple[int, ...]:
+        """Validate and canonicalize latent coordinates selected for conditioning."""
+        normalized = tuple(int(index) for index in indices)
+        if not normalized:
+            raise ValueError("Conditioning requires at least one latent index.")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Conditioning indices must be unique.")
+        invalid = tuple(index for index in normalized if index < 0 or index >= latent_size)
+        if invalid:
+            raise ValueError(f"Conditioning indices {invalid} are outside latent size {latent_size}.")
+        return tuple(sorted(normalized))
+
+    def condition_indices(self, *, indices: Sequence[int] | None = None, **options: Any) -> tuple[int, ...]:
+        """Resolve artifact-specific conditioning options to flat latent indices.
+
+        The default implementation supports explicit ``indices``. Specialized
+        compression artifacts may add selectors while retaining this fallback.
+
+        :param indices: explicit latent coordinate indices
+        :param options: unsupported artifact-specific selector options
+        :return: sorted, unique latent coordinate indices
+        """
+        if options:
+            names = ", ".join(sorted(options))
+            raise ValueError(f"{type(self).__name__} does not support conditioning options: {names}.")
+        if indices is None:
+            raise ValueError("Conditioning requires an 'indices' selector.")
+        return self._validate_condition_indices(indices, self.latent_size())
+
+    def gather_conditioning_sample(
+        self,
+        sample: PyTree,
+        *,
+        missing: Literal["error", "nan"] = "error",
+    ) -> PyTree:
+        """Project a partial runtime sample onto the artifact's saved template.
+
+        :param sample: partial runtime sample, conventionally rooted at ``inputs`` and ``outputs``
+        :param missing: fail on missing array leaves or fill them with NaNs
+        :return: sample matching the artifact template exactly
+        """
+        template = getattr(self, "template", None)
+        if template is None:
+            raise ValueError(f"{type(self).__name__} requires a saved template for conditional sampling.")
+
+        sentinel = object()
+        missing_paths: list[tuple[str | int, ...]] = []
+
+        def gather(template_value: Any, sample_value: Any, path: tuple[str | int, ...]) -> Any:
+            if is_shape_dtype(template_value):
+                if sample_value is sentinel or sample_value is None:
+                    missing_paths.append(path)
+                    if missing == "nan":
+                        if not jnp.issubdtype(template_value.dtype, jnp.inexact):
+                            joined = ".".join(map(str, path)) or "<root>"
+                            raise ValueError(f"Cannot fill non-inexact conditioning leaf {joined!r} with NaN.")
+                        return jnp.full(template_value.shape, jnp.nan, dtype=template_value.dtype)
+                    return jnp.zeros(template_value.shape, dtype=template_value.dtype)
+                return sample_value
+            if isinstance(template_value, Mapping):
+                source = sample_value if isinstance(sample_value, Mapping) else {}
+                return {
+                    key: gather(value, source.get(key, sentinel), (*path, key))
+                    for key, value in template_value.items()
+                }
+            if isinstance(template_value, tuple):
+                source = sample_value if isinstance(sample_value, tuple | list) else ()
+                return tuple(
+                    gather(value, source[index] if index < len(source) else sentinel, (*path, index))
+                    for index, value in enumerate(template_value)
+                )
+            if isinstance(template_value, list):
+                source = sample_value if isinstance(sample_value, tuple | list) else ()
+                return [
+                    gather(value, source[index] if index < len(source) else sentinel, (*path, index))
+                    for index, value in enumerate(template_value)
+                ]
+            return template_value
+
+        gathered = gather(template, sample, ())
+        if missing_paths and missing == "error":
+            formatted = ", ".join(".".join(map(str, path)) or "<root>" for path in missing_paths)
+            raise ValueError(
+                f"Conditional sampling is missing compression template leaves: {formatted}. "
+                "Set conditioning.missing='nan' to fill missing array data with NaNs."
+            )
+        return gathered
+
+    @staticmethod
     def _empirical_covariance(samples: jax.Array) -> jax.Array:
         """Return the unbiased empirical covariance of row-wise samples.
 
@@ -551,6 +640,7 @@ class BlockLinearCompression(Compression):
     input_sizes: tuple[PositiveInt, ...] | None = None
     latent_sizes: tuple[PositiveInt, ...] | None = None
     diagonal: bool = False
+    ignore_nan: bool = False
     minval: np.ndarray | None = None
     maxval: np.ndarray | None = None
     latent_mean: np.ndarray | None = None
@@ -612,6 +702,7 @@ class BlockLinearCompression(Compression):
             decoder_blocks=self.decoder_blocks,
             bias=self.bias,
             diagonal=self.diagonal,
+            ignore_nan=self.ignore_nan,
         )
 
     def _resolve_initial_module(self) -> BlockLinearAutoencoder:
@@ -704,6 +795,7 @@ class BlockLinearCompression(Compression):
             decoder_blocks=tuple(tuple(row) for row in decoder),
             bias=bias,
             diagonal=initial.diagonal,
+            ignore_nan=initial.ignore_nan,
         )
 
     def _flatten_sample(self, sample: PyTree) -> jax.Array:
@@ -827,6 +919,7 @@ class BlockLinearCompression(Compression):
             ),
             bias=None if trained.bias is None else np.asarray(trained.bias),
             input_sizes=trained.input_sizes, latent_sizes=trained.latent_sizes, diagonal=trained.diagonal,
+            ignore_nan=trained.ignore_nan,
             minval=np.asarray(jnp.min(latent, axis=0)), maxval=np.asarray(jnp.max(latent, axis=0)),
             latent_mean=np.asarray(jnp.mean(latent, axis=0)), latent_std=np.asarray(jnp.std(latent, axis=0)),
             latent_covariance=np.asarray(self._empirical_covariance(latent)),
@@ -858,6 +951,40 @@ class BlockLinearCompression(Compression):
         if self.latent_mean is None or self.latent_std is None:
             return None
         return jnp.asarray(self.latent_mean), jnp.asarray(self.latent_std)
+
+    def condition_indices(
+        self,
+        *,
+        indices: Sequence[int] | None = None,
+        blocks: Sequence[int] | None = None,
+        **options: Any,
+    ) -> tuple[int, ...]:
+        """Resolve explicit indices or complete latent blocks for conditioning."""
+        if options:
+            names = ", ".join(sorted(options))
+            raise ValueError(f"BlockLinearCompression does not support conditioning options: {names}.")
+        if (indices is None) == (blocks is None):
+            raise ValueError("BlockLinearCompression conditioning requires exactly one of 'indices' or 'blocks'.")
+        if indices is not None:
+            return super().condition_indices(indices=indices)
+        if self.latent_sizes is None:
+            raise ValueError("BlockLinearCompression does not define latent block sizes.")
+
+        normalized_blocks = tuple(int(block) for block in blocks or ())
+        if not normalized_blocks:
+            raise ValueError("Conditioning requires at least one latent block.")
+        if len(set(normalized_blocks)) != len(normalized_blocks):
+            raise ValueError("Conditioning blocks must be unique.")
+        invalid = tuple(block for block in normalized_blocks if block < 0 or block >= len(self.latent_sizes))
+        if invalid:
+            raise ValueError(f"Conditioning blocks {invalid} are outside {len(self.latent_sizes)} latent blocks.")
+        offsets = np.cumsum((0, *self.latent_sizes))
+        expanded = tuple(
+            index
+            for block in normalized_blocks
+            for index in range(int(offsets[block]), int(offsets[block + 1]))
+        )
+        return self._validate_condition_indices(expanded, self.latent_size())
 
     def save_orbax(self, path: str | Path) -> None:
         """Save the trained block autoencoder through Orbax."""

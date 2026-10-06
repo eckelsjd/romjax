@@ -35,7 +35,13 @@ from romjax.graph import CompositeEdge, EdgePatch
 from romjax.model import ImplicitModel, ImplicitSampleable, SourceSampleable
 from romjax.nn import Affine
 from romjax.preconditioner import LinearSystemStructure, RegisteredLinearPreconditioner
-from romjax.rng import Distribution, DistributionPyTree, SamplerCallable, validate_distribution_pytree
+from romjax.rng import (
+    CompressionSampler,
+    Distribution,
+    DistributionPyTree,
+    SamplerCallable,
+    validate_distribution_pytree,
+)
 from romjax.tree import TreePath, coerce_tree_paths, get_subtree, pytree_merge
 from romjax.typing import CallableModel, DictModel, ThirdPartyType, from_registry, require_type
 
@@ -1195,11 +1201,12 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
         solution: PyTree | None = None,
         conditions: PyTree | None = None,
     ) -> PyTree:
-        """Sample an output value payload, inputs/solution/conditions not used."""
-        del inputs, solution, conditions
-
+        """Sample an output value payload with optional runtime conditioning context."""
         if self.outputs_sampler is None:
             raise ValueError("ImplicitAffine output sampler could not be resolved.")
+        if isinstance(self.outputs_sampler, CompressionSampler):
+            sample = self.outputs_sampler(key, inputs=inputs, solution=solution, conditions=conditions)
+            return sample["outputs"] if isinstance(sample, Mapping) and "outputs" in sample else sample
         if hasattr(self.outputs_sampler, "sample"):
             return self.outputs_sampler.sample(key)
         return self.outputs_sampler(key)

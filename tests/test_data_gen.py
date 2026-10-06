@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from romjax.compression import SVD, Compression
+from romjax.compression import SVD, BlockLinearCompression, Compression
 from romjax.data_gen import (
     DataGeneration,
     DataLoader,
@@ -20,6 +21,7 @@ from romjax.data_gen import (
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.norm import NormTree
+from romjax.rng import CompressionSampler
 from romjax.utils import load_h5, save_h5
 
 
@@ -101,6 +103,35 @@ class _ConditionedSampleableEdge(Edge, ImplicitSampleable):
         return self.solve(augmented_inputs)
 
 
+class _CompressionSampleableEdge(Edge, ImplicitSampleable):
+    """Exercise CompressionSampler through the standard data-generation contract."""
+
+    outputs_sampler: Any
+
+    def forward(self, x):
+        return x
+
+    def backward(self, x):
+        return x
+
+    def sample_inputs(self, key):
+        del key
+        return {"x": jnp.asarray([0.25], dtype=jnp.float32)}
+
+    def solve(self, inputs):
+        del inputs
+        raise AssertionError("skip_solve must not evaluate the baseline solution")
+
+    def sample_outputs(self, key, inputs=None, solution=None, conditions=None):
+        sample = self.outputs_sampler(
+            key,
+            inputs=inputs,
+            solution=solution,
+            conditions=conditions,
+        )
+        return sample["outputs"]
+
+
 def _get_graph():
     graph = FunctionGraph(
         edges={
@@ -161,6 +192,62 @@ def test_generate_implicit_persists_and_loads_conditions(
 def test_load_implicit_model_conditions_default_is_include():
     """Retain separate condition payloads unless a loading mode is requested."""
     assert LoadImplicitModel().conditions == "include"
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_generate_implicit_conditions_compression_without_solution(tmp_path, batch_size) -> None:
+    template = {
+        "inputs": {"x": jax.ShapeDtypeStruct((1,), jnp.float32)},
+        "outputs": {"y": jax.ShapeDtypeStruct((1,), jnp.float32)},
+    }
+    blocks = ((np.ones((1, 1)), None), (None, np.ones((1, 1))))
+    compression = BlockLinearCompression(
+        encoder_blocks=blocks,
+        decoder_blocks=blocks,
+        input_sizes=(1, 1),
+        latent_sizes=(1, 1),
+        diagonal=True,
+        ignore_nan=True,
+        minval=-np.ones(2),
+        maxval=np.ones(2),
+        latent_mean=np.zeros(2),
+        latent_std=np.ones(2),
+        latent_covariance=np.eye(2),
+        template=template,
+    )
+    edge = _CompressionSampleableEdge(
+        source="inputs",
+        target="outputs",
+        outputs_sampler=CompressionSampler(
+            compression=compression,
+            distribution="uniform",
+            reconstruct=True,
+            conditioning={"blocks": [0], "missing": "nan"},
+        ),
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        datasets={
+            "conditioned": {
+                "input_samples": 2,
+                "outputs_per_input": 2,
+                "input_seed": 0,
+                "output_seed": 1,
+                "batch_size": batch_size,
+                "skip_solve": True,
+                "skip_evaluate": True,
+            }
+        },
+        graph=FunctionGraph(edges={"conditioned": edge}),
+    )
+
+    assert generation.run() == 0
+    output_paths = sorted((tmp_path / "conditioned").glob("seed_0/sample_*/seed_1/sample_*/output.h5"))
+    assert len(output_paths) == 4
+    for output_path in output_paths:
+        output = load_h5({}, output_path, jax=True)
+        assert output["y"].shape == (1,)
+        assert jnp.isfinite(output["y"]).all()
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

@@ -521,6 +521,40 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
         )
 
 
+def test_block_linear_autoencoder_optionally_ignores_nan_components() -> None:
+    """NaN masking removes only missing encoder contributions and remains transform-safe."""
+    encoder = (
+        (jnp.asarray([[1.0, 2.0]]), jnp.asarray([[3.0]])),
+        (jnp.asarray([[4.0, 5.0]]), jnp.asarray([[6.0]])),
+    )
+    decoder = (
+        (jnp.asarray([[1.0], [0.0]]), jnp.asarray([[0.0], [1.0]])),
+        (jnp.asarray([[1.0]]), jnp.asarray([[1.0]])),
+    )
+    kwargs = {
+        "input_sizes": [2, 1],
+        "latent_sizes": [1, 1],
+        "encoder_blocks": encoder,
+        "decoder_blocks": decoder,
+        "bias": jnp.ones(3),
+    }
+    values = jnp.asarray([3.0, jnp.nan, jnp.nan])
+
+    assert jnp.isnan(BlockLinearAutoencoder(**kwargs).reduce(values)).all()
+
+    module = BlockLinearAutoencoder(**kwargs, ignore_nan=True)
+    expected = jnp.asarray([2.0, 8.0])
+    assert jnp.allclose(module.reduce(values), expected)
+    assert jnp.allclose(eqx.filter_jit(module.reduce)(values), expected)
+    assert jnp.allclose(
+        eqx.filter_vmap(module.reduce)(jnp.stack((values, values))),
+        jnp.stack((expected, expected)),
+    )
+
+    derivative = jax.grad(lambda first: jnp.sum(module.reduce(jnp.asarray([first, jnp.nan, jnp.nan]))))(3.0)
+    assert jnp.allclose(derivative, 5.0)
+
+
 def test_block_linear_autoencoder_filter_model_handles_unequal_field_shapes() -> None:
     """Use flat gather/scatter templates to split and restore unequal fields."""
     module = BlockLinearAutoencoder(input_sizes=[6, 4], latent_sizes=[2, 3], key=jax.random.key(1))

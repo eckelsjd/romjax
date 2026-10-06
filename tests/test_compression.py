@@ -144,6 +144,154 @@ def test_compression_sampler_normal_uses_joint_covariance_by_default() -> None:
     np.testing.assert_allclose(marginal, expected_marginal)
 
 
+def _conditionable_block_compression(*, ignore_nan: bool = True) -> BlockLinearCompression:
+    template = {
+        "inputs": {"x": jax.ShapeDtypeStruct((1,), jnp.float32)},
+        "outputs": {"y": jax.ShapeDtypeStruct((1,), jnp.float32)},
+    }
+    blocks = ((np.ones((1, 1)), None), (None, np.ones((1, 1))))
+    return BlockLinearCompression(
+        encoder_blocks=blocks,
+        decoder_blocks=blocks,
+        input_sizes=(1, 1),
+        latent_sizes=(1, 1),
+        diagonal=True,
+        ignore_nan=ignore_nan,
+        minval=np.asarray([-1.0, -2.0]),
+        maxval=np.asarray([1.0, 2.0]),
+        latent_mean=np.asarray([1.0, -2.0]),
+        latent_std=np.asarray([2.0, 3.0]),
+        latent_covariance=np.asarray([[4.0, 2.0], [2.0, 9.0]]),
+        template=template,
+    )
+
+
+def test_compression_condition_indices_support_exact_indices_and_blocks() -> None:
+    compression = _conditionable_block_compression()
+
+    assert SVD(rank=2).condition_indices(indices=[1, 0]) == (0, 1)
+    assert compression.condition_indices(indices=[1]) == (1,)
+    assert compression.condition_indices(blocks=[0]) == (0,)
+    with pytest.raises(ValueError, match="exactly one"):
+        compression.condition_indices(indices=[0], blocks=[1])
+    with pytest.raises(ValueError, match="unique"):
+        compression.condition_indices(blocks=[0, 0])
+    with pytest.raises(ValueError, match="outside"):
+        compression.condition_indices(indices=[2])
+
+
+def test_compression_sampler_conditions_joint_normal_with_missing_nan_fill() -> None:
+    compression = _conditionable_block_compression()
+    key = jax.random.key(9)
+    sampler = CompressionSampler(
+        compression=compression,
+        distribution="normal",
+        conditioning={"blocks": [0], "missing": "nan"},
+    )
+
+    sample = sampler.sample(key, inputs={"x": jnp.asarray([1.5], dtype=jnp.float32), "unused": 7})
+    conditional_mean = jnp.asarray([-2.0 + 2.0 / 4.0 * (1.5 - 1.0)])
+    conditional_covariance = jnp.asarray([[9.0 - 2.0 * 2.0 / 4.0]])
+    expected_free = jax.random.multivariate_normal(key, conditional_mean, conditional_covariance, method="svd")
+
+    np.testing.assert_allclose(sample, jnp.asarray([1.5, expected_free[0]]), rtol=1e-6, atol=1e-6)
+
+    marginal = CompressionSampler(
+        compression=compression,
+        distribution="normal",
+        marginal=True,
+        conditioning={"blocks": [0], "missing": "nan"},
+    ).sample(key, inputs={"x": jnp.asarray([1.5], dtype=jnp.float32)})
+    expected_marginal = jax.random.normal(key, (1,)) * 3.0 - 2.0
+    np.testing.assert_allclose(marginal, jnp.asarray([1.5, expected_marginal[0]]))
+
+
+def test_compression_sampler_conditions_singular_joint_normal() -> None:
+    compression = _conditionable_block_compression().model_copy(
+        update={
+            "latent_mean": np.zeros(2),
+            "latent_std": np.ones(2),
+            "latent_covariance": np.ones((2, 2)),
+        }
+    )
+    sampler = CompressionSampler(
+        compression=compression,
+        distribution="normal",
+        conditioning={"blocks": [0], "missing": "nan"},
+    )
+
+    sample = sampler.sample(jax.random.key(3), inputs={"x": jnp.asarray([0.75], dtype=jnp.float32)})
+
+    np.testing.assert_allclose(sample, jnp.asarray([0.75, 0.75]), rtol=1e-5, atol=1e-5)
+
+
+def test_compression_sampler_uniform_condition_overlay_and_missing_error() -> None:
+    compression = _conditionable_block_compression()
+    default_sampler = CompressionSampler(
+        compression=compression,
+        distribution="uniform",
+        conditioning={"blocks": [0]},
+    )
+    with pytest.raises(ValueError, match="outputs.y"):
+        default_sampler.sample(jax.random.key(1), inputs={"x": jnp.asarray([0.25], dtype=jnp.float32)})
+
+    sampler = CompressionSampler(
+        compression=compression,
+        distribution="uniform",
+        conditioning={"indices": [0], "missing": "nan"},
+    )
+    sample = sampler.sample(
+        jax.random.key(2),
+        inputs={"x": jnp.asarray([0.25], dtype=jnp.float32)},
+        conditions={"inputs": {"x": jnp.asarray([3.0], dtype=jnp.float32)}},
+    )
+
+    assert sample[0] == 3.0
+    assert -2.0 <= sample[1] < 2.0
+    with pytest.raises(ValueError, match="rooted at inputs/outputs"):
+        sampler.sample(jax.random.key(2), conditions={"x": jnp.asarray([1.0])})
+
+
+def test_compression_sampler_rejects_artifact_conditioning_and_handles_all_fixed() -> None:
+    compression = _conditionable_block_compression()
+    with pytest.raises(ValueError, match="does not support conditioning"):
+        CompressionSampler(
+            compression=compression,
+            distribution="artifact",
+            conditioning={"indices": [0]},
+        ).resolve_sampler()
+
+    sampler = CompressionSampler(
+        compression=compression,
+        distribution="uniform",
+        conditioning={"indices": [0, 1]},
+    )
+    kwargs = {
+        "inputs": {"x": jnp.asarray([0.25], dtype=jnp.float32)},
+        "solution": {"y": jnp.asarray([-0.5], dtype=jnp.float32)},
+    }
+    np.testing.assert_allclose(sampler.sample(jax.random.key(1), **kwargs), jnp.asarray([0.25, -0.5]))
+    np.testing.assert_allclose(sampler.sample(jax.random.key(2), **kwargs), jnp.asarray([0.25, -0.5]))
+
+
+def test_block_linear_compression_persists_ignore_nan(tmp_path: Path) -> None:
+    compression = _conditionable_block_compression()
+
+    reloaded = Compression.load(compression.dump(tmp_path / "ignore_nan.h5"))
+
+    assert isinstance(reloaded, BlockLinearCompression)
+    assert reloaded.ignore_nan is True
+    np.testing.assert_allclose(
+        reloaded.compress(
+            {
+                "inputs": {"x": jnp.asarray([2.0], dtype=jnp.float32)},
+                "outputs": {"y": jnp.asarray([jnp.nan], dtype=jnp.float32)},
+            }
+        ),
+        jnp.asarray([2.0, 0.0]),
+    )
+
+
 def test_block_linear_compression_round_trip_and_artifact(tmp_path: Path) -> None:
     template = {
         "inputs": {"b": jax.ShapeDtypeStruct((1,), jnp.float32)},
