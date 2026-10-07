@@ -7,10 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import romjax.data_gen as data_gen_module
 from romjax.compression import SVD, BlockLinearCompression, Compression
 from romjax.data_gen import (
     DataGeneration,
     DataLoader,
+    GenDataBenchmark,
     GenDataConfig,
     GenLatent,
     GenNorm,
@@ -889,6 +891,170 @@ def test_data_generation_expands_base_overrides_cartesian_product(tmp_path: Path
             source_root = tmp_path / f"inputs={samples}" / f"outputs={seed}" / "source"
             assert (source_root / f"seed_{seed}").exists()
             assert (source_root / f"seed_{seed}" / "sample_0" / "source.h5").exists()
+
+
+@pytest.mark.parametrize("kind", ["implicit", "source"])
+def test_data_generation_benchmark_caches_total_and_amortized_timings(tmp_path: Path, kind: str) -> None:
+    if kind == "implicit":
+        graph = FunctionGraph(edges={"sample": _ToySampleableEdge(source="inputs", target="sample")})
+        generator = {
+            "kind": "implicit",
+            "graph": graph,
+            "input_samples": 1,
+            "outputs_per_input": 0,
+            "input_seed": 3,
+            "output_seed": 5,
+            "batch_size": 2,
+        }
+    else:
+        graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+        generator = {"kind": "source", "graph": graph, "samples": 1, "seed": 3, "batch_size": 2}
+
+    benchmark = GenDataBenchmark(
+        generator=generator,
+        samples=6,
+        repeat=2,
+        warmup=1,
+        hardware="test",
+    )
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
+
+    cached = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)["test"]
+    assert cached["total"].shape == (2,)
+    assert np.all(cached["total"] > 0.0)
+    np.testing.assert_allclose(cached["amortized"], cached["total"] / 6)
+    assert cached["_benchmark"]["samples"] == 6
+    assert not list((tmp_path / "sample").glob("seed_*"))
+
+
+def test_data_generation_benchmark_honors_cache_write_policy(tmp_path: Path, monkeypatch) -> None:
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=1,
+        warmup=0,
+        hardware="test",
+    )
+    monkeypatch.setattr(benchmark, "_benchmark", lambda path: np.asarray([4.0]))
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
+
+    monkeypatch.setattr(benchmark, "_benchmark", lambda path: pytest.fail("reuse must not benchmark"))
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="reuse")
+    with pytest.raises(RoutineError, match="already exist"):
+        benchmark.generate(tmp_path / "sample", format="h5", write_policy="error")
+
+    incompatible = benchmark.model_copy(update={"repeat": 2}, deep=True)
+    with pytest.raises(RoutineError, match="incompatible"):
+        incompatible.generate(tmp_path / "sample", format="h5", write_policy="reuse")
+
+
+def test_data_generation_benchmark_reports_repeat_and_batch_progress(tmp_path: Path, monkeypatch) -> None:
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=2,
+        warmup=1,
+        show_progress=True,
+        hardware="test",
+    )
+    workload_calls: list[int] = []
+    batches = ((1,), (2,))
+    monkeypatch.setattr(
+        benchmark,
+        "_workload",
+        lambda path: (lambda value: workload_calls.append(value) or np.asarray(value), batches),
+    )
+
+    durations = iter((1.0, 3.0, 5.0, 7.0))
+    clock_state = {"timing": False}
+
+    def perf_counter() -> float:
+        if not clock_state["timing"]:
+            clock_state["timing"] = True
+            return 0.0
+        clock_state["timing"] = False
+        return next(durations)
+
+    monkeypatch.setattr(data_gen_module.time, "perf_counter", perf_counter)
+    progress: dict[str, Any] = {"updates": 0, "messages": []}
+
+    class FakeProgress:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def text(self, message):
+            assert not clock_state["timing"]
+            progress["messages"].append(message)
+
+        def __call__(self):
+            assert not clock_state["timing"]
+            progress["updates"] += 1
+
+    def progress_factory(total, **kwargs):
+        progress["total"] = total
+        progress["title"] = kwargs["title"]
+        return FakeProgress()
+
+    monkeypatch.setattr(data_gen_module, "alive_bar", progress_factory)
+
+    totals = benchmark._benchmark(tmp_path / "sample")
+
+    np.testing.assert_allclose(totals, [4.0, 12.0])
+    assert len(workload_calls) == 6
+    assert progress["total"] == 6
+    assert progress["updates"] == 6
+    assert progress["title"] == "Benchmark sample"
+    assert any("Repeat 2/2" in message and "batch 2/2" in message for message in progress["messages"])
+
+
+def test_data_generation_expands_benchmark_cases(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "benchmark.yml"
+    base_path.write_text(
+        "\n".join(
+            [
+                "sample:",
+                "  kind: benchmark",
+                "  repeat: 1",
+                "  warmup: 0",
+                "  hardware: test",
+                "  generator:",
+                "    kind: source",
+                "    samples: 1",
+                "    seed: 0",
+                "    graph: !romx:FunctionGraph",
+                "      edges:",
+                    f"        - !pd:{__name__}._ToySourceEdge",
+                "          source: noise",
+                "          target: sample",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    generation = DataGeneration(
+        root=tmp_path,
+        base=base_path,
+        overrides=[
+            {
+                "name": "samples",
+                "cases": [
+                    {"name": "2", "value": {"sample": {"samples": 2}}},
+                    {"name": "4", "value": {"sample": {"samples": 4}}},
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(GenDataBenchmark, "_benchmark", lambda self, path: np.asarray([self.samples]))
+
+    assert generation.run() == 0
+    for samples in (2, 4):
+        cached = load_h5({}, tmp_path / f"samples={samples}" / "sample" / "timings.h5", jax=False)["test"]
+        np.testing.assert_allclose(cached["total"], [samples])
+        np.testing.assert_allclose(cached["amortized"], [1.0])
 
 
 def test_data_generation_expands_yaml_base_path_and_empty_base(tmp_path: Path) -> None:
