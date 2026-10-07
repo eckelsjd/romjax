@@ -1,9 +1,12 @@
 """Data generation routine and data loading."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
+import re
+import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -52,6 +55,7 @@ from romjax.utils import _NullProgress, load_h5, required_fields, save_h5
 __all__ = [
     "DataGeneration",
     "DataLoader",
+    "GenDataBenchmark",
     "GenDataConfig",
     "GenSymlink",
     "LoadDataConfig",
@@ -1208,6 +1212,235 @@ class GenSource(GenGraph):
             _process_batch(batch, sample_source, bar)
 
 
+def _validate_benchmark_generator(value: Any) -> GenImplicitModel | GenSource:
+    """Validate a benchmark's nested generator from a YAML-friendly mapping."""
+    if isinstance(value, GenImplicitModel | GenSource):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("Benchmark generator must be an implicit or source generator configuration.")
+    options = dict(value)
+    kind = options.pop("kind", None)
+    if kind == "implicit":
+        return GenImplicitModel(**options)
+    if kind == "source":
+        return GenSource(**options)
+    raise ValueError("Benchmark generator requires kind='implicit' or kind='source'.")
+
+
+class GenDataBenchmark(GenDataConfig):
+    """Benchmark a data generator without persisting generated samples.
+
+    The configured generator supplies the graph, random seeds, batching, and numerical
+    operations. It stores repeat-wise wall times in an HDF5 cache. Each hardware group
+    contains ``total`` in seconds per repeat and ``amortized`` in seconds per generated
+    sample.
+
+    :param generator: implicit or source data generator to benchmark
+    :param samples: number of generated samples included in every batch-timing pass
+    :param repeat: number of complete timed passes over all batches
+    :param warmup: number of untimed repetitions for every distinct batch shape
+    :param filename: HDF5 timing-cache filename written below the dataset path
+    :param hardware: optional cache group; inferred from the active JAX backend when omitted
+    """
+
+    generator: Annotated[GenImplicitModel | GenSource, BeforeValidator(_validate_benchmark_generator)]
+    samples: PositiveInt
+    repeat: PositiveInt = 5
+    warmup: NonNegativeInt = 1
+    filename: str = "timings.h5"
+    hardware: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_benchmark(self) -> "GenDataBenchmark":
+        if not self.filename or Path(self.filename).name != self.filename:
+            raise ValueError("Benchmark filename must be a non-empty basename.")
+        if not self.generator.throw:
+            raise ValueError("Data-generation benchmarks require generator.throw=True.")
+        self.hardware = self._hardware_label(self.hardware)
+        return self
+
+    @staticmethod
+    def _hardware_label(configured: str | None) -> str:
+        """Return a stable explicit or environment-derived cache label."""
+        label = configured or os.environ.get("DATA_GEN_HARDWARE")
+        if label is None:
+            if jax.default_backend() == "gpu":
+                label = "gpu"
+            else:
+                threads = os.environ.get("CPU_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
+                label = f"cpu_{threads}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+            raise ValueError("Hardware labels may contain only letters, numbers, '_', '-', and '.'.")
+        return label
+
+    def _metadata(self) -> dict[str, Any]:
+        """Return cache metadata sufficient to reject incompatible reuse."""
+        import romjax
+
+        generator = self.generator
+        serialized = romjax.YamlLoader.dump(generator, sort_keys=True, _preserve_yaml_sources=True)
+        return {
+            "schema_version": np.asarray(2),
+            "samples": np.asarray(int(self.samples)),
+            "repeat": np.asarray(int(self.repeat)),
+            "warmup": np.asarray(int(self.warmup)),
+            "batch_size": np.asarray(int(generator.batch_size)),
+            "generator": np.bytes_(type(generator).__name__),
+            "generator_hash": np.bytes_(hashlib.sha256(serialized.encode()).hexdigest()),
+        }
+
+    @staticmethod
+    def _metadata_matches(cached: Mapping[str, Any], requested: Mapping[str, Any]) -> bool:
+        """Return whether cached scalar metadata matches the requested benchmark."""
+        if set(cached) != set(requested):
+            return False
+        return all(np.array_equal(np.asarray(cached[key]), np.asarray(value)) for key, value in requested.items())
+
+    def _input_batches(self, seed: int, batch_size: int) -> tuple[jax.Array, ...]:
+        """Construct deterministic key batches without creating sample directories."""
+        keys = tuple(gen_keys(self.samples, seed))
+        return tuple(pytree_stack(keys[start : start + batch_size]) for start in range(0, len(keys), batch_size))
+
+    @staticmethod
+    def _output_keys(generator: GenImplicitModel, input_keys: jax.Array) -> jax.Array | None:
+        """Construct one output-key row per input key using normal generation semantics."""
+        if generator.outputs_per_input == 0:
+            return None
+        output_base = jax.random.key(generator.output_seed)
+
+        def keys_for_input(input_key: Key) -> jax.Array:
+            base = jax.random.fold_in(input_key, generator.output_seed) if generator.mix_output_seed else output_base
+            return jax.vmap(lambda index: jax.random.fold_in(base, index))(
+                np.arange(generator.outputs_per_input)
+            )
+
+        return jax.vmap(keys_for_input)(input_keys)
+
+    @staticmethod
+    def _implicit_callable(generator: GenImplicitModel, model: Any) -> Callable[..., PyTree]:
+        """Build the batched no-I/O workload corresponding to implicit generation."""
+        has_solve = hasattr(model, "solve") and not generator.skip_solve
+        has_evaluate = hasattr(model, "evaluate") and not generator.skip_evaluate
+        has_conditions = _has_custom_sample_conditions(model)
+
+        def generate_one(input_key: Key, output_keys: jax.Array | None) -> PyTree:
+            inputs = model.sample_inputs(input_key)
+            solution = model.solve(inputs) if has_solve and inputs is not None else None
+            solution_residual = (
+                model.evaluate(inputs, solution)
+                if has_evaluate and inputs is not None and solution is not None
+                else None
+            )
+            if output_keys is None:
+                return inputs, solution, solution_residual
+
+            conditions = eqx.filter_vmap(model.sample_conditions)(output_keys) if has_conditions else None
+
+            def sample_output(key: Key, condition: PyTree | None = None) -> PyTree:
+                return _call_sample_outputs(model, key, inputs, solution, condition)
+
+            outputs = (
+                eqx.filter_vmap(sample_output)(output_keys, conditions)
+                if conditions is not None
+                else eqx.filter_vmap(sample_output)(output_keys)
+            )
+            residuals = (
+                eqx.filter_vmap(model.evaluate, in_axes=(None, 0))(inputs, outputs)
+                if has_evaluate
+                else None
+            )
+            return inputs, solution, solution_residual, conditions, outputs, residuals
+
+        return eqx.filter_jit(eqx.filter_vmap(generate_one))
+
+    def _workload(self, path: Path) -> tuple[Callable[..., PyTree], tuple[tuple[Any, ...], ...]]:
+        """Build the JIT workload and its deterministic batches outside timed regions."""
+        generator = self.generator
+        if generator.graph is None:
+            raise ValueError("Data-generation benchmarks require a generator graph.")
+        generator._validate_required_methods(path)
+        model = generator._edge_from_path(path)
+        if isinstance(generator, GenSource):
+            _resolve_model_samplers(model, ("source",))
+            batches = self._input_batches(generator.seed, generator.batch_size)
+            return eqx.filter_jit(eqx.filter_vmap(model.sample_source)), tuple((keys,) for keys in batches)
+
+        _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
+        batches = self._input_batches(generator.input_seed, generator.batch_size)
+        args = tuple((keys, self._output_keys(generator, keys)) for keys in batches)
+        return self._implicit_callable(generator, model), args
+
+    def _benchmark(self, path: Path) -> np.ndarray:
+        """Return one complete batch-pass wall time for every configured repeat."""
+        workload, batches = self._workload(path)
+        progress_total = len(batches) * (self.warmup + self.repeat)
+        context = (
+            alive_bar(progress_total, title=f"Benchmark {path.name}")
+            if self.show_progress
+            else _NullProgress()
+        )
+        totals: list[float] = []
+        with context as bar:
+            for warmup_index in range(self.warmup):
+                for batch_index, args in enumerate(batches):
+                    bar.text(
+                        f"Warmup {warmup_index + 1}/{self.warmup}; "
+                        f"batch {batch_index + 1}/{len(batches)}"
+                    )
+                    jax.block_until_ready(workload(*args))
+                    bar()
+
+            for repeat_index in range(self.repeat):
+                total = 0.0
+                for batch_index, args in enumerate(batches):
+                    bar.text(
+                        f"Repeat {repeat_index + 1}/{self.repeat}; "
+                        f"batch {batch_index + 1}/{len(batches)}"
+                    )
+                    start = time.perf_counter()
+                    result = workload(*args)
+                    jax.block_until_ready(result)
+                    total += time.perf_counter() - start
+                    bar()
+                totals.append(total)
+        return np.asarray(totals)
+
+    def generate(
+        self,
+        path: Path,
+        format: SUPPORTED_FORMATS | None = None,
+        write_policy: SUPPORTED_POLICIES | None = None,
+    ) -> None:
+        """Reuse or collect timings and persist the current hardware entry."""
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
+        if format != "h5":
+            raise RoutineError(f"Save format {format!r} not recognized.")
+        path = Path(path)
+        cache_path = path / self.filename
+        cached = load_h5({}, cache_path, jax=False) if cache_path.exists() else {}
+        assert self.hardware is not None
+        exists = self.hardware in cached
+        metadata = self._metadata()
+        if exists and write_policy == "error":
+            raise RoutineError(f"Benchmark timings already exist for {self.hardware!r} at {cache_path}.")
+        if exists and write_policy == "reuse":
+            entry = cached[self.hardware]
+            if not isinstance(entry, Mapping) or not self._metadata_matches(entry.get("_benchmark", {}), metadata):
+                raise RoutineError(
+                    f"Cached benchmark at {cache_path} is incompatible; use write_policy='overwrite'."
+                )
+            return
+
+        total = self._benchmark(path)
+        cached[self.hardware] = {
+            "_benchmark": metadata,
+            "total": total,
+            "amortized": total / self.samples,
+        }
+        path.mkdir(parents=True, exist_ok=True)
+        save_h5(cached, cache_path, mode="w")
+
+
 class LoadSource(LoadDataConfig[Path]):
     """
     File-based load configuration for source-node datasets corresponding to `GenSource`.
@@ -1965,6 +2198,8 @@ class GenLatent(GenDataConfig):
 def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
     """Validate every leaf in a pytree-like template as a :class:`GenDataConfig`. Leave anything else untouched."""
     if isinstance(template, Mapping):
+        if template.get("kind") == "benchmark":
+            return GenDataBenchmark(**{key: value for key, value in template.items() if key != "kind"})
         if all(field in template for field in required_fields(GenSymlink)):
             return GenSymlink(**template)
         latent_fields = {"compression", "gather_paths", "gather_template"}
@@ -2073,6 +2308,8 @@ class DataGeneration(Routine):
         """Pass the configured graph to graph-based dataset leaves."""
         leaves, _ = jax.tree.flatten(datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig))
         for ds in leaves:
+            if isinstance(ds, GenDataBenchmark) and ds.generator.graph is None:
+                ds.generator.graph = self.graph
             if hasattr(ds, "graph") and ds.graph is None:
                 ds.graph = self.graph
 
@@ -2090,7 +2327,10 @@ class DataGeneration(Routine):
         if isinstance(self.base, str | Path):
             path = romjax.YamlLoader._resolve_override_path(str(self.base), self._source_path)
             return romjax.YamlLoader._compose_resolved_node(path)
-        node = yaml.compose(romjax.YamlLoader.dump(self.base, sort_keys=False), Loader=yaml.SafeLoader)
+        node = yaml.compose(
+            romjax.YamlLoader.dump(self.base, sort_keys=False, _preserve_yaml_sources=True),
+            Loader=yaml.SafeLoader,
+        )
         return node, self._source_path
 
     def _expanded_datasets(self) -> Iterator[tuple[Path, PyTree]]:
@@ -2109,7 +2349,8 @@ class DataGeneration(Routine):
                 if case.value is None:
                     continue
                 override_node = yaml.compose(
-                    romjax.YamlLoader.dump(case.value, sort_keys=False), Loader=yaml.SafeLoader
+                    romjax.YamlLoader.dump(case.value, sort_keys=False, _preserve_yaml_sources=True),
+                    Loader=yaml.SafeLoader,
                 )
                 if override_node is not None:
                     override_node = romjax.YamlLoader._resolve_parent_refs(override_node, self._source_path)
