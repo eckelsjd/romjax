@@ -512,6 +512,7 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
     assert initialized.encoder_blocks[0][1] is None
     assert initialized.decoder_blocks[1][0] is None
     assert initialized.bias is not None
+    assert initialized.bias_mask == (True, True)
     assert len(jax.tree.leaves(initialized)) == 5
     diagonal_encoder, diagonal_decoder = initialized.projection_matrices(samples)
     assert diagonal_encoder.shape == (3, 8)
@@ -537,12 +538,106 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
         BlockLinearAutoencoder(input_sizes=[2], latent_sizes=[1, 1], key=jax.random.key(1))
     with pytest.raises(ValueError, match="bias must have shape"):
         BlockLinearAutoencoder(input_sizes=[2], latent_sizes=[1], key=jax.random.key(1), bias=jnp.ones(3))
+    with pytest.raises(ValueError, match="random_bias must contain 2 values"):
+        BlockLinearAutoencoder(
+            input_sizes=[2, 3], latent_sizes=[1, 1], key=jax.random.key(1), random_bias=(True,)
+        )
+    with pytest.raises(TypeError, match="boolean or a sequence of booleans"):
+        BlockLinearAutoencoder(
+            input_sizes=[2, 3], latent_sizes=[1, 1], key=jax.random.key(1), random_bias=(True, 1)
+        )
     with pytest.raises(ValueError, match="Off-diagonal"):
         BlockLinearAutoencoder(
             input_sizes=[1, 1], latent_sizes=[1, 1], diagonal=True,
             encoder_blocks=((jnp.ones((1, 1)), jnp.ones((1, 1))), (None, jnp.ones((1, 1)))),
             decoder_blocks=((jnp.ones((1, 1)), None), (None, jnp.ones((1, 1)))),
         )
+
+
+def test_block_linear_autoencoder_supports_blockwise_random_bias() -> None:
+    """Only selected bias chunks participate in evaluation and differentiation."""
+    module = BlockLinearAutoencoder(
+        input_sizes=[2, 3],
+        latent_sizes=[1, 2],
+        key=jax.random.key(8),
+        random_bias=(True, False),
+        diagonal=True,
+    )
+    assert module.bias is not None
+    assert module.bias.shape == (5,)
+    assert module.bias_mask == (True, False)
+    assert jnp.any(module.bias[:2] != 0.0)
+    assert jnp.all(module.bias[2:] == 0.0)
+
+    effective_bias = module._effective_bias()
+    assert effective_bias is not None
+    assert jnp.any(effective_bias[:2] != 0.0)
+    assert jnp.all(effective_bias[2:] == 0.0)
+
+    values = jnp.arange(5.0)
+
+    def loss(current: BlockLinearAutoencoder) -> jax.Array:
+        return jnp.sum(current.reconstruct(current.reduce(values)))
+
+    gradients = jax.grad(jax.jit(loss))(module)
+    assert gradients.bias is not None
+    assert jnp.all(gradients.bias[2:] == 0.0)
+
+    without_bias = eqx.tree_at(lambda current: current.bias, module, None)
+    expected = without_bias.reconstruct(without_bias.reduce(values))
+    actual = module.reconstruct(module.reduce(values))
+    assert jnp.allclose(actual[2:], expected[2:])
+
+
+def test_block_linear_autoencoder_accepts_yaml_random_bias_sequence() -> None:
+    """YAML sequences normalize to the static block-wise bias mask."""
+    sampler = YamlLoader.load(
+        """
+!romx:PyTreeSampler
+template:
+  name: BlockLinearAutoencoder
+  kwargs:
+    input_sizes: [2, 3]
+    latent_sizes: [1, 2]
+    diagonal: true
+    random_bias: [true, false]
+"""
+    )
+    module = sampler(jax.random.key(8))
+
+    assert isinstance(module, BlockLinearAutoencoder)
+    assert module.bias_mask == (True, False)
+    assert module.bias is not None
+    assert jnp.any(module.bias[:2] != 0.0)
+    assert jnp.all(module.bias[2:] == 0.0)
+
+    invalid_sampler = YamlLoader.load(
+        """
+!romx:PyTreeSampler
+template:
+  name: BlockLinearAutoencoder
+  kwargs:
+    input_sizes: [2, 3]
+    latent_sizes: [1, 2]
+    random_bias: [true]
+"""
+    )
+    with pytest.raises(ValueError, match="random_bias must contain 2 values"):
+        invalid_sampler(jax.random.key(8))
+
+    invalid_sampler = YamlLoader.load(
+        """
+!romx:PyTreeSampler
+template:
+  name: BlockLinearAutoencoder
+  kwargs:
+    input_sizes: [2, 3]
+    latent_sizes: [1, 2]
+    random_bias: [true, 0]
+"""
+    )
+    with pytest.raises(TypeError, match="random_bias must be a boolean or a sequence of booleans"):
+        invalid_sampler(jax.random.key(8))
 
 
 def test_block_linear_autoencoder_optionally_ignores_nan_components() -> None:
