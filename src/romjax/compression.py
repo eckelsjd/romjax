@@ -625,6 +625,7 @@ class BlockLinearCompression(Compression):
     :param init_seed: deterministic sampler seed used by POD-only fitting
     :param graph: optional reference tree for resolving POD-only initializer references
     :param train: training routine used by train and POD-then-train modes
+    :param bias_mask: optional persisted mask selecting the active full-space bias chunks
     """
 
     fit_mode: Literal["train", "pod", "pod_then_train"] = Field(default="train", exclude=True)
@@ -637,6 +638,7 @@ class BlockLinearCompression(Compression):
     encoder_blocks: tuple[tuple[np.ndarray | None, ...], ...] | None = None
     decoder_blocks: tuple[tuple[np.ndarray | None, ...], ...] | None = None
     bias: np.ndarray | None = None
+    bias_mask: tuple[bool, ...] | None = None
     input_sizes: tuple[PositiveInt, ...] | None = None
     latent_sizes: tuple[PositiveInt, ...] | None = None
     diagonal: bool = False
@@ -661,6 +663,15 @@ class BlockLinearCompression(Compression):
             raise ValueError("input_sizes and latent_sizes must contain the same number of partitions.")
         if self.bias is not None and self.input_sizes is None:
             raise ValueError("bias requires input_sizes and latent_sizes.")
+        if self.bias_mask is not None:
+            if self.bias is None:
+                raise ValueError("bias_mask requires bias.")
+            if self.input_sizes is None:
+                raise ValueError("bias_mask requires input_sizes and latent_sizes.")
+            if len(self.bias_mask) != len(self.input_sizes):
+                raise ValueError(
+                    f"bias_mask must contain {len(self.input_sizes)} values, got {len(self.bias_mask)}."
+                )
         if self.encoder_blocks is not None:
             if self.input_sizes is None:
                 raise ValueError("Persisted blocks require input_sizes and latent_sizes.")
@@ -701,6 +712,7 @@ class BlockLinearCompression(Compression):
             encoder_blocks=self.encoder_blocks,
             decoder_blocks=self.decoder_blocks,
             bias=self.bias,
+            bias_mask=self.bias_mask,
             diagonal=self.diagonal,
             ignore_nan=self.ignore_nan,
         )
@@ -744,6 +756,7 @@ class BlockLinearCompression(Compression):
     ) -> BlockLinearAutoencoder:
         """Replace active blocks with joint or chunk-wise POD bases."""
         center = initial.bias is not None
+        bias_mask = initial.bias_mask
         count = len(initial.input_sizes)
         input_offsets = np.cumsum((0, *initial.input_sizes))
         latent_offsets = np.cumsum((0, *initial.latent_sizes))
@@ -755,16 +768,29 @@ class BlockLinearCompression(Compression):
             for index, (input_size, latent_size) in enumerate(zip(initial.input_sizes, initial.latent_sizes)):
                 chunk = vectors[:, input_offsets[index] : input_offsets[index + 1]]
                 self._check_pod_rank(chunk, latent_size, f"Block {index}")
-                pod = SVD(rank=latent_size, center=center).fit(list(chunk))
+                block_center = center and bias_mask[index]
+                pod = SVD(rank=latent_size, center=block_center).fit(list(chunk))
                 basis = jnp.asarray(pod.basis)
                 encoder[index][index] = basis
                 decoder[index][index] = basis.T
                 if center:
-                    means.append(jnp.asarray(pod.mean))
+                    means.append(jnp.asarray(pod.mean) if block_center else jnp.zeros(input_size, dtype=chunk.dtype))
             bias = jnp.concatenate(means) if center else None
         else:
             self._check_pod_rank(vectors, initial.latent_size, "Joint")
-            pod = SVD(rank=initial.latent_size, center=center).fit(list(vectors))
+            if center:
+                means = tuple(
+                    jnp.mean(vectors[:, input_offsets[index] : input_offsets[index + 1]], axis=0)
+                    if bias_mask[index]
+                    else jnp.zeros(input_size, dtype=vectors.dtype)
+                    for index, input_size in enumerate(initial.input_sizes)
+                )
+                bias = jnp.concatenate(means)
+                pod_vectors = vectors - bias
+            else:
+                bias = None
+                pod_vectors = vectors
+            pod = SVD(rank=initial.latent_size, center=False).fit(list(pod_vectors))
             basis = jnp.asarray(pod.basis)
             encoder = [
                 [
@@ -786,7 +812,6 @@ class BlockLinearCompression(Compression):
                 ]
                 for i in range(count)
             ]
-            bias = jnp.asarray(pod.mean) if center else None
 
         return BlockLinearAutoencoder(
             input_sizes=initial.input_sizes,
@@ -794,6 +819,7 @@ class BlockLinearCompression(Compression):
             encoder_blocks=tuple(tuple(row) for row in encoder),
             decoder_blocks=tuple(tuple(row) for row in decoder),
             bias=bias,
+            bias_mask=bias_mask if bias is not None else None,
             diagonal=initial.diagonal,
             ignore_nan=initial.ignore_nan,
         )
@@ -918,6 +944,7 @@ class BlockLinearCompression(Compression):
                 for row in trained.decoder_blocks
             ),
             bias=None if trained.bias is None else np.asarray(trained.bias),
+            bias_mask=trained.bias_mask if trained.bias is not None else None,
             input_sizes=trained.input_sizes, latent_sizes=trained.latent_sizes, diagonal=trained.diagonal,
             ignore_nan=trained.ignore_nan,
             minval=np.asarray(jnp.min(latent, axis=0)), maxval=np.asarray(jnp.max(latent, axis=0)),

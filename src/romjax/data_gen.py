@@ -270,7 +270,7 @@ class GenGraph(GenDataConfig, ABC):
     """
 
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
-    name_depth: int = 2
+    name_depth: int = 3
     batch_size: PositiveInt = 1
     _required_methods: list[str] = PrivateAttr(default_factory=list)
 
@@ -1249,6 +1249,7 @@ class GenDataBenchmark(GenDataConfig):
     warmup: NonNegativeInt = 1
     filename: str = "timings.h5"
     hardware: str | None = None
+    name_depth: int = 3
 
     @model_validator(mode="after")
     def _validate_benchmark(self) -> "GenDataBenchmark":
@@ -1272,6 +1273,9 @@ class GenDataBenchmark(GenDataConfig):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
             raise ValueError("Hardware labels may contain only letters, numbers, '_', '-', and '.'.")
         return label
+
+    def bar_text(self, path: Path):
+        return "/".join(path.parts[-self.name_depth:])
 
     def _metadata(self) -> dict[str, Any]:
         """Return cache metadata sufficient to reject incompatible reuse."""
@@ -1375,7 +1379,7 @@ class GenDataBenchmark(GenDataConfig):
         workload, batches = self._workload(path)
         progress_total = len(batches) * (self.warmup + self.repeat)
         context = (
-            alive_bar(progress_total, title=f"Benchmark {path.name}")
+            alive_bar(progress_total, title=self.bar_text(path))
             if self.show_progress
             else _NullProgress()
         )

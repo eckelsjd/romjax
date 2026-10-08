@@ -407,6 +407,63 @@ def test_block_linear_compression_fits_joint_uncentered_pod() -> None:
             np.testing.assert_allclose(projection.decoder_blocks[i][j], projection.encoder_blocks[j][i].T)
 
 
+def test_block_linear_compression_preserves_partial_bias_mask(tmp_path: Path) -> None:
+    """Fitting and artifact round trips retain block-wise bias selection."""
+    vectors = jnp.asarray(
+        [[0.0, 1.0, 2.0, -1.0], [1.0, 2.0, 1.0, 1.0], [2.0, 0.0, 0.0, 3.0]]
+    )
+    initial = BlockLinearAutoencoder(
+        input_sizes=[2, 2],
+        latent_sizes=[1, 1],
+        key=jax.random.key(12),
+        random_bias=[True, False],
+        diagonal=True,
+    )
+    train = Train(
+        loss=lambda _params, _batch: jnp.asarray(0.0),
+        init_params=initial,
+        optimizer=optax.sgd(0.01),
+        termination=TerminationConfig(max_steps=1),
+    )
+
+    compression = BlockLinearCompression(train=train, show_progress=False).fit(list(vectors))
+    projection = compression._projection()
+
+    assert compression.bias_mask == (True, False)
+    assert projection.bias_mask == (True, False)
+    assert compression.bias is not None
+    np.testing.assert_array_equal(compression.bias[2:], np.zeros(2))
+
+    reloaded = Compression.load(compression.dump(tmp_path / "partial_bias.h5"))
+    assert isinstance(reloaded, BlockLinearCompression)
+    assert reloaded.bias_mask == (True, False)
+    assert reloaded._projection().bias_mask == (True, False)
+    np.testing.assert_allclose(reloaded.compress(vectors[0]), compression.compress(vectors[0]))
+
+
+def test_block_linear_compression_pod_centers_only_masked_blocks() -> None:
+    """POD initialization computes means only for bias-enabled blocks."""
+    vectors = jnp.asarray(
+        [[0.0, 1.0, 2.0, -1.0], [1.0, 2.0, 1.0, 1.0], [2.0, 0.0, 0.0, 3.0]]
+    )
+    initial = BlockLinearAutoencoder(
+        input_sizes=[2, 2],
+        latent_sizes=[1, 1],
+        key=jax.random.key(13),
+        random_bias=[True, False],
+        diagonal=True,
+    )
+
+    compression = BlockLinearCompression(
+        fit_mode="pod", init_params=initial, show_progress=False
+    ).fit(list(vectors))
+
+    assert compression.bias_mask == (True, False)
+    assert compression.bias is not None
+    np.testing.assert_allclose(compression.bias[:2], jnp.mean(vectors[:, :2], axis=0))
+    np.testing.assert_array_equal(compression.bias[2:], np.zeros(2))
+
+
 def test_block_linear_compression_pod_initializes_train(monkeypatch) -> None:
     vectors = jnp.asarray([[0.0, 1.0], [1.0, 0.0], [2.0, 2.0]])
     initial = BlockLinearAutoencoder(

@@ -442,6 +442,7 @@ class BlockLinearAutoencoder(eqx.Module):
     encoder_blocks: tuple[tuple[ArrayLike | None, ...], ...]
     decoder_blocks: tuple[tuple[ArrayLike | None, ...], ...]
     bias: ArrayLike | None
+    bias_mask: tuple[bool, ...] = eqx.field(static=True)
     input_sizes: tuple[int, ...] = eqx.field(static=True)
     latent_sizes: tuple[int, ...] = eqx.field(static=True)
     diagonal: bool = eqx.field(static=True)
@@ -455,7 +456,8 @@ class BlockLinearAutoencoder(eqx.Module):
         encoder_blocks: Sequence[Sequence[ArrayLike | None]] | None = None,
         decoder_blocks: Sequence[Sequence[ArrayLike | None]] | None = None,
         bias: ArrayLike | None = None,
-        random_bias: bool = False,
+        bias_mask: Sequence[bool] | None = None,
+        random_bias: bool | Sequence[bool] = False,
         diagonal: bool = False,
         ignore_nan: bool = False,
         scale: float = 0.25,
@@ -472,7 +474,9 @@ class BlockLinearAutoencoder(eqx.Module):
         :param encoder_blocks: block grid with shapes ``(latent_sizes[i], input_sizes[j])``
         :param decoder_blocks: block grid with shapes ``(input_sizes[i], latent_sizes[j])``
         :param bias: optional full-space centering vector
-        :param random_bias: randomly initialize an omitted bias using ``key``
+        :param bias_mask: optional block mask controlling which chunks of an explicit bias are active
+        :param random_bias: randomly initialize an omitted bias using ``key``; a
+            boolean applies to every block, while a tuple selects individual blocks
         :param diagonal: omit and skip every off-diagonal block
         :param ignore_nan: omit NaN input components from every encoder contribution
         :param scale: random initialization scaling factor
@@ -482,6 +486,8 @@ class BlockLinearAutoencoder(eqx.Module):
         self.diagonal = diagonal
         self.ignore_nan = ignore_nan
         self._validate_sizes()
+        random_bias_blocks = self._validate_random_bias(random_bias)
+        explicit_bias_mask = None if bias_mask is None else self._validate_bias_mask(bias_mask, "bias_mask")
 
         if (encoder_blocks is None) != (decoder_blocks is None):
             raise ValueError("encoder_blocks and decoder_blocks must be supplied together.")
@@ -498,12 +504,21 @@ class BlockLinearAutoencoder(eqx.Module):
             self.bias = jnp.asarray(bias)
             if self.bias.shape != (self.input_size,):
                 raise ValueError(f"bias must have shape {(self.input_size,)}, got shape {self.bias.shape}.")
-        elif random_bias:
+            self.bias_mask = explicit_bias_mask or (True,) * len(self.input_sizes)
+            self.bias = self._effective_bias()
+        elif any(random_bias_blocks):
+            if explicit_bias_mask is not None:
+                raise ValueError("bias_mask requires an explicit bias.")
             if bias_key is None:
                 raise ValueError("random_bias requires a key.")
             self.bias = scale * jax.random.normal(bias_key, (self.input_size,))
+            self.bias_mask = random_bias_blocks
+            self.bias = self._effective_bias()
         else:
+            if explicit_bias_mask is not None and any(explicit_bias_mask):
+                raise ValueError("bias_mask requires an explicit bias.")
             self.bias = None
+            self.bias_mask = (False,) * len(self.input_sizes)
 
     @property
     def input_size(self) -> int:
@@ -523,6 +538,37 @@ class BlockLinearAutoencoder(eqx.Module):
             raise ValueError("input_sizes and latent_sizes must contain the same number of partitions.")
         if any(size < 1 for size in (*self.input_sizes, *self.latent_sizes)):
             raise ValueError("Block partition sizes must be positive.")
+
+    def _validate_random_bias(self, random_bias: bool | Sequence[bool]) -> tuple[bool, ...]:
+        """Normalize and validate the block-wise random bias selection."""
+        if isinstance(random_bias, bool):
+            return (random_bias,) * len(self.latent_sizes)
+        return self._validate_bias_mask(random_bias, "random_bias")
+
+    def _validate_bias_mask(self, mask: Sequence[bool], name: str) -> tuple[bool, ...]:
+        """Validate and normalize block-wise bias selection metadata."""
+        count = len(self.latent_sizes)
+        expected = "a boolean or a sequence of booleans" if name == "random_bias" else "a sequence of booleans"
+        if not isinstance(mask, Sequence) or isinstance(mask, str | bytes):
+            raise TypeError(f"{name} must be {expected}.")
+        if len(mask) != count:
+            raise ValueError(f"{name} must contain {count} values, got {len(mask)}.")
+        if any(not isinstance(value, bool) for value in mask):
+            raise TypeError(f"{name} must be {expected}.")
+        return tuple(mask)
+
+    def _effective_bias(self) -> jax.Array | None:
+        """Return the concatenated bias with disabled block chunks masked out."""
+        if self.bias is None:
+            return None
+        values = jnp.asarray(self.bias)
+        if all(self.bias_mask):
+            return values
+        offsets = tuple(sum(self.input_sizes[:index]) for index in range(1, len(self.input_sizes)))
+        chunks = jnp.split(values, offsets)
+        return jnp.concatenate(
+            tuple(chunk if enabled else jnp.zeros_like(chunk) for chunk, enabled in zip(chunks, self.bias_mask))
+        )
 
     def _random_blocks(
         self, key: Key, scale: float
@@ -650,8 +696,9 @@ class BlockLinearAutoencoder(eqx.Module):
         values = jnp.asarray(x)
         if values.ndim == 0 or values.shape[-1] != self.input_size:
             raise ValueError(f"x must have last-axis size {self.input_size}, got shape {values.shape}.")
-        if self.bias is not None:
-            values = values - jnp.asarray(self.bias)
+        bias = self._effective_bias()
+        if bias is not None:
+            values = values - bias
         if self.ignore_nan:
             values = jnp.where(jnp.isnan(values), jnp.zeros_like(values), values)
         split_indices = tuple(sum(self.input_sizes[:index]) for index in range(1, len(self.input_sizes)))
@@ -670,8 +717,9 @@ class BlockLinearAutoencoder(eqx.Module):
         split_indices = tuple(sum(self.latent_sizes[:index]) for index in range(1, len(self.latent_sizes)))
         partitions = tuple(jnp.split(values, split_indices, axis=-1))
         reconstructed = self._apply_blocks(self.decoder_blocks, partitions)
-        if self.bias is not None:
-            reconstructed = reconstructed + jnp.asarray(self.bias)
+        bias = self._effective_bias()
+        if bias is not None:
+            reconstructed = reconstructed + bias
         return reconstructed
 
     def __call__(self, x: ArrayLike) -> ArrayLike:
