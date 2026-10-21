@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import romjax
+from romjax.execution import ExecutionError
 from romjax.mpi_runtime import cli_context
 from romjax.routine import RoutineError
 
@@ -96,7 +97,7 @@ def cli(argv: list[str] | None = None) -> int:
 
                 return routine.run()
             
-        except RoutineError as exc:
+        except (RoutineError, ExecutionError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
     

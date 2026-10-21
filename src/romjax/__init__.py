@@ -74,6 +74,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
+    "ExecutorConfig": ("romjax.execution", "ExecutorConfig"),
+    "mpi_context": ("romjax.mpi_runtime", "mpi_context"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
     "FilterModel": ("romjax.model", "FilterModel"),
     "ImplicitModel": ("romjax.model", "ImplicitModel"),
@@ -137,6 +139,7 @@ if TYPE_CHECKING:
     from .compression import BlockLinearCompression, Compression, SVD
     from .compare import CompareMetric, CompareOrbax
     from .data_gen import DataGeneration, DataLoader
+    from .execution import ExecutorConfig
     from .graph import CompositeEdge, FunctionGraph, IdentityEdge
     from .grid_search import GridSearch
     from .model import ExplicitModel, FilterModel, ImplicitModel, eqx_evaluate
@@ -349,7 +352,24 @@ class YamlLoader(ConfigLoader):
         return _Loader
 
     @classmethod
-    def get_dumper(cls, *, preserve_yaml_sources: bool = False) -> _Type[_yaml.SafeDumper]:
+    def _restore_model_values(cls, original: _Any, payload: _Any) -> _Any:
+        """Restore nested model objects in a reconstruction-only YAML payload."""
+        if isinstance(original, _BaseModel) and isinstance(payload, dict):
+            for key in payload:
+                if hasattr(original, key):
+                    value = getattr(original, key)
+                    payload[key] = value if isinstance(value, _BaseModel) else cls._restore_model_values(value, payload[key])
+        elif isinstance(original, dict) and isinstance(payload, dict):
+            for key in payload.keys() & original.keys():
+                value = original[key]
+                payload[key] = value if isinstance(value, _BaseModel) else cls._restore_model_values(value, payload[key])
+        elif isinstance(original, (list, tuple)) and isinstance(payload, (list, tuple)):
+            payload = [value if isinstance(value, _BaseModel) else cls._restore_model_values(value, item)
+                       for value, item in zip(original, payload)]
+        return payload
+
+    @classmethod
+    def get_dumper(cls, *, preserve_yaml_sources: bool = False, preserve_model_types: bool = False) -> _Type[_yaml.SafeDumper]:
         """Return a custom yaml dumper that handles callables and pydantic models."""
         class _Dumper(_yaml.SafeDumper):
             pass
@@ -361,7 +381,16 @@ class YamlLoader(ConfigLoader):
         def _represent_base_model(dumper: _yaml.SafeDumper, data: _BaseModel) -> _yaml.Node:
             """Essentially a convenience that defers serialization to pydantic model_dump"""
             tag = cls.get_tag(data)
-            payload = data.model_dump()
+            payload = data.model_dump(serialize_as_any=True) if preserve_model_types else data.model_dump()
+            if preserve_model_types:
+                from romjax.typing import ListModel
+
+                if isinstance(data, ListModel):
+                    payload = dict(data.items())
+                elif isinstance(payload, dict):
+                    # Keep field serializers (callables, third-party specs, etc.), but
+                    # let YAML visit actual nested models before Pydantic erases types.
+                    payload = cls._restore_model_values(data, payload)
             if isinstance(payload, list | tuple):
                 return dumper.represent_sequence(tag, payload)
             if isinstance(payload, _FunctionType | _BuiltinFunctionType):
@@ -636,25 +665,30 @@ class YamlLoader(ConfigLoader):
             return None
 
         copied = _deepcopy(node)
-        if copied.tag.startswith(cls.OVERRIDES_TAG):
-            suffix = copied.tag[len(cls.OVERRIDES_TAG):]
-            copied.tag = f"{cls.OVERRIDES_TAG}{cls._resolve_parent_scalar(suffix, source_path)}"
+        seen: set[int] = set()
 
-        if isinstance(copied, _yaml.ScalarNode):
-            copied.value = cls._resolve_parent_scalar(copied.value, source_path)
-            return copied
-        if isinstance(copied, _yaml.SequenceNode):
-            copied.value = [cls._resolve_parent_refs(item, source_path) for item in copied.value]
-            return copied
-        if isinstance(copied, _yaml.MappingNode):
-            copied.value = [
-                (
-                    cls._resolve_parent_refs(key_node, source_path),
-                    cls._resolve_parent_refs(value_node, source_path),
-                )
-                for key_node, value_node in copied.value
-            ]
-            return copied
+        def resolve(current: _yaml.Node) -> None:
+            if id(current) in seen:
+                return
+            seen.add(id(current))
+            # Deferred sources have their own source_path. Resolve their contents
+            # only when that source is loaded, not relative to this wrapper.
+            if current.tag == cls.YAML_SOURCE_TAG:
+                return
+            if current.tag.startswith(cls.OVERRIDES_TAG):
+                suffix = current.tag[len(cls.OVERRIDES_TAG):]
+                current.tag = f"{cls.OVERRIDES_TAG}{cls._resolve_parent_scalar(suffix, source_path)}"
+            if isinstance(current, _yaml.ScalarNode):
+                current.value = cls._resolve_parent_scalar(current.value, source_path)
+            elif isinstance(current, _yaml.SequenceNode):
+                for item in current.value:
+                    resolve(item)
+            elif isinstance(current, _yaml.MappingNode):
+                for key, value in current.value:
+                    resolve(key)
+                    resolve(value)
+
+        resolve(copied)
         return copied
 
     @classmethod
@@ -905,6 +939,7 @@ class YamlLoader(ConfigLoader):
         token = cls._SOURCE_PATH.set(source_path)
         try:
             node = cls._render_templates(node)
+            node = cls._resolve_parent_refs(node, source_path)
             return _yaml.load(cls._node_to_yaml(node), **kwargs)
         finally:
             cls._SOURCE_PATH.reset(token)
@@ -917,8 +952,10 @@ class YamlLoader(ConfigLoader):
         :param stream: A string, path, file-stream, byte-stream, or similar.
         """
         preserve_yaml_sources = kwargs.pop("_preserve_yaml_sources", False)
+        preserve_model_types = kwargs.pop("_preserve_model_types", False)
         if "Dumper" not in kwargs:
-            kwargs["Dumper"] = cls.get_dumper(preserve_yaml_sources=preserve_yaml_sources)
+            kwargs["Dumper"] = cls.get_dumper(preserve_yaml_sources=preserve_yaml_sources,
+                                              preserve_model_types=preserve_model_types)
 
         if stream is None:
             return _yaml.dump(obj, **kwargs)

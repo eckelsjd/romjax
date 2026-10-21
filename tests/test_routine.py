@@ -457,6 +457,7 @@ def test_nested_composite_routines_run_child_before_parent_continues(tmp_path) -
     )
 
     composite = romjax.load(parent_path)
+    composite.executor.show_progress = False
 
     assert composite.run() == 0
     assert DemoRoutine.observed == ["child-one", "child-two", "parent-after"]
@@ -724,7 +725,7 @@ def test_composite_process_executor_propagates_parent_jax_options(tmp_path: Path
 
 def test_composite_routine_rejects_process_executor_with_direct_instances() -> None:
     with pytest.raises(ValueError, match="requires YAML-backed"):
-        CompositeRoutine(routines=[DemoRoutine()], executor="process")
+        CompositeRoutine(routines=[DemoRoutine()], executor="process").run()
 
 
 def test_composite_routine_thread_executor_runs_legacy_children() -> None:
@@ -736,3 +737,41 @@ def test_composite_routine_thread_executor_runs_legacy_children() -> None:
 
     assert composite.run() == 0
     assert set(DemoRoutine.observed) == {"one", "two"}
+
+
+def test_composite_progress_is_independent_from_child_executor_options(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from romjax.data_gen import DataGeneration, GenSource
+    from romjax.graph import FunctionGraph
+    from tests.test_data_gen import _ToySourceEdge
+
+    opened = []
+    updates = []
+
+    class Bar:
+        text = ''
+        def __call__(self, units=1):
+            updates.append((self.text, units))
+
+    @contextmanager
+    def factory(total, **options):
+        opened.append((total, options))
+        yield Bar()
+
+    monkeypatch.setattr('romjax.execution.alive_bar', factory)
+    monkeypatch.setenv('ROMJAX_MPI_CASE_CHILD', '1')
+    graph = FunctionGraph(edges={'source': _ToySourceEdge(source='noise', target='source')})
+    children = [DataGeneration(root=tmp_path / name, graph=graph,
+                               datasets={'source': GenSource(samples=count, seed=0, batch_size=2)},
+                               executor={'progress_bar': {'title': name}})
+                for name, count in [('first', 2), ('second', 3)]]
+    composite = CompositeRoutine(routines=children,
+                                 executor={'show_progress': False, 'progress_bar': {'title': 'parent'}})
+    assert composite.run() == 0
+    assert opened == [(2, {'title': 'first'}), (3, {'title': 'second'})]
+    assert sum(units for _, units in updates) == 5
+    opened.clear()
+    composite.executor.show_progress = True
+    assert composite.run() == 0
+    assert opened == [(2, {'title': 'parent'}), (2, {'title': 'first'}), (3, {'title': 'second'})]

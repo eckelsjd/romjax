@@ -1,13 +1,9 @@
 """Base routine classes."""
 
 import ast
-import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import import_module as _import_module
 from itertools import product
@@ -17,7 +13,7 @@ from typing import Annotated, Any, Callable, Literal, Mapping
 import matplotlib
 import matplotlib.pyplot as plt
 import yaml
-from alive_progress import alive_bar, config_handler
+from alive_progress import config_handler
 from loguru import logger
 from pydantic import (
     BaseModel,
@@ -30,9 +26,9 @@ from pydantic import (
     model_validator,
 )
 
+from romjax.execution import ExecutionAction, ExecutorConfig, ProgressBarConfig, TaskContext, TaskSpec, TaskWorker
 from romjax.plotting import GridplotConfig
-from romjax.typing import DictModel, WriteStream, from_yaml
-from romjax.utils import _NullProgress
+from romjax.typing import WriteStream, from_yaml
 
 __all__ = [
     "CompositeRoutine",
@@ -50,8 +46,6 @@ _LAZY_EXPORTS = {
     "CompareMetric": ("romjax.compare", "CompareMetric")
 }
 
-_COMPOSITE_PROGRESS_ACTIVE: ContextVar[bool] = ContextVar("romjax_composite_progress_active", default=False)
-
 available = list(_LAZY_EXPORTS.keys())
 
 def __getattr__(name: str) -> Any:
@@ -62,18 +56,6 @@ def __getattr__(name: str) -> Any:
     value = module if attr_name is None else getattr(module, attr_name)
     globals()[name] = value
     return value
-
-
-class ProgressBarConfig(DictModel):
-    """Store configuration options for alive_bar."""
-
-    @model_validator(mode="after")
-    def _normalize_file(self):
-        """Allow any write-able file stream."""
-        ta = TypeAdapter(WriteStream)
-        if hasattr(self, "file"):
-            object.__setattr__(self, "file", ta.validate_python(self.file))
-        return self
 
 
 class LoggerConfig(BaseModel):
@@ -317,9 +299,7 @@ class _CompositeCaseResult:
 
     case: _CompositeCase
     exit_code: int | None = None
-    error: Exception | None = None
     routine_name: str | None = None
-    stage: Literal["validation", "run"] = "validation"
 
 
 def _load_composite_routine(value: Any) -> Routine:
@@ -332,168 +312,26 @@ def _load_composite_routine(value: Any) -> Routine:
     return routine
 
 
-def _run_composite_case(case: _CompositeCase) -> _CompositeCaseResult:
-    """Run one child and write its resolved config when it owns a root directory."""
-    try:
+class _CompositeWorker(TaskWorker):
+    def __init__(self, cases: Sequence[_CompositeCase] = ()) -> None:
+        self.cases = cases
+
+    def prepare(self, *, remote: bool) -> "_CompositeWorker":
+        if remote and any(isinstance(case.value, Routine) for case in self.cases):
+            raise ValueError("Remote CompositeRoutine execution requires YAML-backed routine specifications.")
+        return _CompositeWorker()
+
+    def run(self, case: _CompositeCase, context: TaskContext) -> _CompositeCaseResult:
         routine = _load_composite_routine(case.value)
-    except Exception as exc:
-        return _CompositeCaseResult(case, error=exc)
-    try:
         root = getattr(routine, "root", None)
         if root is not None:
             import romjax
 
             root_path = Path(root)
             root_path.mkdir(parents=True, exist_ok=True)
-            romjax.dump(
-                routine,
-                root_path / "resolved.yml",
-                sort_keys=False,
-                _preserve_yaml_sources=True,
-            )
-        return _CompositeCaseResult(
-            case,
-            exit_code=int(routine.run()),
-            routine_name=type(routine).__name__,
-            stage="run",
-        )
-    except Exception as exc:
-        return _CompositeCaseResult(case, error=exc, routine_name=type(routine).__name__, stage="run")
-
-
-def _configure_composite_process(jax_env: Mapping[str, str]) -> None:
-    """Apply parent routine JAX settings before a composite worker loads a child."""
-    os.environ.update(jax_env)
-
-
-class CompositeExecutorConfig(BaseModel, ABC):
-    """Abstract scheduler configuration for composite routine cases."""
-
-    show_progress: bool = True
-
-    @classmethod
-    def from_dict(cls, value: Any) -> "CompositeExecutorConfig":
-        """Construct a concrete executor from YAML-friendly input.
-
-        :param value: executor name, mapping, or existing executor config
-        :return: normalized executor configuration
-        """
-        if isinstance(value, CompositeExecutorConfig):
-            return value
-        aliases = {
-            "serial": "serial",
-            "thread": "thread",
-            "threads": "thread",
-            "process": "process",
-            "processes": "process",
-        }
-        if isinstance(value, str):
-            value = {"kind": aliases.get(value, value)}
-        if not isinstance(value, Mapping):
-            raise ValueError("CompositeRoutine executor must be a string, mapping, or CompositeExecutorConfig.")
-        kind = aliases.get(str(value.get("kind", "serial")))
-        if kind == "serial":
-            return CompositeSerialExecutorConfig.model_validate(value)
-        if kind in {"thread", "process"}:
-            return CompositeConcurrentExecutorConfig.model_validate({**value, "kind": kind})
-        raise ValueError(f"Unknown CompositeRoutine executor: {value.get('kind')!r}.")
-
-    @contextmanager
-    def progress_context(self, total: int):
-        """Return the master progress-bar context."""
-        if not self.show_progress or _COMPOSITE_PROGRESS_ACTIVE.get():
-            yield _NullProgress()
-            return
-        token = _COMPOSITE_PROGRESS_ACTIVE.set(True)
-        try:
-            with alive_bar(total) as bar:
-                yield bar
-        finally:
-            _COMPOSITE_PROGRESS_ACTIVE.reset(token)
-
-    @abstractmethod
-    def run_cases(self, cases: Sequence[_CompositeCase], stop_on_failure: bool) -> list[_CompositeCaseResult]:
-        """Run prepared cases and return completed results."""
-        raise NotImplementedError
-
-
-class CompositeSerialExecutorConfig(CompositeExecutorConfig):
-    """Serial composite routine executor."""
-
-    kind: Literal["serial"] = "serial"
-
-    def run_cases(self, cases: Sequence[_CompositeCase], stop_on_failure: bool) -> list[_CompositeCaseResult]:
-        results: list[_CompositeCaseResult] = []
-        with self.progress_context(len(cases)) as bar:
-            for case in cases:
-                bar.text = case.label
-                result = _run_composite_case(case)
-                results.append(result)
-                bar()
-                if stop_on_failure and (result.error is not None or result.exit_code != 0):
-                    break
-        return results
-
-
-class CompositeConcurrentExecutorConfig(CompositeExecutorConfig):
-    """Thread- or process-based composite routine executor.
-
-    :param kind: concurrent backend kind
-    :param max_workers: worker count for the executor
-    """
-
-    kind: Literal["thread", "process"] = "process"
-    max_workers: int | None = Field(default=None, gt=0)
-
-    def _context(self, jax_env: Mapping[str, str]) -> ThreadPoolExecutor | ProcessPoolExecutor:
-        if self.kind == "thread":
-            return ThreadPoolExecutor(max_workers=self.max_workers)
-        from romjax.mpi_runtime import active_executor
-
-        if active_executor() is not None:
-            raise RoutineError(
-                "CompositeRoutine process executor cannot run inside an MPI launch; use serial or thread."
-            )
-        return ProcessPoolExecutor(
-            self.max_workers,
-            initializer=_configure_composite_process,
-            initargs=(dict(jax_env),),
-        )
-
-    def run_cases(
-        self,
-        cases: Sequence[_CompositeCase],
-        stop_on_failure: bool,
-        jax_env: Mapping[str, str] | None = None,
-    ) -> list[_CompositeCaseResult]:
-        results: list[_CompositeCaseResult] = []
-        pending = iter(cases)
-        workers = self.max_workers or min(32, max(1, len(cases)))
-        with self.progress_context(len(cases)) as bar, self._context(jax_env or {}) as executor:
-            active: dict[Future[_CompositeCaseResult], _CompositeCase] = {}
-            for _ in range(min(workers, len(cases))):
-                case = next(pending, None)
-                if case is not None:
-                    active[executor.submit(_run_composite_case, case)] = case
-            stopped = False
-            while active:
-                future = next(as_completed(active))
-                case = active.pop(future)
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = _CompositeCaseResult(case, error=exc)
-                results.append(result)
-                bar.text = case.label
-                bar()
-                failed = result.error is not None or result.exit_code != 0
-                if stop_on_failure and failed:
-                    stopped = True
-                if not stopped:
-                    next_case = next(pending, None)
-                    if next_case is not None:
-                        active[executor.submit(_run_composite_case, next_case)] = next_case
-        return results
+            romjax.dump(routine, root_path / "resolved.yml", sort_keys=False,
+                        _preserve_yaml_sources=True, _preserve_model_types=True)
+        return _CompositeCaseResult(case, exit_code=int(routine.run()), routine_name=type(routine).__name__)
 
 
 _CASE_ROOT_PATTERN = re.compile(r"\{\{\s*case_root(?P<index>\s*\[[^\]]+\])?\s*\}\}")
@@ -512,7 +350,9 @@ class CompositeRoutine(Routine):
     routines: list[Any] | None = None
     base: Any | None = None
     overrides: tuple[CompositeOverride, ...] | None = None
-    executor: CompositeExecutorConfig = Field(default_factory=CompositeSerialExecutorConfig)
+    executor: Annotated[ExecutorConfig, BeforeValidator(ExecutorConfig.from_dict)] = Field(
+        default_factory=ExecutorConfig
+    )
     failure_policy: Literal["stop", "continue", "force"] = "stop"
     _source_path: Path | None = PrivateAttr(default=None)
 
@@ -529,11 +369,6 @@ class CompositeRoutine(Routine):
             return value
         return list(value) if isinstance(value, list | tuple) else [value]
 
-    @field_validator("executor", mode="before")
-    @classmethod
-    def _coerce_executor(cls, value: Any) -> CompositeExecutorConfig:
-        return CompositeExecutorConfig.from_dict(value)
-
     @model_validator(mode="after")
     def _validate_mode(self) -> "CompositeRoutine":
         import romjax
@@ -547,9 +382,6 @@ class CompositeRoutine(Routine):
             raise ValueError("CompositeRoutine base/overrides mode requires both base and a non-empty overrides list.")
         if self.overrides is not None and len({item.name for item in self.overrides}) != len(self.overrides):
             raise ValueError("CompositeRoutine override names must be unique.")
-        if isinstance(self.executor, CompositeConcurrentExecutorConfig) and self.executor.kind == "process":
-            if self.routines is not None and any(isinstance(item, Routine) for item in self.routines):
-                raise ValueError("CompositeRoutine process executor requires YAML-backed routine specifications.")
         return self
 
     def _resolve_child_spec(self, value: Any) -> Any:
@@ -687,35 +519,31 @@ class CompositeRoutine(Routine):
         failures: list[str] = []
         exit_code = 0
         cases = self._cases()
-        if isinstance(self.executor, CompositeConcurrentExecutorConfig):
-            results = self.executor.run_cases(
-                cases,
-                stop_on_failure=self.failure_policy == "stop",
-                jax_env=self._jax_child_env(),
-            )
-        else:
-            results = self.executor.run_cases(cases, stop_on_failure=self.failure_policy == "stop")
-        for result in results:
-            label = result.case.label
-            if result.error is not None:
-                if self.failure_policy != "force":
-                    raise result.error
-                if result.stage == "validation":
-                    summary = f"{label} failed validation with {type(result.error).__name__}: {result.error}"
-                else:
-                    summary = f"{label} ({result.routine_name}) raised {type(result.error).__name__}: {result.error}"
+
+        def handle(outcome):
+            nonlocal exit_code
+            label = outcome.task.label
+            result = outcome.value
+            if outcome.error is not None:
+                value = outcome.task.payload.value
+                name = f" ({type(value).__name__})" if isinstance(value, Routine) else ""
+                summary = f"{label}{name} raised {type(outcome.error).__name__}: {outcome.error}"
                 logger.exception("CompositeRoutine {}", summary)
                 code = 1
             elif result.exit_code == 0:
-                continue
+                return ExecutionAction.CONTINUE
             else:
                 summary = f"{label} ({result.routine_name}) exited with code {result.exit_code}"
                 code = result.exit_code or 1
             failures.append(summary)
             if exit_code == 0:
                 exit_code = code
-            if self.failure_policy == "stop":
-                break
+            return ExecutionAction.STOP if self.failure_policy == "stop" else ExecutionAction.CONTINUE
+
+        tasks = [TaskSpec(str(index), case.label, case) for index, case in enumerate(cases)]
+        self.executor.execute(tasks, _CompositeWorker(cases), on_result=handle,
+                              error_policy="collect" if self.failure_policy == "force" else "raise",
+                              jax_env=self._jax_child_env(), collect_results=False)
         if failures:
             logger.error(self._failure_summary(failures))
         return exit_code

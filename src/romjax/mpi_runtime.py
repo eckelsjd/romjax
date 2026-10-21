@@ -1,14 +1,15 @@
-"""Optional MPI context shared by the CLI and GridSearch executor."""
+"""Optional MPI context shared by the CLI and routine executors."""
 
 from __future__ import annotations
 
 import os
 import warnings
 from collections.abc import Iterator
+from concurrent.futures import Executor
 from contextlib import contextmanager
 from typing import Any
 
-from romjax.routine import RoutineError
+from romjax.execution import ExecutionError
 
 _MPI_LAUNCH_KEYS = (
     "OMPI_COMM_WORLD_SIZE",
@@ -18,11 +19,11 @@ _MPI_LAUNCH_KEYS = (
     "MV2_COMM_WORLD_SIZE",
     "SLURM_PROCID",
 )
-_active_executor: Any | None = None
+_active_executor: Executor | None = None
 _active_size = 0
 
 
-def active_executor() -> Any | None:
+def active_executor() -> Executor | None:
     """Return the MPI pool owned by the current CLI invocation, if any."""
     return _active_executor
 
@@ -38,19 +39,27 @@ def _require_mpi() -> tuple[Any, Any]:
         from mpi4py import MPI
         from mpi4py.futures import MPICommExecutor
     except (ImportError, OSError, RuntimeError) as exc:
-        message = "MPI GridSearch requires the mpi extra and a working MPI runtime (install with uv sync --extra mpi)."
+        message = "MPI execution requires the mpi extra and a working MPI runtime (install with uv sync --extra mpi)."
         warnings.warn(message, RuntimeWarning, stacklevel=2)
-        raise RoutineError(message) from exc
+        raise ExecutionError(message) from exc
     return MPI, MPICommExecutor
 
 
 @contextmanager
-def cli_context() -> Iterator[bool]:
-    """Give rank zero the CLI and reserve other launched ranks for case work.
+def mpi_context() -> Iterator[bool]:
+    """Own one MPI pool on rank zero and reserve other launched ranks for task work.
+
+    Enter this context on every launched rank, before loading routine configuration.
+    Only the controller should load configurations or call ``run()``. Outside an
+    MPI launch it yields ``True`` without creating a pool.
 
     :return: ``True`` on the controlling rank, ``False`` on workers
     """
     global _active_executor, _active_size
+
+    if _active_executor is not None:
+        yield True
+        return
 
     if os.environ.get("ROMJAX_MPI_CASE_CHILD") == "1" or not any(key in os.environ for key in _MPI_LAUNCH_KEYS):
         yield True
@@ -68,3 +77,7 @@ def cli_context() -> Iterator[bool]:
         finally:
             _active_executor = None
             _active_size = 0
+
+
+# Backward-compatible CLI entry point.
+cli_context = mpi_context

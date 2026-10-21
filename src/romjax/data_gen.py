@@ -10,6 +10,8 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
+from functools import lru_cache
 from itertools import product
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal, Mapping, Sequence, get_args
@@ -34,6 +36,7 @@ from pydantic import (
 )
 
 from romjax.compression import SVD, Compression
+from romjax.execution import ExecutionError, ExecutorConfig, TaskContext, TaskSpec, TaskWorker
 from romjax.graph import Edge, FunctionGraph
 from romjax.model import ImplicitSampleable
 from romjax.norm import NormOperator, NormTree
@@ -179,7 +182,6 @@ class GenDataConfig(BaseModel, ABC):
 
     format: SUPPORTED_FORMATS | None = None
     write_policy: SUPPORTED_POLICIES | None = None
-    show_progress: bool = True
 
     def _validate_format_and_policy(self, format, write_policy):
         """Make sure we have format and policy at runtime."""
@@ -266,21 +268,82 @@ class GenGraph(GenDataConfig, ABC):
     :ivar graph: the FunctionGraph or Yaml path
     :ivar name_depth: depth in the path for displaying current dataset name (default: 2)
     :ivar batch_size: batch size
+    :ivar executor: optional batch executor; inherits DataGeneration settings when omitted
     :ivar _required_methods: names of the sampling methods that corresponding graph edges must implement.
     """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
     name_depth: int = 3
     batch_size: PositiveInt = 1
     _required_methods: list[str] = PrivateAttr(default_factory=list)
+    executor: Annotated[ExecutorConfig | None, BeforeValidator(
+        lambda value: None if value is None else ExecutorConfig.from_dict(value)
+    )] = None
+    _compiled: dict[tuple[int, bool], dict[str, Callable | None]] = PrivateAttr(default_factory=dict)
+
+    def _functions(self, path: Path, batched: bool | None = None) -> dict[str, Callable | None]:
+        """Resolve samplers and compile stable callables once per worker/configuration."""
+        if batched is None:
+            batched = self.batch_size > 1 and self.throw
+        model = self._edge_from_path(path)
+        cache_key = (id(model), batched)
+        if cache_key in self._compiled:
+            return self._compiled[cache_key]
+        roles = ('source',) if isinstance(self, GenSource) else ('inputs', 'outputs', 'conditions')
+        _resolve_model_samplers(model, roles)
+        functions: dict[str, Callable | None] = {}
+        for name in ('sample_source', 'sample_inputs', 'solve', 'sample_conditions', 'evaluate'):
+            method = getattr(model, name, None)
+            if method is None or (name == 'solve' and getattr(self, 'skip_solve', False)):
+                functions[name] = None
+            elif name == 'evaluate' and getattr(self, 'skip_evaluate', False):
+                functions[name] = None
+            elif name == 'sample_conditions' and not _has_custom_sample_conditions(model):
+                functions[name] = None
+            else:
+                functions[name] = eqx.filter_jit(eqx.filter_vmap(method) if batched else method)
+        if isinstance(self, GenImplicitModel):
+            functions['sample_outputs'] = (
+                _build_batched_sample_outputs(model) if batched else eqx.filter_jit(
+                    lambda key, inputs, solution, conditions=None:
+                    _call_sample_outputs(model, key, inputs, solution, conditions))
+            )
+            functions['evaluate_outputs'] = (
+                eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0)))
+                if batched and functions['evaluate'] is not None else functions['evaluate']
+            )
+        self._compiled[cache_key] = functions
+        return functions
+
+    def _generate(
+        self, path: Path, format: str, write_policy: str, executor: ExecutorConfig,
+        jax_env: Mapping[str, str] | None = None,
+    ) -> None:
+        """Prepare batch payloads and delegate their execution to the common driver."""
+        path = Path(path).absolute()
+        if self.graph is None:
+            raise ValueError("Must specify a graph to generate data.")
+        self._validate_required_methods(path)
+        if write_policy == 'error' and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        count = self.samples if isinstance(self, GenSource) else self.input_samples
+        policy = 'overwrite' if write_policy == 'error' else write_policy
+        tasks = (TaskSpec(str(start), f"inputs {start}:{min(count, start + self.batch_size)}",
+                          tuple(range(start, min(count, start + self.batch_size))),
+                          units=min(self.batch_size, count - start))
+                 for start in range(0, count, self.batch_size))
+        executor.execute(tasks, _GenerationWorker(self, path, format, policy), total_units=count,
+                         progress_bar={'title': self.bar_text(path)}, jax_env=jax_env, collect_results=False)
 
     @abstractmethod
-    def generate_serial(self, path, format, write_policy):
+    def _generate_serial(self, path, indices, format, write_policy):
         """Generate data in serial (batch=1)."""
         raise NotImplementedError
     
     @abstractmethod
-    def generate_batch(self, path, format, write_policy):
+    def _generate_batch(self, path, indices, format, write_policy):
         """Genereate data in batches (batch>1)."""
         raise NotImplementedError
 
@@ -314,10 +377,8 @@ class GenGraph(GenDataConfig, ABC):
         
         self._validate_required_methods(path)
         
-        if self.batch_size > 1:
-            self.generate_batch(path, format, write_policy)
-        else:
-            self.generate_serial(path, format, write_policy)
+        self._generate(path, format, write_policy, self.executor or ExecutorConfig())
+
 
 
 class LoadDataConfig[T: Any](BaseModel, ABC):
@@ -542,10 +603,9 @@ class GenImplicitModel(GenGraph):
             )
             yield output_key, Path(output_dir)
 
-    def generate_serial(self, path, format, write_policy):
+    def _generate_serial(self, path, indices, format, write_policy):
         """Generate data in serial for an ImplicitModel."""
         path = Path(path)
-        model = self._edge_from_path(path)
         failed_dirs: set[Path] = set()
         failed_cases = 0
 
@@ -556,119 +616,102 @@ class GenImplicitModel(GenGraph):
                 failed_cases += 1
             _log_sample_failure(sample_dir, message, exc)
 
-        ctxt = (
-            alive_bar(self.input_samples, title=self.bar_text(path))
-            if self.show_progress else _NullProgress()
-        )
+        if write_policy == "error" and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
-        with ctxt as bar:
-            if write_policy == "error" and path.exists():
-                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        path.mkdir(parents=True, exist_ok=True)
 
-            path.mkdir(parents=True, exist_ok=True)
+        functions = self._functions(path, batched=False)
+        sample_inputs = functions['sample_inputs']
+        solve = functions['solve']
+        evaluate = functions['evaluate']
+        sample_conditions = functions['sample_conditions']
+        sample_outputs = functions['sample_outputs']
 
-            _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
+        for input_key, input_dir in gen_keys(indices, self.input_seed, path=path):
+            input_path = input_dir / "input.h5"
+            solution_path = input_dir / "solution.h5"
+            solution_residual_path = input_dir / "solution_residual.h5"
 
-            sample_inputs = eqx.filter_jit(model.sample_inputs)
-            solve = eqx.filter_jit(model.solve) if hasattr(model, "solve") and not self.skip_solve else None
-            evaluate = eqx.filter_jit(model.evaluate) if hasattr(model, "evaluate") and not self.skip_evaluate else None
-            sample_conditions = (
-                eqx.filter_jit(model.sample_conditions)
-                if _has_custom_sample_conditions(model)
-                else None
-            )
-            sample_outputs = eqx.filter_jit(
-                lambda key, one_input, one_solution, one_conditions=None: _call_sample_outputs(
-                    model, key, one_input, one_solution, one_conditions
-                )
-            )
-
-            for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
-                input_path = input_dir / "input.h5"
-                solution_path = input_dir / "solution.h5"
-                solution_residual_path = input_dir / "solution_residual.h5"
-
-                if write_policy == "reuse" and input_path.exists():
-                    if format != "h5":
-                        raise RoutineError(f"Save format '{format}' not recognized")
-                    one_input = load_h5({}, input_path, jax=True)
-                    one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
-                else:
-                    one_input = sample_inputs(input_key)
-                    one_solution = None
-                    if solve is not None and one_input is not None:
-                        if self.throw:
+            if write_policy == "reuse" and input_path.exists():
+                if format != "h5":
+                    raise RoutineError(f"Save format '{format}' not recognized")
+                one_input = load_h5({}, input_path, jax=True)
+                one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
+            else:
+                one_input = sample_inputs(input_key)
+                one_solution = None
+                if solve is not None and one_input is not None:
+                    if self.throw:
+                        one_solution = solve(one_input)
+                    else:
+                        try:
                             one_solution = solve(one_input)
-                        else:
-                            try:
-                                one_solution = solve(one_input)
-                            except Exception as exc:  # noqa: BLE001
-                                _record_failure(input_dir, f"Failed to solve sample at {input_dir}", exc)
-                    one_solution_residual = None
-                    if evaluate is not None and one_solution is not None:
-                        if self.throw:
+                        except Exception as exc:  # noqa: BLE001
+                            _record_failure(input_dir, f"Failed to solve sample at {input_dir}", exc)
+                one_solution_residual = None
+                if evaluate is not None and one_solution is not None:
+                    if self.throw:
+                        one_solution_residual = evaluate(one_input, one_solution)
+                    else:
+                        try:
                             one_solution_residual = evaluate(one_input, one_solution)
-                        else:
-                            try:
-                                one_solution_residual = evaluate(one_input, one_solution)
-                            except Exception as exc:  # noqa: BLE001
-                                _record_failure(
-                                    input_dir,
-                                    f"Failed to evaluate solution sample at {input_dir}",
-                                    exc,
-                                )
+                        except Exception as exc:  # noqa: BLE001
+                            _record_failure(
+                                input_dir,
+                                f"Failed to evaluate solution sample at {input_dir}",
+                                exc,
+                            )
 
-                    if format == "h5":
-                        if one_input is not None:
-                            save_h5(one_input, input_path, mode="w")
-                        if one_solution is not None:
-                            save_h5(one_solution, solution_path, mode="w")
-                        if one_solution_residual is not None:
-                            save_h5(one_solution_residual, solution_residual_path, mode="w")
+                if format == "h5":
+                    if one_input is not None:
+                        save_h5(one_input, input_path, mode="w")
+                    if one_solution is not None:
+                        save_h5(one_solution, solution_path, mode="w")
+                    if one_solution_residual is not None:
+                        save_h5(one_solution_residual, solution_residual_path, mode="w")
+                else:
+                    raise RoutineError(f"Save format '{format}' not recognized")
+
+            skip = "existing" if write_policy == "reuse" else None
+            for output_key, output_dir in self._gen_output_keys(input_key, input_dir, skip=skip):
+                one_conditions = sample_conditions(output_key) if sample_conditions is not None else None
+                if one_conditions is not None:
+                    save_h5(one_conditions, output_dir / "conditions.h5", mode="w")
+
+                one_output = sample_outputs(output_key, one_input, one_solution, one_conditions)
+                one_residual = None
+                if evaluate is not None:
+                    if self.throw:
+                        one_residual = evaluate(one_input, one_output)
                     else:
-                        raise RoutineError(f"Save format '{format}' not recognized")
-
-                skip = "existing" if write_policy == "reuse" else None
-                for output_key, output_dir in self._gen_output_keys(input_key, input_dir, skip=skip):
-                    one_conditions = sample_conditions(output_key) if sample_conditions is not None else None
-                    if one_conditions is not None:
-                        save_h5(one_conditions, output_dir / "conditions.h5", mode="w")
-
-                    one_output = sample_outputs(output_key, one_input, one_solution, one_conditions)
-                    one_residual = None
-                    if evaluate is not None:
-                        if self.throw:
+                        try:
                             one_residual = evaluate(one_input, one_output)
-                        else:
-                            try:
-                                one_residual = evaluate(one_input, one_output)
-                            except Exception as exc:  # noqa: BLE001
-                                _record_failure(
-                                    output_dir,
-                                    f"Failed to evaluate output sample at {output_dir}",
-                                    exc,
-                                )
+                        except Exception as exc:  # noqa: BLE001
+                            _record_failure(
+                                output_dir,
+                                f"Failed to evaluate output sample at {output_dir}",
+                                exc,
+                            )
 
-                    if format == "h5":
-                        save_h5(one_output, output_dir / "output.h5", mode="w")
-                        if one_residual is not None:
-                            save_h5(one_residual, output_dir / "residual.h5", mode="w")
-                    else:
-                        raise RoutineError(f"Save format '{format}' not recognized")
-
-                bar()
+                if format == "h5":
+                    save_h5(one_output, output_dir / "output.h5", mode="w")
+                    if one_residual is not None:
+                        save_h5(one_residual, output_dir / "residual.h5", mode="w")
+                else:
+                    raise RoutineError(f"Save format '{format}' not recognized")
 
         if failed_cases:
             logger.debug(f"Implicit generation completed with {failed_cases} failed cases at {path}")
 
-    def generate_batch(self, path, format, write_policy):
+    def _generate_batch(self, path, indices, format, write_policy):
         """Generate data for an ImplicitModel using batches and vmap."""
         if not self.throw:
             logger.warning(
                 "GenImplicitModel.throw=False requires per-sample failure handling, "
                 "so batch generation falls back to serial execution."
             )
-            return self.generate_serial(path, format, write_policy)
+            return self._generate_serial(path, indices, format, write_policy)
 
         def _save_outputs(
             sample_outputs: Callable,
@@ -716,7 +759,6 @@ class GenImplicitModel(GenGraph):
             sample_outputs: Callable,
             sample_conditions: Callable | None,
             evaluate: Callable | None,
-            bar: Callable,
         ) -> None:
             if not input_batch:
                 return
@@ -819,7 +861,7 @@ class GenImplicitModel(GenGraph):
                         output_keys,
                         output_paths,
                         evaluate,
-                    )
+        )
                     output_batch.clear()
                     output_batch.append((output_key, output_dir))
 
@@ -833,66 +875,32 @@ class GenImplicitModel(GenGraph):
                         output_keys,
                         output_paths,
                         evaluate,
-                    )
+        )
 
-                bar()
 
             input_batch.clear()
         
         path = Path(path)
-        model = self._edge_from_path(path)
 
-        ctxt = (
-            alive_bar(self.input_samples, title=self.bar_text(path))
-            if self.show_progress else _NullProgress()
-        )
+        if write_policy == 'error' and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
 
-        with ctxt as bar:
-            if write_policy == 'error' and path.exists():
-                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        path.mkdir(parents=True, exist_ok=True)
 
-            path.mkdir(parents=True, exist_ok=True)
+        functions = self._functions(path, batched=True)
+        sample_inputs = functions['sample_inputs']
+        solve = functions['solve']
+        sample_outputs = functions['sample_outputs']
+        sample_conditions = functions['sample_conditions']
+        evaluate_solution = functions['evaluate']
+        evaluate = functions['evaluate_outputs']
 
-            _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
+        input_batch: list[tuple[Key, Path]] = []
 
-            sample_inputs = eqx.filter_jit(eqx.filter_vmap(model.sample_inputs))
-            solve = (
-                eqx.filter_jit(eqx.filter_vmap(model.solve))
-                if hasattr(model, "solve") and not self.skip_solve else None
-            )
-            sample_outputs = _build_batched_sample_outputs(model)
-            sample_conditions = (
-                eqx.filter_jit(eqx.filter_vmap(model.sample_conditions))
-                if _has_custom_sample_conditions(model)
-                else None
-            )
-            evaluate_solution = (
-                eqx.filter_jit(eqx.filter_vmap(model.evaluate))
-                if hasattr(model, "evaluate") and not self.skip_evaluate else None
-            )
-            evaluate = (
-                eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0))) 
-                if hasattr(model, "evaluate") and not self.skip_evaluate else None
-            )
-
-            input_batch: list[tuple[Key, Path]] = []
-
-            for input_key, input_dir in gen_keys(self.input_samples, self.input_seed, path=path):
-                if len(input_batch) < self.batch_size:
-                    input_batch.append((input_key, input_dir))
-                    continue
-
-                _process_input_batch(
-                    input_batch,
-                    sample_inputs,
-                    solve,
-                    evaluate_solution,
-                    sample_outputs,
-                    sample_conditions,
-                    evaluate,
-                    bar,
-                )
+        for input_key, input_dir in gen_keys(indices, self.input_seed, path=path):
+            if len(input_batch) < self.batch_size:
                 input_batch.append((input_key, input_dir))
+                continue
 
             _process_input_batch(
                 input_batch,
@@ -902,8 +910,18 @@ class GenImplicitModel(GenGraph):
                 sample_outputs,
                 sample_conditions,
                 evaluate,
-                bar,
-            )
+        )
+            input_batch.append((input_key, input_dir))
+
+        _process_input_batch(
+            input_batch,
+            sample_inputs,
+            solve,
+            evaluate_solution,
+            sample_outputs,
+            sample_conditions,
+            evaluate,
+        )
 
 
 type ImplicitSampleRef = tuple[Path, Path, Literal["output", "solution"]]
@@ -1093,10 +1111,9 @@ class GenSource(GenGraph):
     throw: bool = True
     _required_methods: list[str] = PrivateAttr(default=["sample_source"])
 
-    def generate_serial(self, path, format, write_policy):
+    def _generate_serial(self, path, indices, format, write_policy):
         """Generate source node data in serial."""
         path = Path(path)
-        model = self._edge_from_path(path)
         failed_dirs: set[Path] = set()
         failed_cases = 0
 
@@ -1107,57 +1124,47 @@ class GenSource(GenGraph):
                 failed_cases += 1
             _log_sample_failure(sample_dir, message, exc)
 
-        ctxt = (
-            alive_bar(self.samples, title=self.bar_text(path))
-            if self.show_progress else _NullProgress()
+        if write_policy == "error" and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        sample_source = self._functions(path, batched=False)['sample_source']
+        skip = (
+            lambda p: (Path(p) / "source.h5").exists()
+            if write_policy == "reuse"
+            else False
         )
 
-        with ctxt as bar:
-            if write_policy == "error" and path.exists():
-                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        for input_key, input_dir in gen_keys(indices, self.seed, path=path):
+            if skip(input_dir):
+                continue
 
-            path.mkdir(parents=True, exist_ok=True)
+            if format != "h5":
+                raise RoutineError(f"Save format '{format}' not recognized.")
 
-            _resolve_model_samplers(model, ("source",))
-
-            sample_source = eqx.filter_jit(model.sample_source)
-            skip = (
-                lambda p: (Path(p) / "source.h5").exists()
-                if write_policy == "reuse"
-                else False
-            )
-
-            for input_key, input_dir in gen_keys(self.samples, self.seed, path=path):
-                if skip(input_dir):
-                    bar()
-                    continue
-
-                if format != "h5":
-                    raise RoutineError(f"Save format '{format}' not recognized.")
-
-                if self.throw:
+            if self.throw:
+                save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
+            else:
+                try:
                     save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
-                else:
-                    try:
-                        save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
-                    except Exception as exc:  # noqa: BLE001
-                        _record_failure(input_dir, f"Failed to sample source at {input_dir}", exc)
+                except Exception as exc:  # noqa: BLE001
+                    _record_failure(input_dir, f"Failed to sample source at {input_dir}", exc)
 
-                bar()
 
         if failed_cases:
             logger.debug(f"Source generation completed with {failed_cases} failed cases at {path}")
 
-    def generate_batch(self, path, format, write_policy):
+    def _generate_batch(self, path, indices, format, write_policy):
         """Generate source node data in batches using vmap."""
         if not self.throw:
             logger.warning(
                 "GenSource.throw=False requires per-sample failure handling, "
                 "so batch generation falls back to serial execution."
             )
-            return self.generate_serial(path, format, write_policy)
+            return self._generate_serial(path, indices, format, write_policy)
 
-        def _process_batch(batch, sample_source, bar):
+        def _process_batch(batch, sample_source):
             if not batch:
                 return
             
@@ -1169,47 +1176,88 @@ class GenSource(GenGraph):
                     save_h5(one_input, one_path / "source.h5", mode="w")
                 else:
                     raise RoutineError(f"Save format '{format}' not recognized.")
-                bar()
+
         
         path = Path(path)
-        model = self._edge_from_path(path)
 
-        ctxt = (
-            alive_bar(self.samples, title=self.bar_text(path))
-            if self.show_progress else _NullProgress()
+        if write_policy == "error" and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        sample_source = self._functions(path, batched=True)['sample_source']
+        skip = (
+            lambda p: (Path(p) / "source.h5").exists()
+            if write_policy == "reuse"
+            else False
         )
 
-        with ctxt as bar:
-            if write_policy == "error" and path.exists():
-                raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        batch: list[tuple[Key, Path]] = []
 
-            path.mkdir(parents=True, exist_ok=True)
+        for input_key, input_dir in gen_keys(indices, self.seed, path=path):
+            if skip(input_dir):
+                continue
 
-            _resolve_model_samplers(model, ("source",))
-
-            sample_source = eqx.filter_jit(eqx.filter_vmap(model.sample_source))
-            skip = (
-                lambda p: (Path(p) / "source.h5").exists()
-                if write_policy == "reuse"
-                else False
-            )
-
-            batch: list[tuple[Key, Path]] = []
-
-            for input_key, input_dir in gen_keys(self.samples, self.seed, path=path):
-                if skip(input_dir):
-                    bar()
-                    continue
-
-                if len(batch) < self.batch_size:
-                    batch.append((input_key, input_dir))
-                    continue
-
-                _process_batch(batch, sample_source, bar)
-                batch.clear()
+            if len(batch) < self.batch_size:
                 batch.append((input_key, input_dir))
-            
-            _process_batch(batch, sample_source, bar)
+                continue
+
+            _process_batch(batch, sample_source)
+            batch.clear()
+            batch.append((input_key, input_dir))
+
+        _process_batch(batch, sample_source)
+
+
+@lru_cache(maxsize=4)
+def _generation_worker(identity: str, configuration: str) -> GenGraph:
+    """Keep reconstructed models and compiled functions local to each worker."""
+    import romjax
+
+    return romjax.load(configuration)
+
+
+@dataclass
+class _GenerationWorker(TaskWorker):
+    generator: GenGraph | None
+    path: Path
+    format: str
+    write_policy: str
+    configuration: str = ''
+
+    def prepare(self, *, remote: bool) -> "_GenerationWorker":
+        import romjax
+
+        generator = self.generator
+        generator._compiled = {}
+        prepared = self
+        if remote:
+            try:
+                text = romjax.YamlLoader.dump(generator, _preserve_yaml_sources=True, _preserve_model_types=True)
+                restored = romjax.load(text)
+                if type(restored) is not type(generator):
+                    raise TypeError('Generator type changed during reconstruction.')
+                restored._validate_required_methods(self.path)
+            except Exception as exc:
+                message = f'Cannot reconstruct {type(generator).__name__} for remote execution: {exc}'
+                raise ExecutionError(message) from exc
+            prepared = _GenerationWorker(None, self.path, self.format, self.write_policy, text)
+        else:
+            generator._functions(self.path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        return prepared
+
+    def run(self, indices: tuple[int, ...], context: TaskContext) -> None:
+        generator = self.generator
+        if generator is None:
+            try:
+                generator = _generation_worker(context.run_id, self.configuration)
+            except Exception as exc:
+                raise ExecutionError(f'Failed to initialize generation worker: {exc}') from exc
+        if generator.batch_size > 1 and generator.throw:
+            generator._generate_batch(self.path, indices, self.format, self.write_policy)
+        else:
+            generator._generate_serial(self.path, indices, self.format, self.write_policy)
 
 
 def _validate_benchmark_generator(value: Any) -> GenImplicitModel | GenSource:
@@ -1242,6 +1290,8 @@ class GenDataBenchmark(GenDataConfig):
     :param filename: HDF5 timing-cache filename written below the dataset path
     :param hardware: optional cache group; inferred from the active JAX backend when omitted
     """
+
+    show_progress: bool = True
 
     generator: Annotated[GenImplicitModel | GenSource, BeforeValidator(_validate_benchmark_generator)]
     samples: PositiveInt
@@ -1895,6 +1945,8 @@ def _write_norm_tree_group(group: h5py.Group, tree: Any) -> None:
 class GenNorm(GenDataConfig):
     """Compute and save normalization constants from loaded datasets."""
 
+    show_progress: bool = True
+
     loader: DataLoader
     filename: str | Path = "norm.h5"
     norm: GenNormTree
@@ -2026,6 +2078,8 @@ class GenNorm(GenDataConfig):
 
 class GenLatent(GenDataConfig):
     """Fit a latent-space compressor and emit the compression artifact."""
+
+    show_progress: bool = True
 
     loader: DataLoader
     dataset: str | None = None
@@ -2270,6 +2324,7 @@ class DataGeneration(Routine):
     File-based data generation routine.
 
     :ivar root: root directory for saving data
+    :ivar executor: batch execution backend for implicit and source generators (default: serial)
     :ivar datasets: pytree template for datasets to generate under root
     :ivar base: optional YAML configuration template or YAML path to expand
     :ivar overrides: named Cartesian-product configuration overrides
@@ -2279,6 +2334,9 @@ class DataGeneration(Routine):
     """
 
     root: Path
+    executor: Annotated[ExecutorConfig, BeforeValidator(ExecutorConfig.from_dict)] = Field(
+        default_factory=ExecutorConfig
+    )
     datasets: GenDataPyTree | None = None
     base: Any | None = None
     overrides: tuple[CompositeOverride, ...] | None = None
@@ -2368,11 +2426,19 @@ class DataGeneration(Routine):
                 raise ValueError("Expanded data-generation configuration does not contain a supported data generator.")
             yield self.root.joinpath(*parts), datasets
 
+    def _generate_dataset(self, dataset: GenDataConfig, path: Path) -> None:
+        if isinstance(dataset, GenImplicitModel | GenSource):
+            format, policy = dataset._validate_format_and_policy(self.format, self.write_policy)
+            dataset._generate(path, format, policy, dataset.executor or self.executor,
+                                            self._jax_child_env())
+        else:
+            dataset.generate(path, format=self.format, write_policy=self.write_policy)
+
     def _run_expanded_cases(self) -> None:
         """Generate every Cartesian-product data-generation case."""
         for case_root, datasets in self._expanded_datasets():
             for path, dataset in pytree_path_iter(datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
-                dataset.generate(case_root / "/".join(path), format=self.format, write_policy=self.write_policy)
+                self._generate_dataset(dataset, case_root / "/".join(path))
 
     def run(self) -> int:
         """Generate all datasets."""
@@ -2382,7 +2448,7 @@ class DataGeneration(Routine):
 
         assert self.datasets is not None
         for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
-            dataset.generate(self.root / "/".join(path), format=self.format, write_policy=self.write_policy)
+            self._generate_dataset(dataset, self.root / "/".join(path))
         
         return 0
 

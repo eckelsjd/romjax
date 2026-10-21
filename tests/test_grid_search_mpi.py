@@ -14,8 +14,9 @@ import pytest
 import yaml
 
 import romjax
-from romjax.grid_search import GridSearch, MpiExecutorConfig
-from romjax.routine import Routine, RoutineError
+from romjax.execution import ExecutionError, ExecutorConfig
+from romjax.grid_search import GridSearch
+from romjax.routine import Routine
 
 
 class MpiEnvRoutine(Routine):
@@ -49,8 +50,8 @@ def test_grid_search_accepts_mpi_executor_from_yaml(tmp_path: Path) -> None:
     search = romjax.load(config)
 
     assert isinstance(search, GridSearch)
-    assert isinstance(search.executor, MpiExecutorConfig)
-    assert search.executor.model_dump() == {"show_progress": True, "kind": "mpi"}
+    assert isinstance(search.executor, ExecutorConfig)
+    assert search.executor.kind == "mpi" and search.executor.show_progress
 
 
 def test_mpi_grid_search_requires_mpi_launch(tmp_path: Path) -> None:
@@ -88,7 +89,7 @@ def test_mpi_grid_search_warns_if_mpi_extra_is_missing(monkeypatch: pytest.Monke
     )
     monkeypatch.setattr(builtins, "__import__", missing_mpi)
 
-    with pytest.warns(RuntimeWarning, match="mpi extra"), pytest.raises(RoutineError, match="mpi extra"):
+    with pytest.warns(RuntimeWarning, match="mpi extra"), pytest.raises(ExecutionError, match="mpi extra"):
         search.run()
 
 
@@ -143,7 +144,7 @@ def test_mpi_grid_search_runs_nested_base_overrides(tmp_path: Path, composite_ex
 
     if composite_executor == "process":
         assert result.returncode != 0
-        assert "CompositeRoutine process executor cannot run inside an MPI launch" in result.stderr
+        assert "Nested MPI execution" in result.stderr
         return
 
     assert result.returncode == 0, result.stdout + result.stderr
