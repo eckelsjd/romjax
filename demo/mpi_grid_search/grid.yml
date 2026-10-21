@@ -1,0 +1,9 @@
+!romx:GridSearch
+root: demo/mpi_grid_search/output
+jax_platforms: cpu
+base: __parent__/base.yml
+override:
+  - path: [value]
+    cases: [0, 1, 2, 3, 4, 5]
+executor: {kind: mpi, show_progress: true}
+write_policy: overwrite

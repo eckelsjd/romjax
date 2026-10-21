@@ -1,0 +1,4 @@
+!pd:demo.mpi_grid_search_case.DemoCase
+jax_platforms: cpu
+root: unused
+value: 0

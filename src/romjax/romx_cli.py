@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import romjax
+from romjax.mpi_runtime import cli_context
 from romjax.routine import RoutineError
 
 
@@ -74,24 +75,26 @@ def cli(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             _configure_profile_env(args.profile, args.profile_dir, args.profile_label)
-            if not Path(args.config).exists():
-                raise RoutineError(f"Config file '{args.config}' not found")
-            
             sys.path.insert(0, os.getcwd())  # treat this as if it were launched with python directly
-            routine = romjax.load(args.config)
+            with cli_context() as is_master:
+                if not is_master:
+                    return 0
+                if not Path(args.config).exists():
+                    raise RoutineError(f"Config file '{args.config}' not found")
+                routine = romjax.load(args.config)
 
-            if not hasattr(routine, "run") or not callable(getattr(routine, "run")):
-                raise RoutineError(f"Top-level object loaded from '{args.config}' must implement `run()`.")
+                if not hasattr(routine, "run") or not callable(getattr(routine, "run")):
+                    raise RoutineError(f"Top-level object loaded from '{args.config}' must implement `run()`.")
 
-            if hasattr(routine, "root"):
-                if routine.root is not None:
-                    Path(routine.root).mkdir(exist_ok=True, parents=True)
-                    src = Path(args.config)
-                    dest = routine.root / Path(args.config).name
-                    if src.resolve() != dest.resolve():
-                        shutil.copy(src, dest)
-            
-            return routine.run()
+                if hasattr(routine, "root"):
+                    if routine.root is not None:
+                        Path(routine.root).mkdir(exist_ok=True, parents=True)
+                        src = Path(args.config)
+                        dest = routine.root / Path(args.config).name
+                        if src.resolve() != dest.resolve():
+                            shutil.copy(src, dest)
+
+                return routine.run()
             
         except RoutineError as exc:
             print(str(exc), file=sys.stderr)

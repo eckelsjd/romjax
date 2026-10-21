@@ -90,6 +90,7 @@ class ExecutorConfig(BaseModel, ABC):
             "processes": "process",
             "ppool": "process",
             "hybrid": "hybrid",
+            "mpi": "mpi",
         }
         if isinstance(value, str):
             try:
@@ -113,6 +114,8 @@ class ExecutorConfig(BaseModel, ABC):
                 data = {**data, **data["hybrid"]}
             data.pop("hybrid", None)
             return HybridExecutorConfig.model_validate(data)
+        if kind == "mpi":
+            return MpiExecutorConfig.model_validate(value)
         raise RoutineError(f"Unsupported executor: {kind}")
     
     def progress_context(self, total: int):
@@ -386,6 +389,48 @@ class ConcurrentExecutorConfig(ExecutorConfig):
                         on_result(result)
                     bar()
             for future in as_completed(future_to_name):
+                result = future.result()
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
+                bar()
+        return results
+
+
+class MpiExecutorConfig(ExecutorConfig):
+    """Schedule independent cases on ranks supplied by an external MPI launcher."""
+
+    kind: Literal["mpi"] = "mpi"
+
+    def run_cases(
+        self,
+        specs: Sequence["_CaseSpec"],
+        on_result: Callable[["GridSearchCaseResult"], None] | None = None,
+    ) -> list["GridSearchCaseResult"]:
+        """Submit case subprocesses to the active CLI MPI pool.
+
+        :param specs: prepared case specs
+        :param on_result: optional callback for each completed case
+        :return: case results
+        """
+        from romjax.mpi_runtime import _require_mpi, active_executor, active_size
+
+        _require_mpi()
+        executor = active_executor()
+        if executor is None or active_size() < 2:
+            raise RoutineError("MPI GridSearch requires an MPI launch with at least two ranks via mpiexec or srun.")
+
+        results: list[GridSearchCaseResult] = []
+        with self.progress_context(len(specs)) as bar:
+            futures = [executor.submit(_run_case_subprocess, spec) for spec in specs if not spec.reuse_existing]
+            for spec in specs:
+                if spec.reuse_existing:
+                    result = _reuse_case_result(spec)
+                    results.append(result)
+                    if on_result is not None:
+                        on_result(result)
+                    bar()
+            for future in as_completed(futures):
                 result = future.result()
                 results.append(result)
                 if on_result is not None:
@@ -869,6 +914,8 @@ class GridSearch(Routine):
                 jax_env.pop("JAX_PLATFORMS", None)
             env.update(jax_env)
             env.update(build_profile_env("train", case_root, os.environ))
+            if isinstance(self.executor, MpiExecutorConfig):
+                env["ROMJAX_MPI_CASE_CHILD"] = "1"
             specs.append(
                 _CaseSpec(
                     name=name,
