@@ -1,0 +1,117 @@
+!romx:FunctionGraph
+nodes:
+  - { name: Zh }
+  - { name: Rh }
+  - { name: Rl }
+  - { name: Zl }
+edges:
+  - !romx:AdvectionDiffusion2D
+    source: Zh
+    target: Rh
+    name: Fh
+    grid:
+      shape: &shape [64, 64]
+      bounds: &bounds [[0, 1], [0, 1]]
+    solver:
+      solver:
+        name: lineax.GMRES
+        kwargs:
+          rtol: 2.0e-6
+          atol: 2.0e-6
+          max_steps: 50
+          restart: 20
+          stagnation_iters: 5
+      throw: true
+      preconditioner:
+        name: five_point_block_jacobi
+        block_shape: [4, 4]
+    boundary:
+      callable: identity
+      inputs_default:
+        boundary:
+          - [ &bc {type: dirichlet, value: 0.0}, *bc ]
+          - [ *bc, *bc ]
+    forcing:
+      callable: cubic
+      beta_op:
+        op: tanh
+        input_scale: 2.0
+        output_scale: 2.75
+        output_offset: 3.0
+      inputs_default: { scale: -1.0, alpha: -1.0, beta: 0.0 }
+    diffusion:
+      callable: cubic
+      inputs_default: { alpha: 0.05 }
+    velocity:
+      callable: constant
+      inputs_default: { const: [0.0, 0.0] }
+    incompressible: true
+    inputs_sampler: !romx:PyTreeSampler
+      forcing:
+        beta:
+          callable: kle
+          bounds: "{{ edges.0.grid.bounds }}"
+          shape: "{{ edges.0.grid.shape }}"
+          truncation: [4, 4]
+          correlation_lengths: [0.1, 0.1]
+          variance: 1.0
+          spectral_decay: 1.5
+
+  - !romx:FilterModel
+    source: Zh
+    target: Zl
+    name: Tz
+    filters:
+      - forward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [[inputs, forcing, beta], [outputs, phi]]
+          opts:
+            gather: flat
+            scatter: flat
+            method: reduce
+            template:
+              inputs: { value: { shape: ["{{edges.3.inputs_size}}"] } }
+              outputs: { value: { shape: ["{{edges.3.outputs_size}}"] } }
+        backward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [[inputs, value], [outputs, value]]
+          opts:
+            gather: flat
+            scatter: flat
+            method: reconstruct
+            template:
+              inputs: { forcing: { beta: { shape: "{{edges.0.grid.shape}}" } } }
+              outputs: { phi: { shape: "{{ edges.0.grid.shape }}" } }
+
+  - !romx:FilterModel
+    source: Rh
+    target: Rl
+    name: Tr
+    filters:
+      - forward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [[inputs, forcing, beta], [residuals, phi_residual]]
+          opts:
+            gather: flat
+            scatter: flat
+            method: reduce
+            template:
+              inputs: { value: { shape: ["{{edges.3.inputs_size}}"] } }
+              residuals: { value: { shape: ["{{edges.3.outputs_size}}"] } }
+        backward:
+          callable: !!python/name:romjax.model.eqx_evaluate
+          input_routes: [[inputs, value], [residuals, value]]
+          opts:
+            gather: flat
+            scatter: flat
+            method: reconstruct
+            template:
+              inputs: { forcing: { beta: { shape: "{{edges.0.grid.shape}}" } } }
+              residuals: { phi_residual: { shape: "{{ edges.0.grid.shape }}" } }
+
+  - !romx:ImplicitAffine
+    source: Zl
+    target: Rl
+    name: Fl
+    inputs_size: 16
+    outputs_size: 16
