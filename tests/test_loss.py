@@ -187,8 +187,9 @@ def test_projection_regularization_constraint_hierarchy() -> None:
 
     oblique = ProjectionRegularization(ref=("autoencoder",), mode="oblique")(params, jnp.zeros(3), None)
     full_projection = decoder @ encoder
-    symmetry = jnp.mean(jnp.square(full_projection - full_projection.T))
-    transpose = jnp.mean(jnp.square(decoder - encoder.T))
+    latent_rank = encoder.shape[0]
+    symmetry = jnp.sum(jnp.square(full_projection - full_projection.T)) / latent_rank
+    transpose = jnp.sum(jnp.square(decoder - encoder.T)) / latent_rank
     orthogonal = ProjectionRegularization(ref=("autoencoder",), mode="orthogonal")(
         params, jnp.zeros(3), None
     )
@@ -210,7 +211,7 @@ def test_projection_regularization_uses_latent_space_symmetry_penalty() -> None:
     encoder = jax.random.normal(jax.random.key(0), (3, 11))
     decoder = jax.random.normal(jax.random.key(1), (11, 3))
     full_projection = decoder @ encoder
-    expected = jnp.mean(jnp.square(full_projection - full_projection.T))
+    expected = jnp.sum(jnp.square(full_projection - full_projection.T)) / encoder.shape[0]
     actual = ProjectionRegularization._full_projection_symmetry_penalty(encoder, decoder)
 
     assert actual == pytest.approx(expected)
