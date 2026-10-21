@@ -40,6 +40,9 @@ Repository = "https://github.com/eckelsjd/romjax.git"
 romx = "romjax.romx_cli:main"
 
 [project.optional-dependencies]
+mpi = [
+    "mpi4py>=4.0",
+]
 cuda12 = [
     "jax[cuda12]>=0.9.1",
 ]

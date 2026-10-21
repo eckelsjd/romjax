@@ -448,6 +448,12 @@ class CompositeConcurrentExecutorConfig(CompositeExecutorConfig):
     def _context(self, jax_env: Mapping[str, str]) -> ThreadPoolExecutor | ProcessPoolExecutor:
         if self.kind == "thread":
             return ThreadPoolExecutor(max_workers=self.max_workers)
+        from romjax.mpi_runtime import active_executor
+
+        if active_executor() is not None:
+            raise RoutineError(
+                "CompositeRoutine process executor cannot run inside an MPI launch; use serial or thread."
+            )
         return ProcessPoolExecutor(
             self.max_workers,
             initializer=_configure_composite_process,

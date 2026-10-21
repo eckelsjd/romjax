@@ -10,3 +10,4 @@ split_latent
 *.png
 *.npz
 *.json
+mpi_grid_search/output
