@@ -224,7 +224,7 @@ class YamlLoader(ConfigLoader):
         t = type(data)
         import romjax
         tag = cls.ROMX_TAG if hasattr(romjax, t.__name__) else cls.PYDANTIC_TAG
-        return f"{tag}{t.__module__}.{t.__name__}"
+        return f"{tag}{t.__module__}.{t.__qualname__}"
 
     @classmethod
     def get_loader(cls) -> _Type[_yaml.SafeLoader]:
@@ -276,18 +276,11 @@ class YamlLoader(ConfigLoader):
             """Essentially just a convenience to automatically construct Pydantic models when loading."""
             if not tag_suffix:
                 raise ValueError("Missing class path in YAML tag.")
-            module_name, _, class_name = tag_suffix.rpartition(".")
-            
-            if module_name == '':
-                module_name = default_module  # Try to load from a default module
-            if not module_name or not class_name:
-                raise ValueError(f"Invalid pydantic tag suffix: {tag_suffix!r}")
-            
-            module = _import_module(module_name)
-            cls_obj = getattr(module, class_name, None)
-
-            if cls_obj is None:
-                raise ValueError(f"Class not found: {tag_suffix!r}")
+            name = tag_suffix if '.' in tag_suffix else f'{default_module}.{tag_suffix}'
+            try:
+                cls_obj = _import_python_name(name)
+            except (AttributeError, ValueError) as exc:
+                raise ValueError(f"Class not found: {tag_suffix!r}") from exc
             if not isinstance(cls_obj, type) or not issubclass(cls_obj, _BaseModel):
                 raise TypeError(f"Tagged class is not an instance of required pydantic BaseModel: {tag_suffix!r}")
             
@@ -353,24 +346,104 @@ class YamlLoader(ConfigLoader):
 
     @classmethod
     def _restore_model_values(cls, original: _Any, payload: _Any) -> _Any:
-        """Restore nested model objects in a reconstruction-only YAML payload."""
-        if isinstance(original, _BaseModel) and isinstance(payload, dict):
-            for key in payload:
-                if hasattr(original, key):
-                    value = getattr(original, key)
-                    payload[key] = value if isinstance(value, _BaseModel) else cls._restore_model_values(value, payload[key])
-        elif isinstance(original, dict) and isinstance(payload, dict):
+        """Restore nested model types without undoing explicit Pydantic serializers."""
+        if type(original).__pydantic_decorators__.model_serializers:
+            return payload
+        schema = type(original).__pydantic_core_schema__
+        definitions = {item['ref']: item for item in schema.get('definitions', ())}
+        while schema['type'] != 'model':
+            schema = definitions[schema['schema_ref']] if schema['type'] == 'definition-ref' else schema['schema']
+        if schema.get('root_model'):
+            return cls._restore_model_value(original.root, payload, schema['schema'], definitions)
+        if not isinstance(payload, dict):
+            return payload
+        while schema['type'] != 'model-fields':
+            schema = definitions[schema['schema_ref']] if schema['type'] == 'definition-ref' else schema['schema']
+        fields = schema['fields']
+        aliases = {field.get('serialization_alias', name): name for name, field in fields.items()}
+        for key in payload:
+            name = aliases.get(key, key) if type(original).model_config.get('serialize_by_alias') else key
+            if hasattr(original, name):
+                payload[key] = cls._restore_model_value(
+                    getattr(original, name), payload[key], fields.get(name, {}).get('schema', {}), definitions
+                )
+        return payload
+
+    @classmethod
+    def _schema_value_type(cls, schema: dict, definitions: dict) -> type | None:
+        """Identify a union branch's Python type without running user validators."""
+        while schema:
+            if schema['type'] == 'model':
+                return schema['cls']
+            if schema['type'] == 'definition-ref':
+                schema = definitions.get(schema['schema_ref'], {})
+            elif 'schema' in schema:
+                schema = schema['schema']
+            else:
+                return {'list': list, 'tuple': tuple, 'dict': dict, 'str': str, 'int': int,
+                        'float': float, 'bool': bool, 'bytes': bytes, 'none': type(None)}.get(schema['type'])
+        return None
+
+    @classmethod
+    def _restore_model_value(cls, original: _Any, payload: _Any, schema: dict, definitions: dict) -> _Any:
+        """Follow field schemas so annotated serializers also control nested containers."""
+        while schema:
+            # Stop before the model itself: its serializer owns its tagged YAML body,
+            # whereas serializers on fields/annotations own the entire field value.
+            if schema['type'] == 'model':
+                break
+            if 'serialization' in schema:
+                return payload
+            if schema['type'] == 'definition-ref':
+                schema = definitions.get(schema['schema_ref'], {})
+            elif 'schema' in schema:
+                schema = schema['schema']
+            elif schema['type'] in ('union', 'tagged-union'):
+                choices = schema['choices']
+                choices = choices.values() if isinstance(choices, dict) else choices
+                matches = []
+                for choice in choices:
+                    choice = choice[0] if isinstance(choice, tuple) else choice
+                    value_type = cls._schema_value_type(choice, definitions)
+                    if value_type is not None and isinstance(original, value_type):
+                        matches.append((value_type is type(original), choice))
+                if not matches:
+                    # An unknown/custom branch may have serialized the value. Keep
+                    # its output rather than guess and undo that transformation.
+                    return payload
+                schema = max(matches, key=lambda item: item[0])[1]
+            else:
+                break
+        if isinstance(original, _BaseModel):
+            return original
+        if isinstance(original, dict) and isinstance(payload, dict):
             for key in payload.keys() & original.keys():
-                value = original[key]
-                payload[key] = value if isinstance(value, _BaseModel) else cls._restore_model_values(value, payload[key])
+                payload[key] = cls._restore_model_value(
+                    original[key], payload[key], schema.get('values_schema', {}), definitions
+                )
         elif isinstance(original, (list, tuple)) and isinstance(payload, (list, tuple)):
-            payload = [value if isinstance(value, _BaseModel) else cls._restore_model_values(value, item)
-                       for value, item in zip(original, payload)]
+            items = schema.get('items_schema', {})
+            restored = []
+            for index, (value, item) in enumerate(zip(original, payload)):
+                item_schema = items
+                if isinstance(items, list):
+                    item_index = index
+                    variadic = schema.get('variadic_item_index')
+                    if variadic is not None and index >= variadic:
+                        tail_start = len(original) - (len(items) - variadic - 1)
+                        item_index = variadic if index < tail_start else len(items) - len(original) + index
+                    item_schema = items[item_index]
+                restored.append(cls._restore_model_value(value, item, item_schema, definitions))
+            payload = restored
         return payload
 
     @classmethod
     def get_dumper(cls, *, preserve_yaml_sources: bool = False, preserve_model_types: bool = False) -> _Type[_yaml.SafeDumper]:
-        """Return a custom yaml dumper that handles callables and pydantic models."""
+        """Return a YAML dumper preserving model types and explicit serializers.
+
+        ``preserve_model_types`` remains accepted for compatibility; model types
+        are now preserved in ordinary dumps as well.
+        """
         class _Dumper(_yaml.SafeDumper):
             pass
 
@@ -380,17 +453,16 @@ class YamlLoader(ConfigLoader):
 
         def _represent_base_model(dumper: _yaml.SafeDumper, data: _BaseModel) -> _yaml.Node:
             """Essentially a convenience that defers serialization to pydantic model_dump"""
-            tag = cls.get_tag(data)
-            payload = data.model_dump(serialize_as_any=True) if preserve_model_types else data.model_dump()
-            if preserve_model_types:
-                from romjax.typing import ListModel
+            from romjax.typing import ListModel
 
-                if isinstance(data, ListModel):
-                    payload = dict(data.items())
-                elif isinstance(payload, dict):
-                    # Keep field serializers (callables, third-party specs, etc.), but
-                    # let YAML visit actual nested models before Pydantic erases types.
-                    payload = cls._restore_model_values(data, payload)
+            tag = cls.get_tag(data)
+            serializers = type(data).__pydantic_decorators__.model_serializers.values()
+            if isinstance(data, ListModel) and all(item.func is ListModel._serialize_as_list for item in serializers):
+                # A sequence loses explicit storage keys; sorting a mapping changes
+                # integer indexing. A list of pairs preserves both independently of
+                # the dumper's sort_keys option for ordinary dictionaries.
+                return dumper.represent_mapping(tag, list(data.items()))
+            payload = cls._restore_model_values(data, data.model_dump())
             if isinstance(payload, list | tuple):
                 return dumper.represent_sequence(tag, payload)
             if isinstance(payload, _FunctionType | _BuiltinFunctionType):
@@ -947,6 +1019,11 @@ class YamlLoader(ConfigLoader):
     @classmethod
     def dump(cls, obj: _Any, stream: _Stream | None = None, **kwargs: _Any) -> _Optional[str]:
         """Dump a configuration to a yaml-like stream. Small wrapper around yaml.dump
+
+        Model types and explicit Pydantic serializers are preserved. Custom graph
+        edges must be importable and reconstructible from their serialized
+        configuration; exclude runtime caches and provide serializers for state
+        that cannot be represented directly in YAML.
         
         :param obj: the yaml configuration
         :param stream: A string, path, file-stream, byte-stream, or similar.

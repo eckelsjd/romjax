@@ -61,7 +61,7 @@ def test_block_jacobi_matches_independent_tile_solves() -> None:
         jnp.ones(stencil.shape),
         structure=structure,
     )
-    rhs = jnp.arange(64, dtype=jnp.float32).reshape(stencil.shape) / 64.0
+    rhs = jnp.arange(64, dtype=stencil.center.dtype).reshape(stencil.shape) / 64.0
 
     matrices = stencil.block_diagonal(block_shape)
     packed_rhs = stencil._pack_blocks(rhs, block_shape)

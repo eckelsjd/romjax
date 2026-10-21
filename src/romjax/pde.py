@@ -1031,7 +1031,9 @@ class ImplicitAffine(ImplicitModel, ImplicitSampleable, SourceSampleable):
     @classmethod
     def _coerce_additional_inputs(cls, value: Any) -> Any:
         """Normalize configured paths while preserving ``()`` as the all-arrays sentinel."""
-        if value is None or (isinstance(value, tuple | list) and len(value) == 0):
+        if value is None:
+            return None
+        if isinstance(value, tuple | list) and len(value) == 0:
             return tuple(value)
         return tuple(coerce_tree_paths(value))
 

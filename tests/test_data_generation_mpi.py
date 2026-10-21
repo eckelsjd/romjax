@@ -147,3 +147,33 @@ def test_mpi_implicit_generation_matches_serial_and_reuses_outputs(tmp_path):
     result = launch(config)
     assert result.returncode == 0, result.stdout + result.stderr
     assert timestamps == {path: (root / path).stat().st_mtime_ns for path in paths}
+
+
+def test_mpi_poisson_graph_generation_matches_serial(tmp_path):
+    import romjax
+
+    fixture = Path(__file__).with_name('fixtures_poisson_graph.yml')
+    (tmp_path / 'graph.yml').write_text(
+        fixture.read_text().replace('[64, 64]', '[8, 8]'), encoding='utf-8')
+    root = tmp_path / 'parallel'
+    config = tmp_path / 'poisson.yml'
+    config.write_text(
+        f'!romx:DataGeneration\nroot: {root}\n'
+        'executor: {kind: mpi, show_progress: false}\njax_platforms: cpu\n'
+        'graph: __parent__/graph.yml\ndatasets:\n'
+        '  Fh: {input_samples: 2, outputs_per_input: 0, input_seed: 1, output_seed: 2}\n', encoding='utf-8')
+    reference = romjax.load(config)
+    reference.root = tmp_path / 'serial'
+    reference.executor = romjax.ExecutorConfig(kind='serial', show_progress=False)
+    with jax.default_device(jax.devices('cpu')[0]):
+        assert reference.run() == 0
+    result = launch(config)
+    assert result.returncode == 0, result.stdout + result.stderr
+    paths = sorted(path.relative_to(reference.root) for path in reference.root.rglob('*.h5'))
+    assert paths
+    assert paths == sorted(path.relative_to(root) for path in root.rglob('*.h5'))
+    for path in paths:
+        before, after = load_h5({}, reference.root / path), load_h5({}, root / path)
+        assert jax.tree.structure(before) == jax.tree.structure(after)
+        for left, right in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True):
+            np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
