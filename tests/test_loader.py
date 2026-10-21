@@ -484,3 +484,29 @@ def test_yaml_invalid_cases() -> None:
 
     with pytest.raises(TypeError):
         YamlLoader.load("solver: !romx:builtins.dict\n  a: 1\n")
+
+
+def test_reconstruction_dump_preserves_graph_edge_types():
+    from tests.test_data_gen import _get_graph
+
+    graph = _get_graph()
+    text = YamlLoader.dump(graph, _preserve_model_types=True)
+    restored = YamlLoader.load(text)
+    for name, edge in graph.edges.items():
+        assert type(restored.edges[name]) is type(edge)
+        assert restored.edges[name].shift == edge.shift
+        assert restored.edges[name].source is restored.nodes[edge.source.name]
+
+
+def test_reconstruction_preserves_deferred_source_directory(tmp_path):
+    import yaml
+
+    inner = tmp_path / 'inner' / 'config.yml'
+    source = YamlSource(yaml.compose('artifact: __parent__/data.h5'), inner)
+    text = YamlLoader.dump(source, _preserve_yaml_sources=True, _preserve_model_types=True)
+    restored = YamlLoader.load(text)
+    assert YamlLoader.load(restored)['artifact'] == str(inner.parent / 'data.h5')
+    outer = tmp_path / 'outer.yml'
+    outer.write_text(text, encoding='utf-8')
+    restored = YamlLoader.load(outer)
+    assert YamlLoader.load(restored)['artifact'] == str(inner.parent / 'data.h5')

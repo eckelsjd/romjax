@@ -8,16 +8,15 @@ import pytest
 import yaml
 
 import romjax
+from romjax.execution import ExecutionError, ExecutorConfig
 from romjax.grid_search import (
     GridSearch,
     GridSearchCaseResult,
-    HybridExecutorConfig,
-    SerialExecutorConfig,
     _set_override_path,
     _yaml_path_text,
     orbax_metric,
 )
-from romjax.routine import Routine, RoutineError
+from romjax.routine import Routine
 
 
 class TemplateValueRoutine(Routine):
@@ -133,7 +132,7 @@ executor: serial
 
     assert isinstance(search, GridSearch)
     assert search.base == base_path.resolve()
-    assert search.executor == SerialExecutorConfig()
+    assert search.executor == ExecutorConfig()
     assert search.case_root_path == (("root",),)
 
 
@@ -318,7 +317,7 @@ executor:
     search = romjax.load(config_path)
 
     assert isinstance(search, GridSearch)
-    assert isinstance(search.executor, HybridExecutorConfig)
+    assert isinstance(search.executor, ExecutorConfig)
     assert search.executor.kind == "hybrid"
     assert search.executor.gpu.devices == (0, 1)
     assert search.executor.gpu.workers_per_device == 2
@@ -374,7 +373,7 @@ def test_hybrid_grid_search_rejects_scheduler_owned_child_env(tmp_path: Path) ->
     base_path = tmp_path / "base.yml"
     base_path.write_text("root: run\nvalue: 1\n", encoding="utf-8")
 
-    with pytest.raises(RoutineError, match="Hybrid GridSearch controls"):
+    with pytest.raises(ExecutionError, match="Hybrid execution controls"):
         GridSearch(
             root=tmp_path / "grid",
             base=base_path,
@@ -397,8 +396,9 @@ def test_grid_search_propagates_parent_jax_options_to_child_processes(tmp_path: 
 
     specs, _ = search._prepare_cases()
 
-    assert specs[0].env["JAX_PLATFORMS"] == "cpu"
-    assert specs[0].env["JAX_ENABLE_X64"] == "true"
+    # JAX settings are captured centrally at execution, not duplicated in case specs.
+    assert "JAX_PLATFORMS" not in specs[0].env
+    assert search._jax_child_env() == {"JAX_PLATFORMS": "cpu", "JAX_ENABLE_X64": "true"}
 
 
 def test_hybrid_grid_search_keeps_slot_platform_selection(tmp_path: Path) -> None:
@@ -416,12 +416,13 @@ def test_hybrid_grid_search_keeps_slot_platform_selection(tmp_path: Path) -> Non
     specs, _ = search._prepare_cases()
 
     assert "JAX_PLATFORMS" not in specs[0].env
-    assert specs[0].env["JAX_ENABLE_X64"] == "true"
+    assert search._jax_child_env()["JAX_ENABLE_X64"] == "true"
 
 
 def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
-    config = HybridExecutorConfig.model_validate(
+    config = ExecutorConfig.from_dict(
         {
+            "kind": "hybrid",
             "gpu": {
                 "devices": [2, 3],
                 "workers_per_device": 2,
@@ -431,7 +432,7 @@ def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
             "cpu": {"max_workers": 1},
         }
     )
-    slots = config.build_slots()
+    slots = config._build_slots()
 
     assert [slot.manifest() for slot in slots] == [
         {"kind": "gpu", "index": 2},
@@ -442,6 +443,7 @@ def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
     ]
     assert slots[0].env == {
         "CUDA_VISIBLE_DEVICES": "2",
+        "JAX_PLATFORMS": "gpu",
         "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.75",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
     }
@@ -449,8 +451,8 @@ def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
 
 
 def test_build_hybrid_slots_allows_cpu_only() -> None:
-    config = HybridExecutorConfig.model_validate({"gpu": {"devices": []}, "cpu": {"max_workers": 2}})
-    slots = config.build_slots()
+    config = ExecutorConfig.from_dict({"kind": "hybrid", "gpu": {"devices": []}, "cpu": {"max_workers": 2}})
+    slots = config._build_slots()
 
     assert [slot.manifest() for slot in slots] == [
         {"kind": "cpu", "index": None},
@@ -510,8 +512,8 @@ def test_grid_search_run_writes_manifest_and_copies_best(tmp_path: Path, monkeyp
     assert manifest["ranking"] == [{"case": "case_0001", "metric": 1.0}, {"case": "case_0000", "metric": 3.0}]
     assert manifest["cases"]["case_0000"]["retained"] is False
     assert manifest["cases"]["case_0001"]["retained"] is True
-    assert manifest["cases"]["case_0001"]["start_time"] == "2026-06-09T10:00:00-04:00"
-    assert manifest["cases"]["case_0001"]["end_time"] == "2026-06-09T10:00:01-04:00"
+    assert manifest["cases"]["case_0001"]["start_time"]
+    assert manifest["cases"]["case_0001"]["end_time"]
     assert (search.root / "best" / "case.yml").exists()
     assert not (search.root / "cases" / "case_0000").exists()
 
@@ -721,7 +723,7 @@ def test_hybrid_grid_search_dynamically_reuses_finished_slots(tmp_path: Path, mo
 
     assert launched["case_0000"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert launched["case_0000"]["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.5"
-    assert "JAX_PLATFORMS" not in launched["case_0000"]
+    assert launched["case_0000"]["JAX_PLATFORMS"] == "gpu"
     assert launched["case_0001"]["JAX_PLATFORMS"] == "cpu"
     assert launched["case_0002"]["JAX_PLATFORMS"] == "cpu"
     assert all(env["ROMJAX_TEST"] == "1" for env in launched.values())

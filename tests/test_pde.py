@@ -345,7 +345,7 @@ def test_block_linear_compression_generates_implicit_source_dataset(tmp_path: Pa
         source_sampler=CompressionSampler(compression=artifact_path, reconstruct=True),
     )
     graph = FunctionGraph(edges={"implicit": edge})
-    GenSource(graph=graph, samples=1, seed=0, show_progress=False).generate(
+    GenSource(graph=graph, samples=1, seed=0, executor={"show_progress": False}).generate(
         tmp_path / "implicit", format="h5", write_policy="overwrite"
     )
 

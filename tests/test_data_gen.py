@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from pydantic import BeforeValidator
 
 import romjax.data_gen as data_gen_module
 from romjax.compression import SVD, BlockLinearCompression, Compression
@@ -21,11 +22,13 @@ from romjax.data_gen import (
     LoadImplicitModel,
     LoadSource,
 )
+from romjax.execution import ExecutionError
 from romjax.graph import FunctionGraph
 from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.norm import NormTree
 from romjax.rng import CompressionSampler
 from romjax.routine import RoutineError
+from romjax.typing import from_yaml
 from romjax.utils import load_h5, save_h5
 
 
@@ -1769,3 +1772,138 @@ def test_load_implicit_model_solution_only_skips_output_samples(tmp_path):
 def test_load_implicit_model_solution_only_requires_solution_loading() -> None:
     with pytest.raises(ValueError, match="solution_only=True requires load_solution=True"):
         LoadImplicitModel(solution_only=True, load_solution=False)
+
+
+@pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
+@pytest.mark.parametrize('source', [False, True])
+def test_generation_executors_match_serial(tmp_path, kind, source):
+    from romjax.data_gen import GenImplicitModel
+
+    edge = _ToySourceEdge(source='noise', target='sample') if source else _ToySampleableEdge(
+        source='inputs', target='sample', shift=3.5)
+    graph = FunctionGraph(edges={'sample': edge})
+    options = {'samples': 5, 'seed': 7} if source else {
+        'input_samples': 5, 'outputs_per_input': 3, 'input_seed': 7, 'output_seed': 8}
+    generator_type = GenSource if source else GenImplicitModel
+    roots = [tmp_path / 'reference', tmp_path / 'actual']
+    for root, backend in zip(roots, ['serial', kind]):
+        config = {'kind': backend, 'show_progress': False}
+        if backend in {'thread', 'process'}:
+            config['max_workers'] = 2
+        generation = DataGeneration(root=root, graph=graph, executor=config, datasets={
+            'sample': generator_type(**options, batch_size=2)})
+        assert generation.run() == 0
+    paths = sorted(path.relative_to(roots[0]) for path in roots[0].rglob('*.h5'))
+    assert paths == sorted(path.relative_to(roots[1]) for path in roots[1].rglob('*.h5'))
+    for path in paths:
+        before = load_h5({}, roots[0] / path)
+        after = load_h5({}, roots[1] / path)
+        for left, right in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
+            np.testing.assert_allclose(left, right)
+
+
+def test_generation_leaf_executor_overrides_parent(tmp_path):
+    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
+    generation = DataGeneration(root=tmp_path, graph=graph, executor='mpi', datasets={
+        'sample': GenSource(samples=2, seed=1, executor='serial')})
+    assert generation.run() == 0
+    assert len(list(tmp_path.rglob('source.h5'))) == 2
+
+
+class _FileCompressionEdge(_CompressionSampleableEdge):
+    """Load a separately declared sampler using the normal YAML validator."""
+    outputs_sampler: Annotated[CompressionSampler, BeforeValidator(from_yaml)]
+
+
+def test_process_generation_round_trips_external_graph_and_compression(tmp_path, monkeypatch):
+    import romjax
+
+    config_dir = tmp_path / 'configuration'
+    config_dir.mkdir()
+    compression = SVD(rank=1).fit([
+        {'outputs': {'y': jnp.asarray([value], dtype=jnp.float32)}} for value in [1., 2., 3.]])
+    compression.dump(config_dir / 'compression.h5')
+    (config_dir / 'sampler.yml').write_text(
+        '!romx:CompressionSampler\ncompression: __parent__/compression.h5\n'
+        'distribution: uniform\nreconstruct: true\n', encoding='utf-8')
+    (config_dir / 'graph.yml').write_text(
+        '!romx:FunctionGraph\nedges:\n  sample: !pd:tests.test_data_gen._FileCompressionEdge\n'
+        '    source: inputs\n    target: outputs\n    outputs_sampler: __parent__/sampler.yml\n', encoding='utf-8')
+    config = config_dir / 'generation.yml'
+    config.write_text(
+        f'!romx:DataGeneration\nroot: {tmp_path / "data"}\n'
+        'executor: {kind: process, max_workers: 2, show_progress: false}\n'
+        'graph: __parent__/graph.yml\ndatasets:\n  sample:\n'
+        '    input_samples: 3\n    outputs_per_input: 2\n    input_seed: 1\n    output_seed: 2\n'
+        '    batch_size: 2\n    skip_solve: true\n    skip_evaluate: true\n',
+        encoding='utf-8')
+    generation = romjax.load(config)
+    edge = generation.graph.edges['sample']
+    assert isinstance(edge.outputs_sampler, CompressionSampler)
+    text = romjax.YamlLoader.dump(generation.datasets['sample'], _preserve_model_types=True)
+    restored = romjax.load(text)
+    restored_edge = restored.graph.edges['sample']
+    assert type(restored_edge) is type(edge)
+    assert Path(restored_edge.outputs_sampler.compression) == config_dir / 'compression.h5'
+    key = jax.random.key(10)
+    np.testing.assert_allclose(edge.sample_outputs(key)['y'], restored_edge.sample_outputs(key)['y'])
+    # The cached compression contains arrays; they must never enter the worker spec.
+    monkeypatch.chdir(tmp_path)
+    assert generation.run() == 0
+    assert len(list((tmp_path / 'data').rglob('output.h5'))) == 6
+
+
+def test_remote_generation_rejects_nonserializable_model_before_writing(tmp_path):
+    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
+    # A local runtime callable cannot be imported by a fresh worker.
+    from pydantic import Field
+
+    from romjax.typing import CallableModel
+
+    class LocalEdge(_ToySourceEdge):
+        sampler: Any = Field(default_factory=lambda: CallableModel(callable=lambda: 1))
+
+    graph.edges['sample'] = LocalEdge(source='noise', target='sample')
+    generator = GenSource(graph=graph, samples=2, seed=1, executor='process')
+    with pytest.raises(ExecutionError, match='Cannot reconstruct'):
+        generator.generate(tmp_path / 'sample', format='h5', write_policy='error')
+    assert not (tmp_path / 'sample').exists()
+
+
+def test_generation_error_policy_checked_before_batch_submission(tmp_path):
+    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
+    destination = tmp_path / 'sample'
+    destination.mkdir()
+    generator = GenSource(graph=graph, samples=4, seed=1, executor='thread', batch_size=2)
+    with pytest.raises(RoutineError, match="policy='error'"):
+        generator.generate(destination, format='h5', write_policy='error')
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.parametrize('batched', [False, True])
+def test_direct_generation_cache_distinguishes_graph_edges(tmp_path, batched):
+    graph = FunctionGraph(edges={
+        name: _ToySourceEdge(source='noise', target=name, bias=bias)
+        for name, bias in [('first', 1.), ('second', 3.)]})
+    generator = GenSource(graph=graph, samples=1, seed=4)
+    generate = generator._generate_batch if batched else generator._generate_serial
+    for name in ['first', 'second']:
+        generate(tmp_path / name, (0,), 'h5', 'reuse')
+    first = load_h5({}, next((tmp_path / 'first').rglob('source.h5')))
+    second = load_h5({}, next((tmp_path / 'second').rglob('source.h5')))
+    assert float(second['state']['x']) - float(first['state']['x']) == pytest.approx(2.)
+
+
+def test_thread_generation_throw_false_preserves_other_samples(tmp_path, monkeypatch):
+    monkeypatch.setattr('romjax.data_gen.eqx.filter_jit', lambda fn: fn)
+    graph = FunctionGraph(edges={'source': _FailingSourceEdge(source='noise', target='source')})
+    generation = DataGeneration(root=tmp_path, graph=graph,
+                                executor={'kind': 'thread', 'max_workers': 2, 'show_progress': False},
+                                datasets={'source': {'samples': 6, 'seed': 0, 'batch_size': 2,
+                                                     'throw': False, }})
+    assert generation.run() == 0
+    failed = _failed_sample_dirs(tmp_path / 'source')
+    successful = list((tmp_path / 'source').rglob('source.h5'))
+    assert failed and successful
+    assert len(failed) + len(successful) == 6
+    assert all((path / 'failure.log').exists() for path in failed)

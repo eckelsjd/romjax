@@ -80,6 +80,8 @@ Obviously, this is a lot of extra work for plain least-squares, but the same set
 
 All of these diverse learning problems share the same fundamental graph structure as the simple least-squares problem.
 
+See [routine executors](docs/execution.md) for serial, thread, process, and MPI execution.
+
 ## 🏗️ Contributing
 See the [contribution](https://github.com/eckelsjd/romjax/blob/main/CONTRIBUTING.md) guidelines.
 
