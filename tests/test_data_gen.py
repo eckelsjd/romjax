@@ -960,6 +960,7 @@ def test_data_generation_benchmark_reports_repeat_and_batch_progress(tmp_path: P
         repeat=2,
         warmup=1,
         show_progress=True,
+        name_depth=1,
         hardware="test",
     )
     workload_calls: list[int] = []
@@ -1011,7 +1012,7 @@ def test_data_generation_benchmark_reports_repeat_and_batch_progress(tmp_path: P
     assert len(workload_calls) == 6
     assert progress["total"] == 6
     assert progress["updates"] == 6
-    assert progress["title"] == "Benchmark sample"
+    assert progress["title"] == "sample"
     assert any("Repeat 2/2" in message and "batch 2/2" in message for message in progress["messages"])
 
 
@@ -1776,8 +1777,12 @@ def test_load_implicit_model_solution_only_requires_solution_loading() -> None:
 
 @pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
 @pytest.mark.parametrize('source', [False, True])
-def test_generation_executors_match_serial(tmp_path, kind, source):
+def test_generation_executors_match_serial(tmp_path, monkeypatch, kind, source):
     from romjax.data_gen import GenImplicitModel
+
+    if kind == 'process':
+        # Spawned workers otherwise compete with the parent for GPU preallocation.
+        monkeypatch.setenv('JAX_PLATFORMS', 'cpu')
 
     edge = _ToySourceEdge(source='noise', target='sample') if source else _ToySampleableEdge(
         source='inputs', target='sample', shift=3.5)
@@ -1817,6 +1822,9 @@ class _FileCompressionEdge(_CompressionSampleableEdge):
 
 def test_process_generation_round_trips_external_graph_and_compression(tmp_path, monkeypatch):
     import romjax
+
+    # Keep GPU execution in the parent; only spawned workers inherit this setting.
+    monkeypatch.setenv('JAX_PLATFORMS', 'cpu')
 
     config_dir = tmp_path / 'configuration'
     config_dir.mkdir()
