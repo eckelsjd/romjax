@@ -313,18 +313,19 @@ def _load_composite_routine(value: Any) -> Routine:
 
 
 class _CompositeWorker(TaskWorker):
-    def __init__(self, cases: Sequence[_CompositeCase] = ()) -> None:
+    def __init__(self, cases: Sequence[_CompositeCase] = (), *, write_resolved: bool = False) -> None:
         self.cases = cases
+        self.write_resolved = write_resolved
 
     def prepare(self, *, remote: bool) -> "_CompositeWorker":
         if remote and any(isinstance(case.value, Routine) for case in self.cases):
             raise ValueError("Remote CompositeRoutine execution requires YAML-backed routine specifications.")
-        return _CompositeWorker()
+        return _CompositeWorker(write_resolved=self.write_resolved)
 
     def run(self, case: _CompositeCase, context: TaskContext) -> _CompositeCaseResult:
         routine = _load_composite_routine(case.value)
         root = getattr(routine, "root", None)
-        if root is not None:
+        if self.write_resolved and root is not None:
             import romjax
 
             root_path = Path(root)
@@ -345,6 +346,9 @@ class CompositeRoutine(Routine):
     :param overrides: named override dimensions in base/overrides mode
     :param executor: case scheduling backend
     :param failure_policy: handling for non-zero child exits or raised exceptions
+    :param write_resolved: write each child to ``root/resolved.yml`` before running;
+        defaults to false for ``routines`` and true for ``base``/``overrides``.
+        Enabled snapshots require YAML-serializable child state.
     """
 
     routines: list[Any] | None = None
@@ -354,6 +358,7 @@ class CompositeRoutine(Routine):
         default_factory=ExecutorConfig
     )
     failure_policy: Literal["stop", "continue", "force"] = "stop"
+    write_resolved: bool | None = None
     _source_path: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="before")
@@ -541,7 +546,8 @@ class CompositeRoutine(Routine):
             return ExecutionAction.STOP if self.failure_policy == "stop" else ExecutionAction.CONTINUE
 
         tasks = [TaskSpec(str(index), case.label, case) for index, case in enumerate(cases)]
-        self.executor.execute(tasks, _CompositeWorker(cases), on_result=handle,
+        write_resolved = self.write_resolved if self.write_resolved is not None else self.routines is None
+        self.executor.execute(tasks, _CompositeWorker(cases, write_resolved=write_resolved), on_result=handle,
                               error_policy="collect" if self.failure_policy == "force" else "raise",
                               jax_env=self._jax_child_env(), collect_results=False)
         if failures:

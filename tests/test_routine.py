@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import pytest
 from alive_progress import config_handler
 from loguru import logger
-from pydantic import field_validator
+from pydantic import BeforeValidator, field_validator
 
 import romjax
 from romjax import plotting
@@ -31,6 +32,13 @@ class DemoRoutine(Routine):
         if self.fail:
             raise RuntimeError(f"{self.name} failed")
         return self.exit_code
+
+
+class ArrayRoutine(DemoRoutine):
+    """Routine with artifact-like state that cannot be dumped to YAML."""
+
+    root: Path
+    values: Annotated[np.ndarray, BeforeValidator(np.asarray)]
 
 
 class RootRoutine(Routine):
@@ -200,6 +208,62 @@ def test_composite_routine_validates_from_plain_list() -> None:
     assert composite.failure_policy == "stop"
     assert composite.run() == 0
     assert DemoRoutine.observed == ["one", "two"]
+
+
+@pytest.mark.parametrize("yaml_backed", [False, True])
+def test_composite_sequence_runs_array_children_without_snapshots(tmp_path: Path, yaml_backed: bool) -> None:
+    DemoRoutine.observed = []
+    root = tmp_path / "outputs"
+    if yaml_backed:
+        child_path = tmp_path / "child.yml"
+        child_path.write_text(
+            f"!pd:{MODULE_NAME}.ArrayRoutine\nroot: {root}\nvalues: [1, 2]\n",
+            encoding="utf-8",
+        )
+        composite = romjax.load(
+            "!romx:CompositeRoutine\nexecutor: {show_progress: false}\nroutines:\n"
+            f"  - !overrides:{child_path}\n    name: first\n"
+            f"  - !overrides:{child_path}\n    name: second\n"
+        )
+    else:
+        composite = CompositeRoutine(
+            routines=[ArrayRoutine(name=name, root=root, values=[1, 2]) for name in ("first", "second")],
+            executor={"show_progress": False},
+        )
+
+    assert composite.run() == 0
+    assert DemoRoutine.observed == ["first", "second"]
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+@pytest.mark.parametrize("write_resolved", [None, False, True])
+def test_composite_resolved_snapshot_policy(tmp_path: Path, expanded: bool, write_resolved: bool | None) -> None:
+    RootRoutine.observed = []
+    root = tmp_path / "outputs"
+    child_path = tmp_path / "child.yml"
+    child_path.write_text(
+        f"!pd:{MODULE_NAME}.RootRoutine\nname: child\nroot: {root}\n",
+        encoding="utf-8",
+    )
+    mode = (
+        f"base: {child_path}\noverrides: [{{name: mode, cases: [{{name: one}}]}}]\n"
+        if expanded else f"routines: [{child_path}]\n"
+    )
+    policy = "" if write_resolved is None else f"write_resolved: {str(write_resolved).lower()}\n"
+    composite = romjax.load(
+        "!romx:CompositeRoutine\nexecutor: {show_progress: false}\n" + mode + policy
+    )
+
+    assert composite.run() == 0
+    assert RootRoutine.observed == [("child", root, None)]
+    snapshot = root / "resolved.yml"
+    assert snapshot.exists() == (expanded if write_resolved is None else write_resolved)
+    if snapshot.exists():
+        resolved = romjax.load(snapshot)
+        assert isinstance(resolved, RootRoutine)
+        assert resolved.name == "child"
+        assert resolved.root == root
 
 
 def test_composite_routine_loads_mixed_yaml_and_inline_children(tmp_path, monkeypatch) -> None:
