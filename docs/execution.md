@@ -31,8 +31,58 @@ Each routine prepares domain payloads and handles results:
 
 GenImplicitModel and GenSource inherit DataGeneration's executor unless they
 specify their own `executor`. Standalone generators default to serial execution.
-Other generator kinds, including benchmarks, retain their independent execution
-and progress behavior.
+GenDataBenchmark uses its nested generator's executor, falling back to the parent
+DataGeneration executor or serial execution when used alone. Other generator
+kinds retain their independent execution and progress behavior.
+
+## Data-generation benchmarks
+
+```yaml
+executor: {kind: process, max_workers: 4, show_progress: false}
+datasets:
+  sample:
+    kind: benchmark
+    generator: {kind: source, samples: 1, seed: 7, batch_size: 8}
+    samples: 100
+    warmup: 1
+    repeat: 5
+    hardware: workstation
+```
+
+The graph must contain the corresponding `sample` edge, as for normal generation.
+The benchmark's `samples` sets the number of inputs in each repeat; the nested
+generator supplies numerical settings and seeds. Implicit output batches use the
+generator's `batch_size`, including partial input and output batches.
+
+Each repeat records one wall-clock interval from submission of the first input
+batch through completion of all batches. Dispatch, transport of task metadata,
+and synchronization are included. Pool startup/shutdown, model reconstruction,
+key preparation, warmup, progress rendering, and all file I/O are excluded.
+Numerical results stay on their executing worker and are synchronized before
+completion is reported. Generated samples are never saved.
+
+One pool is retained across warmup and all repeats. Every participating worker
+executes `warmup` complete untimed passes so that all batch shapes are compiled
+before measurement. With `warmup: 0`, first-use compilation is measured. Progress
+is updated between passes; either `show_progress: false` on the benchmark or
+`executor.show_progress: false` suppresses it.
+
+The HDF5 cache groups use `<hardware>.<executor-kind>.<fingerprint>`, for example
+`workstation.process.<fingerprint>`. Explicit `hardware` and `DATA_GEN_HARDWARE`
+values supply the prefix. The fingerprint identifies execution settings,
+participating worker count, and inherited JAX settings; progress options are
+excluded. Each group stores `total` seconds per repeat and `amortized` seconds
+per input sample, plus compatibility metadata. Old cache groups are preserved
+but are not reused for the new full-pass measurement schema.
+
+`ExecutorConfig.execute_passes(tasks, worker, warmup=1, repeat=5)` provides the
+shared pass driver and returns one duration per repeat. `TaskWorker.initialize`
+may prepare worker-local state from all task payloads before warmup begins.
+Each worker retains its own shallow copy of the prepared instance, so attributes
+assigned during initialization persist across passes. The worker must synchronize
+asynchronous work before `run` returns.
+Task results are discarded, exceptions propagate, and cleanup retains ownership
+of borrowed MPI pools. Hybrid execution is not supported for repeated passes.
 
 ## User-controlled progress
 
