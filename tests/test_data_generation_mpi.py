@@ -76,6 +76,32 @@ def test_mpi_generation_distributes_batches(tmp_path, python_context):
         assert float(load_h5({}, path)['x']) == pytest.approx(float(expected))
 
 
+def test_mpi_benchmark_reuses_pool_and_writes_only_timings(tmp_path):
+    root = tmp_path / 'data'
+    config = tmp_path / 'benchmark.yml'
+    text = generation_yaml(root, 'mpi').replace(
+        '  sample: {samples: 20, seed: 7, batch_size: 2}\n',
+        '  bench:\n'
+        '    sample:\n'
+        '      kind: benchmark\n'
+        '      generator: {kind: source, samples: 1, seed: 7, batch_size: 2}\n'
+        '      samples: 5\n      repeat: 2\n      warmup: 1\n'
+        '      hardware: test\n      show_progress: false\n'
+        '  data:\n'
+        '    sample: {samples: 4, seed: 7, batch_size: 2}\n',
+    )
+    config.write_text(text, encoding='utf-8')
+    result = launch(config, python_context=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    cached = load_h5({}, root / 'bench' / 'sample' / 'timings.h5', jax=False)
+    assert next(iter(cached)).startswith('test.mpi.')
+    entry = next(iter(cached.values()))
+    assert entry['total'].shape == (2,) and np.all(entry['total'] > 0)
+    np.testing.assert_allclose(entry['amortized'], entry['total'] / 5)
+    assert not list((root / 'bench').rglob('seed_*'))
+    assert len(list((root / 'data').rglob('source.h5'))) == 4
+
+
 def test_serial_composite_reuses_pool_for_generation_then_grid(tmp_path):
     generation = tmp_path / 'generate.yml'
     generation.write_text(generation_yaml(tmp_path / 'data', 'mpi'), encoding='utf-8')

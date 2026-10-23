@@ -36,6 +36,175 @@ class NestedMpiWorker(TaskWorker):
         ExecutorConfig(kind='mpi', show_progress=False).execute([], SquareWorker())
 
 
+def test_execute_passes_times_whole_pass_and_defers_progress(monkeypatch):
+    import romjax.execution as execution
+
+    state = {'timing': False, 'paused': False, 'calls': [], 'updates': 0}
+    ticks = iter([10., 14., 20., 27.])
+
+    def clock():
+        assert state['paused']
+        state['timing'] = not state['timing']
+        return next(ticks)
+
+    class Worker(TaskWorker):
+        def prepare(self, *, remote):
+            assert not state['timing']
+            return self
+
+        def initialize(self, payloads, context):
+            assert not state['timing']
+            assert list(payloads) == [0, 1, 2]
+
+        def run(self, payload, context):
+            state['calls'].append((payload, state['timing']))
+
+    class Bar:
+        def __enter__(self):
+            assert not state['timing']
+            return self
+
+        def __exit__(self, *args):
+            assert not state['timing']
+
+        def __setattr__(self, name, value):
+            assert not state['timing']
+
+        def __call__(self, units):
+            assert not state['timing']
+            state['updates'] += units
+
+        @contextmanager
+        def pause(self):
+            assert not state['timing']
+            state['paused'] = True
+            yield
+            assert not state['timing']
+            state['paused'] = False
+
+    monkeypatch.setattr(execution.time, 'perf_counter', clock)
+    monkeypatch.setattr(execution, 'alive_bar', lambda *args, **kwargs: Bar())
+    elapsed = ExecutorConfig().execute_passes(tasks(3), Worker(), warmup=1, repeat=2)
+    assert elapsed == [4., 7.]
+    assert state['calls'] == [(0, False), (1, False), (2, False)] + [(0, True), (1, True), (2, True)] * 2
+    assert state['updates'] == 9
+
+
+@pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
+def test_execute_passes_warms_every_participating_worker(kind, tmp_path):
+    config = ExecutorConfig(kind=kind, show_progress=False, max_workers=2 if kind != 'serial' else None)
+    worker = RecordingPassWorker(str(tmp_path))
+    durations = config.execute_passes(tasks(3), worker, warmup=1, repeat=2)
+    assert len(durations) == 2 and all(value > 0 for value in durations)
+    records = list(tmp_path.glob('*.txt'))
+    assert len(records) == (1 if kind == 'serial' else 2)
+    lines = [path.read_text().splitlines() for path in records]
+    assert all(record[:4] == ['initialize', '0', '1', '2'] for record in lines)
+    assert sum(len(record) - 4 for record in lines) == 6
+
+
+class RecordingPassWorker(TaskWorker):
+    def __init__(self, directory):
+        self.directory = directory
+
+    def _record(self, text):
+        import os
+        from pathlib import Path
+        from threading import get_ident
+
+        with (Path(self.directory) / f'{os.getpid()}-{get_ident()}.txt').open('a') as stream:
+            stream.write(text + '\n')
+
+    def initialize(self, payloads, context):
+        self._record('initialize')
+
+    def run(self, payload, context):
+        self._record(str(payload))
+
+
+class InitializedPassWorker(TaskWorker):
+    def initialize(self, payloads, context):
+        self.initialized_payloads = tuple(payloads)
+
+    def run(self, payload, context):
+        assert payload in self.initialized_payloads
+
+
+@pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
+def test_execute_passes_retains_initialized_worker(kind):
+    config = ExecutorConfig(kind=kind, show_progress=False, max_workers=2 if kind != 'serial' else None)
+    assert len(config.execute_passes(tasks(3), InitializedPassWorker(), warmup=1, repeat=2)) == 2
+
+
+def test_execute_passes_honors_configured_workers_above_default_budget():
+    from threading import Lock, get_ident
+
+    identities = set()
+    lock = Lock()
+
+    class Worker(TaskWorker):
+        def initialize(self, payloads, context):
+            with lock:
+                identities.add(get_ident())
+
+        def run(self, payload, context):
+            pass
+
+    ExecutorConfig(kind='thread', max_workers=40, show_progress=False).execute_passes(
+        tasks(40), Worker(), warmup=0, repeat=1)
+    assert len(identities) == 40
+
+
+def test_execute_passes_keeps_initialization_local_to_each_thread():
+    from threading import Barrier, get_ident
+
+    rendezvous = Barrier(2)
+
+    class Worker(TaskWorker):
+        def initialize(self, payloads, context):
+            self.identity = get_ident()
+
+        def run(self, payload, context):
+            rendezvous.wait(timeout=5)
+            assert self.identity == get_ident()
+
+    ExecutorConfig(kind='thread', max_workers=2, show_progress=False).execute_passes(
+        tasks(2), Worker(), warmup=0, repeat=1)
+
+
+def test_execute_passes_propagates_warmup_failure():
+    with pytest.raises(ValueError, match='task failed'):
+        ExecutorConfig(kind='thread', max_workers=2, show_progress=False).execute_passes(
+            tasks(3), FailingWorker(), warmup=1, repeat=2)
+
+
+@pytest.mark.parametrize('warmup', [0, 1])
+def test_execute_passes_manual_progress_accepts_zero_units(monkeypatch, warmup):
+    import romjax.execution as execution
+
+    updates = []
+
+    class Bar:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __call__(self, value):
+            updates.append(value)
+
+        @contextmanager
+        def pause(self):
+            yield
+
+    monkeypatch.setattr(execution, 'alive_bar', lambda *args, **kwargs: Bar())
+    config = ExecutorConfig(progress_bar={'manual': True})
+    assert len(config.execute_passes([TaskSpec('a', 'a', 3, units=0)], SquareWorker(),
+                                     warmup=warmup, repeat=1)) == 1
+    assert updates == [1.] * (warmup + 1)
+
+
 def tasks(count):
     return [TaskSpec(str(i), f'task {i}', i) for i in range(count)]
 

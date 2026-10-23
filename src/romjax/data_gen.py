@@ -6,7 +6,6 @@ import inspect
 import json
 import os
 import re
-import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -1280,15 +1279,20 @@ class GenDataBenchmark(GenDataConfig):
 
     The configured generator supplies the graph, random seeds, batching, and numerical
     operations. It stores repeat-wise wall times in an HDF5 cache. Each hardware group
-    contains ``total`` in seconds per repeat and ``amortized`` in seconds per generated
-    sample.
+    contains ``total`` in seconds per repeat and ``amortized`` in seconds per input
+    sample. Each repeat times all input batches through the selected executor,
+    including dispatch and synchronization. Preparation, warmup, progress, and
+    file I/O are excluded. With ``warmup=0``, first-use compilation is measured.
+
+    Note that each worker (for parallel executors) will iterate the entire dataset `warmup` times, to account
+    for changing batch sizes and compilation.
 
     :param generator: implicit or source data generator to benchmark
-    :param samples: number of generated samples included in every batch-timing pass
+    :param samples: number of input samples included in each complete timed pass
     :param repeat: number of complete timed passes over all batches
-    :param warmup: number of untimed repetitions for every distinct batch shape
+    :param warmup: number of untimed full passes on each participating worker
     :param filename: HDF5 timing-cache filename written below the dataset path
-    :param hardware: optional cache group; inferred from the active JAX backend when omitted
+    :param hardware: hardware-label prefix; inferred from JAX when omitted, then suffixed with executor identity
     """
 
     show_progress: bool = True
@@ -1332,9 +1336,13 @@ class GenDataBenchmark(GenDataConfig):
         import romjax
 
         generator = self.generator
-        serialized = romjax.YamlLoader.dump(generator, sort_keys=True, _preserve_yaml_sources=True)
+        # Executor settings are tracked separately; presentation changes must
+        # not invalidate an otherwise identical numerical benchmark.
+        numerical = generator.model_copy(update={'executor': None, 'name_depth': 3})
+        serialized = romjax.YamlLoader.dump(numerical, sort_keys=True, _preserve_yaml_sources=True)
         return {
-            "schema_version": np.asarray(2),
+            "schema_version": np.asarray(3),
+            "timing": np.bytes_('full_pass_wall'),
             "samples": np.asarray(int(self.samples)),
             "repeat": np.asarray(int(self.repeat)),
             "warmup": np.asarray(int(self.warmup)),
@@ -1371,93 +1379,89 @@ class GenDataBenchmark(GenDataConfig):
         return jax.vmap(keys_for_input)(input_keys)
 
     @staticmethod
-    def _implicit_callable(generator: GenImplicitModel, model: Any) -> Callable[..., PyTree]:
-        """Build the batched no-I/O workload corresponding to implicit generation."""
-        has_solve = hasattr(model, "solve") and not generator.skip_solve
-        has_evaluate = hasattr(model, "evaluate") and not generator.skip_evaluate
-        has_conditions = _has_custom_sample_conditions(model)
+    def _implicit_callable(generator: GenImplicitModel, functions: Mapping[str, Callable | None]) -> Callable:
+        """Replay generation's separate numerical calls without saving their results."""
+        batched = generator.batch_size > 1
 
-        def generate_one(input_key: Key, output_keys: jax.Array | None) -> PyTree:
-            inputs = model.sample_inputs(input_key)
-            solution = model.solve(inputs) if has_solve and inputs is not None else None
-            solution_residual = (
-                model.evaluate(inputs, solution)
-                if has_evaluate and inputs is not None and solution is not None
-                else None
+        def workload(input_keys: PyTree, output_batches: tuple) -> PyTree:
+            inputs = functions['sample_inputs'](input_keys)
+            solutions = functions['solve'](inputs) if functions['solve'] is not None and inputs is not None else None
+            residuals = (functions['evaluate'](inputs, solutions)
+                         if functions['evaluate'] is not None and solutions is not None else None)
+            results = [inputs, solutions, residuals]
+            if not generator.outputs_per_input:
+                return results
+            count = len(output_batches)
+            input_values = ([None] * count if inputs is None else list(pytree_iter(inputs))) if batched else [inputs]
+            solution_values = (
+                ([None] * count if solutions is None else list(pytree_iter(solutions))) if batched else [solutions]
             )
-            if output_keys is None:
-                return inputs, solution, solution_residual
+            for one_input, solution, batches in zip(input_values, solution_values, output_batches):
+                for keys in batches:
+                    conditions = (functions['sample_conditions'](keys)
+                                  if functions['sample_conditions'] is not None else None)
+                    outputs = functions['sample_outputs'](keys, one_input, solution, conditions)
+                    evaluated = (functions['evaluate_outputs'](one_input, outputs)
+                                 if functions['evaluate_outputs'] is not None else None)
+                    results.extend((conditions, outputs, evaluated))
+            return results
 
-            conditions = eqx.filter_vmap(model.sample_conditions)(output_keys) if has_conditions else None
-
-            def sample_output(key: Key, condition: PyTree | None = None) -> PyTree:
-                return _call_sample_outputs(model, key, inputs, solution, condition)
-
-            outputs = (
-                eqx.filter_vmap(sample_output)(output_keys, conditions)
-                if conditions is not None
-                else eqx.filter_vmap(sample_output)(output_keys)
-            )
-            residuals = (
-                eqx.filter_vmap(model.evaluate, in_axes=(None, 0))(inputs, outputs)
-                if has_evaluate
-                else None
-            )
-            return inputs, solution, solution_residual, conditions, outputs, residuals
-
-        return eqx.filter_jit(eqx.filter_vmap(generate_one))
+        return workload
 
     def _workload(self, path: Path) -> tuple[Callable[..., PyTree], tuple[tuple[Any, ...], ...]]:
-        """Build the JIT workload and its deterministic batches outside timed regions."""
+        """Prepare generation callables and deterministic key batches before timing."""
         generator = self.generator
         if generator.graph is None:
             raise ValueError("Data-generation benchmarks require a generator graph.")
         generator._validate_required_methods(path)
-        model = generator._edge_from_path(path)
+        functions = generator._functions(path)
+        batched = generator.batch_size > 1
+        seed = generator.seed if isinstance(generator, GenSource) else generator.input_seed
+        batches = self._input_batches(seed, generator.batch_size)
         if isinstance(generator, GenSource):
-            _resolve_model_samplers(model, ("source",))
-            batches = self._input_batches(generator.seed, generator.batch_size)
-            return eqx.filter_jit(eqx.filter_vmap(model.sample_source)), tuple((keys,) for keys in batches)
+            args = tuple((keys if batched else keys[0],) for keys in batches)
+            jax.block_until_ready(args)
+            return functions['sample_source'], args
 
-        _resolve_model_samplers(model, ("inputs", "outputs", "conditions"))
-        batches = self._input_batches(generator.input_seed, generator.batch_size)
-        args = tuple((keys, self._output_keys(generator, keys)) for keys in batches)
-        return self._implicit_callable(generator, model), args
+        args = []
+        for keys in batches:
+            output_keys = self._output_keys(generator, keys)
+            output_batches = (() if output_keys is None else tuple(
+                tuple(row[start:start + generator.batch_size] if batched else row[start]
+                      for start in range(0, generator.outputs_per_input, generator.batch_size))
+                for row in output_keys))
+            args.append((keys if batched else keys[0], output_batches))
+        jax.block_until_ready(args)
+        return self._implicit_callable(generator, functions), tuple(args)
 
-    def _benchmark(self, path: Path) -> np.ndarray:
-        """Return one complete batch-pass wall time for every configured repeat."""
-        workload, batches = self._workload(path)
-        progress_total = len(batches) * (self.warmup + self.repeat)
-        context = (
-            alive_bar(progress_total, title=self.bar_text(path))
-            if self.show_progress
-            else _NullProgress()
+    def _benchmark(
+        self, path: Path, executor: ExecutorConfig | None = None,
+        jax_env: Mapping[str, str] | None = None,
+    ) -> np.ndarray:
+        """Measure each complete input pass through the selected executor."""
+        executor = executor or self.generator.executor or ExecutorConfig()
+        executor = executor.model_copy(update={'show_progress': self.show_progress and executor.show_progress})
+        count = (self.samples + self.generator.batch_size - 1) // self.generator.batch_size
+        tasks = tuple(TaskSpec(str(index), f'batch {index + 1}/{count}', index,
+                               units=min(self.generator.batch_size, self.samples - index * self.generator.batch_size))
+                      for index in range(count))
+        durations = executor.execute_passes(
+            tasks, _BenchmarkWorker(self, Path(path).absolute()), warmup=self.warmup, repeat=self.repeat,
+            progress_bar={'title': self.bar_text(path)}, jax_env=jax_env,
         )
-        totals: list[float] = []
-        with context as bar:
-            for warmup_index in range(self.warmup):
-                for batch_index, args in enumerate(batches):
-                    bar.text(
-                        f"Warmup {warmup_index + 1}/{self.warmup}; "
-                        f"batch {batch_index + 1}/{len(batches)}"
-                    )
-                    jax.block_until_ready(workload(*args))
-                    bar()
+        return np.asarray(durations)
 
-            for repeat_index in range(self.repeat):
-                total = 0.0
-                for batch_index, args in enumerate(batches):
-                    bar.text(
-                        f"Repeat {repeat_index + 1}/{self.repeat}; "
-                        f"batch {batch_index + 1}/{len(batches)}"
-                    )
-                    start = time.perf_counter()
-                    result = workload(*args)
-                    jax.block_until_ready(result)
-                    total += time.perf_counter() - start
-                    bar()
-                totals.append(total)
-        return np.asarray(totals)
+    def _executor_metadata(self, executor: ExecutorConfig, jax_env: Mapping[str, str] | None) -> str:
+        """Describe timing-relevant settings without presentation options."""
+        count = (self.samples + self.generator.batch_size - 1) // self.generator.batch_size
+        settings = executor.model_dump(mode='json', exclude={'show_progress', 'progress_bar'})
+        settings['workers'] = executor._pass_worker_count(count)
+        settings['jax_env'] = {
+            'JAX_ENABLE_X64': str(jax.config.jax_enable_x64).lower(),
+            'JAX_PLATFORMS': jax.config.jax_platforms,
+            **(jax_env or {}),
+        }
+        return json.dumps(settings, sort_keys=True)
 
     def generate(
         self,
@@ -1467,32 +1471,75 @@ class GenDataBenchmark(GenDataConfig):
     ) -> None:
         """Reuse or collect timings and persist the current hardware entry."""
         format, write_policy = self._validate_format_and_policy(format, write_policy)
+        self._generate(Path(path), format, write_policy, self.generator.executor or ExecutorConfig())
+
+    def _generate(
+        self, path: Path, format: str, write_policy: str, executor: ExecutorConfig,
+        jax_env: Mapping[str, str] | None = None,
+    ) -> None:
+        """Collect or reuse one executor-specific hardware entry."""
         if format != "h5":
             raise RoutineError(f"Save format {format!r} not recognized.")
         path = Path(path)
         cache_path = path / self.filename
         cached = load_h5({}, cache_path, jax=False) if cache_path.exists() else {}
         assert self.hardware is not None
-        exists = self.hardware in cached
+        execution = self._executor_metadata(executor, jax_env)
+        fingerprint = hashlib.sha256(execution.encode()).hexdigest()[:12]
+        label = f'{self.hardware}.{executor.kind}.{fingerprint}'
+        exists = label in cached
         metadata = self._metadata()
+        metadata['executor'] = np.bytes_(execution)
         if exists and write_policy == "error":
-            raise RoutineError(f"Benchmark timings already exist for {self.hardware!r} at {cache_path}.")
+            raise RoutineError(f"Benchmark timings already exist for {label!r} at {cache_path}.")
         if exists and write_policy == "reuse":
-            entry = cached[self.hardware]
+            entry = cached[label]
             if not isinstance(entry, Mapping) or not self._metadata_matches(entry.get("_benchmark", {}), metadata):
                 raise RoutineError(
                     f"Cached benchmark at {cache_path} is incompatible; use write_policy='overwrite'."
                 )
             return
 
-        total = self._benchmark(path)
-        cached[self.hardware] = {
+        total = self._benchmark(path, executor=executor, jax_env=jax_env)
+        cached[label] = {
             "_benchmark": metadata,
             "total": total,
             "amortized": total / self.samples,
         }
         path.mkdir(parents=True, exist_ok=True)
         save_h5(cached, cache_path, mode="w")
+
+
+@dataclass
+class _BenchmarkWorker(TaskWorker[int, None]):
+    benchmark: GenDataBenchmark | None
+    path: Path
+    configuration: str = ''
+    workload: tuple[Callable, tuple] | None = None
+
+    def prepare(self, *, remote: bool) -> _BenchmarkWorker:
+        import romjax
+
+        if not remote:
+            return _BenchmarkWorker(self.benchmark, self.path, workload=self.benchmark._workload(self.path))
+        try:
+            configuration = romjax.YamlLoader.dump(
+                self.benchmark, _preserve_yaml_sources=True, _preserve_model_types=True)
+            restored = romjax.load(configuration)
+            restored.generator._validate_required_methods(self.path)
+        except Exception as exc:
+            raise ExecutionError(f'Cannot reconstruct benchmark for remote execution: {exc}') from exc
+        return _BenchmarkWorker(None, self.path, configuration)
+
+    def initialize(self, payloads: Sequence[int], context: TaskContext) -> None:
+        import romjax
+
+        if self.workload is None:
+            self.workload = romjax.load(self.configuration)._workload(self.path)
+
+    def run(self, payload: int, context: TaskContext) -> None:
+        workload, batches = self.workload
+        jax.block_until_ready(workload(*batches[payload]))
 
 
 class LoadSource(LoadDataConfig[Path]):
@@ -2427,10 +2474,10 @@ class DataGeneration(Routine):
             yield self.root.joinpath(*parts), datasets
 
     def _generate_dataset(self, dataset: GenDataConfig, path: Path) -> None:
-        if isinstance(dataset, GenImplicitModel | GenSource):
+        if isinstance(dataset, GenImplicitModel | GenSource | GenDataBenchmark):
             format, policy = dataset._validate_format_and_policy(self.format, self.write_policy)
-            dataset._generate(path, format, policy, dataset.executor or self.executor,
-                                            self._jax_child_env())
+            generator = dataset.generator if isinstance(dataset, GenDataBenchmark) else dataset
+            dataset._generate(path, format, policy, generator.executor or self.executor, self._jax_child_env())
         else:
             dataset.generate(path, format=self.format, write_policy=self.write_policy)
 
