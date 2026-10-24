@@ -162,7 +162,8 @@ class RoutineConfig(BaseModel):
         
         if (plot := self.gridplot) is not None:     # gridplot style
             import romjax.plotting
-            romjax.plotting.set_global(**{name: getattr(plot, name) for name in type(plot).model_fields})
+            names = plot.model_fields_set if plot.override_none else type(plot).model_fields
+            romjax.plotting.set_global(**{name: getattr(plot, name) for name in names})
         
         if (log := self.logger) is not None:        # loguru
             logger.configure(**dict(log))
