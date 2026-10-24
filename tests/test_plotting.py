@@ -12,6 +12,44 @@ from romjax.plotting import AxisOptions, GridplotConfig, PlotSpec, gridplot
 matplotlib.use("Agg")
 
 
+@pytest.mark.parametrize("override_none", [False, True])
+def test_gridplot_merge_explicit_none(override_none):
+    base = GridplotConfig(shape=(2, 3), global_axis_opts={"clim": (0, 1), "xlabel": "keep"})
+    override = GridplotConfig(override_none=override_none, global_axis_opts={"clim": None})
+    merged = GridplotConfig.merge(base, override)
+    assert merged.shape == (2, 3)
+    assert merged.global_axis_opts.xlabel == "keep"
+    assert merged.global_axis_opts.clim == (None if override_none else (0, 1))
+    assert base.global_axis_opts.clim == (0, 1)
+
+
+def test_set_global_none_policy_is_not_persistent(monkeypatch):
+    monkeypatch.setattr(plotting, "global_config", GridplotConfig(shape=(2, 3), savefig={"fname": "old.png"}))
+    plotting.set_global(override_none=True, savefig=None)
+    assert plotting.global_config.savefig is None
+    assert plotting.global_config.override_none is False
+    plotting.set_global(shape=None)
+    assert plotting.global_config.shape == (2, 3)
+
+
+def test_gridplot_explicit_none_clears_inherited_axis_limits(monkeypatch):
+    monkeypatch.setattr(
+        plotting, "global_config",
+        GridplotConfig(
+            scheme="white", subplot_size_in=(3, 2.5),
+            subplots_kwargs={"squeeze": False},
+            global_axis_opts={"xlim": (0, 100), "xlabel": "keep"},
+        ),
+    )
+    spec = PlotSpec(kind="line", data=(np.asarray([0, 1]), np.asarray([0, 1])))
+    fig, axes = gridplot(spec, override_none=True, global_axis_opts={"xlim": None})
+    ax = np.asarray(axes).flat[0]
+    assert ax.get_xlim()[1] < 2
+    assert ax.get_xlabel() == "keep"
+    assert plotting.global_config.global_axis_opts.xlim == (0, 100)
+    plt.close(fig)
+
+
 def test_basic_gridplot(tmp_path):
     t = np.linspace(0, 2*np.pi, 30)
     def generate_sinusoid():

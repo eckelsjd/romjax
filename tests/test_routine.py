@@ -19,6 +19,24 @@ from romjax.routine import CompositeRoutine, LoggerConfig, ProgressBarConfig, Ro
 MODULE_NAME = __name__
 
 
+def test_routine_gridplot_yaml_explicit_none(monkeypatch):
+    import yaml
+
+    monkeypatch.setattr(
+        plotting, "global_config",
+        plotting.GridplotConfig(shape=(2, 3), global_axis_opts={"clim": (0, 1), "xlabel": "keep"}),
+    )
+    RoutineConfig.model_validate(yaml.safe_load("""
+gridplot:
+  override_none: true
+  global_axis_opts:
+    clim: null
+"""))
+    assert plotting.global_config.shape == (2, 3)
+    assert plotting.global_config.global_axis_opts.xlabel == "keep"
+    assert plotting.global_config.global_axis_opts.clim is None
+
+
 class DemoRoutine(Routine):
     """Minimal routine used to exercise configuration validation."""
 

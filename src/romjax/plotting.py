@@ -187,7 +187,10 @@ class GridplotConfig(DictModel):
     :ivar subplots_kwargs: all extra arguments are passed to plt.subplots
     :ivar tight_layout: extra arguments for fig.tight_layout
     :ivar subplots_adjust: extra arguments for fig.subplots_adjust
+    :ivar override_none: allow explicitly supplied None values to clear inherited settings for this merge only.
+                         Omitted model fields are ignored when enabled; defaults to False for compatibility.
     """
+    override_none: bool = False
     scheme: Literal['white', 'dark'] | None = None
     subplot_size_in: tuple[float, float] | None = None
     shape: tuple[int, int] | None = None
@@ -276,25 +279,44 @@ class GridplotConfig(DictModel):
         return grid
 
     @staticmethod
-    def merge(base: Mapping, override: Mapping, in_place: bool = False) -> Mapping:
+    def merge(
+        base: Mapping, override: Mapping, in_place: bool = False, *, override_none: bool | None = None,
+    ) -> Mapping:
         """Recursively merge two mappings into a new one.
 
         Values in ``override`` only replace corresponding values in ``base``
         when the override value is not ``None``. Nested mappings are merged
-        recursively with the same rule.
+        recursively with the same rule. When ``override_none`` is True, explicit
+        None values replace inherited values and omitted DictModel fields are
+        ignored. The flag defaults to the override's ``override_none`` option,
+        or False, and is consumed rather than inherited by the result.
+
+        :param base: Settings to inherit.
+        :param override: Settings to apply.
+        :param in_place: Whether to update base directly.
+        :param override_none: Whether explicit None values replace inherited settings.
+        :return: The merged settings.
         """
+        if override_none is None:
+            override_none = override.get("override_none", False)
         merged = base if in_place else copy.deepcopy(base)
 
         for key, value in override.items():
-            if value is None:
+            if key == "override_none" and (isinstance(base, GridplotConfig) or isinstance(override, GridplotConfig)):
+                continue
+            if override_none and isinstance(override, DictModel) and key not in override.model_fields_set:
+                continue
+            if value is None and not override_none:
                 continue
 
             if isinstance(value, Mapping):
                 base_value = merged.get(key)
                 if isinstance(base_value, Mapping):
-                    merged[key] = GridplotConfig.merge(base_value, value)
-                else:
+                    merged[key] = GridplotConfig.merge(base_value, value, override_none=override_none)
+                elif not override_none:
                     merged[key] = copy.deepcopy(value)
+                else:
+                    merged[key] = GridplotConfig.merge({}, value, override_none=override_none)
             elif key == "title":
                 merged[key] = value  # skip copying title which may be an iterable
             else:
@@ -312,9 +334,14 @@ global_config = GridplotConfig(
 )
 
 
-def set_global(**settings):
-    """Update global default gridplot settings."""
-    GridplotConfig.merge(global_config, settings, in_place=True)
+def set_global(*, override_none: bool = False, **settings: Any) -> None:
+    """Update global default gridplot settings.
+
+    :param override_none: Allow explicit None values to clear settings, recursively,
+                          for this update only. Omitted model fields are ignored.
+    :param settings: Gridplot settings to update.
+    """
+    GridplotConfig.merge(global_config, settings, in_place=True, override_none=override_none)
 
 
 def gridplot(
