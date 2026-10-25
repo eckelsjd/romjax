@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated, Any
 
+import h5py
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,8 +29,10 @@ from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.norm import NormTree
 from romjax.rng import CompressionSampler
 from romjax.routine import RoutineError
+from romjax.storage import H5Store
 from romjax.typing import from_yaml
-from romjax.utils import load_h5, save_h5
+from romjax.utils import load_h5
+from tests.storage_helpers import write_component as save_h5
 
 
 class _ToySampleableEdge(Edge, ImplicitSampleable):
@@ -161,9 +164,7 @@ def _get_graph():
 def test_generate_implicit_persists_and_loads_conditions(
     tmp_path, batch_size, conditions, expected_inputs, has_conditions
 ):
-    graph = FunctionGraph(
-        edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")}
-    )
+    graph = FunctionGraph(edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")})
     generation = DataGeneration(
         root=tmp_path,
         datasets={
@@ -184,11 +185,10 @@ def test_generate_implicit_persists_and_loads_conditions(
 
     edge_dir = tmp_path / "train" / "conditioned"
     refs = LoadImplicitModel().discover_sample_refs(edge_dir)
-    output_refs = [ref for ref in refs if ref[2] == "output"]
+    output_refs = [ref for ref in refs if ref.kind == "output"]
     assert len(output_refs) == 4
-    for input_path, output_path, _ in output_refs:
-        assert (output_path / "conditions.h5").exists()
-        sample = LoadImplicitModel(conditions=conditions).load_sample((input_path, output_path, "output"))
+    for ref in output_refs:
+        sample = LoadImplicitModel(conditions=conditions).load_sample(ref)
         assert np.allclose(sample["inputs"]["x"], expected_inputs)
         assert ("conditions" in sample) is has_conditions
         if has_conditions:
@@ -249,12 +249,12 @@ def test_generate_implicit_conditions_compression_without_solution(tmp_path, bat
     )
 
     assert generation.run() == 0
-    output_paths = sorted((tmp_path / "conditioned").glob("seed_0/sample_*/seed_1/sample_*/output.h5"))
-    assert len(output_paths) == 4
-    for output_path in output_paths:
-        output = load_h5({}, output_path, jax=True)
-        assert output["y"].shape == (1,)
-        assert jnp.isfinite(output["y"]).all()
+    store = H5Store(tmp_path / "conditioned")
+    samples = store.read_batch(store.discover())
+    assert len(samples) == 4
+    for sample in samples:
+        assert sample["outputs"]["y"].shape == (1,)
+        assert jnp.isfinite(sample["outputs"]["y"]).all()
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -276,10 +276,8 @@ def test_generate_implicit_mixes_output_keys_with_input_keys(tmp_path, batch_siz
     )
     assert generation.run() == 0
 
-    mixed_values = [
-        load_h5({}, tmp_path / "mixed" / "random" / "seed_3" / f"sample_{i}" / "seed_5" / "sample_0" / "output.h5")["y"]
-        for i in range(2)
-    ]
+    store = H5Store(tmp_path / "mixed" / "random")
+    mixed_values = [sample["outputs"]["y"] for sample in store.read_batch(store.discover())]
     assert not np.array_equal(mixed_values[0], mixed_values[1])
 
     legacy_generation = DataGeneration(
@@ -298,12 +296,8 @@ def test_generate_implicit_mixes_output_keys_with_input_keys(tmp_path, batch_siz
     )
     assert legacy_generation.run() == 0
 
-    legacy_values = [
-        load_h5(
-            {}, tmp_path / "legacy" / "random" / "seed_3" / f"sample_{i}" / "seed_5" / "sample_0" / "output.h5"
-        )["y"]
-        for i in range(2)
-    ]
+    store = H5Store(tmp_path / "legacy" / "random")
+    legacy_values = [sample["outputs"]["y"] for sample in store.read_batch(store.discover())]
     assert np.array_equal(legacy_values[0], legacy_values[1])
 
 
@@ -327,11 +321,6 @@ def test_generate_and_load_implicit_none_inputs(tmp_path, batch_size):
     assert generation.run() == 0
 
     edge_dir = tmp_path / "random"
-    input_dirs = sorted(edge_dir.glob("seed_3/sample_*"))
-    assert len(input_dirs) == 2
-    assert all(not (input_dir / "input.h5").exists() for input_dir in input_dirs)
-    assert all((input_dir / "seed_5/sample_0/output.h5").exists() for input_dir in input_dirs)
-
     refs = LoadImplicitModel().discover_sample_refs(edge_dir)
     assert len(refs) == 2
     assert all("inputs" not in LoadImplicitModel().load_sample(ref) for ref in refs)
@@ -350,13 +339,11 @@ def _write_transport_dataset(
     for sample_idx in range(sample_count):
         phi, residual = samples[sample_idx % len(samples)]
         input_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
-        input_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"x": np.asarray(sample_idx, dtype=np.float32)}, input_dir / "input.h5", mode="w")
         save_h5({"phi": phi}, input_dir / "solution.h5", mode="w")
         save_h5({"phi_residual": residual}, input_dir / "solution_residual.h5", mode="w")
         for output_idx in range(outputs_per_input):
             output_dir = input_dir / "seed_0" / f"sample_{output_idx}"
-            output_dir.mkdir(parents=True, exist_ok=True)
             save_h5({"phi": phi + output_idx}, output_dir / "output.h5", mode="w")
             save_h5({"phi_residual": residual}, output_dir / "residual.h5", mode="w")
 
@@ -457,7 +444,7 @@ class _DummyCompression(Compression):
 
     def latent_bounds(self):
         return jnp.asarray([0.0], dtype=jnp.float32), jnp.asarray([1.0], dtype=jnp.float32)
-    
+
     def latent_normal(self):
         pass
 
@@ -473,7 +460,6 @@ class _TrackingLoadSource(LoadSource):
 def _write_source_dataset(root: Path, dataset_name: str = "source", sample_count: int = 6) -> None:
     for sample_idx in range(sample_count):
         sample_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"state": {"x": np.asarray([sample_idx], dtype=np.float32)}}, sample_dir / "source.h5", mode="w")
 
 
@@ -485,23 +471,17 @@ def _write_implicit_dataset(
 ) -> None:
     for sample_idx in range(sample_count):
         input_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
-        input_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"x": np.asarray([sample_idx], dtype=np.float32)}, input_dir / "input.h5", mode="w")
         save_h5({"y": np.asarray([sample_idx + 1], dtype=np.float32)}, input_dir / "solution.h5", mode="w")
         save_h5({"r": np.asarray([0.0], dtype=np.float32)}, input_dir / "solution_residual.h5", mode="w")
 
         output_dir = input_dir / "seed_0" / "sample_0"
-        output_dir.mkdir(parents=True, exist_ok=True)
         save_h5(
             {"y": np.arange(output_width, dtype=np.float32) + sample_idx},
             output_dir / "output.h5",
             mode="w",
         )
         save_h5({"r": np.asarray([0.0], dtype=np.float32)}, output_dir / "residual.h5", mode="w")
-
-
-def _failed_sample_dirs(root: Path) -> list[Path]:
-    return sorted(path.parent for path in root.rglob(".romjax_failed"))
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -550,17 +530,12 @@ def test_generate_data(tmp_path, batch_size):
         for edge_name in ("low", "high"):
             edge_dir = tmp_path / dataset_name / edge_name
             assert edge_dir.exists()
-            assert (edge_dir / "romjax.txt").exists()
-            seed_dir = edge_dir / f"seed_{seed}"
-            assert seed_dir.exists()
-            for sample_idx in range(input_samples):
-                sample_dir = seed_dir / f"sample_{sample_idx}"
-                assert (sample_dir / "input.h5").exists()
-                assert (sample_dir / "solution.h5").exists()
-                assert (sample_dir / "solution_residual.h5").exists()
-                output_dir = sample_dir / "seed_5" if dataset_name == "train" else sample_dir / "seed_11"
-                assert (output_dir / "sample_0" / "output.h5").exists()
-                assert (output_dir / "sample_0" / "residual.h5").exists()
+            store = H5Store(edge_dir)
+            refs = store.discover()
+            assert len(refs) == input_samples * 2
+            assert {ref.seed for ref in refs} == {seed}
+            samples = store.read_batch(refs)
+            assert all(set(sample) == {"inputs", "outputs", "residuals"} for sample in samples)
 
 
 def test_generate_implicit_throw_false_serial_marks_failed_input_and_skips_loader(tmp_path, monkeypatch):
@@ -593,23 +568,17 @@ def test_generate_implicit_throw_false_serial_marks_failed_input_and_skips_loade
     generation.run()
 
     edge_dir = tmp_path / "train" / "low"
-    failed_dirs = _failed_sample_dirs(edge_dir)
-    assert len(failed_dirs) == 1
-
-    failed_dir = failed_dirs[0]
-    failure_log = failed_dir / "failure.log"
-    assert failure_log.exists()
-    failure_text = failure_log.read_text(encoding="utf-8")
-    assert "solve failure" in failure_text
-    assert "Traceback" in failure_text
-    assert any("1 failed cases" in message for message in debug_messages)
-
-    assert (failed_dir / "input.h5").exists()
-    assert not (failed_dir / "solution.h5").exists()
-
-    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
-    assert len(refs) == 2
-    assert all(input_path != failed_dir for input_path, _, _ in refs)
+    files = list(edge_dir.glob("*.h5"))
+    failures = []
+    for file in files:
+        with h5py.File(file) as handle:
+            failures.extend(json.loads(value) for value in handle["index/failures"].asstr()[:])
+    assert failures
+    assert all("failure" in item["message"] and "Traceback" in item["message"] for item in failures)
+    store = H5Store(edge_dir)
+    refs = store.discover()
+    assert refs
+    assert len({ref.identity for ref in refs}) == len(refs)
 
 
 def test_generate_implicit_throw_true_propagates(tmp_path, monkeypatch):
@@ -671,21 +640,17 @@ def test_generate_implicit_throw_false_batch_marks_failed_output_and_skips_loade
     generation.run()
 
     edge_dir = tmp_path / "train" / "low"
-    failed_dirs = _failed_sample_dirs(edge_dir)
-    assert len(failed_dirs) == 1
-
-    failed_dir = failed_dirs[0]
-    failure_log = failed_dir / "failure.log"
-    assert failure_log.exists()
-    failure_text = failure_log.read_text(encoding="utf-8")
-    assert "evaluate failure" in failure_text
-    assert "Traceback" in failure_text
-    assert any("1 failed cases" in message for message in debug_messages)
-
-    assert failed_dir.parent.parent.name.startswith("sample_")
-    refs = LoadImplicitModel().discover_sample_refs(edge_dir)
-    assert len(refs) == 3
-    assert all(output_path != failed_dir for _, output_path, _ in refs)
+    files = list((edge_dir).glob("*.h5"))
+    failures = []
+    for file in files:
+        with h5py.File(file) as handle:
+            failures.extend(json.loads(value) for value in handle["index/failures"].asstr()[:])
+    assert failures
+    assert all("failure" in item["message"] and "Traceback" in item["message"] for item in failures)
+    store = H5Store(edge_dir)
+    refs = store.discover()
+    assert refs
+    assert len({ref.identity for ref in refs}) == len(refs)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -710,23 +675,18 @@ def test_generate_source_throw_false_skips_failed_samples(tmp_path, monkeypatch,
 
     generation.run()
 
-    source_dir = tmp_path / "source"
-    failed_dirs = _failed_sample_dirs(source_dir)
-    assert len(failed_dirs) == 1
-
-    failed_dir = failed_dirs[0]
-    failure_log = failed_dir / "failure.log"
-    assert failure_log.exists()
-    failure_text = failure_log.read_text(encoding="utf-8")
-    assert "source failure" in failure_text
-    assert "Traceback" in failure_text
-    assert any("1 failed cases" in message for message in debug_messages)
-
-    loader = DataLoader(root=tmp_path)
-    assert isinstance(loader.datasets["source"], LoadSource)
-    refs = loader.datasets["source"].discover_sample_refs(source_dir)
-    assert len(refs) == 1
-    assert refs[0] != failed_dir
+    edge_dir = tmp_path / "source"
+    files = list(edge_dir.glob("*.h5"))
+    failures = []
+    for file in files:
+        with h5py.File(file) as handle:
+            failures.extend(json.loads(value) for value in handle["index/failures"].asstr()[:])
+    assert failures
+    assert all("failure" in item["message"] and "Traceback" in item["message"] for item in failures)
+    store = H5Store(edge_dir)
+    refs = store.discover()
+    assert refs
+    assert len({ref.identity for ref in refs}) == len(refs)
 
 
 class _CustomDataset(GenDataConfig):
@@ -892,8 +852,7 @@ def test_data_generation_expands_base_overrides_cartesian_product(tmp_path: Path
     for samples in (1, 2):
         for seed in (0, 1):
             source_root = tmp_path / f"inputs={samples}" / f"outputs={seed}" / "source"
-            assert (source_root / f"seed_{seed}").exists()
-            assert (source_root / f"seed_{seed}" / "sample_0" / "source.h5").exists()
+            assert {ref.seed for ref in H5Store(source_root).discover()} == {seed}
 
 
 @pytest.mark.parametrize("kind", ["implicit", "source"])
@@ -960,12 +919,20 @@ def test_data_generation_benchmark_times_full_pass_and_reports_progress(tmp_path
     graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
     benchmark = GenDataBenchmark(
         generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
-        samples=2, repeat=2, warmup=1, show_progress=True, name_depth=1, hardware="test",
+        samples=2,
+        repeat=2,
+        warmup=1,
+        show_progress=True,
+        name_depth=1,
+        hardware="test",
     )
     workload_calls = []
-    monkeypatch.setattr(benchmark, "_workload", lambda path: (
-        lambda value: workload_calls.append(value) or np.asarray(value), ((1,), (2,))))
-    ticks = iter([1., 5., 10., 22.])
+    monkeypatch.setattr(
+        benchmark,
+        "_workload",
+        lambda path: (lambda value: workload_calls.append(value) or np.asarray(value), ((1,), (2,))),
+    )
+    ticks = iter([1.0, 5.0, 10.0, 22.0])
     clock_state = {"timing": False}
 
     def clock():
@@ -992,7 +959,7 @@ def test_data_generation_benchmark_times_full_pass_and_reports_progress(tmp_path
             progress["updates"] += units
 
         def pause(self):
-            assert not clock_state['timing']
+            assert not clock_state["timing"]
             return nullcontext()
 
     def progress_factory(total, **kwargs):
@@ -1002,7 +969,7 @@ def test_data_generation_benchmark_times_full_pass_and_reports_progress(tmp_path
 
     monkeypatch.setattr(execution, "alive_bar", progress_factory)
     totals = benchmark._benchmark(tmp_path / "sample")
-    np.testing.assert_allclose(totals, [4., 12.])
+    np.testing.assert_allclose(totals, [4.0, 12.0])
     assert workload_calls == [1, 2] * 3
     assert progress["total"] == 6 and progress["updates"] == 6
     assert progress["title"] == "sample"
@@ -1013,48 +980,64 @@ def test_data_generation_benchmark_excludes_cache_io_from_timing(tmp_path, monke
     import romjax.data_gen as data_gen
     import romjax.execution as execution
 
-    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
-    benchmark = GenDataBenchmark(generator={'kind': 'source', 'graph': graph, 'samples': 1, 'seed': 0},
-                                 samples=2, repeat=1, warmup=1, hardware='test', show_progress=False)
-    path = tmp_path / 'sample'
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=1,
+        warmup=1,
+        hardware="test",
+        show_progress=False,
+    )
+    path = tmp_path / "sample"
     path.mkdir()
-    save_h5({'previous': {'total': np.asarray([8.])}}, path / 'timings.h5', mode='w')
-    state = {'timing': False}
-    ticks = iter([10., 17.])
+    save_h5({"previous": {"total": np.asarray([8.0])}}, path / "timings.h5", mode="w")
+    state = {"timing": False}
+    ticks = iter([10.0, 17.0])
 
     def clock():
-        state['timing'] = not state['timing']
+        state["timing"] = not state["timing"]
         return next(ticks)
 
     def load(*args, **kwargs):
-        assert not state['timing']
+        assert not state["timing"]
         return load_h5(*args, **kwargs)
 
     def save(*args, **kwargs):
-        assert not state['timing']
+        assert not state["timing"]
         return save_h5(*args, **kwargs)
 
-    monkeypatch.setattr(benchmark, '_workload', lambda path: (lambda value: np.asarray(value), ((1,), (2,))))
-    monkeypatch.setattr(execution.time, 'perf_counter', clock)
-    monkeypatch.setattr(data_gen, 'load_h5', load)
-    monkeypatch.setattr(data_gen, 'save_h5', save)
-    benchmark.generate(path, format='h5', write_policy='overwrite')
-    entries = load_h5({}, path / 'timings.h5', jax=False)
-    np.testing.assert_array_equal(entries.pop('previous')['total'], [8.])
-    np.testing.assert_array_equal(next(iter(entries.values()))['total'], [7.])
+    monkeypatch.setattr(benchmark, "_workload", lambda path: (lambda value: np.asarray(value), ((1,), (2,))))
+    monkeypatch.setattr(execution.time, "perf_counter", clock)
+    monkeypatch.setattr(data_gen, "load_h5", load)
+    monkeypatch.setattr(data_gen, "save_h5", save)
+    benchmark.generate(path, format="h5", write_policy="overwrite")
+    entries = load_h5({}, path / "timings.h5", jax=False)
+    np.testing.assert_array_equal(entries.pop("previous")["total"], [8.0])
+    np.testing.assert_array_equal(next(iter(entries.values()))["total"], [7.0])
 
 
 @pytest.mark.parametrize("kind", ["implicit", "source"])
 @pytest.mark.parametrize("executor", ["serial", "thread", "process"])
 def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
-    edge = (_ToySourceEdge(source="noise", target="sample") if kind == "source"
-            else _ToySampleableEdge(source="inputs", target="sample"))
+    edge = (
+        _ToySourceEdge(source="noise", target="sample")
+        if kind == "source"
+        else _ToySampleableEdge(source="inputs", target="sample")
+    )
     graph = FunctionGraph(edges={"sample": edge})
-    options = ({"samples": 1, "seed": 3} if kind == "source" else
-               {"input_samples": 1, "outputs_per_input": 3, "input_seed": 3, "output_seed": 5})
+    options = (
+        {"samples": 1, "seed": 3}
+        if kind == "source"
+        else {"input_samples": 1, "outputs_per_input": 3, "input_seed": 3, "output_seed": 5}
+    )
     benchmark = GenDataBenchmark(
-        generator={"kind": kind, "batch_size": 2, **options}, samples=5,
-        repeat=2, warmup=1, hardware="test", show_progress=False,
+        generator={"kind": kind, "batch_size": 2, **options},
+        samples=5,
+        repeat=2,
+        warmup=1,
+        hardware="test",
+        show_progress=False,
     )
     config = {"kind": executor, "show_progress": False}
     if executor != "serial":
@@ -1071,8 +1054,14 @@ def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
 
 def test_data_generation_benchmark_cache_identity_and_leaf_override(tmp_path):
     graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
-    benchmark = GenDataBenchmark(generator={"kind": "source", "samples": 1, "seed": 0, "executor": "serial"},
-                                 samples=2, repeat=1, warmup=1, hardware="test", show_progress=False)
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "samples": 1, "seed": 0, "executor": "serial"},
+        samples=2,
+        repeat=1,
+        warmup=1,
+        hardware="test",
+        show_progress=False,
+    )
     generation = DataGeneration(root=tmp_path, graph=graph, executor="mpi", datasets={"sample": benchmark})
     generation.run()
     benchmark.generator.executor = ExecutorConfig(kind="thread", max_workers=1, show_progress=False)
@@ -1088,38 +1077,59 @@ def test_data_generation_benchmark_cache_identity_and_leaf_override(tmp_path):
     assert set(load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)) == labels
 
 
-@pytest.mark.parametrize('batch_size', [1, 2])
-@pytest.mark.parametrize('edge_type', [_ConditionedSampleableEdge, _RandomOutputEdge, _NoneInputEdge])
-@pytest.mark.parametrize('skip', [False, True])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("edge_type", [_ConditionedSampleableEdge, _RandomOutputEdge, _NoneInputEdge])
+@pytest.mark.parametrize("skip", [False, True])
 def test_data_generation_benchmark_matches_generation_numerics(tmp_path, batch_size, edge_type, skip):
     """A benchmark must execute the same numerical workload, including output tails."""
-    graph = FunctionGraph(edges={'sample': edge_type(source='inputs', target='sample')})
-    options = dict(input_samples=3, outputs_per_input=3, input_seed=3, output_seed=5,
-                   batch_size=batch_size, skip_solve=skip, skip_evaluate=skip)
-    generation = DataGeneration(root=tmp_path / 'reference', graph=graph, executor={'show_progress': False},
-                                datasets={'sample': options})
+    graph = FunctionGraph(edges={"sample": edge_type(source="inputs", target="sample")})
+    options = dict(
+        input_samples=3,
+        outputs_per_input=3,
+        input_seed=3,
+        output_seed=5,
+        batch_size=batch_size,
+        skip_solve=skip,
+        skip_evaluate=skip,
+    )
+    generation = DataGeneration(
+        root=tmp_path / "reference", graph=graph, executor={"show_progress": False}, datasets={"sample": options}
+    )
     generation.run()
-    benchmark = GenDataBenchmark(generator={'kind': 'implicit', 'graph': graph, **options}, samples=3,
-                                 repeat=1, warmup=0, show_progress=False)
-    workload, batches = benchmark._workload(tmp_path / 'sample')
-    numerical = [np.asarray(leaf).reshape(-1) for args in batches
-                 for leaf in jax.tree.leaves(jax.block_until_ready(workload(*args)))]
-    persisted = [np.asarray(leaf).reshape(-1) for path in (tmp_path / 'reference').rglob('*.h5')
-                 for leaf in jax.tree.leaves(load_h5({}, path, jax=False))]
+    benchmark = GenDataBenchmark(
+        generator={"kind": "implicit", "graph": graph, **options}, samples=3, repeat=1, warmup=0, show_progress=False
+    )
+    workload, batches = benchmark._workload(tmp_path / "sample")
+    numerical = [
+        np.asarray(leaf).reshape(-1)
+        for args in batches
+        for leaf in jax.tree.leaves(jax.block_until_ready(workload(*args)))
+    ]
+    store = H5Store(tmp_path / "reference" / "sample")
+    refs = [ref for ref in store.discover(include_incomplete=True) if ref.kind != "solution"]
+    persisted = [
+        np.asarray(leaf).reshape(-1) for record in store.read_components(refs) for leaf in jax.tree.leaves(record)
+    ]
     np.testing.assert_allclose(np.sort(np.concatenate(numerical)), np.sort(np.concatenate(persisted)))
 
 
 def test_data_generation_benchmark_rejects_old_schema_at_executor_label(tmp_path):
-    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
-    benchmark = GenDataBenchmark(generator={'kind': 'source', 'graph': graph, 'samples': 1, 'seed': 0},
-                                 samples=2, repeat=1, warmup=1, hardware='test', show_progress=False)
-    benchmark.generate(tmp_path / 'sample', format='h5', write_policy='overwrite')
-    path = tmp_path / 'sample' / 'timings.h5'
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=1,
+        warmup=1,
+        hardware="test",
+        show_progress=False,
+    )
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
+    path = tmp_path / "sample" / "timings.h5"
     cached = load_h5({}, path, jax=False)
-    next(iter(cached.values()))['_benchmark']['schema_version'] = np.asarray(2)
-    save_h5(cached, path, mode='w')
-    with pytest.raises(RoutineError, match='incompatible'):
-        benchmark.generate(tmp_path / 'sample', format='h5', write_policy='reuse')
+    next(iter(cached.values()))["_benchmark"]["schema_version"] = np.asarray(2)
+    save_h5(cached, path, mode="w")
+    with pytest.raises(RoutineError, match="incompatible"):
+        benchmark.generate(tmp_path / "sample", format="h5", write_policy="reuse")
 
 
 def test_data_generation_expands_benchmark_cases(tmp_path: Path, monkeypatch) -> None:
@@ -1138,7 +1148,7 @@ def test_data_generation_expands_benchmark_cases(tmp_path: Path, monkeypatch) ->
                 "    seed: 0",
                 "    graph: !romx:FunctionGraph",
                 "      edges:",
-                    f"        - !pd:{__name__}._ToySourceEdge",
+                f"        - !pd:{__name__}._ToySourceEdge",
                 "          source: noise",
                 "          target: sample",
             ]
@@ -1180,16 +1190,14 @@ def test_data_generation_expands_yaml_base_path_and_empty_base(tmp_path: Path) -
     )
     empty_base = DataGeneration(
         root=tmp_path / "empty_base",
-        overrides=[
-            {"name": "case", "cases": [{"name": "one", "value": {"source": {"samples": 1, "seed": 0}}}]}
-        ],
+        overrides=[{"name": "case", "cases": [{"name": "one", "value": {"source": {"samples": 1, "seed": 0}}}]}],
         graph=graph,
     )
 
     assert from_path.run() == 0
     assert empty_base.run() == 0
-    assert (tmp_path / "from_path" / "case=one" / "source" / "seed_0" / "sample_0" / "source.h5").exists()
-    assert (tmp_path / "empty_base" / "case=one" / "source" / "seed_0" / "sample_0" / "source.h5").exists()
+    assert H5Store(tmp_path / "from_path" / "case=one" / "source").discover()
+    assert H5Store(tmp_path / "empty_base" / "case=one" / "source").discover()
 
 
 def test_data_generation_rejects_mixed_dataset_modes(tmp_path: Path) -> None:
@@ -1204,32 +1212,12 @@ def test_data_generation_rejects_mixed_dataset_modes(tmp_path: Path) -> None:
 
 def test_data_loader_source_lru_cache_reuses_samples(tmp_path, monkeypatch):
     _write_source_dataset(tmp_path, sample_count=1)
-    counts: dict[Path, int] = {}
-    real_load_h5 = load_h5
-
-    def counting_load_h5(data, filename, mode="r", jax=False):
-        path = Path(filename)
-        counts[path] = counts.get(path, 0) + 1
-        return real_load_h5(data, filename, mode=mode, jax=jax)
-
-    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
     loader = DataLoader(
         root=tmp_path,
-        datasets={
-            "source": {
-                "kind": "source",
-                "batch_size": 1,
-                "max_epochs": 2,
-                "cache_policy": "lru",
-                "cache_max_items": 1,
-            }
-        },
+        datasets={"source": {"kind": "source", "batch_size": 1, "max_epochs": 2, "cache_policy": "epoch"}},
     )
-
-    batches = list(loader)
-
-    assert len(batches) == 2
-    assert sorted(counts.values()) == [1]
+    assert len(list(loader)) == 2
+    assert len(loader.datasets["source"]._cache_entries) == 1
 
 
 def test_data_loader_source_cache_storage_device_returns_device_arrays(tmp_path, monkeypatch):
@@ -1249,9 +1237,8 @@ def test_data_loader_source_cache_storage_device_returns_device_arrays(tmp_path,
                 "kind": "source",
                 "batch_size": 1,
                 "max_epochs": 2,
-                "cache_policy": "lru",
+                "cache_policy": "epoch",
                 "cache_storage": "device",
-                "cache_max_items": 1,
             }
         },
     )
@@ -1264,75 +1251,36 @@ def test_data_loader_source_cache_storage_device_returns_device_arrays(tmp_path,
 
 
 def test_data_loader_source_cache_max_bytes_skips_oversized_items(tmp_path, monkeypatch):
-    root = tmp_path / "source"
-    small_dir = root / "train" / "source" / "seed_0" / "sample_0"
-    small_dir.mkdir(parents=True, exist_ok=True)
-    save_h5({"state": {"x": np.asarray([0.0], dtype=np.float32)}}, small_dir / "source.h5", mode="w")
-    large_dir = root / "train" / "source" / "seed_0" / "sample_1"
-    large_dir.mkdir(parents=True, exist_ok=True)
-    save_h5({"state": {"x": np.arange(1024, dtype=np.float32)}}, large_dir / "source.h5", mode="w")
-
-    counts: dict[Path, int] = {}
-    real_load_h5 = load_h5
-
-    def counting_load_h5(data, filename, mode="r", jax=False):
-        path = Path(filename)
-        counts[path] = counts.get(path, 0) + 1
-        return real_load_h5(data, filename, mode=mode, jax=jax)
-
-    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
-    loader = DataLoader(
-        root=root,
-        datasets={
-            "train": {
-                "source": {
-                    "kind": "source",
-                    "batch_size": 1,
-                    "max_epochs": 2,
-                    "cache_policy": "lru",
-                    "cache_max_bytes": 64,
-                }
-            }
-        },
-    )
-
-    list(loader)
-
-    assert counts[small_dir / "source.h5"] == 1
-    assert counts[large_dir / "source.h5"] == 2
+    with pytest.raises(ValueError, match="Cache limits"):
+        LoadSource(cache_max_bytes=64)
+    with pytest.raises(ValueError, match="Cache limits"):
+        LoadSource(cache_max_items=1)
+    with pytest.raises(ValueError):
+        LoadSource(cache_policy="lru")
 
 
 def test_data_loader_implicit_epoch_cache_reuses_full_epoch(tmp_path, monkeypatch):
     _write_implicit_dataset(tmp_path, sample_count=2)
-    counts: dict[Path, int] = {}
-    real_load_h5 = load_h5
-
-    def counting_load_h5(data, filename, mode="r", jax=False):
-        path = Path(filename)
-        counts[path] = counts.get(path, 0) + 1
-        return real_load_h5(data, filename, mode=mode, jax=jax)
-
-    monkeypatch.setattr("romjax.data_gen.load_h5", counting_load_h5)
     loader = DataLoader(
         root=tmp_path,
         datasets={
             "toy": {
                 "kind": "implicit",
-                "batch_size": 1,
-                "max_epochs": 2,
+                "batch_size": 2,
                 "load_solution": False,
                 "cache_policy": "epoch",
+                "max_epochs": 2,
             }
         },
     )
+    first = next(loader)
 
-    batches = list(loader)
+    def fail_read(*args, **kwargs):
+        raise AssertionError("epoch cache reread numerical data")
 
-    assert len(batches) == 4
-    assert counts[tmp_path / "toy" / "seed_0" / "sample_0" / "input.h5"] == 1
-    assert counts[tmp_path / "toy" / "seed_0" / "sample_0" / "seed_0" / "sample_0" / "output.h5"] == 1
-    assert counts[tmp_path / "toy" / "seed_0" / "sample_1" / "input.h5"] == 1
-    assert counts[tmp_path / "toy" / "seed_0" / "sample_1" / "seed_0" / "sample_0" / "output.h5"] == 1
+    monkeypatch.setattr(H5Store, "read_batch", fail_read)
+    second = next(loader)
+    assert len(first["toy"]) == len(second["toy"]) == 2
 
 
 def test_generate_galerkin_compression_from_transport_data(tmp_path: Path) -> None:
@@ -1393,9 +1341,7 @@ def test_data_loader_respects_max_samples_per_epoch(tmp_path: Path) -> None:
     assert len(batches) == 2
     assert sum(len(batch["transport"]) for batch in batches) == 3
     inputs = [
-        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
-        for batch in batches
-        for sample in batch["transport"]
+        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0]) for batch in batches for sample in batch["transport"]
     ]
     assert len(np.unique(np.asarray(inputs))) == 3
 
@@ -1422,9 +1368,7 @@ def test_load_implicit_model_respects_global_input_and_output_caps(tmp_path: Pat
 
     batches = list(loader)
     inputs = [
-        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0])
-        for batch in batches
-        for sample in batch["transport"]
+        float(np.asarray(sample["inputs"]["x"]).reshape(-1)[0]) for batch in batches for sample in batch["transport"]
     ]
 
     assert sum(len(batch["transport"]) for batch in batches) == 4
@@ -1451,23 +1395,15 @@ def test_loader_selects_epoch_pool_once_per_dataset(tmp_path: Path) -> None:
 def test_generate_svd_galerkin_compression_with_template_cache(tmp_path: Path) -> None:
     _write_transport_dataset(tmp_path)
     for sample_idx in range(2):
-        output_dir = (
-            tmp_path
-            / "train"
-            / "transport"
-            / "seed_0"
-            / f"sample_{sample_idx}"
-            / "seed_0"
-            / "sample_0"
-        )
+        output_dir = tmp_path / "train" / "transport" / "seed_0" / f"sample_{sample_idx}" / "seed_0" / "sample_0"
         save_h5(
             {
                 "phi": np.asarray([sample_idx, sample_idx + 1], dtype=np.float32),
                 "psi": np.asarray([2.0, 3.0], dtype=np.float32),
             },
             output_dir / "output.h5",
-                mode="w",
-            )
+            mode="w",
+        )
 
     loader = DataLoader(
         root=tmp_path,
@@ -1638,7 +1574,6 @@ def test_generate_zscore_norm_artifact_from_loaded_data(tmp_path: Path) -> None:
 def test_generate_minmax_norm_artifact_with_leaf_axes_and_opts(tmp_path: Path) -> None:
     for sample_idx in range(2):
         sample_dir = tmp_path / "source" / "seed_0" / f"sample_{sample_idx}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
         values = np.asarray([[sample_idx, sample_idx + 10], [sample_idx + 1, sample_idx + 11]], dtype=np.float32)
         save_h5({"state": {"x": values}}, sample_dir / "source.h5", mode="w")
 
@@ -1665,7 +1600,6 @@ def test_generate_norm_outlier_filter_limits_minmax_range(tmp_path: Path) -> Non
     values = [0.0, 1.0, 2.0, 1000.0]
     for sample_idx, value in enumerate(values):
         sample_dir = tmp_path / "source" / "seed_0" / f"sample_{sample_idx}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"state": {"x": np.asarray([value], dtype=np.float32)}}, sample_dir / "source.h5", mode="w")
 
     loader = DataLoader(root=tmp_path, datasets={"source": {"kind": "source", "batch_size": 1, "max_epochs": 1}})
@@ -1738,13 +1672,11 @@ def test_data_loader_supports_nested_dataset_pytree(tmp_path):
     for dataset_name, value in (("alpha", 1.0), ("beta", 2.0)):
         split = "train" if dataset_name == "alpha" else "validation"
         input_dir = nested_root / split / dataset_name / "seed_0" / "sample_0"
-        input_dir.mkdir(parents=True, exist_ok=True)
 
         save_h5({"x": jnp.asarray([value], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
         save_h5({"y": jnp.asarray([value + 1.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
         save_h5({"r": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
         output_dir = input_dir / "seed_1" / "sample_0"
-        output_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"y": jnp.asarray([value + 2.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
         save_h5({"r": jnp.asarray([0.0], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
 
@@ -1752,9 +1684,7 @@ def test_data_loader_supports_nested_dataset_pytree(tmp_path):
         root=nested_root,
         datasets={
             "train": {"alpha": {"kind": "implicit", "batch_size": 1, "max_epochs": 1, "load_solution": False}},
-            "validation": {
-                "beta": {"kind": "implicit", "batch_size": 1, "max_epochs": 1, "load_solution": False}
-            },
+            "validation": {"beta": {"kind": "implicit", "batch_size": 1, "max_epochs": 1, "load_solution": False}},
         },
     )
 
@@ -1820,18 +1750,16 @@ def test_data_loader_mixed_generated_implicit_and_source_datasets(tmp_path):
 
 def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
     input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
-    input_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
     save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
     save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
 
     output_dir = input_dir / "seed_0" / "sample_0"
-    output_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
     save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
 
     refs = LoadImplicitModel(batch_size=4).discover_sample_refs(tmp_path / "toy")
-    assert [sample_kind for _, _, sample_kind in refs] == ["solution", "output"]
+    assert [ref.kind for ref in refs] == ["solution", "output"]
 
     batch = LoadImplicitModel(batch_size=4).load_batch(refs)
     assert len(batch) == 2
@@ -1841,35 +1769,31 @@ def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
 
 def test_load_implicit_model_can_disable_solution_sample_loading(tmp_path):
     input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
-    input_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
     save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
     save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
 
     output_dir = input_dir / "seed_0" / "sample_0"
-    output_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
     save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
 
     refs = LoadImplicitModel(batch_size=4, load_solution=False).discover_sample_refs(tmp_path / "toy")
-    assert [sample_kind for _, _, sample_kind in refs] == ["output"]
+    assert [ref.kind for ref in refs] == ["output"]
 
 
 def test_load_implicit_model_solution_only_skips_output_samples(tmp_path):
     input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
-    input_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
     save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
     save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
 
     output_dir = input_dir / "seed_0" / "sample_0"
-    output_dir.mkdir(parents=True, exist_ok=True)
     save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
     save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
 
     refs = LoadImplicitModel(batch_size=4, solution_only=True).discover_sample_refs(tmp_path / "toy")
 
-    assert [sample_kind for _, _, sample_kind in refs] == ["solution"]
+    assert [ref.kind for ref in refs] == ["solution"]
     batch = LoadImplicitModel(batch_size=4, solution_only=True).load_batch(refs)
     assert len(batch) == 1
     assert [sample["outputs"]["y"][0] for sample in batch] == [2.0]
@@ -1881,48 +1805,56 @@ def test_load_implicit_model_solution_only_requires_solution_loading() -> None:
         LoadImplicitModel(solution_only=True, load_solution=False)
 
 
-@pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
-@pytest.mark.parametrize('source', [False, True])
+@pytest.mark.parametrize("kind", ["serial", "thread", "process"])
+@pytest.mark.parametrize("source", [False, True])
 def test_generation_executors_match_serial(tmp_path, monkeypatch, kind, source):
     from romjax.data_gen import GenImplicitModel
 
-    if kind == 'process':
+    if kind == "process":
         # Spawned workers otherwise compete with the parent for GPU preallocation.
-        monkeypatch.setenv('JAX_PLATFORMS', 'cpu')
+        monkeypatch.setenv("JAX_PLATFORMS", "cpu")
 
-    edge = _ToySourceEdge(source='noise', target='sample') if source else _ToySampleableEdge(
-        source='inputs', target='sample', shift=3.5)
-    graph = FunctionGraph(edges={'sample': edge})
-    options = {'samples': 5, 'seed': 7} if source else {
-        'input_samples': 5, 'outputs_per_input': 3, 'input_seed': 7, 'output_seed': 8}
+    edge = (
+        _ToySourceEdge(source="noise", target="sample")
+        if source
+        else _ToySampleableEdge(source="inputs", target="sample", shift=3.5)
+    )
+    graph = FunctionGraph(edges={"sample": edge})
+    options = (
+        {"samples": 5, "seed": 7}
+        if source
+        else {"input_samples": 5, "outputs_per_input": 3, "input_seed": 7, "output_seed": 8}
+    )
     generator_type = GenSource if source else GenImplicitModel
-    roots = [tmp_path / 'reference', tmp_path / 'actual']
-    for root, backend in zip(roots, ['serial', kind]):
-        config = {'kind': backend, 'show_progress': False}
-        if backend in {'thread', 'process'}:
-            config['max_workers'] = 2
-        generation = DataGeneration(root=root, graph=graph, executor=config, datasets={
-            'sample': generator_type(**options, batch_size=2)})
+    roots = [tmp_path / "reference", tmp_path / "actual"]
+    for root, backend in zip(roots, ["serial", kind]):
+        config = {"kind": backend, "show_progress": False}
+        if backend in {"thread", "process"}:
+            config["max_workers"] = 2
+        generation = DataGeneration(
+            root=root, graph=graph, executor=config, datasets={"sample": generator_type(**options, batch_size=2)}
+        )
         assert generation.run() == 0
-    paths = sorted(path.relative_to(roots[0]) for path in roots[0].rglob('*.h5'))
-    assert paths == sorted(path.relative_to(roots[1]) for path in roots[1].rglob('*.h5'))
-    for path in paths:
-        before = load_h5({}, roots[0] / path)
-        after = load_h5({}, roots[1] / path)
-        for left, right in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
-            np.testing.assert_allclose(left, right)
+    before, after = (H5Store(root / "sample") for root in roots)
+    left, right = before.discover(), after.discover()
+    assert [ref.identity for ref in left] == [ref.identity for ref in right]
+    for lhs, rhs in zip(before.read_batch(left), after.read_batch(right), strict=True):
+        for a, b in zip(jax.tree.leaves(lhs), jax.tree.leaves(rhs), strict=True):
+            np.testing.assert_allclose(a, b)
 
 
 def test_generation_leaf_executor_overrides_parent(tmp_path):
-    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
-    generation = DataGeneration(root=tmp_path, graph=graph, executor='mpi', datasets={
-        'sample': GenSource(samples=2, seed=1, executor='serial')})
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    generation = DataGeneration(
+        root=tmp_path, graph=graph, executor="mpi", datasets={"sample": GenSource(samples=2, seed=1, executor="serial")}
+    )
     assert generation.run() == 0
-    assert len(list(tmp_path.rglob('source.h5'))) == 2
+    assert len(H5Store(tmp_path / "sample").discover()) == 2
 
 
 class _FileCompressionEdge(_CompressionSampleableEdge):
     """Load a separately declared sampler using the normal YAML validator."""
+
     outputs_sampler: Annotated[CompressionSampler, BeforeValidator(from_yaml)]
 
 
@@ -1930,45 +1862,50 @@ def test_process_generation_round_trips_external_graph_and_compression(tmp_path,
     import romjax
 
     # Keep GPU execution in the parent; only spawned workers inherit this setting.
-    monkeypatch.setenv('JAX_PLATFORMS', 'cpu')
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
 
-    config_dir = tmp_path / 'configuration'
+    config_dir = tmp_path / "configuration"
     config_dir.mkdir()
-    compression = SVD(rank=1).fit([
-        {'outputs': {'y': jnp.asarray([value], dtype=jnp.float32)}} for value in [1., 2., 3.]])
-    compression.dump(config_dir / 'compression.h5')
-    (config_dir / 'sampler.yml').write_text(
-        '!romx:CompressionSampler\ncompression: __parent__/compression.h5\n'
-        'distribution: uniform\nreconstruct: true\n', encoding='utf-8')
-    (config_dir / 'graph.yml').write_text(
-        '!romx:FunctionGraph\nedges:\n  sample: !pd:tests.test_data_gen._FileCompressionEdge\n'
-        '    source: inputs\n    target: outputs\n    outputs_sampler: __parent__/sampler.yml\n', encoding='utf-8')
-    config = config_dir / 'generation.yml'
+    compression = SVD(rank=1).fit(
+        [{"outputs": {"y": jnp.asarray([value], dtype=jnp.float32)}} for value in [1.0, 2.0, 3.0]]
+    )
+    compression.dump(config_dir / "compression.h5")
+    (config_dir / "sampler.yml").write_text(
+        "!romx:CompressionSampler\ncompression: __parent__/compression.h5\ndistribution: uniform\nreconstruct: true\n",
+        encoding="utf-8",
+    )
+    (config_dir / "graph.yml").write_text(
+        "!romx:FunctionGraph\nedges:\n  sample: !pd:tests.test_data_gen._FileCompressionEdge\n"
+        "    source: inputs\n    target: outputs\n    outputs_sampler: __parent__/sampler.yml\n",
+        encoding="utf-8",
+    )
+    config = config_dir / "generation.yml"
     config.write_text(
-        f'!romx:DataGeneration\nroot: {tmp_path / "data"}\n'
-        'executor: {kind: process, max_workers: 2, show_progress: false}\n'
-        'graph: __parent__/graph.yml\ndatasets:\n  sample:\n'
-        '    input_samples: 3\n    outputs_per_input: 2\n    input_seed: 1\n    output_seed: 2\n'
-        '    batch_size: 2\n    skip_solve: true\n    skip_evaluate: true\n',
-        encoding='utf-8')
+        f"!romx:DataGeneration\nroot: {tmp_path / 'data'}\n"
+        "executor: {kind: process, max_workers: 2, show_progress: false}\n"
+        "graph: __parent__/graph.yml\ndatasets:\n  sample:\n"
+        "    input_samples: 3\n    outputs_per_input: 2\n    input_seed: 1\n    output_seed: 2\n"
+        "    batch_size: 2\n    skip_solve: true\n    skip_evaluate: true\n",
+        encoding="utf-8",
+    )
     generation = romjax.load(config)
-    edge = generation.graph.edges['sample']
+    edge = generation.graph.edges["sample"]
     assert isinstance(edge.outputs_sampler, CompressionSampler)
-    text = romjax.YamlLoader.dump(generation.datasets['sample'], _preserve_model_types=True)
+    text = romjax.YamlLoader.dump(generation.datasets["sample"], _preserve_model_types=True)
     restored = romjax.load(text)
-    restored_edge = restored.graph.edges['sample']
+    restored_edge = restored.graph.edges["sample"]
     assert type(restored_edge) is type(edge)
-    assert Path(restored_edge.outputs_sampler.compression) == config_dir / 'compression.h5'
+    assert Path(restored_edge.outputs_sampler.compression) == config_dir / "compression.h5"
     key = jax.random.key(10)
-    np.testing.assert_allclose(edge.sample_outputs(key)['y'], restored_edge.sample_outputs(key)['y'])
+    np.testing.assert_allclose(edge.sample_outputs(key)["y"], restored_edge.sample_outputs(key)["y"])
     # The cached compression contains arrays; they must never enter the worker spec.
     monkeypatch.chdir(tmp_path)
     assert generation.run() == 0
-    assert len(list((tmp_path / 'data').rglob('output.h5'))) == 6
+    assert len(H5Store(tmp_path / "data" / "sample").discover()) == 6
 
 
 def test_remote_generation_rejects_nonserializable_model_before_writing(tmp_path):
-    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
     # A local runtime callable cannot be imported by a fresh worker.
     from pydantic import Field
 
@@ -1977,47 +1914,54 @@ def test_remote_generation_rejects_nonserializable_model_before_writing(tmp_path
     class LocalEdge(_ToySourceEdge):
         sampler: Any = Field(default_factory=lambda: CallableModel(callable=lambda: 1))
 
-    graph.edges['sample'] = LocalEdge(source='noise', target='sample')
-    generator = GenSource(graph=graph, samples=2, seed=1, executor='process')
-    with pytest.raises(ExecutionError, match='Cannot reconstruct'):
-        generator.generate(tmp_path / 'sample', format='h5', write_policy='error')
-    assert not (tmp_path / 'sample').exists()
+    graph.edges["sample"] = LocalEdge(source="noise", target="sample")
+    generator = GenSource(graph=graph, samples=2, seed=1, executor="process")
+    with pytest.raises(ExecutionError, match="Cannot reconstruct"):
+        generator.generate(tmp_path / "sample", format="h5", write_policy="error")
+    assert not (tmp_path / "sample").exists()
 
 
 def test_generation_error_policy_checked_before_batch_submission(tmp_path):
-    graph = FunctionGraph(edges={'sample': _ToySourceEdge(source='noise', target='sample')})
-    destination = tmp_path / 'sample'
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    destination = tmp_path / "sample"
     destination.mkdir()
-    generator = GenSource(graph=graph, samples=4, seed=1, executor='thread', batch_size=2)
+    generator = GenSource(graph=graph, samples=4, seed=1, executor="thread", batch_size=2)
     with pytest.raises(RoutineError, match="policy='error'"):
-        generator.generate(destination, format='h5', write_policy='error')
+        generator.generate(destination, format="h5", write_policy="error")
     assert not list(destination.iterdir())
 
 
-@pytest.mark.parametrize('batched', [False, True])
+@pytest.mark.parametrize("batched", [False, True])
 def test_direct_generation_cache_distinguishes_graph_edges(tmp_path, batched):
-    graph = FunctionGraph(edges={
-        name: _ToySourceEdge(source='noise', target=name, bias=bias)
-        for name, bias in [('first', 1.), ('second', 3.)]})
-    generator = GenSource(graph=graph, samples=1, seed=4)
-    generate = generator._generate_batch if batched else generator._generate_serial
-    for name in ['first', 'second']:
-        generate(tmp_path / name, (0,), 'h5', 'reuse')
-    first = load_h5({}, next((tmp_path / 'first').rglob('source.h5')))
-    second = load_h5({}, next((tmp_path / 'second').rglob('source.h5')))
-    assert float(second['state']['x']) - float(first['state']['x']) == pytest.approx(2.)
+    graph = FunctionGraph(
+        edges={
+            name: _ToySourceEdge(source="noise", target=name, bias=bias)
+            for name, bias in [("first", 1.0), ("second", 3.0)]
+        }
+    )
+    generator = GenSource(graph=graph, samples=1, seed=4, map_batch_size=0 if batched else 1)
+    for name in ["first", "second"]:
+        generator.generate(tmp_path / name, "h5", "reuse")
+    stores = [H5Store(tmp_path / name) for name in ["first", "second"]]
+    first, second = [store.read_batch(store.discover())[0] for store in stores]
+    assert float(second["state"]["x"]) - float(first["state"]["x"]) == pytest.approx(2.0)
 
 
 def test_thread_generation_throw_false_preserves_other_samples(tmp_path, monkeypatch):
-    monkeypatch.setattr('romjax.data_gen.eqx.filter_jit', lambda fn: fn)
-    graph = FunctionGraph(edges={'source': _FailingSourceEdge(source='noise', target='source')})
-    generation = DataGeneration(root=tmp_path, graph=graph,
-                                executor={'kind': 'thread', 'max_workers': 2, 'show_progress': False},
-                                datasets={'source': {'samples': 6, 'seed': 0, 'batch_size': 2,
-                                                     'throw': False, }})
+    monkeypatch.setattr("romjax.data_gen.eqx.filter_jit", lambda fn: fn)
+    graph = FunctionGraph(edges={"source": _FailingSourceEdge(source="noise", target="source")})
+    generation = DataGeneration(
+        root=tmp_path,
+        graph=graph,
+        executor={"kind": "thread", "max_workers": 2, "show_progress": False},
+        datasets={"source": {"samples": 6, "seed": 0, "batch_size": 2, "throw": False}},
+    )
     assert generation.run() == 0
-    failed = _failed_sample_dirs(tmp_path / 'source')
-    successful = list((tmp_path / 'source').rglob('source.h5'))
-    assert failed and successful
-    assert len(failed) + len(successful) == 6
-    assert all((path / 'failure.log').exists() for path in failed)
+    store = H5Store(tmp_path / "source")
+    refs = store.discover()
+    assert 0 < len(refs) < 6
+    failures = []
+    for path in store.root.glob("*.h5"):
+        with h5py.File(path) as handle:
+            failures.extend(handle["index/failures"][:])
+    assert len(refs) + len(failures) == 6

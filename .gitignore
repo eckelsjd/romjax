@@ -4,6 +4,7 @@ scripts/darcy-opt/
 *.mp4
 *.gif
 *.png
+.superpowers
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
