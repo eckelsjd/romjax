@@ -30,7 +30,6 @@ from romjax.pde import (
 )
 from romjax.rng import CompressionSampler, Distribution
 from romjax.tree import pytree_merge
-from romjax.utils import load_h5
 
 
 def test_sum_forcing_delegates_to_independently_configured_forcings() -> None:
@@ -349,7 +348,9 @@ def test_block_linear_compression_generates_implicit_source_dataset(tmp_path: Pa
         tmp_path / "implicit", format="h5", write_policy="overwrite"
     )
 
-    source = load_h5({}, tmp_path / "implicit" / "seed_0" / "sample_0" / "source.h5", jax=True)
+    from romjax.storage import H5Store
+    store = H5Store(tmp_path / "implicit")
+    source = jax.device_put(store.read_batch(store.discover())[0])
     affine = Affine(inputs_rank=1, outputs_rank=1, key=jax.random.key(8), eps=1.0)
     residual = edge.evaluate({**source["inputs"], "module": affine}, source["outputs"])
     assert source["inputs"]["value"].shape == (1,)

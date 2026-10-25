@@ -1,4 +1,5 @@
 """Data generation routine and data loading."""
+
 from __future__ import annotations
 
 import hashlib
@@ -6,9 +7,9 @@ import inspect
 import json
 import os
 import re
+import traceback
 import warnings
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product
@@ -35,12 +36,21 @@ from pydantic import (
 )
 
 from romjax.compression import SVD, Compression
-from romjax.execution import ExecutionError, ExecutorConfig, TaskContext, TaskSpec, TaskWorker
+from romjax.execution import (
+    ExecutionAction,
+    ExecutionError,
+    ExecutorConfig,
+    ImmediateResult,
+    TaskContext,
+    TaskSpec,
+    TaskWorker,
+)
 from romjax.graph import Edge, FunctionGraph
 from romjax.model import ImplicitSampleable
 from romjax.norm import NormOperator, NormTree
 from romjax.rng import gen_keys
 from romjax.routine import CompositeOverride, Routine, RoutineError
+from romjax.storage import ComponentStatus, H5StorageConfig, H5Store, Record, SampleRef
 from romjax.tree import (
     TreePath,
     coerce_tree_paths,
@@ -63,15 +73,14 @@ __all__ = [
     "LoadDataConfig",
 ]
 
-_FAILURE_MARKER = ".romjax_failed"
-
 
 def _get_kwargs(fn: Callable) -> set[str]:
     signature = inspect.signature(fn)
     return {
         name
         for name, parameter in signature.parameters.items()
-        if parameter.kind in (
+        if parameter.kind
+        in (
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             inspect.Parameter.KEYWORD_ONLY,
         )
@@ -81,10 +90,7 @@ def _get_kwargs(fn: Callable) -> set[str]:
 def _accepts_kwarg(fn: Callable, name: str) -> bool:
     """Return whether a callable accepts a named keyword argument."""
     parameters = inspect.signature(fn).parameters.values()
-    return any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == name
-        for parameter in parameters
-    )
+    return any(parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == name for parameter in parameters)
 
 
 def _resolve_model_samplers(model: Any, roles: Sequence[str]) -> None:
@@ -126,49 +132,6 @@ def _call_sample_outputs(
     return model.sample_outputs(key, **kwargs)
 
 
-def _build_batched_sample_outputs(model):
-    """Build one batched ``sample_outputs`` function for a model."""
-    has_conditions = _has_custom_sample_conditions(model)
-
-    def _sample_outputs(keys, one_input, one_solution, one_conditions=None):
-        if has_conditions:
-            return jax.vmap(
-                lambda key, conditions: _call_sample_outputs(
-                    model, key, one_input, one_solution, conditions
-                )
-            )(keys, one_conditions)
-        return jax.vmap(
-            lambda key: _call_sample_outputs(model, key, one_input, one_solution, None)
-        )(keys)
-
-    return eqx.filter_jit(_sample_outputs)
-
-
-def _is_failed_sample_dir(sample_dir: Path) -> bool:
-    """Return whether a sample directory has been marked as failed."""
-    return (sample_dir / _FAILURE_MARKER).exists()
-
-
-def _log_sample_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
-    """Persist a detailed failure record for one sample directory."""
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    (sample_dir / _FAILURE_MARKER).touch(exist_ok=True)
-
-    failure_log = sample_dir / "failure.log"
-    sink_id = logger.add(
-        failure_log,
-        level="DEBUG",
-        mode="a",
-        backtrace=True,
-        diagnose=True,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}\n{exception}",
-    )
-    try:
-        logger.opt(exception=exc).error(message)
-    finally:
-        logger.remove(sink_id)
-
-
 type SUPPORTED_FORMATS = Literal["h5"]
 type SUPPORTED_POLICIES = Literal["reuse", "overwrite", "error"]
 type SUPPORTED_CONDITIONS = Literal["ignore", "include", "merge"]
@@ -191,15 +154,12 @@ class GenDataConfig(BaseModel, ABC):
             raise ValueError(f"Must specify a write format. Supported: {get_args(SUPPORTED_FORMATS)}")
         if write_policy is None:
             raise ValueError(f"Must specify a write policy. Supported: {get_args(SUPPORTED_POLICIES)}")
-        
+
         return format, write_policy
 
     @abstractmethod
     def generate(
-        self, 
-        path: Path, 
-        format: SUPPORTED_FORMATS | None = None,
-        write_policy: SUPPORTED_POLICIES | None = None
+        self, path: Path, format: SUPPORTED_FORMATS | None = None, write_policy: SUPPORTED_POLICIES | None = None
     ) -> None:
         """Generate data at the provided path using the specified format and write_policy."""
         raise NotImplementedError
@@ -246,9 +206,7 @@ class GenSymlink(GenDataConfig):
             if write_policy == "error":
                 raise RoutineError(f"Dataset already exists at {destination} and policy='error'")
             if not destination.is_symlink():
-                raise RoutineError(
-                    f"Refusing to overwrite non-symlink destination at {destination}"
-                )
+                raise RoutineError(f"Refusing to overwrite non-symlink destination at {destination}")
             destination.unlink()
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -259,319 +217,428 @@ class GenSymlink(GenDataConfig):
 
 
 class GenGraph(GenDataConfig, ABC):
-    """
-    Datasets that use a FunctionGraph for sample generation.
+    """Graph sampling with independent task, compute, and storage batch sizes.
 
-    Concrete classes must specify how to generate both in serial and in batch.
-    
-    :ivar graph: the FunctionGraph or Yaml path
-    :ivar name_depth: depth in the path for displaying current dataset name (default: 2)
-    :ivar batch_size: batch size
-    :ivar executor: optional batch executor; inherits DataGeneration settings when omitted
-    :ivar _required_methods: names of the sampling methods that corresponding graph edges must implement.
+    :param batch_size: source samples or complete input families per executor task
+    :param map_batch_size: lax.map vectorization width; zero maps the full axis
+    :param storage: settings for newly created files; inherits the routine default
+    :param executor: task executor; inherits the routine executor
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
-
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
     name_depth: int = 3
     batch_size: PositiveInt = 1
+    map_batch_size: NonNegativeInt = 0
+    storage: H5StorageConfig | None = None
+    executor: Annotated[
+        ExecutorConfig | None, BeforeValidator(lambda value: None if value is None else ExecutorConfig.from_dict(value))
+    ] = None
     _required_methods: list[str] = PrivateAttr(default_factory=list)
-    executor: Annotated[ExecutorConfig | None, BeforeValidator(
-        lambda value: None if value is None else ExecutorConfig.from_dict(value)
-    )] = None
-    _compiled: dict[tuple[int, bool], dict[str, Callable | None]] = PrivateAttr(default_factory=dict)
+    _compiled: dict[Any, Callable] = PrivateAttr(default_factory=dict)
 
-    def _functions(self, path: Path, batched: bool | None = None) -> dict[str, Callable | None]:
-        """Resolve samplers and compile stable callables once per worker/configuration."""
-        if batched is None:
-            batched = self.batch_size > 1 and self.throw
+    def bar_text(self, path: Path) -> str:
+        return "/".join(path.parts[-self.name_depth :])
+
+    def _edge_from_path(self, path: Path) -> Edge:
+        if self.graph is None or path.name not in self.graph.edges:
+            raise ValueError(f"Last folder name must be an edge name: {path.name}")
+        return self.graph.edges[path.name]
+
+    def _validate_required_methods(self, path: Path) -> None:
         model = self._edge_from_path(path)
-        cache_key = (id(model), batched)
+        for name in self._required_methods:
+            if not hasattr(model, name):
+                raise ValueError(f"Graph edge {path.name} must implement {name}.")
+
+    def _kernel(self, path: Path, stage: str, flags: tuple[bool, ...], mapped: bool) -> Callable:
+        model = self._edge_from_path(path)
+        cache_key = id(model), stage, flags, mapped, self.map_batch_size
         if cache_key in self._compiled:
             return self._compiled[cache_key]
-        roles = ('source',) if isinstance(self, GenSource) else ('inputs', 'outputs', 'conditions')
-        _resolve_model_samplers(model, roles)
-        functions: dict[str, Callable | None] = {}
-        for name in ('sample_source', 'sample_inputs', 'solve', 'sample_conditions', 'evaluate'):
-            method = getattr(model, name, None)
-            if method is None or (name == 'solve' and getattr(self, 'skip_solve', False)):
-                functions[name] = None
-            elif name == 'evaluate' and getattr(self, 'skip_evaluate', False):
-                functions[name] = None
-            elif name == 'sample_conditions' and not _has_custom_sample_conditions(model):
-                functions[name] = None
-            else:
-                functions[name] = eqx.filter_jit(eqx.filter_vmap(method) if batched else method)
-        if isinstance(self, GenImplicitModel):
-            functions['sample_outputs'] = (
-                _build_batched_sample_outputs(model) if batched else eqx.filter_jit(
-                    lambda key, inputs, solution, conditions=None:
-                    _call_sample_outputs(model, key, inputs, solution, conditions))
+        if stage == "source":
+            single = model.sample_source
+        elif stage == "input":
+
+            def single(key, inputs, solution, residual):
+                if flags[0]:
+                    inputs = model.sample_inputs(key)
+                if flags[1]:
+                    solution = model.solve(inputs) if inputs is not None else None
+                if flags[2]:
+                    residual = model.evaluate(inputs, solution) if solution is not None else None
+                return inputs, solution, residual
+        else:
+
+            def single(key, conditions, outputs, residual, inputs, solution):
+                if flags[0]:
+                    conditions = model.sample_conditions(key)
+                if flags[1]:
+                    outputs = _call_sample_outputs(model, key, inputs, solution, conditions)
+                if flags[2]:
+                    residual = model.evaluate(inputs, outputs)
+                return conditions, outputs, residual
+
+        if not mapped:
+            result = eqx.filter_jit(single)
+        elif stage == "source":
+            result = eqx.filter_jit(lambda keys: jax.lax.map(single, keys, batch_size=self.map_batch_size))
+        elif stage == "input":
+            result = eqx.filter_jit(
+                lambda keys, inputs, solutions, residuals: jax.lax.map(
+                    lambda item: single(*item), (keys, inputs, solutions, residuals), batch_size=self.map_batch_size
+                )
             )
-            functions['evaluate_outputs'] = (
-                eqx.filter_jit(eqx.filter_vmap(model.evaluate, in_axes=(None, 0)))
-                if batched and functions['evaluate'] is not None else functions['evaluate']
+        else:
+            result = eqx.filter_jit(
+                lambda keys, conditions, outputs, residuals, inputs, solution: jax.lax.map(
+                    lambda item: single(*item, inputs, solution),
+                    (keys, conditions, outputs, residuals),
+                    batch_size=self.map_batch_size,
+                )
             )
-        self._compiled[cache_key] = functions
-        return functions
-
-    def _generate(
-        self, path: Path, format: str, write_policy: str, executor: ExecutorConfig,
-        jax_env: Mapping[str, str] | None = None,
-    ) -> None:
-        """Prepare batch payloads and delegate their execution to the common driver."""
-        path = Path(path).absolute()
-        if self.graph is None:
-            raise ValueError("Must specify a graph to generate data.")
-        self._validate_required_methods(path)
-        if write_policy == 'error' and path.exists():
-            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
-        count = self.samples if isinstance(self, GenSource) else self.input_samples
-        policy = 'overwrite' if write_policy == 'error' else write_policy
-        tasks = (TaskSpec(str(start), f"inputs {start}:{min(count, start + self.batch_size)}",
-                          tuple(range(start, min(count, start + self.batch_size))),
-                          units=min(self.batch_size, count - start))
-                 for start in range(0, count, self.batch_size))
-        executor.execute(tasks, _GenerationWorker(self, path, format, policy), total_units=count,
-                         progress_bar={'title': self.bar_text(path)}, jax_env=jax_env, collect_results=False)
-
-    @abstractmethod
-    def _generate_serial(self, path, indices, format, write_policy):
-        """Generate data in serial (batch=1)."""
-        raise NotImplementedError
-    
-    @abstractmethod
-    def _generate_batch(self, path, indices, format, write_policy):
-        """Genereate data in batches (batch>1)."""
-        raise NotImplementedError
-
-    def bar_text(self, path: Path):
-        return "/".join(path.parts[-self.name_depth:])
-    
-    def _edge_from_path(self, path: Path) -> Edge:
-        edge_name = path.name
-
-        if edge_name not in self.graph.edges:
-            raise ValueError(f"Last folder name must be an edge name in the graph. '{edge_name}' not recognized.")
-        
-        return self.graph.edges[edge_name]
-
-    def _validate_required_methods(self, path: Path):
-        """Make sure all required methods are implemented."""
-        edge = self._edge_from_path(Path(path))
-
-        for meth in self._required_methods:
-            if not hasattr(edge, meth):
-                raise ValueError(f"Graph edge '{edge}' must implement '{meth}' method.")
-
-    def generate(self, path, format=None, write_policy=None):
-        """
-        Generate data for a FunctionGraph. Assumes graph edge name is the last name in the `path`.
-        """
-        format, write_policy = self._validate_format_and_policy(format, write_policy)
-
-        if self.graph is None:
-            raise ValueError("Must specify a graph to generate data.")
-        
-        self._validate_required_methods(path)
-        
-        self._generate(path, format, write_policy, self.executor or ExecutorConfig())
-
-
-
-class LoadDataConfig[T: Any](BaseModel, ABC):
-    """
-    Abstract class for batch-loading datasets.
-
-    :param batch_size: number of output samples per yielded mini-batch
-    :param shuffle_seed: seed for shuffling mini-batch data
-    :param max_epochs: maximum times to iterate through all available data (defaults to infinite loop)
-    :param cache_policy: file-cache policy for loaded samples
-    :param cache_storage: storage location for cached samples
-    :param cache_max_items: maximum number of cached samples, if any
-    :param cache_max_bytes: maximum total cached sample size, if any
-    :param stack_batch: stack samples into a batched pytree before returning them
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    batch_size: PositiveInt = 16
-    shuffle_seed: int = 0
-    max_epochs: PositiveInt | None = None
-    cache_policy: Literal["none", "lru", "epoch"] = "none"
-    cache_storage: Literal["host", "device"] = "host"
-    cache_max_items: NonNegativeInt | None = None
-    cache_max_bytes: NonNegativeInt | None = None
-    stack_batch: bool = False
-
-    _cache_entries: OrderedDict[Any, tuple[PyTree, int]] = PrivateAttr(default_factory=OrderedDict)
-    _cache_bytes: int = PrivateAttr(default=0)
-    _epoch_cache_items: int | None = PrivateAttr(default=None)
-
-    @abstractmethod
-    def discover_sample_refs(self, root: Path) -> list[T]:
-        """Discover sample references below one dataset root."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_sample(self, ref: T) -> PyTree:
-        """Load one sample referenced from disk."""
-        raise NotImplementedError
-
-    def configure_epoch_cache(self, epoch_size: int | None) -> None:
-        """Set the selected epoch size used by ``cache_policy='epoch'``."""
-        self._epoch_cache_items = epoch_size
-        if self.cache_policy == "epoch":
-            self._enforce_cache_limits()
-
-    def select_epoch_refs(self, refs: Sequence[T], indices: jax.Array) -> list[T]:
-        """Select the full epoch reference order from a shuffled dataset index order."""
-        return [refs[int(index)] for index in indices]
-
-    def count_epoch_refs(self, refs: Sequence[T], indices: jax.Array) -> int:
-        """Count the number of references selected for one epoch without materializing them."""
-        return len(indices)
-
-    def load_batch(self, refs: Sequence[T]) -> PyTree | list[PyTree]:
-        """Load a selected batch of dataset references."""
-        samples = [self._load_cached_sample(ref) for ref in refs]
-        if len(samples) == 0:
-            return {}
-        if self.stack_batch:
-            return pytree_stack(samples)
-        return samples
-
-    def _cache_key(self, ref: T) -> Any:
-        """Return a hashable cache key for one sample reference."""
-        def _normalize(value: Any) -> Any:
-            # if isinstance(value, Path):
-            #     return value.resolve()
-            if isinstance(value, tuple):
-                return tuple(_normalize(item) for item in value)
-            if isinstance(value, list):
-                return tuple(_normalize(item) for item in value)
-            return value
-
-        return _normalize(ref)
-
-    def _cache_limit_items(self) -> int | None:
-        """Return the effective item cap for the current cache policy."""
-        if self.cache_policy != "epoch":
-            return self.cache_max_items
-        if self._epoch_cache_items is None:
-            return self.cache_max_items
-        if self.cache_max_items is None:
-            return self._epoch_cache_items
-        return max(self.cache_max_items, self._epoch_cache_items)
-
-    def _cache_limit_bytes(self) -> int | None:
-        """Return the effective byte cap for the current cache policy."""
-        return self.cache_max_bytes
+        self._compiled[cache_key] = result
+        return result
 
     @staticmethod
-    def _sample_nbytes(sample: PyTree) -> int:
-        """Estimate the in-memory size of one cached sample in bytes."""
-        total = 0
-        for leaf in jax.tree.leaves(sample):
-            if leaf is None:
+    def _unstack(tree: PyTree, count: int) -> list[PyTree]:
+        return [jax.tree.map(lambda leaf: leaf[i], tree) for i in range(count)]
+
+    @staticmethod
+    def _group_key(flags: tuple, values: Any) -> tuple:
+        leaves, structure = jax.tree.flatten(values)
+        return flags, str(structure), tuple((np.shape(leaf), str(np.asarray(leaf).dtype)) for leaf in leaves)
+
+    def _apply(
+        self,
+        path: Path,
+        stage: str,
+        flags: tuple,
+        keys: Sequence[Key],
+        values: Sequence[PyTree],
+        *context: Any,
+        mapped: bool = True,
+    ) -> list[PyTree]:
+        kernel = self._kernel(path, stage, flags, mapped)
+        if mapped:
+            args = () if stage == "source" else tuple(pytree_stack(values))
+            result = kernel(pytree_stack(keys), *args, *context)
+            return self._unstack(jax.device_get(result), len(keys))
+        result = []
+        for key, value in zip(keys, values, strict=True):
+            args = () if stage == "source" else tuple(value)
+            result.append(jax.device_get(kernel(key, *args, *context)))
+        return result
+
+    def _compute(self, path: Path, plans: Sequence[dict[str, Any]], *, mapped: bool = True) -> _GeneratedBatch:
+        """Compute independent families; this method has no target-file access."""
+        model = self._edge_from_path(path)
+        records: list[Record] = []
+        source = isinstance(self, GenSource)
+        seed = self.seed if source else self.input_seed
+        if not self.throw and mapped:
+            # Host orchestration isolates Python/model exceptions; numerical kernels are shared.
+            for plan in plans:
+                try:
+                    records.extend(self._compute(path, [plan], mapped=False).records)
+                except Exception as exc:
+                    records.append(
+                        Record(
+                            seed,
+                            plan["index"],
+                            "source" if source else "input",
+                            {},
+                            states={"values" if source else "inputs": ComponentStatus.FAILED},
+                            failure=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+            return _GeneratedBatch(records)
+        groups = {}
+        for plan in plans:
+            flags, values = plan["flags"], plan["values"]
+            groups.setdefault(self._group_key(flags, values), []).append(plan)
+        try:
+            for group in groups.values():
+                flags = group[0]["flags"]
+                keys = [jax.random.fold_in(jax.random.key(seed), item["index"]) for item in group]
+                values = [item["values"] for item in group]
+                computed = self._apply(path, "source" if source else "input", flags, keys, values, mapped=mapped)
+                for plan, key, value in zip(group, keys, computed, strict=True):
+                    index = plan["index"]
+                    if source:
+                        records.append(Record(seed, index, "source", {"values": value}))
+                        continue
+                    inputs, solution, residual = value
+                    components = {
+                        name: val
+                        for name, val, needed in zip(
+                            ("inputs", "solutions", "solution_residuals"), value, flags, strict=True
+                        )
+                        if needed
+                    }
+                    states = {}
+                    for name, skip in (
+                        ("solutions", self.skip_solve or not hasattr(model, "solve")),
+                        ("solution_residuals", self.skip_evaluate or not hasattr(model, "evaluate")),
+                    ):
+                        if skip and (plan["overwrite"] or name not in plan["old"]):
+                            components[name], states[name] = None, ComponentStatus.SKIPPED
+                    records.append(Record(seed, index, "input", components, states=states))
+                    out_groups = {}
+                    for output in plan["outputs"]:
+                        group_key = self._group_key(output["flags"], output["values"])
+                        if not mapped or not self.throw:
+                            group_key = (*group_key, output["index"])
+                        out_groups.setdefault(group_key, []).append(output)
+                    for outputs in out_groups.values():
+                        out_keys = [self._output_key(key, item["index"]) for item in outputs]
+                        try:
+                            results = self._apply(
+                                path,
+                                "output",
+                                outputs[0]["flags"],
+                                out_keys,
+                                [item["values"] for item in outputs],
+                                inputs,
+                                solution,
+                                mapped=mapped,
+                            )
+                        except Exception as failure:
+                            if mapped:
+                                raise
+                            message = f"{type(failure).__name__}: {failure}\n{traceback.format_exc()}"
+                            records.append(
+                                Record(
+                                    seed,
+                                    index,
+                                    "output",
+                                    {},
+                                    self.output_seed,
+                                    outputs[0]["index"],
+                                    {"values": ComponentStatus.FAILED},
+                                    message,
+                                )
+                            )
+                            if self.throw:
+                                return _GeneratedBatch(records, message)
+                            continue
+                        for output, result in zip(outputs, results, strict=True):
+                            fields = {
+                                name: val
+                                for name, val, needed in zip(
+                                    ("conditions", "values", "residuals"), result, output["flags"], strict=True
+                                )
+                                if needed
+                            }
+                            states = {}
+                            if self.skip_evaluate or not hasattr(model, "evaluate"):
+                                fields["residuals"], states["residuals"] = None, ComponentStatus.SKIPPED
+                            if not _has_custom_sample_conditions(model):
+                                fields["conditions"], states["conditions"] = None, ComponentStatus.NONE
+                            records.append(
+                                Record(seed, index, "output", fields, self.output_seed, output["index"], states)
+                            )
+            return _GeneratedBatch(records)
+        except Exception as exc:
+            if not mapped:
+                index = plans[0]["index"]
+                message = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                records.append(
+                    Record(
+                        seed,
+                        index,
+                        "source" if source else "input",
+                        {},
+                        states={"values" if source else "inputs": ComponentStatus.FAILED},
+                        failure=message,
+                    )
+                )
+                return _GeneratedBatch(records, message if self.throw else None)
+            # Replay pure kernels to identify the failing identity and salvage completed records.
+            recovered = []
+            for plan in plans:
+                result = self._compute(path, [plan], mapped=False)
+                recovered.extend(result.records)
+                if result.fatal:
+                    return _GeneratedBatch(recovered, result.fatal)
+            raise RuntimeError(f"Mapped generation failed although individual samples succeeded: {exc}") from exc
+
+    def _plans(self, store: H5Store, indices: Sequence[int], policy: str) -> list[dict[str, Any]]:
+        source = isinstance(self, GenSource)
+        model = self._edge_from_path(store.root)
+        seed = self.seed if source else self.input_seed
+        requested = []
+        for index in indices:
+            ref = store.reference(seed, index, "source" if source else "input")
+            if ref is not None:
+                requested.append(ref)
+            if not source:
+                for j in range(self.outputs_per_input):
+                    ref = store.reference(seed, index, "output", self.output_seed, j)
+                    if ref is not None:
+                        requested.append(ref)
+        raw = {}
+        plans = []
+        valid = (ComponentStatus.COMPLETE, ComponentStatus.NONE)
+        for index in indices:
+            old = raw.get(("source" if source else "input", seed, index, None, None), {})
+            status = store.status(seed, index)
+            overwrite = policy == "overwrite"
+            needed = overwrite or status["values" if source else "inputs"] not in valid
+            if source:
+                if needed:
+                    plans.append({"index": index, "flags": (), "values": (), "old": old, "overwrite": overwrite})
                 continue
-            if hasattr(leaf, "nbytes"):
-                total += int(leaf.nbytes)
+            solve = (
+                not self.skip_solve
+                and hasattr(model, "solve")
+                and (needed or overwrite or status["solutions"] not in valid)
+            )
+            evaluate = (
+                not self.skip_evaluate
+                and hasattr(model, "evaluate")
+                and (solve or overwrite or status["solution_residuals"] not in valid)
+            )
+            outputs = []
+            for j in range(self.outputs_per_input):
+                state = store.status(seed, index, self.output_seed, j)
+                previous = raw.get(("output", seed, index, self.output_seed, j), {})
+                conditions = _has_custom_sample_conditions(model) and (overwrite or state["conditions"] not in valid)
+                values = overwrite or needed or solve or conditions or state["values"] not in valid
+                residual = (
+                    not self.skip_evaluate
+                    and hasattr(model, "evaluate")
+                    and (values or state["residuals"] not in valid)
+                )
+                if conditions or values or residual:
+                    outputs.append(
+                        {
+                            "index": j,
+                            "flags": (conditions, values, residual),
+                            "values": tuple(previous.get(name) for name in ("conditions", "values", "residuals")),
+                        }
+                    )
+            if needed or solve or evaluate or outputs or overwrite:
+                plans.append(
+                    {
+                        "index": index,
+                        "flags": (needed, solve, evaluate),
+                        "old": old,
+                        "values": tuple(old.get(name) for name in ("inputs", "solutions", "solution_residuals")),
+                        "outputs": outputs,
+                        "overwrite": overwrite,
+                    }
+                )
+        # Decide work from metadata first: a complete reuse pass reads no numerical fields.
+        identities = set()
+        for plan in plans:
+            identities.add(("source" if source else "input", seed, plan["index"], None, None))
+            for output in plan.get("outputs", []):
+                identities.add(("output", seed, plan["index"], self.output_seed, output["index"]))
+        requested = [ref for ref in requested if ref.identity in identities]
+        raw = {ref.identity: data for ref, data in zip(requested, store.read_components(requested), strict=True)}
+        for plan in plans:
+            old = raw.get(("source" if source else "input", seed, plan["index"], None, None), {})
+            plan["old"] = old
+            if source:
                 continue
-            if hasattr(leaf, "size") and hasattr(leaf, "dtype"):
-                total += int(leaf.size * leaf.dtype.itemsize)
-                continue
-            total += int(np.asarray(leaf).nbytes)
-        return total
+            # Overwrite cannot use a solution which this request explicitly discards.
+            plan["values"] = (
+                old.get("inputs"),
+                None if plan["overwrite"] and self.skip_solve else old.get("solutions"),
+                None if plan["overwrite"] and self.skip_evaluate else old.get("solution_residuals"),
+            )
+            for output in plan["outputs"]:
+                previous = raw.get(("output", seed, plan["index"], self.output_seed, output["index"]), {})
+                output["values"] = tuple(previous.get(name) for name in ("conditions", "values", "residuals"))
+        reservations = []
+        for plan in plans:
+            reservations.append(Record(seed, plan["index"], "source" if source else "input", {}))
+            for output in plan.get("outputs", []):
+                reservations.append(Record(seed, plan["index"], "output", {}, self.output_seed, output["index"]))
+        store.reserve(reservations)
+        return plans
 
-    def _materialize_for_cache(self, sample: PyTree) -> PyTree:
-        """Convert one loaded sample to the configured cache storage."""
-        if self.cache_storage == "device":
-            return jax.device_put(sample)
-        return sample
+    def _generate(
+        self,
+        path: Path,
+        format: str,
+        write_policy: str,
+        executor: ExecutorConfig,
+        jax_env: Mapping[str, str] | None = None,
+        storage: H5StorageConfig | None = None,
+    ) -> None:
+        path = Path(path).resolve()
+        self._validate_required_methods(path)
+        if format != "h5":
+            raise RoutineError(f"Unsupported sample format: {format}")
+        if write_policy == "error" and path.exists():
+            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
+        source = isinstance(self, GenSource)
+        store = H5Store(path, "source" if source else "implicit", self.storage or storage)
+        worker = _GenerationWorker(self, path)
+        # Reconstruction must succeed before creating target directories or locks.
+        worker.prepare(remote=executor.kind in {"process", "mpi"})
+        if executor.kind == "hybrid":
+            raise ExecutionError("Hybrid generation is not supported.")
+        count = self.samples if source else self.input_samples
+        fatal = []
 
-    def _load_cached_sample(self, ref: T) -> PyTree:
-        """Load a sample through the in-memory cache when enabled."""
-        if self.cache_policy == "none":
-            return self.load_sample(ref)
+        def tasks():
+            for start in range(0, count, self.batch_size):
+                stop = min(count, start + self.batch_size)
+                plans = self._plans(store, range(start, stop), write_policy)
+                yield TaskSpec(
+                    str(start),
+                    f"inputs {start}:{stop}",
+                    plans,
+                    units=stop - start,
+                    immediate=None if plans else ImmediateResult(_GeneratedBatch([])),
+                )
 
-        # key = self._cache_key(ref)
-        key = ref
-        if key in self._cache_entries:
-            cached_sample, cached_size = self._cache_entries.pop(key)
-            self._cache_entries[key] = (cached_sample, cached_size)
-            return cached_sample
+        def commit(outcome):
+            store.write(outcome.value.records)
+            if outcome.value.fatal:
+                fatal.append(outcome.value.fatal)
+            return ExecutionAction.STOP if fatal else ExecutionAction.CONTINUE
 
-        sample = self._materialize_for_cache(self.load_sample(ref))
-        sample_size = self._sample_nbytes(sample)
-        byte_limit = self._cache_limit_bytes()
-        item_limit = self._cache_limit_items()
-        if item_limit == 0:
-            return sample
-        if byte_limit is not None and sample_size > byte_limit:
-            return sample
+        with store.locked():
+            store.validate_storage()
+            if not source:
+                store.configure_key_scheme(self.input_seed, self.output_seed, self.mix_output_seed)
+            executor.execute(
+                tasks(),
+                worker,
+                on_result=commit,
+                total_units=count,
+                collect_results=False,
+                progress_bar={"title": self.bar_text(path)},
+                jax_env=jax_env,
+            )
+        if fatal:
+            raise RoutineError(fatal[0])
 
-        self._evict_for_insert(sample_size)
-        self._cache_entries[key] = (sample, sample_size)
-        self._cache_bytes += sample_size
-        return sample
-
-    def _evict_for_insert(self, sample_size: int) -> None:
-        """Evict least-recently-used samples until the next insert fits."""
-        item_limit = self._cache_limit_items()
-        byte_limit = self._cache_limit_bytes()
-
-        while self._cache_entries:
-            over_items = item_limit is not None and len(self._cache_entries) >= item_limit
-            over_bytes = byte_limit is not None and self._cache_bytes + sample_size > byte_limit
-            if not over_items and not over_bytes:
-                break
-            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
-            self._cache_bytes -= evicted_size
-
-    def _enforce_cache_limits(self) -> None:
-        """Prune the cache to the current effective policy limits."""
-        item_limit = self._cache_limit_items()
-        byte_limit = self._cache_limit_bytes()
-
-        while self._cache_entries and item_limit is not None and len(self._cache_entries) > item_limit:
-            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
-            self._cache_bytes -= evicted_size
-
-        if byte_limit is None:
-            return
-
-        while self._cache_entries and self._cache_bytes > byte_limit:
-            _, (_, evicted_size) = self._cache_entries.popitem(last=False)
-            self._cache_bytes -= evicted_size
+    def generate(self, path: Path, format: str | None = None, write_policy: str | None = None) -> None:
+        """Generate records through the selected executor and controller-owned writer."""
+        format, write_policy = self._validate_format_and_policy(format, write_policy)
+        self._generate(Path(path), format, write_policy, self.executor or ExecutorConfig())
 
 
 class GenImplicitModel(GenGraph):
-    """
-    Sampling configuration for a nested input/output strategy for implicit models in a FunctionGraph.
+    """Generate reproducible implicit input families with optional solves/conditions.
 
-    A nested folder structure will be generated with the outer seed_i/sample_j set corresponding to the
-    result of `sample_inputs`, and the inner seed/sample set corresponding to the result of `sample_outputs`.
-    Generally, output samples are conditioned on input samples, and so several output samples may be requested
-    for a single input sample. When implemented, `sample_conditions` is called for each inner sample and its
-    result is saved as `conditions.h5` alongside the output.
-
-    If an Edge implements `solve` and `evaluate`, a solution will be generated and saved alongside each input, 
-    and a residual will be computed and saved alongside each output (unless explicitly skipped using the flags).
-
-    :ivar input_samples: number of input samples
-    :ivar outputs_per_input: number of output samples for each input sample
-    :ivar input_seed: random seed for inputs
-    :ivar output_seed: random seed for outputs
-    :ivar mix_output_seed: whether output keys should also depend on the input key (default: true)
-    :ivar throw: whether solve/evaluate failures should propagate immediately
-    :ivar skip_solve: whether to skip implicit model solve (even if the model has a solve method)
-    :ivar skip_evaluate: whether to skip implicit model evaluate (even if the model has an evaluate method)
+    :param input_samples: number of input identities to request
+    :param outputs_per_input: sampled output identities requested for each input
+    :param input_seed: input key seed
+    :param output_seed: output key seed
+    :param mix_output_seed: fold output seed into each input key
+    :param skip_solve: omit base solutions
+    :param skip_evaluate: omit residual evaluation
+    :param throw: stop after a model failure; false isolates failures
     """
 
-    input_samples: int
-    outputs_per_input: int
+    input_samples: NonNegativeInt
+    outputs_per_input: NonNegativeInt
     input_seed: int
     output_seed: int
     mix_output_seed: bool = True
@@ -580,683 +647,255 @@ class GenImplicitModel(GenGraph):
     skip_evaluate: bool = False
     _required_methods: list[str] = PrivateAttr(default=["sample_inputs"])
 
-    def _gen_output_keys(
-        self,
-        input_key: Key,
-        input_dir: Path,
-        skip: Literal["existing"] | None = None,
-    ) -> Iterator[tuple[Key, Path]]:
-        """Generate output keys and paths for one input sample."""
-        mixed_key = jax.random.fold_in(input_key, self.output_seed) if self.mix_output_seed else None
-        for output_index in range(self.outputs_per_input):
-            output_generator = gen_keys(
-                [output_index], self.output_seed, path=input_dir, skip=skip
-            )
-            try:
-                legacy_key, output_dir = next(output_generator)
-            except StopIteration:
-                continue
-
-            output_key = (
-                jax.random.fold_in(mixed_key, output_index) if mixed_key is not None else legacy_key
-            )
-            yield output_key, Path(output_dir)
-
-    def _generate_serial(self, path, indices, format, write_policy):
-        """Generate data in serial for an ImplicitModel."""
-        path = Path(path)
-        failed_dirs: set[Path] = set()
-        failed_cases = 0
-
-        def _record_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
-            nonlocal failed_cases
-            if sample_dir not in failed_dirs:
-                failed_dirs.add(sample_dir)
-                failed_cases += 1
-            _log_sample_failure(sample_dir, message, exc)
-
-        if write_policy == "error" and path.exists():
-            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
-
-        path.mkdir(parents=True, exist_ok=True)
-
-        functions = self._functions(path, batched=False)
-        sample_inputs = functions['sample_inputs']
-        solve = functions['solve']
-        evaluate = functions['evaluate']
-        sample_conditions = functions['sample_conditions']
-        sample_outputs = functions['sample_outputs']
-
-        for input_key, input_dir in gen_keys(indices, self.input_seed, path=path):
-            input_path = input_dir / "input.h5"
-            solution_path = input_dir / "solution.h5"
-            solution_residual_path = input_dir / "solution_residual.h5"
-
-            if write_policy == "reuse" and input_path.exists():
-                if format != "h5":
-                    raise RoutineError(f"Save format '{format}' not recognized")
-                one_input = load_h5({}, input_path, jax=True)
-                one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
-            else:
-                one_input = sample_inputs(input_key)
-                one_solution = None
-                if solve is not None and one_input is not None:
-                    if self.throw:
-                        one_solution = solve(one_input)
-                    else:
-                        try:
-                            one_solution = solve(one_input)
-                        except Exception as exc:  # noqa: BLE001
-                            _record_failure(input_dir, f"Failed to solve sample at {input_dir}", exc)
-                one_solution_residual = None
-                if evaluate is not None and one_solution is not None:
-                    if self.throw:
-                        one_solution_residual = evaluate(one_input, one_solution)
-                    else:
-                        try:
-                            one_solution_residual = evaluate(one_input, one_solution)
-                        except Exception as exc:  # noqa: BLE001
-                            _record_failure(
-                                input_dir,
-                                f"Failed to evaluate solution sample at {input_dir}",
-                                exc,
-                            )
-
-                if format == "h5":
-                    if one_input is not None:
-                        save_h5(one_input, input_path, mode="w")
-                    if one_solution is not None:
-                        save_h5(one_solution, solution_path, mode="w")
-                    if one_solution_residual is not None:
-                        save_h5(one_solution_residual, solution_residual_path, mode="w")
-                else:
-                    raise RoutineError(f"Save format '{format}' not recognized")
-
-            skip = "existing" if write_policy == "reuse" else None
-            for output_key, output_dir in self._gen_output_keys(input_key, input_dir, skip=skip):
-                one_conditions = sample_conditions(output_key) if sample_conditions is not None else None
-                if one_conditions is not None:
-                    save_h5(one_conditions, output_dir / "conditions.h5", mode="w")
-
-                one_output = sample_outputs(output_key, one_input, one_solution, one_conditions)
-                one_residual = None
-                if evaluate is not None:
-                    if self.throw:
-                        one_residual = evaluate(one_input, one_output)
-                    else:
-                        try:
-                            one_residual = evaluate(one_input, one_output)
-                        except Exception as exc:  # noqa: BLE001
-                            _record_failure(
-                                output_dir,
-                                f"Failed to evaluate output sample at {output_dir}",
-                                exc,
-                            )
-
-                if format == "h5":
-                    save_h5(one_output, output_dir / "output.h5", mode="w")
-                    if one_residual is not None:
-                        save_h5(one_residual, output_dir / "residual.h5", mode="w")
-                else:
-                    raise RoutineError(f"Save format '{format}' not recognized")
-
-        if failed_cases:
-            logger.debug(f"Implicit generation completed with {failed_cases} failed cases at {path}")
-
-    def _generate_batch(self, path, indices, format, write_policy):
-        """Generate data for an ImplicitModel using batches and vmap."""
-        if not self.throw:
-            logger.warning(
-                "GenImplicitModel.throw=False requires per-sample failure handling, "
-                "so batch generation falls back to serial execution."
-            )
-            return self._generate_serial(path, indices, format, write_policy)
-
-        def _save_outputs(
-            sample_outputs: Callable,
-            sample_conditions: Callable | None,
-            one_input: PyTree,
-            one_solution: PyTree,
-            output_keys: tuple[Key, ...],
-            output_paths: tuple[Path, ...],
-            evaluate: Callable | None,
-        ) -> None:
-            conditions = sample_conditions(pytree_stack(output_keys)) if sample_conditions is not None else None
-            conditions = jax.device_get(conditions) if conditions is not None else None
-            if conditions is not None:
-                condition_iter = pytree_iter(conditions)
-                for output_path in output_paths:
-                    if format != "h5":
-                        raise RoutineError(f"Save format '{format}' not recognized")
-                    save_h5(next(condition_iter), output_path / "conditions.h5", mode="w")
-
-            outputs = (
-                sample_outputs(pytree_stack(output_keys), one_input, one_solution, conditions)
-                if conditions is not None
-                else sample_outputs(pytree_stack(output_keys), one_input, one_solution)
-            )
-            residuals = evaluate(one_input, outputs) if evaluate is not None else None
-            outputs = jax.device_get(outputs)
-            residuals = jax.device_get(residuals) if residuals is not None else None
-
-            residual_iter = pytree_iter(residuals) if residuals is not None else None
-            for one_output, output_path in zip(pytree_iter(outputs), output_paths):
-                one_residual = next(residual_iter) if residual_iter is not None else None
-
-                if format == "h5":
-                    save_h5(one_output, output_path / "output.h5", mode="w")
-                    if one_residual is not None:
-                        save_h5(one_residual, output_path / "residual.h5", mode="w")
-                else:
-                    raise RoutineError(f"Save format '{format}' not recognized")
-
-        def _process_input_batch(
-            input_batch: list[tuple[Key, Path]],
-            sample_inputs: Callable,
-            solve: Callable | None,
-            evaluate_solution: Callable | None,
-            sample_outputs: Callable,
-            sample_conditions: Callable | None,
-            evaluate: Callable | None,
-        ) -> None:
-            if not input_batch:
-                return
-
-            # Only sample/solve missing inputs for policy=reuse
-            inputs_by_index: dict[int, object] = {}
-            solutions_by_index: dict[int, object] = {}
-            solution_residuals_by_index: dict[int, object] = {}
-
-            missing_indices = range(len(input_batch))
-            if write_policy == "reuse":
-                missing_indices = [
-                    i for i, (_, input_path) in enumerate(input_batch) if not (input_path / "input.h5").exists()
-                ]
-
-            if missing_indices:
-                missing_keys = tuple(input_batch[i][0] for i in missing_indices)
-                generated_inputs = sample_inputs(pytree_stack(missing_keys))
-                # ``sample_inputs`` may intentionally return ``None`` for an input
-                # sample.  In that case there is no input to solve, but output
-                # sampling can still be meaningful for models whose outputs are
-                # independent of inputs.
-                generated_solutions = (
-                    solve(generated_inputs)
-                    if solve is not None and generated_inputs is not None
-                    else None
-                )
-                generated_solution_residuals = (
-                    evaluate_solution(generated_inputs, generated_solutions)
-                    if (
-                        evaluate_solution is not None
-                        and generated_inputs is not None
-                        and generated_solutions is not None
-                    )
-                    else None
-                )
-                generated_inputs = jax.device_get(generated_inputs)
-                generated_solutions = jax.device_get(generated_solutions) if generated_solutions is not None else None
-                generated_solution_residuals = (
-                    jax.device_get(generated_solution_residuals)
-                    if generated_solution_residuals is not None
-                    else None
-                )
-                input_samples = (
-                    [None] * len(missing_indices)
-                    if generated_inputs is None
-                    else list(pytree_iter(generated_inputs))
-                )
-                solution_samples = list(pytree_iter(generated_solutions)) if generated_solutions is not None else None
-                solution_residual_samples = (
-                    list(pytree_iter(generated_solution_residuals))
-                    if generated_solution_residuals is not None
-                    else None
-                )
-
-                for batch_index, input_index in enumerate(missing_indices):
-                    inputs_by_index[input_index] = input_samples[batch_index]
-                    if solution_samples is not None:
-                        solutions_by_index[input_index] = solution_samples[batch_index]
-                    if solution_residual_samples is not None:
-                        solution_residuals_by_index[input_index] = solution_residual_samples[batch_index]
-
-            for i, (input_key, input_path) in enumerate(input_batch):
-                if i in inputs_by_index:
-                    one_input = inputs_by_index[i]
-                    one_solution = solutions_by_index.get(i)
-                    one_solution_residual = solution_residuals_by_index.get(i)
-
-                    if format == "h5":
-                        if one_input is not None:
-                            save_h5(one_input, input_path / "input.h5", mode="w")
-                        if one_solution is not None:
-                            save_h5(one_solution, input_path / "solution.h5", mode="w")
-                        if one_solution_residual is not None:
-                            save_h5(one_solution_residual, input_path / "solution_residual.h5", mode="w")
-                    else:
-                        raise RoutineError(f"Save format '{format}' not recognized")
-
-                else:
-                    if format != "h5":
-                        raise RoutineError(f"Save format '{format}' not recognized")
-                    one_input = load_h5({}, input_path / "input.h5", jax=True)
-                    solution_path = input_path / "solution.h5"
-                    one_solution = load_h5({}, solution_path, jax=True) if solution_path.exists() else None
-
-                output_batch: list[tuple[Key, Path]] = []
-                skip = 'existing' if write_policy == 'reuse' else None
-
-                for output_key, output_dir in self._gen_output_keys(input_key, input_path, skip=skip):
-                    if len(output_batch) < self.batch_size:
-                        output_batch.append((output_key, output_dir))
-                        continue
-
-                    output_keys, output_paths = zip(*output_batch)
-                    _save_outputs(
-                        sample_outputs,
-                        sample_conditions,
-                        one_input,
-                        one_solution,
-                        output_keys,
-                        output_paths,
-                        evaluate,
+    def _output_key(self, input_key: Key, index: int) -> Key:
+        base = (
+            jax.random.fold_in(input_key, self.output_seed)
+            if self.mix_output_seed
+            else jax.random.key(self.output_seed)
         )
-                    output_batch.clear()
-                    output_batch.append((output_key, output_dir))
-
-                if output_batch:
-                    output_keys, output_paths = zip(*output_batch)
-                    _save_outputs(
-                        sample_outputs,
-                        sample_conditions,
-                        one_input,
-                        one_solution,
-                        output_keys,
-                        output_paths,
-                        evaluate,
-        )
-
-
-            input_batch.clear()
-        
-        path = Path(path)
-
-        if write_policy == 'error' and path.exists():
-            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
-
-        path.mkdir(parents=True, exist_ok=True)
-
-        functions = self._functions(path, batched=True)
-        sample_inputs = functions['sample_inputs']
-        solve = functions['solve']
-        sample_outputs = functions['sample_outputs']
-        sample_conditions = functions['sample_conditions']
-        evaluate_solution = functions['evaluate']
-        evaluate = functions['evaluate_outputs']
-
-        input_batch: list[tuple[Key, Path]] = []
-
-        for input_key, input_dir in gen_keys(indices, self.input_seed, path=path):
-            if len(input_batch) < self.batch_size:
-                input_batch.append((input_key, input_dir))
-                continue
-
-            _process_input_batch(
-                input_batch,
-                sample_inputs,
-                solve,
-                evaluate_solution,
-                sample_outputs,
-                sample_conditions,
-                evaluate,
-        )
-            input_batch.append((input_key, input_dir))
-
-        _process_input_batch(
-            input_batch,
-            sample_inputs,
-            solve,
-            evaluate_solution,
-            sample_outputs,
-            sample_conditions,
-            evaluate,
-        )
-
-
-type ImplicitSampleRef = tuple[Path, Path, Literal["output", "solution"]]
-
-
-class LoadImplicitModel(LoadDataConfig[ImplicitSampleRef]):
-    """
-    File-based load configuration for implicit-model datasets corresponding to `GenImplicitModel`.
-
-    :param max_samples: maximum loaded samples per epoch (defaults to all)
-    :param max_input_samples: maximum loaded input samples  (defaults to all)
-    :param max_outputs_per_input: maximum loaded output samples below each input sample  (defaults to all)
-    :param skip_input: decide whether to skip a particular input sample when loading
-    :param skip_output: decide whether to skip a particular output sample when loading
-    :param load_solution: whether to include ``solution.h5`` and ``solution_residual.h5`` as an extra
-        sample for each input (defaults to ``True``)
-    :param conditions: how to load output ``conditions.h5`` files: ``"ignore"`` skips them,
-        ``"include"`` adds them as a separate ``conditions`` field, and ``"merge"`` merges them into
-        ``inputs`` with condition values overriding matching paths (defaults to ``"include"``)
-    :param solution_only: whether to load only ``solution.h5`` and skip all output samples (defaults to ``False``)
-    """
-
-    max_samples: PositiveInt | None = None
-    max_input_samples: PositiveInt | None = None
-    max_outputs_per_input: PositiveInt | None = None
-    skip_input: Callable[[Path], bool] | None = None
-    skip_output: Callable[[Path], bool] | None = None
-    load_solution: bool = True
-    conditions: SUPPORTED_CONDITIONS = "include"
-    solution_only: bool = False
-
-    @model_validator(mode="after")
-    def _validate_solution_flags(self) -> LoadImplicitModel:
-        """Validate solution-loading mode flags."""
-        if self.solution_only and not self.load_solution:
-            raise ValueError("solution_only=True requires load_solution=True.")
-        return self
-
-    @staticmethod
-    def walk_sample_directories(
-        root: Path,
-        skip_input: Callable[[Path], bool] | None = None,
-        skip_output: Callable[[Path], bool] | None = None,
-        load_solution: bool = True,
-        solution_only: bool = False,
-    ) -> Generator[ImplicitSampleRef, None, None]:
-        """Walk a nested input/output directory structure generated by `gen_keys` via `DataGeneration`."""
-        if skip_input is None:
-            skip_input = lambda p: False
-        if skip_output is None:
-            skip_output = lambda p: False
-
-        for input_seed_dir in sorted(root.iterdir()):
-            if not input_seed_dir.is_dir() or not input_seed_dir.name.startswith("seed_"):
-                continue
-
-            for input_sample_dir in sorted(input_seed_dir.iterdir()):
-                if (not input_sample_dir.is_dir() or
-                    not input_sample_dir.name.startswith("sample_") or
-                    skip_input(input_sample_dir) or
-                    _is_failed_sample_dir(input_sample_dir)):
-                    continue
-
-                if load_solution and (input_sample_dir / "solution.h5").exists():
-                    yield input_sample_dir, input_sample_dir, "solution"
-
-                if solution_only:
-                    continue
-
-                for output_seed_dir in sorted(input_sample_dir.iterdir()):
-                    if not output_seed_dir.is_dir() or not output_seed_dir.name.startswith("seed_"):
-                        continue
-
-                    for output_sample_dir in sorted(output_seed_dir.iterdir()):
-                        if (not output_sample_dir.is_dir() or
-                            not output_sample_dir.name.startswith("sample_") or
-                            skip_output(output_sample_dir) or
-                            _is_failed_sample_dir(output_sample_dir)):
-                            continue
-
-                        yield input_sample_dir, output_sample_dir, "output"
-
-    def discover_sample_refs(self, root: Path) -> list[ImplicitSampleRef]:
-        """Discover nested implicit-model input/output sample paths."""
-        return list(
-            self.walk_sample_directories(
-                root,
-                skip_input=self.skip_input,
-                skip_output=self.skip_output,
-                load_solution=self.load_solution,
-                solution_only=self.solution_only,
-            )
-        )
-
-    def select_epoch_refs(self, refs: Sequence[ImplicitSampleRef], indices: jax.Array) -> list[ImplicitSampleRef]:
-        """Select a global shuffled subset of implicit samples subject to epoch-level caps."""
-        selected_refs: list[ImplicitSampleRef] = []
-        unique_inputs: set[Path] = set()
-        outputs_per_input: dict[Path, int] = {}
-
-        for index in indices:
-            sample_ref = refs[int(index)]
-            input_path, _, _ = sample_ref
-
-            next_total = len(selected_refs) + 1
-            next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
-            next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
-
-            if self.max_samples is not None and next_total > self.max_samples:
-                break
-            if self.max_input_samples is not None and next_input_total > self.max_input_samples:
-                continue
-            if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
-                continue
-
-            selected_refs.append(sample_ref)
-            unique_inputs.add(input_path)
-            outputs_per_input[input_path] = next_outputs_per_input
-
-        return selected_refs
-
-    def count_epoch_refs(self, refs: Sequence[ImplicitSampleRef], indices: jax.Array) -> int:
-        """Count a global shuffled subset of implicit samples subject to epoch-level caps."""
-        selected_count = 0
-        unique_inputs: set[Path] = set()
-        outputs_per_input: dict[Path, int] = {}
-
-        for index in indices:
-            sample_ref = refs[int(index)]
-            input_path, _, _ = sample_ref
-
-            next_total = selected_count + 1
-            next_input_total = len(unique_inputs) + int(input_path not in unique_inputs)
-            next_outputs_per_input = outputs_per_input.get(input_path, 0) + 1
-
-            if self.max_samples is not None and next_total > self.max_samples:
-                break
-            if self.max_input_samples is not None and next_input_total > self.max_input_samples:
-                continue
-            if self.max_outputs_per_input is not None and next_outputs_per_input > self.max_outputs_per_input:
-                continue
-
-            selected_count += 1
-            unique_inputs.add(input_path)
-            outputs_per_input[input_path] = next_outputs_per_input
-
-        return selected_count
-
-    def load_sample(self, ref: ImplicitSampleRef) -> PyTree:
-        """Load one implicit-model sample from disk."""
-        input_path, output_path, sample_kind = ref
-        sample: dict[str, PyTree] = {}
-
-        input_file = input_path / "input.h5"
-        if input_file.exists():
-            sample["inputs"] = load_h5({}, input_file, jax=False)
-
-        output_file = output_path / ("solution.h5" if sample_kind == "solution" else "output.h5")
-        if output_file.exists():
-            sample["outputs"] = load_h5({}, output_file, jax=False)
-
-        conditions_file = output_path / "conditions.h5"
-        if self.conditions != "ignore" and sample_kind == "output" and conditions_file.exists():
-            loaded_conditions = load_h5({}, conditions_file, jax=False)
-            if self.conditions == "include":
-                sample["conditions"] = loaded_conditions
-            else:
-                sample["inputs"] = pytree_merge(sample.get("inputs"), loaded_conditions)
-
-        residual_name = "solution_residual.h5" if sample_kind == "solution" else "residual.h5"
-        residual_file = output_path / residual_name
-        if residual_file.exists():
-            sample["residuals"] = load_h5({}, residual_file, jax=False)
-
-        return sample
+        return jax.random.fold_in(base, index)
 
 
 class GenSource(GenGraph):
-    """
-    Sampling configuration for a plain source node in a FunctionGraph.
+    """Generate indexed source samples with optional per-sample failure isolation."""
 
-    :ivar throw: whether sample_source failures should propagate immediately
-    """
-
-    samples: int
+    samples: NonNegativeInt
     seed: int
     throw: bool = True
     _required_methods: list[str] = PrivateAttr(default=["sample_source"])
 
-    def _generate_serial(self, path, indices, format, write_policy):
-        """Generate source node data in serial."""
-        path = Path(path)
-        failed_dirs: set[Path] = set()
-        failed_cases = 0
 
-        def _record_failure(sample_dir: Path, message: str, exc: BaseException) -> None:
-            nonlocal failed_cases
-            if sample_dir not in failed_dirs:
-                failed_dirs.add(sample_dir)
-                failed_cases += 1
-            _log_sample_failure(sample_dir, message, exc)
-
-        if write_policy == "error" and path.exists():
-            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
-
-        path.mkdir(parents=True, exist_ok=True)
-
-        sample_source = self._functions(path, batched=False)['sample_source']
-        skip = (
-            lambda p: (Path(p) / "source.h5").exists()
-            if write_policy == "reuse"
-            else False
-        )
-
-        for input_key, input_dir in gen_keys(indices, self.seed, path=path):
-            if skip(input_dir):
-                continue
-
-            if format != "h5":
-                raise RoutineError(f"Save format '{format}' not recognized.")
-
-            if self.throw:
-                save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
-            else:
-                try:
-                    save_h5(sample_source(input_key), input_dir / "source.h5", mode="w")
-                except Exception as exc:  # noqa: BLE001
-                    _record_failure(input_dir, f"Failed to sample source at {input_dir}", exc)
-
-
-        if failed_cases:
-            logger.debug(f"Source generation completed with {failed_cases} failed cases at {path}")
-
-    def _generate_batch(self, path, indices, format, write_policy):
-        """Generate source node data in batches using vmap."""
-        if not self.throw:
-            logger.warning(
-                "GenSource.throw=False requires per-sample failure handling, "
-                "so batch generation falls back to serial execution."
-            )
-            return self._generate_serial(path, indices, format, write_policy)
-
-        def _process_batch(batch, sample_source):
-            if not batch:
-                return
-            
-            input_keys, input_paths = zip(*batch)
-            inputs = jax.device_get(sample_source(pytree_stack(input_keys)))
-
-            for one_input, one_path in zip(pytree_iter(inputs), input_paths):
-                if format == "h5":
-                    save_h5(one_input, one_path / "source.h5", mode="w")
-                else:
-                    raise RoutineError(f"Save format '{format}' not recognized.")
-
-        
-        path = Path(path)
-
-        if write_policy == "error" and path.exists():
-            raise RoutineError(f"Dataset already exists at {path} and policy='error'")
-
-        path.mkdir(parents=True, exist_ok=True)
-
-        sample_source = self._functions(path, batched=True)['sample_source']
-        skip = (
-            lambda p: (Path(p) / "source.h5").exists()
-            if write_policy == "reuse"
-            else False
-        )
-
-        batch: list[tuple[Key, Path]] = []
-
-        for input_key, input_dir in gen_keys(indices, self.seed, path=path):
-            if skip(input_dir):
-                continue
-
-            if len(batch) < self.batch_size:
-                batch.append((input_key, input_dir))
-                continue
-
-            _process_batch(batch, sample_source)
-            batch.clear()
-            batch.append((input_key, input_dir))
-
-        _process_batch(batch, sample_source)
+@dataclass
+class _GeneratedBatch:
+    records: list[Record]
+    fatal: str | None = None
 
 
 @lru_cache(maxsize=4)
 def _generation_worker(identity: str, configuration: str) -> GenGraph:
-    """Keep reconstructed models and compiled functions local to each worker."""
     import romjax
 
-    return romjax.load(configuration)
+    generator = romjax.load(configuration)
+    roles = ("source",) if isinstance(generator, GenSource) else ("inputs", "outputs", "conditions")
+    for model in generator.graph.edges.values():
+        _resolve_model_samplers(model, roles)
+    return generator
 
 
 @dataclass
 class _GenerationWorker(TaskWorker):
     generator: GenGraph | None
     path: Path
-    format: str
-    write_policy: str
-    configuration: str = ''
+    configuration: str = ""
 
-    def prepare(self, *, remote: bool) -> "_GenerationWorker":
+    def prepare(self, *, remote: bool) -> _GenerationWorker:
         import romjax
 
-        generator = self.generator
-        generator._compiled = {}
-        prepared = self
         if remote:
             try:
-                text = romjax.YamlLoader.dump(generator, _preserve_yaml_sources=True, _preserve_model_types=True)
+                text = romjax.YamlLoader.dump(self.generator, _preserve_yaml_sources=True, _preserve_model_types=True)
                 restored = romjax.load(text)
-                if type(restored) is not type(generator):
-                    raise TypeError('Generator type changed during reconstruction.')
                 restored._validate_required_methods(self.path)
             except Exception as exc:
-                message = f'Cannot reconstruct {type(generator).__name__} for remote execution: {exc}'
-                raise ExecutionError(message) from exc
-            prepared = _GenerationWorker(None, self.path, self.format, self.write_policy, text)
-        else:
-            generator._functions(self.path)
-        self.path.mkdir(parents=True, exist_ok=True)
-        return prepared
+                raise ExecutionError(f"Cannot reconstruct {type(self.generator).__name__}: {exc}") from exc
+            return _GenerationWorker(None, self.path, text)
+        self.generator._compiled.clear()
+        roles = ("source",) if isinstance(self.generator, GenSource) else ("inputs", "outputs", "conditions")
+        _resolve_model_samplers(self.generator._edge_from_path(self.path), roles)
+        return self
 
-    def run(self, indices: tuple[int, ...], context: TaskContext) -> None:
-        generator = self.generator
-        if generator is None:
-            try:
-                generator = _generation_worker(context.run_id, self.configuration)
-            except Exception as exc:
-                raise ExecutionError(f'Failed to initialize generation worker: {exc}') from exc
-        if generator.batch_size > 1 and generator.throw:
-            generator._generate_batch(self.path, indices, self.format, self.write_policy)
+    def run(self, plans: Sequence[dict[str, Any]], context: TaskContext) -> _GeneratedBatch:
+        generator = self.generator or _generation_worker(context.run_id, self.configuration)
+        return generator._compute(self.path, plans)
+
+
+class LoadDataConfig[T: Any](BaseModel, ABC):
+    """Batch loading with all-or-none epoch caching.
+
+    :param batch_size: samples returned per batch
+    :param cache_policy: none loads one batch; epoch retains every encountered sample
+    :param cache_storage: host or device placement for cached samples
+    :param stack_batch: explicitly request a stacked PyTree instead of sample lists
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    batch_size: PositiveInt = 16
+    shuffle_seed: int = 0
+    max_epochs: PositiveInt | None = None
+    cache_policy: Literal["none", "epoch"] = "none"
+    cache_storage: Literal["host", "device"] = "host"
+    stack_batch: bool = False
+    _cache_entries: dict[Any, PyTree] = PrivateAttr(default_factory=dict)
+    _stores: dict[Path, H5Store] = PrivateAttr(default_factory=dict)
+    _store_versions: dict[Path, tuple] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_cache_limits(cls, value):
+        if isinstance(value, Mapping) and {"cache_max_items", "cache_max_bytes"} & value.keys():
+            raise ValueError("Cache limits were removed; use cache_policy=none or epoch.")
+        return value
+
+    @abstractmethod
+    def discover_sample_refs(self, root: Path) -> list[T]:
+        """Discover references from index metadata."""
+        raise NotImplementedError
+
+    def _store(self, root: Path, *, refresh: bool = False) -> H5Store:
+        root = Path(root).resolve()
+        if refresh:
+            version = tuple(
+                (path.name, stat.st_mtime_ns, stat.st_size)
+                for path in sorted(root.glob("*.h5"))
+                for stat in [path.stat()]
+            )
+            if root in self._stores and self._store_versions.get(root) != version:
+                del self._stores[root]
+                self._cache_entries = {ref: value for ref, value in self._cache_entries.items() if ref.root != root}
+            self._store_versions[root] = version
+        if root not in self._stores:
+            self._stores[root] = H5Store(root)
+        return self._stores[root]
+
+    def select_epoch_refs(self, refs: Sequence[T], indices: np.ndarray) -> list[T]:
+        """Select the fixed pool before epoch reshuffling."""
+        return [refs[int(index)] for index in indices]
+
+    def count_epoch_refs(self, refs: Sequence[T], indices: np.ndarray) -> int:
+        """Count selected references."""
+        return len(self.select_epoch_refs(refs, indices))
+
+    def _read_samples(self, refs: Sequence[SampleRef]) -> list[PyTree]:
+        result = [None] * len(refs)
+        by_root = {}
+        for i, ref in enumerate(refs):
+            by_root.setdefault(ref.root, []).append((i, ref))
+        for root, items in by_root.items():
+            values = self._store(root).read_batch(
+                [ref for _, ref in items], include_conditions=getattr(self, "conditions", None) != "ignore"
+            )
+            for (i, _), sample in zip(items, values, strict=True):
+                result[i] = sample
+        return result
+
+    def load_sample(self, ref: SampleRef) -> PyTree:
+        """Load an individual sample through the same bulk reader."""
+        return self._read_samples([ref])[0]
+
+    def load_batch(self, refs: Sequence[SampleRef]) -> PyTree | list[PyTree]:
+        """Bulk-read cache misses and restore requested sample order."""
+        if self.cache_policy == "none":
+            samples = self._read_samples(refs)
         else:
-            generator._generate_serial(self.path, indices, self.format, self.write_policy)
+            missing = list(dict.fromkeys(ref for ref in refs if ref not in self._cache_entries))
+            loaded = self._read_samples(missing)
+            for ref, sample in zip(missing, loaded, strict=True):
+                self._cache_entries[ref] = jax.device_put(sample) if self.cache_storage == "device" else sample
+            samples = [self._cache_entries[ref] for ref in refs]
+        if self.stack_batch and samples:
+            try:
+                return pytree_stack(samples)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Cannot stack incompatible sample schemas/shapes; use stack_batch=False.") from exc
+        return samples
+
+
+type ImplicitSampleRef = SampleRef
+
+
+class LoadImplicitModel(LoadDataConfig[SampleRef]):
+    """Select/load implicit solutions and sampled outputs from flat HDF5 indices."""
+
+    max_samples: PositiveInt | None = None
+    max_input_samples: PositiveInt | None = None
+    max_outputs_per_input: PositiveInt | None = None
+    skip_input: Callable[[SampleRef], bool] | None = None
+    skip_output: Callable[[SampleRef], bool] | None = None
+    load_solution: bool = True
+    conditions: SUPPORTED_CONDITIONS = "include"
+    solution_only: bool = False
+
+    @model_validator(mode="after")
+    def _validate_solution_flags(self) -> LoadImplicitModel:
+        if self.solution_only and not self.load_solution:
+            raise ValueError("solution_only=True requires load_solution=True.")
+        return self
+
+    def discover_sample_refs(self, root: Path) -> list[SampleRef]:
+        """Read indices and apply each input predicate once to its parent reference."""
+        store = self._store(root, refresh=True)
+        refs = store.discover()
+        skipped = set()
+        if self.skip_input is not None:
+            for seed, index in dict.fromkeys(ref.input_id for ref in refs):
+                if self.skip_input(store.reference(seed, index, "input")):
+                    skipped.add((seed, index))
+        return [
+            ref
+            for ref in refs
+            if ref.input_id not in skipped
+            and (
+                (ref.kind == "solution" and self.load_solution)
+                or (
+                    ref.kind == "output"
+                    and not self.solution_only
+                    and (not self.skip_output or not self.skip_output(ref))
+                )
+            )
+        ]
+
+    def select_epoch_refs(self, refs: Sequence[SampleRef], indices: np.ndarray) -> list[SampleRef]:
+        """Select a reproducible pool with global input/output/sample caps."""
+        selected, inputs, outputs = [], set(), {}
+        for index in indices:
+            ref = refs[int(index)]
+            if self.max_samples is not None and len(selected) >= self.max_samples:
+                break
+            if (
+                self.max_input_samples is not None
+                and ref.input_id not in inputs
+                and len(inputs) >= self.max_input_samples
+            ):
+                continue
+            if self.max_outputs_per_input is not None and outputs.get(ref.input_id, 0) >= self.max_outputs_per_input:
+                continue
+            selected.append(ref)
+            inputs.add(ref.input_id)
+            outputs[ref.input_id] = outputs.get(ref.input_id, 0) + 1
+        return selected
+
+    def _read_samples(self, refs: Sequence[SampleRef]) -> list[PyTree]:
+        samples = super()._read_samples(refs)
+        for sample in samples:
+            if self.conditions == "ignore":
+                sample.pop("conditions", None)
+            elif self.conditions == "merge" and "conditions" in sample:
+                sample["inputs"] = pytree_merge(sample.get("inputs"), sample.pop("conditions"))
+        return samples
+
+
+class LoadSource(LoadDataConfig[SampleRef]):
+    """Load source samples from flat HDF5 indices."""
+
+    max_samples: PositiveInt | None = None
+    skip_sample: Callable[[SampleRef], bool] | None = None
+
+    def discover_sample_refs(self, root: Path) -> list[SampleRef]:
+        """Discover complete source references."""
+        return [
+            ref
+            for ref in self._store(root, refresh=True).discover()
+            if ref.kind == "source" and (self.skip_sample is None or not self.skip_sample(ref))
+        ]
+
+    def count_epoch_refs(self, refs: Sequence[SampleRef], indices: np.ndarray) -> int:
+        """Count without invoking selection hooks during list preallocation."""
+        return len(indices) if self.max_samples is None else min(len(indices), self.max_samples)
+
+    def select_epoch_refs(self, refs: Sequence[SampleRef], indices: np.ndarray) -> list[SampleRef]:
+        """Apply the global source-sample cap."""
+        selected = super().select_epoch_refs(refs, indices)
+        return selected if self.max_samples is None else selected[: self.max_samples]
 
 
 def _validate_benchmark_generator(value: Any) -> GenImplicitModel | GenSource:
@@ -1329,7 +968,7 @@ class GenDataBenchmark(GenDataConfig):
         return label
 
     def bar_text(self, path: Path):
-        return "/".join(path.parts[-self.name_depth:])
+        return "/".join(path.parts[-self.name_depth :])
 
     def _metadata(self) -> dict[str, Any]:
         """Return cache metadata sufficient to reject incompatible reuse."""
@@ -1338,15 +977,17 @@ class GenDataBenchmark(GenDataConfig):
         generator = self.generator
         # Executor settings are tracked separately; presentation changes must
         # not invalidate an otherwise identical numerical benchmark.
-        numerical = generator.model_copy(update={'executor': None, 'name_depth': 3})
+        numerical = generator.model_copy(update={"executor": None, "name_depth": 3, "storage": None})
         serialized = romjax.YamlLoader.dump(numerical, sort_keys=True, _preserve_yaml_sources=True)
         return {
-            "schema_version": np.asarray(3),
-            "timing": np.bytes_('full_pass_wall'),
+            "schema_version": np.asarray(4),
+            "timing": np.bytes_("full_pass_wall"),
             "samples": np.asarray(int(self.samples)),
             "repeat": np.asarray(int(self.repeat)),
             "warmup": np.asarray(int(self.warmup)),
             "batch_size": np.asarray(int(generator.batch_size)),
+            "map_batch_size": np.asarray(int(generator.map_batch_size)),
+            "compute_policy": np.bytes_("lax_map_staged"),
             "generator": np.bytes_(type(generator).__name__),
             "generator_hash": np.bytes_(hashlib.sha256(serialized.encode()).hexdigest()),
         }
@@ -1372,93 +1013,77 @@ class GenDataBenchmark(GenDataConfig):
 
         def keys_for_input(input_key: Key) -> jax.Array:
             base = jax.random.fold_in(input_key, generator.output_seed) if generator.mix_output_seed else output_base
-            return jax.vmap(lambda index: jax.random.fold_in(base, index))(
-                np.arange(generator.outputs_per_input)
-            )
+            return jax.vmap(lambda index: jax.random.fold_in(base, index))(np.arange(generator.outputs_per_input))
 
         return jax.vmap(keys_for_input)(input_keys)
 
-    @staticmethod
-    def _implicit_callable(generator: GenImplicitModel, functions: Mapping[str, Callable | None]) -> Callable:
-        """Replay generation's separate numerical calls without saving their results."""
-        batched = generator.batch_size > 1
-
-        def workload(input_keys: PyTree, output_batches: tuple) -> PyTree:
-            inputs = functions['sample_inputs'](input_keys)
-            solutions = functions['solve'](inputs) if functions['solve'] is not None and inputs is not None else None
-            residuals = (functions['evaluate'](inputs, solutions)
-                         if functions['evaluate'] is not None and solutions is not None else None)
-            results = [inputs, solutions, residuals]
-            if not generator.outputs_per_input:
-                return results
-            count = len(output_batches)
-            input_values = ([None] * count if inputs is None else list(pytree_iter(inputs))) if batched else [inputs]
-            solution_values = (
-                ([None] * count if solutions is None else list(pytree_iter(solutions))) if batched else [solutions]
-            )
-            for one_input, solution, batches in zip(input_values, solution_values, output_batches):
-                for keys in batches:
-                    conditions = (functions['sample_conditions'](keys)
-                                  if functions['sample_conditions'] is not None else None)
-                    outputs = functions['sample_outputs'](keys, one_input, solution, conditions)
-                    evaluated = (functions['evaluate_outputs'](one_input, outputs)
-                                 if functions['evaluate_outputs'] is not None else None)
-                    results.extend((conditions, outputs, evaluated))
-            return results
-
-        return workload
-
     def _workload(self, path: Path) -> tuple[Callable[..., PyTree], tuple[tuple[Any, ...], ...]]:
-        """Prepare generation callables and deterministic key batches before timing."""
+        """Prepare the same mapped numerical kernels without persistence or array transport."""
         generator = self.generator
-        if generator.graph is None:
-            raise ValueError("Data-generation benchmarks require a generator graph.")
         generator._validate_required_methods(path)
-        functions = generator._functions(path)
-        batched = generator.batch_size > 1
+        model = generator._edge_from_path(path)
+        roles = ("source",) if isinstance(generator, GenSource) else ("inputs", "outputs", "conditions")
+        _resolve_model_samplers(model, roles)
         seed = generator.seed if isinstance(generator, GenSource) else generator.input_seed
         batches = self._input_batches(seed, generator.batch_size)
         if isinstance(generator, GenSource):
-            args = tuple((keys if batched else keys[0],) for keys in batches)
-            jax.block_until_ready(args)
-            return functions['sample_source'], args
+            return generator._kernel(path, "source", (), True), tuple((keys,) for keys in batches)
+        solve = hasattr(model, "solve") and not generator.skip_solve
+        evaluate = hasattr(model, "evaluate") and not generator.skip_evaluate
+        input_kernel = generator._kernel(path, "input", (True, solve, solve and evaluate), True)
+        output_kernel = generator._kernel(path, "output", (_has_custom_sample_conditions(model), True, evaluate), True)
 
-        args = []
-        for keys in batches:
-            output_keys = self._output_keys(generator, keys)
-            output_batches = (() if output_keys is None else tuple(
-                tuple(row[start:start + generator.batch_size] if batched else row[start]
-                      for start in range(0, generator.outputs_per_input, generator.batch_size))
-                for row in output_keys))
-            args.append((keys if batched else keys[0], output_batches))
+        def workload(keys, output_keys):
+            inputs, solutions, residuals = input_kernel(keys, None, None, None)
+            results = [inputs, solutions, residuals]
+            if output_keys is not None:
+                for i in range(len(keys)):
+                    one_input = jax.tree.map(lambda value: value[i], inputs)
+                    one_solution = jax.tree.map(lambda value: value[i], solutions)
+                    results.extend(output_kernel(output_keys[i], None, None, None, one_input, one_solution))
+            return results
+
+        args = tuple((keys, self._output_keys(generator, keys)) for keys in batches)
         jax.block_until_ready(args)
-        return self._implicit_callable(generator, functions), tuple(args)
+        return workload, args
 
     def _benchmark(
-        self, path: Path, executor: ExecutorConfig | None = None,
+        self,
+        path: Path,
+        executor: ExecutorConfig | None = None,
         jax_env: Mapping[str, str] | None = None,
     ) -> np.ndarray:
         """Measure each complete input pass through the selected executor."""
         executor = executor or self.generator.executor or ExecutorConfig()
-        executor = executor.model_copy(update={'show_progress': self.show_progress and executor.show_progress})
+        executor = executor.model_copy(update={"show_progress": self.show_progress and executor.show_progress})
         count = (self.samples + self.generator.batch_size - 1) // self.generator.batch_size
-        tasks = tuple(TaskSpec(str(index), f'batch {index + 1}/{count}', index,
-                               units=min(self.generator.batch_size, self.samples - index * self.generator.batch_size))
-                      for index in range(count))
+        tasks = tuple(
+            TaskSpec(
+                str(index),
+                f"batch {index + 1}/{count}",
+                index,
+                units=min(self.generator.batch_size, self.samples - index * self.generator.batch_size),
+            )
+            for index in range(count)
+        )
         durations = executor.execute_passes(
-            tasks, _BenchmarkWorker(self, Path(path).absolute()), warmup=self.warmup, repeat=self.repeat,
-            progress_bar={'title': self.bar_text(path)}, jax_env=jax_env,
+            tasks,
+            _BenchmarkWorker(self, Path(path).absolute()),
+            warmup=self.warmup,
+            repeat=self.repeat,
+            progress_bar={"title": self.bar_text(path)},
+            jax_env=jax_env,
         )
         return np.asarray(durations)
 
     def _executor_metadata(self, executor: ExecutorConfig, jax_env: Mapping[str, str] | None) -> str:
         """Describe timing-relevant settings without presentation options."""
         count = (self.samples + self.generator.batch_size - 1) // self.generator.batch_size
-        settings = executor.model_dump(mode='json', exclude={'show_progress', 'progress_bar'})
-        settings['workers'] = executor._pass_worker_count(count)
-        settings['jax_env'] = {
-            'JAX_ENABLE_X64': str(jax.config.jax_enable_x64).lower(),
-            'JAX_PLATFORMS': jax.config.jax_platforms,
+        settings = executor.model_dump(mode="json", exclude={"show_progress", "progress_bar"})
+        settings["workers"] = executor._pass_worker_count(count)
+        settings["jax_env"] = {
+            "JAX_ENABLE_X64": str(jax.config.jax_enable_x64).lower(),
+            "JAX_PLATFORMS": jax.config.jax_platforms,
             **(jax_env or {}),
         }
         return json.dumps(settings, sort_keys=True)
@@ -1474,7 +1099,11 @@ class GenDataBenchmark(GenDataConfig):
         self._generate(Path(path), format, write_policy, self.generator.executor or ExecutorConfig())
 
     def _generate(
-        self, path: Path, format: str, write_policy: str, executor: ExecutorConfig,
+        self,
+        path: Path,
+        format: str,
+        write_policy: str,
+        executor: ExecutorConfig,
         jax_env: Mapping[str, str] | None = None,
     ) -> None:
         """Collect or reuse one executor-specific hardware entry."""
@@ -1486,18 +1115,16 @@ class GenDataBenchmark(GenDataConfig):
         assert self.hardware is not None
         execution = self._executor_metadata(executor, jax_env)
         fingerprint = hashlib.sha256(execution.encode()).hexdigest()[:12]
-        label = f'{self.hardware}.{executor.kind}.{fingerprint}'
+        label = f"{self.hardware}.{executor.kind}.{fingerprint}"
         exists = label in cached
         metadata = self._metadata()
-        metadata['executor'] = np.bytes_(execution)
+        metadata["executor"] = np.bytes_(execution)
         if exists and write_policy == "error":
             raise RoutineError(f"Benchmark timings already exist for {label!r} at {cache_path}.")
         if exists and write_policy == "reuse":
             entry = cached[label]
             if not isinstance(entry, Mapping) or not self._metadata_matches(entry.get("_benchmark", {}), metadata):
-                raise RoutineError(
-                    f"Cached benchmark at {cache_path} is incompatible; use write_policy='overwrite'."
-                )
+                raise RoutineError(f"Cached benchmark at {cache_path} is incompatible; use write_policy='overwrite'.")
             return
 
         total = self._benchmark(path, executor=executor, jax_env=jax_env)
@@ -1514,7 +1141,7 @@ class GenDataBenchmark(GenDataConfig):
 class _BenchmarkWorker(TaskWorker[int, None]):
     benchmark: GenDataBenchmark | None
     path: Path
-    configuration: str = ''
+    configuration: str = ""
     workload: tuple[Callable, tuple] | None = None
 
     def prepare(self, *, remote: bool) -> _BenchmarkWorker:
@@ -1524,11 +1151,12 @@ class _BenchmarkWorker(TaskWorker[int, None]):
             return _BenchmarkWorker(self.benchmark, self.path, workload=self.benchmark._workload(self.path))
         try:
             configuration = romjax.YamlLoader.dump(
-                self.benchmark, _preserve_yaml_sources=True, _preserve_model_types=True)
+                self.benchmark, _preserve_yaml_sources=True, _preserve_model_types=True
+            )
             restored = romjax.load(configuration)
             restored.generator._validate_required_methods(self.path)
         except Exception as exc:
-            raise ExecutionError(f'Cannot reconstruct benchmark for remote execution: {exc}') from exc
+            raise ExecutionError(f"Cannot reconstruct benchmark for remote execution: {exc}") from exc
         return _BenchmarkWorker(None, self.path, configuration)
 
     def initialize(self, payloads: Sequence[int], context: TaskContext) -> None:
@@ -1540,72 +1168,6 @@ class _BenchmarkWorker(TaskWorker[int, None]):
     def run(self, payload: int, context: TaskContext) -> None:
         workload, batches = self.workload
         jax.block_until_ready(workload(*batches[payload]))
-
-
-class LoadSource(LoadDataConfig[Path]):
-    """
-    File-based load configuration for source-node datasets corresponding to `GenSource`.
-
-    :param max_samples: maximum loaded samples per epoch (defaults to all)
-    :param skip_sample: decide whether to skip a particular source sample when loading
-    """
-
-    max_samples: PositiveInt | None = None
-    skip_sample: Callable[[Path], bool] | None = None
-
-    @staticmethod
-    def walk_sample_directories(
-        root: Path,
-        skip_sample: Callable[[Path], bool] | None = None,
-    ) -> Generator[Path, None, None]:
-        """
-        Walk a seed/sample directory structure generated by `gen_keys` via `GenSource`.
-
-        :param root: Root directory containing seed/sample subdirectories.
-        :param skip_sample: Optional predicate for skipping sample directories.
-        :return: Generator yielding discovered sample directories.
-        """
-        if skip_sample is None:
-            skip_sample = lambda p: False
-
-        for seed_dir in sorted(root.iterdir()):
-            if not seed_dir.is_dir() or not seed_dir.name.startswith("seed_"):
-                continue
-
-            for sample_dir in sorted(seed_dir.iterdir()):
-                if (not sample_dir.is_dir() or
-                    not sample_dir.name.startswith("sample_") or
-                    skip_sample(sample_dir) or
-                    _is_failed_sample_dir(sample_dir)):
-                    continue
-
-                yield sample_dir
-
-    def discover_sample_refs(self, root: Path) -> list[Path]:
-        """
-        Discover source sample paths.
-
-        :param root: Dataset root directory.
-        :return: List of sample directories containing source data.
-        """
-        return list(self.walk_sample_directories(root, skip_sample=self.skip_sample))
-
-    def select_epoch_refs(self, refs: Sequence[Path], indices: jax.Array) -> list[Path]:
-        """Select a global shuffled subset of source samples subject to epoch-level caps."""
-        selected_refs = [refs[int(index)] for index in indices]
-        if self.max_samples is not None:
-            return selected_refs[: self.max_samples]
-        return selected_refs
-
-    def count_epoch_refs(self, refs: Sequence[Path], indices: jax.Array) -> int:
-        """Count a global shuffled subset of source samples subject to epoch-level caps."""
-        if self.max_samples is not None:
-            return min(len(indices), self.max_samples)
-        return len(indices)
-
-    def load_sample(self, ref: Path) -> PyTree:
-        """Load one source sample from disk."""
-        return load_h5({}, ref / "source.h5", jax=False)
 
 
 type NormAxes = int | Sequence[int] | None
@@ -1663,8 +1225,11 @@ class GenNormLeaf(BaseModel):
 
 
 def _is_gennorm_leaf_spec(value: Any) -> bool:
-    return isinstance(value, GenNormLeaf) or isinstance(value, str) or callable(value) or (
-        isinstance(value, Mapping) and "callable" in value
+    return (
+        isinstance(value, GenNormLeaf)
+        or isinstance(value, str)
+        or callable(value)
+        or (isinstance(value, Mapping) and "callable" in value)
     )
 
 
@@ -1804,9 +1369,7 @@ class _BuiltinNormAccumulator:
     def _check_shape(self, sample_leaf: Any) -> np.ndarray:
         arr = np.asarray(sample_leaf, dtype=np.float64)
         if tuple(arr.shape) != self.input_shape:
-            raise ValueError(
-                f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}."
-            )
+            raise ValueError(f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}.")
         return arr
 
     def _filter_array(self, arr: np.ndarray) -> np.ndarray:
@@ -1897,9 +1460,7 @@ class _CustomNormAccumulator:
     def update(self, sample_leaf: Any) -> None:
         arr = np.asarray(sample_leaf)
         if tuple(arr.shape) != self.input_shape:
-            raise ValueError(
-                f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}."
-            )
+            raise ValueError(f"Normalization leaf shape changed from {self.input_shape} to {tuple(arr.shape)}.")
         self.state = self.stats.update(self.state, sample_leaf)
 
     def finalize(self) -> dict[str, Any]:
@@ -2022,10 +1583,7 @@ class GenNorm(GenDataConfig):
         yield from pytree_iter(loaded)
 
     def _iter_samples(self) -> Generator[tuple[str, PyTree], None, None]:
-        ctxt = (
-            alive_bar(len(self.loader), title=self.filename)
-            if self.show_progress else _NullProgress()
-        )
+        ctxt = alive_bar(len(self.loader), title=self.filename) if self.show_progress else _NullProgress()
 
         with ctxt as bar:
             bar.text("Loading normalization samples...")
@@ -2069,14 +1627,11 @@ class GenNorm(GenDataConfig):
             )
         ]
         artifact_paths = {
-            dataset_name: self._artifact_path(root_path, str(dataset_name))
-            for dataset_name in dataset_names
+            dataset_name: self._artifact_path(root_path, str(dataset_name)) for dataset_name in dataset_names
         }
         existing_paths = [artifact_path for artifact_path in artifact_paths.values() if artifact_path.exists()]
         if write_policy == "error" and existing_paths:
-            raise RoutineError(
-                f"Normalization artifact already exists at {existing_paths[0]} and policy='error'"
-            )
+            raise RoutineError(f"Normalization artifact already exists at {existing_paths[0]} and policy='error'")
         if write_policy == "reuse" and existing_paths and len(existing_paths) == len(artifact_paths):
             return
 
@@ -2169,6 +1724,7 @@ class GenLatent(GenDataConfig):
     def _selected_paths(self) -> list[TreePath]:
         paths = list(self.gather_paths)
         if self.gather_template is not None:
+
             def _collect(template: PyTree, prefix: TreePath = ()) -> list[TreePath]:
                 if isinstance(template, Mapping):
                     paths: list[TreePath] = []
@@ -2231,16 +1787,13 @@ class GenLatent(GenDataConfig):
         return norm(sample)
 
     def bar_text(self, path: Path):
-        return "/".join(path.parts[-self.name_depth:])
+        return "/".join(path.parts[-self.name_depth :])
 
     def _iter_samples(self, path: Path | None = None) -> Generator[PyTree, None, None]:
         if path is None:
             path = Path(self.filename)
-        
-        ctxt = (
-            alive_bar(len(self.loader), title=self.bar_text(path))
-            if self.show_progress else _NullProgress()
-        )
+
+        ctxt = alive_bar(len(self.loader), title=self.bar_text(path)) if self.show_progress else _NullProgress()
 
         with ctxt as bar:
             bar.text("Loading compression samples...")
@@ -2272,9 +1825,9 @@ class GenLatent(GenDataConfig):
             raise RoutineError(f"Latent compression artifact already exists at {artifact_path} and policy='error'")
         if write_policy == "reuse" and artifact_path.exists():
             return
-        
+
         samples = list(self._iter_samples(artifact_path))
-        
+
         if hasattr(self.compression, "show_progress"):
             object.__setattr__(self.compression, "show_progress", self.show_progress)
         compression = self.compression.fit(samples)
@@ -2284,7 +1837,7 @@ class GenLatent(GenDataConfig):
 
         if hasattr(compression, "save_orbax"):
             compression.save_orbax(path)
-        
+
         latent_bounds = compression.latent_bounds()
         latent_normal = compression.latent_normal()
         manifest_path = artifact_path.with_suffix(".manifest.json")
@@ -2293,9 +1846,7 @@ class GenLatent(GenDataConfig):
             "latent_bounds": None
             if latent_bounds is None
             else [np.asarray(bounds).tolist() for bounds in latent_bounds],
-            "latent_normal": None
-            if latent_normal is None
-            else [np.asarray(stats).tolist() for stats in latent_normal],
+            "latent_normal": None if latent_normal is None else [np.asarray(stats).tolist() for stats in latent_normal],
         }
         manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
 
@@ -2327,7 +1878,7 @@ def _validate_gendata_pytree(template: PyTree) -> PyTree[GenDataConfig]:
         return tuple(_validate_gendata_pytree(value) for value in template)
     if isinstance(template, list):
         return [_validate_gendata_pytree(value) for value in template]
-    
+
     return template
 
 
@@ -2358,7 +1909,7 @@ def _validate_loaddata_pytree(template: PyTree) -> PyTree[LoadDataConfig]:
         return tuple(_validate_loaddata_pytree(value) for value in template)
     if isinstance(template, list):
         return [_validate_loaddata_pytree(value) for value in template]
-    
+
     return template
 
 
@@ -2381,6 +1932,7 @@ class DataGeneration(Routine):
     """
 
     root: Path
+    storage: H5StorageConfig = Field(default_factory=H5StorageConfig)
     executor: Annotated[ExecutorConfig, BeforeValidator(ExecutorConfig.from_dict)] = Field(
         default_factory=ExecutorConfig
     )
@@ -2467,9 +2019,10 @@ class DataGeneration(Routine):
 
             datasets = _validate_gendata_pytree(romjax.load(romjax.YamlSource(merged, base_path)))
             self._bind_graph_to_datasets(datasets)
-            if not any(isinstance(leaf, GenDataConfig) for leaf in jax.tree.leaves(
-                datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)
-            )):
+            if not any(
+                isinstance(leaf, GenDataConfig)
+                for leaf in jax.tree.leaves(datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig))
+            ):
                 raise ValueError("Expanded data-generation configuration does not contain a supported data generator.")
             yield self.root.joinpath(*parts), datasets
 
@@ -2477,7 +2030,14 @@ class DataGeneration(Routine):
         if isinstance(dataset, GenImplicitModel | GenSource | GenDataBenchmark):
             format, policy = dataset._validate_format_and_policy(self.format, self.write_policy)
             generator = dataset.generator if isinstance(dataset, GenDataBenchmark) else dataset
-            dataset._generate(path, format, policy, generator.executor or self.executor, self._jax_child_env())
+            dataset._generate(
+                path,
+                format,
+                policy,
+                generator.executor or self.executor,
+                self._jax_child_env(),
+                **({} if isinstance(dataset, GenDataBenchmark) else {"storage": self.storage}),
+            )
         else:
             dataset.generate(path, format=self.format, write_policy=self.write_policy)
 
@@ -2496,7 +2056,7 @@ class DataGeneration(Routine):
         assert self.datasets is not None
         for path, dataset in pytree_path_iter(self.datasets, is_leaf=lambda leaf: isinstance(leaf, GenDataConfig)):
             self._generate_dataset(dataset, self.root / "/".join(path))
-        
+
         return 0
 
 
@@ -2536,45 +2096,34 @@ class DataLoader(BaseModel):
             dataset_dirs = sorted(d for d in self.root.iterdir() if d.is_dir() and not d.name.startswith("."))
 
             def _infer_dataset_dir(ds_dir: Path) -> LoadDataConfig | None:
-                """If nested seed/sample, then ImplicitModel. If flat seed/sample, then Source. Can't tell otherwise."""
-                seed_dirs = [d for d in ds_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-
-                if len(seed_dirs) > 0 and all("seed_" in d.name for d in seed_dirs):
-                    # Just check the first seed directory
-                    sample_dirs = [
-                        d
-                        for d in seed_dirs[0].iterdir()
-                        if d.is_dir() and not d.name.startswith(".") and not _is_failed_sample_dir(d)
-                    ]
-
-                    if len(sample_dirs) > 0 and all("sample_" in d.name for d in sample_dirs):
-                        if all((s / "input.h5").exists() and (s / "solution.h5").exists() for s in sample_dirs):
-                            return LoadImplicitModel()
-                        if all((s / "source.h5").exists() for s in sample_dirs):
-                            return LoadSource()
-                
+                store = H5Store(ds_dir)
+                store.discover()
+                if store.kind == "implicit":
+                    return LoadImplicitModel()
+                if store.kind == "source":
+                    return LoadSource()
                 return None
 
             datasets = {}
             for ds_dir in dataset_dirs:
                 if (load_cfg := _infer_dataset_dir(ds_dir)) is not None:
                     datasets[ds_dir.name] = load_cfg
-            
+
             if datasets:
                 self.datasets = datasets
-        
+
         return self
 
     def _iter_datasets(
-        self, 
-        train_step: int = 0, 
-        refs_only: bool = False, 
+        self,
+        train_step: int = 0,
+        refs_only: bool = False,
         max_epochs: int | None = None,
     ) -> Generator[dict[str, PyTree], None, None]:
         """
         Walk over all available datasets at once, using available configurations to limit sample sizes.
         Yields a mapping of dataset names to PyTree batches of data.
-        
+
         :param train_step: initialize from this training step (default: 0)
         :param refs_only: only return the sample paths (don't load from disk)
         :param max_epochs: override local dataset settings for max_epochs
@@ -2600,13 +2149,12 @@ class DataLoader(BaseModel):
                 raise ValueError(f"No samples selected for dataset '{ds_name}' in {ds_root}")
 
             ds_totals[ds_name] = len(ds_selected_refs[ds_name])
-            ds_cfg.configure_epoch_cache(ds_totals[ds_name])
             ds_config[ds_name] = ds_cfg
 
         # Advance dataset epoch and cursor indices based on current training step
         # Epoch - number of iterations through an entire dataset
         # Cursor - starting index within a dataset for the next mini-batch
-        
+
         ds_epochs = {name: 0 for name in ds_config}
         ds_cursors = {name: 0 for name in ds_config}
         ds_active = {name: True for name in ds_config}
@@ -2657,7 +2205,8 @@ class DataLoader(BaseModel):
                 epoch_refs = ds_selected_refs[name]
                 batch_size = ds_config[name].batch_size
                 batch_paths = [
-                    epoch_refs[int(index)] for index in ds_indices[name][ds_cursors[name]:ds_cursors[name] + batch_size]
+                    epoch_refs[int(index)]
+                    for index in ds_indices[name][ds_cursors[name] : ds_cursors[name] + batch_size]
                 ]
                 ds_batch[name] = batch_paths if refs_only else ds_config[name].load_batch(batch_paths)
                 ds_cursors[name] += len(batch_paths)
@@ -2666,7 +2215,7 @@ class DataLoader(BaseModel):
                     _refresh_epoch(name)
 
             yield ds_batch
-    
+
     def set_iterator(self, train_step: int = 0):
         """Set the iterator based on the current train step."""
         self._iterator = self._iter_datasets(train_step)
@@ -2676,12 +2225,12 @@ class DataLoader(BaseModel):
         if self._iterator is None:
             self.set_iterator()
         return next(self._iterator)
-    
+
     def __iter__(self):
         """Restart iteration from 0."""
         self.set_iterator()
         return self
-    
+
     def __len__(self):
         """Return the number of mini-batches yielded in one epoch.
 

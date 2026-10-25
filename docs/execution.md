@@ -22,7 +22,7 @@ execution uses one, MPI uses its worker count, and hybrid uses its slot count.
 Each routine prepares domain payloads and handles results:
 
 - **DataGeneration:** one GenImplicitModel or GenSource input batch, including all
-  output batches for those inputs. Numerical functions retain JIT/vmap batching.
+  output batches for those inputs. Numerical functions use JIT/lax.map with independent map_batch_size (default 0 for full vectorization). Workers return host arrays; only the controller reads/writes target dataset files.
   Datasets and expanded configurations run in sequence.
 - **GridSearch:** one case specification, run in an isolated subprocess. Reused
   cases produce immediate results and still invoke result handlers.
@@ -228,9 +228,11 @@ Non-reconstructible configurations fail before submission. `__parent__/` paths
 retain the declaring file's context, including separately loaded graph/sampler
 YAML files. Workers need the same configuration, artifact, and dataset filesystem.
 
-Each batch writes only its assigned samples. Completed data remains reusable after
+Each batch computes only its assigned families; the controller commits returned results to the indexed HDF5 shards. Completed data remains reusable after
 a stopped run. With `throw=False`, per-sample failure handling remains inside each
 generation task; infrastructure failures still propagate.
 
 The old routine-specific executor config classes, `run_cases`, `open`,
 `ExecutionSession`, and public completion/progress helpers have been removed.
+
+See [data storage](data-storage.md) for the independent task, compute, and file capacities and controller-only writing.

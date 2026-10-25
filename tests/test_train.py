@@ -33,7 +33,7 @@ from romjax.train import (
     resolve_orbax_params,
 )
 from romjax.tree import TreeRef, is_shape_dtype, pytree_norm, pytree_resolve_refs
-from romjax.utils import save_h5
+from tests.storage_helpers import write_component as save_h5
 
 train_module = importlib.import_module("romjax.train")
 
@@ -331,14 +331,12 @@ def _tree_allclose(lhs, rhs) -> bool:
 def _write_graph_dataset(root: Path, dataset_name: str, *, n_inputs: int = 2, n_outputs: int = 2) -> None:
     for input_idx in range(n_inputs):
         input_dir = root / dataset_name / "seed_0" / f"sample_{input_idx}"
-        input_dir.mkdir(parents=True, exist_ok=True)
         save_h5({"x": np.asarray(10 * input_idx + 1)}, input_dir / "input.h5", mode="w")
         save_h5({"y": np.asarray(10 * input_idx + 2)}, input_dir / "solution.h5", mode="w")
         save_h5({"r": np.asarray(-(10 * input_idx + 2))}, input_dir / "solution_residual.h5", mode="w")
 
         for output_idx in range(n_outputs):
             output_dir = input_dir / "seed_0" / f"sample_{output_idx}"
-            output_dir.mkdir(parents=True, exist_ok=True)
             save_h5({"y": np.asarray(100 * input_idx + output_idx)}, output_dir / "output.h5", mode="w")
             save_h5({"r": np.asarray(-100 * input_idx - output_idx)}, output_dir / "residual.h5", mode="w")
 
@@ -346,7 +344,6 @@ def _write_graph_dataset(root: Path, dataset_name: str, *, n_inputs: int = 2, n_
 def _write_source_dataset(root: Path, dataset_name: str, *, n_samples: int = 2) -> None:
     for sample_idx in range(n_samples):
         sample_dir = root / dataset_name / "seed_0" / f"sample_{sample_idx}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
         save_h5(
             {"x": np.asarray(1000 + sample_idx), "meta": {"i": np.asarray(sample_idx)}},
             sample_dir / "source.h5",
@@ -956,7 +953,7 @@ def test_train_recompiles_at_ramp_start_and_completes_scheduled_ramp(toy_graph: 
                     "batch_reduce": None,
                     "ramp_start": 2,
                     "ramp_duration": 3,
-                }
+                },
             ],
         ),
         init_params={"w": jnp.asarray(0.0)},
@@ -1022,7 +1019,6 @@ def test_train_recompiles_and_continues_for_scheduled_cyclic_path_terms() -> Non
     assert params["ab"]["w"] > 0.9
 
 
-
 def test_graph_init_params(toy_graph: FunctionGraph) -> None:
     train = Train(
         loss=GraphLoss(terms=[{"callable": "path_error", "path_a": ["toy", "toy"], "path_b": []}]),
@@ -1073,8 +1069,8 @@ def test_data_loader(tmp_path: Path) -> None:
             "alpha": {
                 "kind": "implicit",
                 "batch_size": 4,
-                "skip_input": lambda path: path.name == "sample_0",
-                "skip_output": lambda path: path.name == "sample_0",
+                "skip_input": lambda ref: ref.input_index == 0,
+                "skip_output": lambda ref: ref.output_index == 0,
                 "load_solution": False,
                 "max_epochs": 1,
             }
@@ -1170,9 +1166,8 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
         ],
         graph=toy_graph,
     )
-    expected_weighted = (
-        2.0 * np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2)
-        + 0.5 * np.mean(np.abs(0.5 - np.array([1.0, 2.0, 3.0])))
+    expected_weighted = 2.0 * np.mean((0.5 - np.array([1.0, 2.0, 3.0])) ** 2) + 0.5 * np.mean(
+        np.abs(0.5 - np.array([1.0, 2.0, 3.0]))
     )
     assert weighted(params, batch) == pytest.approx(expected_weighted)
     scaled_loss, (raw_terms, scaled_terms) = weighted(
@@ -1194,7 +1189,7 @@ def test_graph_loss(toy_graph: FunctionGraph) -> None:
     )
     recon_params = {"toy": {"weight": jnp.array(0.5), "bias": jnp.array(0.2)}}
     expected_reconstruction = np.mean((np.array([1.0, 2.0, 3.0]) - (0.5 * np.array([1.0, 2.0, 3.0]) + 0.2)) ** 2)
-    expected_regularization = 0.1 * float(pytree_norm(recon_params)**2)
+    expected_regularization = 0.1 * float(pytree_norm(recon_params) ** 2)
     assert reconstructed(recon_params, batch) == pytest.approx(expected_reconstruction + expected_regularization)
 
 
@@ -1453,10 +1448,10 @@ def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: 
             "bc": IdentityEdge(source="b", target="c", name="bc"),
             "galerkin": ImplicitIterativeGalerkin(
                 source="a",
-                    target="c",
-                    name="galerkin",
-                    path=["ab", "bc"],
-                    rank=3,
+                target="c",
+                name="galerkin",
+                path=["ab", "bc"],
+                rank=3,
             ),
         }
     )
@@ -1467,7 +1462,7 @@ def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: 
                 "module": {
                     "name": "LinearProjection",
                     "kwargs": {
-                            "latent": TreeRef(path=("edges", "galerkin", "rank")),
+                        "latent": TreeRef(path=("edges", "galerkin", "rank")),
                         "dof": 4,
                     },
                 }
@@ -1533,9 +1528,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
         assert ckptr.latest is not None
         assert ckptr.latest.step == max_steps
         params = ckptr.load_checkpointables(
-            abstract_checkpointables={
-                "params": {"toy": {"weight": jnp.array(0.0), "bias": jnp.array(0.0)}}
-            }
+            abstract_checkpointables={"params": {"toy": {"weight": jnp.array(0.0), "bias": jnp.array(0.0)}}}
         )["params"]
     assert float(params["toy"]["weight"]) == pytest.approx(1.0, abs=0.2)
     assert abs(float(params["toy"]["bias"])) < 0.2
@@ -1582,7 +1575,7 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
                 "target": 1.0,
                 "min_scale": 1e-6,
                 "max_scale": 1e6,
-                "normalize": True
+                "normalize": True,
             },
             graph=toy_graph,
         ),
@@ -1755,11 +1748,7 @@ def test_term_plot_shared_legend(
     term_axes = captured["axs"].ravel()[1:3]
     if color_cycle is not None:
         cmap = plt.get_cmap(color_cycle)
-        expected_colors = (
-            np.asarray(cmap.colors[:2])
-            if hasattr(cmap, "colors")
-            else cmap(np.linspace(0.0, 1.0, 2))
-        )
+        expected_colors = np.asarray(cmap.colors[:2]) if hasattr(cmap, "colors") else cmap(np.linspace(0.0, 1.0, 2))
         for ax in term_axes:
             np.testing.assert_allclose([line.get_color() for line in ax.lines], expected_colors)
 
