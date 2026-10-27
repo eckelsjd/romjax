@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
+    Field,
     PlainSerializer,
     PrivateAttr,
     SerializationInfo,
@@ -595,3 +596,27 @@ type WriteStream = Annotated[
     BeforeValidator(_resolve_stream_or_path),
     # AfterValidator(partial(require_attr, "write"))
 ]
+
+
+class DeferredThirdPartySpec(DictModel):
+    """A serializable third-party constructor evaluated explicitly at runtime.
+
+    :param name: fully qualified constructor name
+    :param args: positional constructor arguments, including nested specifications
+    :param kwargs: keyword constructor arguments, including nested specifications
+    """
+
+    name: str
+    args: list[Any] = Field(default_factory=list)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode='before')
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value
+        return _normalize_spec_data(value)
+
+    def build(self) -> Any:
+        """Construct the configured object using ThirdPartyType's recursive factory."""
+        return _construct_spec(dict(self))

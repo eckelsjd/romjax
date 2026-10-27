@@ -1,0 +1,4 @@
+!overrides:__parent__/serial.yml
+root: demo/optuna_study/output/process
+study_name: regression-process
+executor: {kind: process, max_workers: 4, max_in_flight: 4}

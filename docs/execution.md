@@ -236,3 +236,16 @@ The old routine-specific executor config classes, `run_cases`, `open`,
 `ExecutionSession`, and public completion/progress helpers have been removed.
 
 See [data storage](data-storage.md) for the independent task, compute, and file capacities and controller-only writing.
+
+## Adaptive Optuna studies
+
+`OptunaStudy` also uses `ExecutorConfig`. It lazily asks for trials as capacity
+becomes available, runs isolated Train children, and tells Optuna their terminal
+states. Rank zero/controller retains all live Optuna objects and storage access.
+A separate feedback thread exchanges metric/pruning messages through the shared
+artifact filesystem; no additional MPI communicator is used. See [studies](studies.md).
+
+`ExecutorConfig.execute(..., on_abort=callback)` can notify a domain's active
+workers before the driver cancels/drains futures following an exception, including
+KeyboardInterrupt. Normal `ExecutionAction.STOP` retains its existing drain
+semantics. OptunaStudy uses this hook to cancel child supervisors promptly.

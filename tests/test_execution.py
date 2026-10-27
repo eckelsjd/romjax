@@ -458,3 +458,22 @@ def test_submission_failure_leaves_borrowed_mpi_pool_usable(monkeypatch):
         with pytest.raises(RuntimeError, match='submission failed'):
             config.execute(tasks(5), SquareWorker(), error_policy='collect')
         assert pool.submit(int, '4').result() == 4
+
+
+def test_abort_notifies_workers_before_draining():
+    started, stopped = Event(), Event()
+
+    class WaitingWorker(TaskWorker):
+        def run(self, payload, context):
+            started.set()
+            assert stopped.wait(3), 'executor drained without notifying the domain worker'
+
+    def failing_source():
+        yield TaskSpec('one', 'one', None)
+        assert started.wait(3)
+        raise RuntimeError('source failed')
+
+    with pytest.raises(RuntimeError, match='source failed'):
+        ExecutorConfig(kind='thread', max_workers=1, max_in_flight=2, show_progress=False).execute(
+            failing_source(), WaitingWorker(), on_abort=lambda: stopped.set())
+    assert stopped.is_set()

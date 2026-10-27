@@ -1,0 +1,11 @@
+!romx:Train
+root: unused
+init_params: !pd:demo.optuna_study.model.Initial {}
+loss: !pd:demo.optuna_study.model.RegressionLoss
+  penalty: l2
+  weight: 0.001
+optimizer: {name: optax.adam, kwargs: {learning_rate: 0.01}}
+test: !!python/name:demo.optuna_study.model.validation
+termination: {max_steps: 180}
+host_interval: null
+diagnostics: {show_progress: false}
