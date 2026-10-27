@@ -5,14 +5,13 @@ study_name: regression-serial
 jax_platforms: cpu
 n_trials: 40
 write_policy: reuse
-save_policy: {best: 3}
 sampler:
   name: optuna.samplers.TPESampler
   kwargs: {seed: 42, n_startup_trials: 8, constant_liar: true}
 pruner:
   name: optuna.pruners.SuccessiveHalvingPruner
   kwargs: {min_resource: 20, reduction_factor: 3, min_early_stopping_rate: 0, bootstrap_count: 0}
-metric: {name: test_score, report_interval: 10, reduction: last}
+metric: {name: test_score, reduction: last}
 override:
   - name: learning_rate
     path: [optimizer, kwargs, learning_rate]

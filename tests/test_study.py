@@ -66,6 +66,17 @@ def test_metric_reduction_invalid_and_direction():
         reducer.observe(TrainingReport(3, {'test_score': float('nan')}))
 
 
+def test_rolling_reducer_replaces_final_step_and_skips_invalid():
+    reducer = MetricConfig(reduction='mean', window=2, invalid='skip').reducer('minimize')
+    assert reducer.observe(TrainingReport(1, {'loss': 3.0})) == 3.0
+    assert reducer.observe(TrainingReport(2, {'loss': 1.0})) == 2.0
+    assert reducer.observe(TrainingReport(2, {'loss': 5.0}, final=True)) == 4.0
+    assert reducer.observe(TrainingReport(3, {'loss': float('nan')})) is None
+    assert reducer.final_value() == 4.0
+    with pytest.raises(ValueError):
+        MetricConfig(invalid='skip').reducer('minimize').final_value()
+
+
 @pytest.fixture
 def base_train(tmp_path):
     path = tmp_path / 'base.yml'
@@ -76,7 +87,7 @@ init_params: !pd:tests.study_helpers.Initial {}
 optimizer: {name: optax.sgd, kwargs: {learning_rate: 0.1}}
 test: !!python/name:tests.study_helpers.score
 termination: {max_steps: 2}
-diagnostics: {show_progress: false}
+diagnostics: {show_progress: false, report_interval: 1, report_metrics: [loss, test_score]}
 ''')
     return path
 
@@ -85,7 +96,7 @@ diagnostics: {show_progress: false}
 def test_study_runs_and_reuses_trials(base_train, tmp_path, executor):
     config = OptunaStudy(root=tmp_path / 'study', base=base_train, n_trials=2,
                          executor=executor, jax_platforms='cpu',
-                         metric={'name': 'test_score', 'report_interval': 1},
+                         metric={'name': 'test_score'},
                          override=[{'name': 'lr', 'path': ['optimizer', 'kwargs', 'learning_rate'],
                                     'distribution': {'kind': 'float', 'low': 0.05, 'high': 0.15}}])
     config.executor.show_progress = False
@@ -107,11 +118,40 @@ def test_pruned_trials_are_not_failures(base_train, tmp_path):
 
     config = OptunaStudy(root=tmp_path / 'prune', base=base_train, n_trials=1, storage=None,
                          pruner=AlwaysPrune(), jax_platforms='cpu',
-                         metric={'report_interval': 1}, executor={'show_progress': False})
+                         executor={'show_progress': False})
     assert config.run() == 0
     import yaml
     manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
     assert manifest['trials'][0]['state'] == 'PRUNED'
+
+
+def test_final_only_training_without_diagnostics(base_train, tmp_path):
+    import yaml
+
+    from tests.study_helpers import AlwaysPrune
+
+    base_train.write_text(base_train.read_text().split('diagnostics:')[0])
+    config = OptunaStudy(root=tmp_path / 'final-only', base=base_train, n_trials=1, storage=None,
+                         pruner=AlwaysPrune(), jax_platforms='cpu', executor={'show_progress': False})
+    assert config.run() == 0
+    case = (config.root / 'trials' / 'trial_00000' / 'case.yml').read_text()
+    assert 'diagnostics:' not in case
+    rows = yaml.safe_load((config.root / 'study_manifest.yml').read_text())['trials']
+    assert rows[0]['state'] == 'COMPLETE'
+
+
+def test_report_interval_removed_from_metric():
+    with pytest.raises(ValueError):
+        MetricConfig(report_interval=1)
+
+
+def test_metric_missing_observation_policy():
+    report = TrainingReport(1, {'loss': 1.0})
+    with pytest.raises(ValueError, match='Missing or nonfinite'):
+        MetricConfig(name='test_score').reducer('minimize').observe(report)
+    reducer = MetricConfig(name='test_score', invalid='skip').reducer('minimize')
+    assert reducer.observe(report) is None
+    assert reducer.observe(TrainingReport(2, {'test_score': 0.5}, final=True)) == 0.5
 
 
 def test_reuse_rejects_changed_config_and_overwrite_resets(base_train, tmp_path):
@@ -123,9 +163,63 @@ def test_reuse_rejects_changed_config_and_overwrite_resets(base_train, tmp_path)
         config.run()
     config.write_policy = 'overwrite'
     assert config.run() == 0
+    archives = list((config.root / 'archive').glob('*/trials/trial_00000/case.yml'))
+    assert len(archives) == 1
     import yaml
     manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
     assert len(manifest['trials']) == 1
+
+
+@pytest.mark.parametrize('direction,values,best', [
+    ('minimize', [2.0, 1.0, 3.0], 1),
+    ('maximize', [2.0, 3.0, 1.0], 1),
+    ('minimize', [1.0, 1.0, 2.0], 0),
+])
+def test_best_copy_reconciliation(tmp_path, direction, values, best):
+    from romjax.study import _StudyCoordinator
+
+    config = OptunaStudy(root=tmp_path, base=Path('unused'), direction=direction)
+    coordinator = _StudyCoordinator(config)
+    coordinator.study = optuna.create_study(direction=direction)
+    for number, value in enumerate(values):
+        trial = coordinator.study.ask()
+        root = tmp_path / 'trials' / f'trial_{number:05d}'
+        (root / 'checkpoint').mkdir(parents=True)
+        (root / 'checkpoint' / 'data').write_text(str(number))
+        (root / 'case.yml').write_text(str(number))
+        coordinator.study.tell(trial, value)
+        coordinator._manifest()
+        coordinator._update_best()
+    assert (tmp_path / 'best' / 'checkpoint' / 'data').read_text() == str(best)
+    import shutil
+    shutil.rmtree(tmp_path / 'best')
+    coordinator._update_best()
+    assert (tmp_path / 'best' / 'case.yml').read_text() == str(best)
+
+
+def test_best_copy_failure_preserves_previous_copy(tmp_path, monkeypatch):
+    import shutil
+
+    from romjax.study import _StudyCoordinator
+
+    coordinator = _StudyCoordinator(OptunaStudy(root=tmp_path, base=Path('unused')))
+    coordinator.study = optuna.create_study()
+    for number, value in enumerate((2.0, 1.0)):
+        trial = coordinator.study.ask()
+        root = tmp_path / 'trials' / f'trial_{number:05d}'
+        root.mkdir(parents=True)
+        (root / 'case.yml').write_text(str(number))
+        coordinator.study.tell(trial, value)
+        coordinator._manifest()
+        if number == 0:
+            coordinator._update_best()
+    with monkeypatch.context() as patch:
+        patch.setattr(shutil, 'copytree', lambda *args: (_ for _ in ()).throw(OSError('copy failed')))
+        with pytest.raises(OSError, match='copy failed'):
+            coordinator._update_best()
+    assert (tmp_path / 'best' / 'case.yml').read_text() == '0'
+    coordinator._update_best()
+    assert (tmp_path / 'best' / 'case.yml').read_text() == '1'
 
 
 def test_grid_sampler_and_callback_stop(base_train, tmp_path):
@@ -146,14 +240,22 @@ def test_grid_sampler_and_callback_stop(base_train, tmp_path):
         assert all(row['state'] == 'COMPLETE' for row in rows)
 
 
-def test_retention_keeps_config_and_metadata(base_train, tmp_path):
+def test_all_artifacts_and_best_copy(base_train, tmp_path):
     config = OptunaStudy(root=tmp_path / 'retention', base=base_train, n_trials=2, jax_platforms='cpu',
-                         save_policy={'best': 1}, executor={'show_progress': False})
+                         executor={'show_progress': False})
     assert config.run() == 0
     import yaml
     rows = yaml.safe_load((config.root / 'study_manifest.yml').read_text())['trials']
-    assert sum(row['retained'] for row in rows) == 1
+    assert all('retained' not in row for row in rows)
     assert all((config.root / 'trials' / f'trial_{row["number"]:05d}' / 'case.yml').exists() for row in rows)
+    assert (config.root / 'best' / 'case.yml').exists()
+    assert (config.root / 'best' / 'trial.yml').exists()
+
+
+@pytest.mark.parametrize('field', ['save_policy', 'retain_unsuccessful', 'final_metric'])
+def test_removed_options_are_rejected(base_train, tmp_path, field):
+    with pytest.raises(ValueError):
+        OptunaStudy(root=tmp_path / 'removed', base=base_train, **{field: 'all'})
 
 
 def test_failure_is_terminal_and_exit_policy_is_configurable(base_train, tmp_path):
@@ -319,15 +421,14 @@ def test_grpc_storage_when_configured(base_train, tmp_path):
         optuna.delete_study(study_name=config.study_name, storage=storage)
 
 
-def test_generated_case_contains_study_reporting_and_preserves_host_gate(base_train, tmp_path):
+def test_generated_case_preserves_train_reporting_and_host_gate(base_train, tmp_path):
     import hashlib
 
     import yaml
 
-    base_train.write_text(base_train.read_text().replace('diagnostics: {show_progress: false}',
-                                                        'host_interval: 2\ndiagnostics: {show_progress: false}'))
+    base_train.write_text(base_train.read_text().replace('diagnostics:', 'host_interval: 2\ndiagnostics:'))
     config = OptunaStudy(root=tmp_path / 'configured', base=base_train, n_trials=1, jax_platforms='cpu',
-                         metric={'name': 'test_score', 'report_interval': 3},
+                         metric={'name': 'test_score'},
                          executor={'show_progress': False})
     assert config.run() == 0
     case = config.root / 'trials' / 'trial_00000' / 'case.yml'
@@ -335,8 +436,8 @@ def test_generated_case_contains_study_reporting_and_preserves_host_gate(base_tr
     fields = {key.value: value for key, value in node.value}
     diagnostics = {key.value: value for key, value in fields['diagnostics'].value}
     assert fields['host_interval'].value == '2'
-    assert diagnostics['report_interval'].value == '3'
-    assert [item.value for item in diagnostics['report_metrics'].value] == ['test_score']
+    assert diagnostics['report_interval'].value == '1'
+    assert [item.value for item in diagnostics['report_metrics'].value] == ['loss', 'test_score']
     assert diagnostics['show_progress'].value == 'false'
     manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
     assert manifest['trials'][0]['user_attrs']['romjax_config_sha256'] == hashlib.sha256(case.read_bytes()).hexdigest()
