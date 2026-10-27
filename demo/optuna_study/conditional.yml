@@ -1,0 +1,6 @@
+!overrides:__parent__/serial.yml
+root: demo/optuna_study/output/conditional
+study_name: regression-conditional
+override: !delete
+search_space:
+  callable: !!python/name:demo.optuna_study.model.conditional_optimizer

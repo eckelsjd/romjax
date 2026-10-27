@@ -3,10 +3,13 @@ import os
 import shutil
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Callable, Generator, Iterator, Literal
 
 import equinox as eqx
@@ -45,7 +48,7 @@ from romjax.tree import (
     pytree_norm,
     pytree_resolve_refs,
 )
-from romjax.typing import ThirdPartyType, from_yaml, require_type
+from romjax.typing import DictModel, ThirdPartyType, from_yaml, require_type
 from romjax.utils import _NullProgress
 
 __all__ = ["Train", "BatchLoader", "OrbaxRef", "resolve_orbax_params"]
@@ -729,6 +732,58 @@ class _TermHistory:
         )
 
 
+class TrainingDecision(Enum):
+    """Host observer decision; stopping still finalizes training artifacts."""
+
+    CONTINUE = 'continue'
+    STOP = 'stop'
+
+
+class TrainingReportConfig(DictModel):
+    """Metrics requested by a host observer.
+
+    :param interval: completed optimizer updates between reports
+    :param metrics: names of fresh metrics to evaluate at report steps
+    """
+
+    model_config = ConfigDict(extra='forbid')
+    interval: PositiveInt = 1
+    metrics: tuple[Literal['loss', 'test_score'], ...] = ('loss',)
+
+
+@dataclass(frozen=True)
+class TrainingReport:
+    """Host metric snapshot at a completed optimizer step.
+
+    :param step: number of completed updates
+    :param metrics: scalar metrics for the current parameter state
+    :param final: whether this notification ends training (decision ignored)
+    """
+
+    step: int
+    metrics: Mapping[str, float]
+    final: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'metrics', MappingProxyType(dict(self.metrics)))
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    """Final parameters, fresh metrics, and reason training stopped.
+
+    :param params: trained parameter PyTree
+    :param step: completed optimizer updates
+    :param metrics: final scalar metric snapshot
+    :param stop_reason: max_steps, observer, dataloader, runtime, test_tol, grad_tol, or loss_tol
+    """
+
+    params: PyTree
+    step: int
+    metrics: Mapping[str, float]
+    stop_reason: str
+
+
 class Train(Routine):
     """
     ROM training routine.
@@ -925,6 +980,24 @@ class Train(Routine):
         return 0
 
     def __call__(self) -> PyTree:
+        """Train and return the final parameter PyTree."""
+        return self.fit().params
+
+    def fit(
+        self, *, observer: Callable[[TrainingReport], TrainingDecision] | None = None,
+        reporting: TrainingReportConfig | None = None,
+    ) -> TrainingResult:
+        """Train with optional host-side metric reports and orderly stopping.
+
+        :param observer: host callback; STOP finalizes artifacts before returning
+        :param reporting: requested metrics and cadence, independent of diagnostics
+        :return: parameters, final metrics, and termination reason
+        """
+        reporting = reporting or TrainingReportConfig()
+        if observer is not None and 'test_score' in reporting.metrics and self.test is None:
+            raise ValueError('Reporting test_score requires Train.test.')
+        stop_reason = 'max_steps'
+        metric_step = -1
 
         test_fn = self.test if self.test is not None else None
         optimizer = self._build_optimizer(self.init_params)
@@ -1221,7 +1294,7 @@ class Train(Routine):
                         logger.debug(
                             f"Training already reached max_steps={self.termination.max_steps} from checkpoint."
                         )
-                        return 0
+                        total_steps = 0
                     
                     logger.debug(f"Restarting train from step {curr_step}")
                 
@@ -1407,13 +1480,16 @@ class Train(Routine):
                         logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
                         batch = None
                     last_batch = batch
+                    final_batch = False
 
                     while True:
                         if batch is None:
+                            stop_reason = 'dataloader'
                             break
 
                         ## LOSS/VALIDATION EVALUATION
-                        host_active = _interval_active(self.host_interval, curr_step)
+                        report_active = observer is not None and curr_step > 0 and curr_step % reporting.interval == 0
+                        host_active = _interval_active(self.host_interval, curr_step) or report_active or final_batch
                         active_terms = (
                             graph_loss.active_term_names(curr_step) if scheduled_graph_loss else term_names
                         )
@@ -1459,7 +1535,7 @@ class Train(Routine):
                                     else:
                                         train_result = _train_step(params, opt_state, batch, iteration)
 
-                            if curr_step < self.termination.max_steps:
+                            if curr_step < self.termination.max_steps and not final_batch:
                                 try:
                                     next_batch = next(self.dataloader)
                                 except StopIteration:
@@ -1487,6 +1563,8 @@ class Train(Routine):
                         t_diff = time.time() - t_start
                         runtime_reached = t_diff >= self.termination.max_runtime.total_seconds()
                         host_active = host_active or runtime_reached
+                        # The final dataloader state must have fresh metrics even without a host interval.
+                        host_active = host_active or (dataloader_stopped and curr_step >= self.termination.max_steps)
                         test_score, grad_norm = None, None
                         loss_value = None
                         stats_str = f"step={curr_step}"
@@ -1506,13 +1584,16 @@ class Train(Routine):
                                 current_scale_arrays = _current_scale_arrays()
 
                             metrics = {"loss": loss_value}
+                            metric_step = curr_step
 
                             if (
                                 test_fn is not None
-                                and 0 < test_interval < float('inf')
                                 and (
-                                    curr_step % test_interval == 0
-                                    or curr_step >= self.termination.max_steps
+                                    (0 < test_interval < float('inf') and (curr_step % test_interval == 0
+                                                                         or curr_step >= self.termination.max_steps))
+                                    or (observer is not None and 'test_score' in reporting.metrics
+                                        and (report_active or runtime_reached or final_batch
+                                             or curr_step >= self.termination.max_steps))
                                 )
                             ):
                                 try:
@@ -1612,6 +1693,10 @@ class Train(Routine):
                                 self.diagnostics.progress_callback(params, self.graph, self.root)
                         
                         ## END CONDITIONS
+                        if final_batch:
+                            stop_reason = 'dataloader'
+                            break
+
                         if (
                             host_active
                             and
@@ -1621,21 +1706,25 @@ class Train(Routine):
                         ):
                             logger.info(f"Termination criteria reached: test score "
                                         f"{test_score:.2e} < {self.termination.test_tol:.2e}")
+                            stop_reason = 'test_tol'
                             break
                             
                         if host_active and self.termination.grad_tol and grad_norm is not None:
                             if not jnp.isfinite(grad_norm):
                                 logger.warning("Grad norm is not finite. Terminating...")
+                                stop_reason = "grad_tol"
                                 break
 
                             if grad_norm < self.termination.grad_tol:
                                 logger.info(f"Termination criteria reached: gradient norm "
                                             f"{grad_norm:.2e} < {self.termination.grad_tol:.2e}")
+                                stop_reason = "grad_tol"
                                 break
                         
                         if host_active and self.termination.loss_tol and loss_value < self.termination.loss_tol:
                             logger.info(f"Termination criteria reached: loss "
                                         f"{loss_value:.2e} < {self.termination.loss_tol:.2e}")
+                            stop_reason = "loss_tol"
                             break
 
                         if curr_step >= self.termination.max_steps:
@@ -1647,16 +1736,25 @@ class Train(Routine):
                             logger.info(f"Termination criteria reached: max runtime "
                                         f"{_prettify_timedelta(t_diff)} / "
                                         f"{_prettify_timedelta(self.termination.max_runtime.total_seconds())}")
+                            stop_reason = 'runtime'
                             break
+
+                        if report_active:
+                            try:
+                                decision = observer(TrainingReport(curr_step, metrics or {}))
+                            except BaseException:
+                                _save_final(metrics)
+                                raise
+                            if decision == TrainingDecision.STOP:
+                                stop_reason = 'observer'
+                                break
 
                         params, opt_state = next_params, next_opt_state
                         curr_step += 1
                         bar()
 
                         if dataloader_stopped:
-                            if loss_hist.has_step(curr_step):
-                                logger.info(f"Train dataloader has stopped at step {curr_step}. Terminating...")
-                                break
+                            final_batch = True
                             logger.info(
                                 f"Train dataloader has stopped at step {curr_step}. "
                                 "Reusing the last batch for final metric evaluation..."
@@ -1666,6 +1764,32 @@ class Train(Routine):
                             batch = next_batch
                 
                 logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
-                _save_final(metrics)
-        
-        return params
+                if observer is not None:
+                    try:
+                        if metric_step != curr_step:
+                            metrics = {}
+                            if last_batch is not None:
+                                if term_diagnostics_enabled:
+                                    evaluated = _graph_train_step(params, opt_state, last_batch, current_scale_arrays,
+                                                                  jnp.asarray(curr_step), active_terms)
+                                else:
+                                    evaluated = _train_step(params, opt_state, last_batch, jnp.asarray(curr_step))
+                                metrics['loss'] = float(evaluated[2])
+                                loss_hist.record(curr_step, metrics['loss'])
+                        if 'test_score' in reporting.metrics and 'test_score' not in (metrics or {}):
+                            try:
+                                score = test_fn(params)
+                                score = float(score) if score is not None else float('nan')
+                            except Exception:
+                                if self.test_failure_policy == 'raise':
+                                    raise
+                                score = float('nan')
+                            metrics = dict(metrics or {}, test_score=score)
+                            test_hist.record(curr_step, score)
+                        observer(TrainingReport(curr_step, metrics or {}, final=True))
+                    finally:
+                        _save_final(metrics)
+                else:
+                    _save_final(metrics)
+
+        return TrainingResult(params, curr_step, dict(metrics or {}), stop_reason)

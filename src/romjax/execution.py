@@ -451,6 +451,7 @@ class ExecutorConfig(DictModel):
         on_result: Callable[[TaskOutcome[P, R]], ExecutionAction | None] | None = None,
         error_policy: Literal['raise', 'collect'] = 'raise', collect_results: bool = True,
         jax_env: Mapping[str, str] | None = None,
+        on_abort: Callable[[], None] | None = None,
     ) -> list[TaskOutcome[P, R]]:
         """Execute tasks using native submit, wait, result, cancel, and shutdown.
 
@@ -461,6 +462,7 @@ class ExecutorConfig(DictModel):
         :param on_result: controller-thread outcome handler; STOP halts new submissions
         :param error_policy: raise task exceptions or deliver them as collected outcomes
         :param collect_results: retain outcomes in submission order
+        :param on_abort: notify domain workers before draining after an exception or interruption
         :param jax_env: explicit inherited JAX settings overriding the current snapshot
         :return: completed outcomes, or an empty list when collection is disabled
         """
@@ -486,7 +488,7 @@ class ExecutorConfig(DictModel):
         with self._pool(environment, slots) as (pool, capacity), context as bar:
             return self._execute(pool, capacity, prepared, tasks, run_id, environment, slots, remote,
                                  bar, manual, total_units,
-                                 on_result, error_policy, collect_results)
+                                 on_result, error_policy, collect_results, on_abort)
 
     def _pass_worker_count(self, task_count: int) -> int:
         """Resolve native worker defaults and bound local pools by runnable work."""
@@ -645,6 +647,7 @@ class ExecutorConfig(DictModel):
         bar: Any, manual: bool, total_units: int | None,
         on_result: Callable[[TaskOutcome[P, R]], ExecutionAction | None] | None,
         error_policy: Literal['raise', 'collect'], collect_results: bool,
+        on_abort: Callable[[], None] | None = None,
     ) -> list[TaskOutcome[P, R]]:
         source = iter(tasks)
         pending: dict[Future[_TaskReturn], tuple[int, TaskSpec[P, R], TaskContext, _DeviceSlot | None]] = {}
@@ -706,6 +709,10 @@ class ExecutorConfig(DictModel):
                         available.append(slot)
                     if not future.cancelled():
                         handle(index, task, future.result(), context)
+        except BaseException:
+            if on_abort is not None:
+                on_abort()
+            raise
         finally:
             for future in pending:
                 future.cancel()

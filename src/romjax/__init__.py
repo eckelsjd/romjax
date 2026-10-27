@@ -74,6 +74,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
+    "OptunaStudy": ("romjax.study", "OptunaStudy"),
     "ExecutorConfig": ("romjax.execution", "ExecutorConfig"),
     "mpi_context": ("romjax.mpi_runtime", "mpi_context"),
     "ExplicitModel": ("romjax.model", "ExplicitModel"),
@@ -306,7 +307,8 @@ class YamlLoader(ConfigLoader):
             """Construct a nested override as a loadable in-memory YAML source."""
             source_path = cls.current_source_path()
             override_path = cls._resolve_override_path(tag_suffix, source_path)
-            base_node, _ = cls._compose_resolved_node(override_path)
+            base_node, base_path = cls._compose_resolved_node(override_path)
+            base_node = cls._resolve_parent_refs(base_node, base_path)
             override_node = cls._copy_with_tag(node, cls._default_node_tag(node))
             merged_node = cls._merge_nodes(base_node, override_node)
             return YamlSource(merged_node, source_path, tag_suffix)
@@ -980,7 +982,8 @@ class YamlLoader(ConfigLoader):
         if node is None:
             return None, source_path
         override_path = cls._resolve_override_path(node.tag[len(cls.OVERRIDES_TAG):], source_path)
-        base_node, _ = cls._compose_resolved_node(override_path)
+        base_node, base_path = cls._compose_resolved_node(override_path)
+        base_node = cls._resolve_parent_refs(base_node, base_path)
         override_node = cls._copy_with_tag(node, cls._default_node_tag(node))
         return cls._merge_nodes(base_node, override_node), source_path
 

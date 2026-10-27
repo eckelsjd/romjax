@@ -1766,3 +1766,84 @@ def test_term_plot_shared_legend(
         assert all(ax.get_legend() is not None for ax in term_axes)
 
     plt.close(fig)
+
+
+def test_fit_reports_current_metrics_and_stops_cleanly(tmp_path):
+    from romjax.train import TrainingDecision, TrainingReportConfig
+
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  test=lambda p: p['w'] ** 2, root=tmp_path, termination={'max_steps': 6},
+                  host_interval=None, diagnostics={'show_progress': False})
+    reports = []
+
+    def observe(report):
+        reports.append(report)
+        return TrainingDecision.STOP if report.step == 4 else TrainingDecision.CONTINUE
+
+    result = train.fit(observer=observe, reporting=TrainingReportConfig(interval=2, metrics=('loss', 'test_score')))
+    assert result.step == 4
+    assert result.stop_reason == 'observer'
+    assert float(result.params['w']) == pytest.approx(0.8 ** 4)
+    assert [(r.step, r.final) for r in reports] == [(2, False), (4, False), (4, True)]
+    assert reports[0].metrics['test_score'] == pytest.approx(0.8 ** 4)
+    assert reports[-1].metrics['loss'] == pytest.approx(0.8 ** 8)
+    assert (tmp_path / 'loss.csv').exists()
+
+
+def test_fit_final_report_without_periodic_report():
+    from romjax.train import TrainingDecision, TrainingReportConfig
+
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  termination={'max_steps': 3}, diagnostics={'show_progress': False}, host_interval=None)
+    reports = []
+    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.STOP,
+                       reporting=TrainingReportConfig(interval=10))
+    assert result.step == 3
+    assert result.stop_reason == 'max_steps'
+    assert len(reports) == 1 and reports[0].final
+    assert result.metrics['loss'] == pytest.approx(0.8 ** 6)
+
+
+def test_fit_observer_failure_saves_and_propagates(tmp_path):
+    from romjax.train import TrainingReportConfig
+
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  root=tmp_path, termination=4, diagnostics={'show_progress': False},
+                  test_failure_policy='record_nan')
+
+    def broken(report):
+        raise RuntimeError('observer unavailable')
+
+    with pytest.raises(RuntimeError, match='observer unavailable'):
+        train.fit(observer=broken, reporting=TrainingReportConfig(interval=1))
+    assert (tmp_path / 'loss.csv').exists()
+
+
+def test_fit_requires_validation_for_requested_score():
+    from romjax.train import TrainingDecision, TrainingReportConfig
+
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  termination=2, diagnostics={'show_progress': False})
+    with pytest.raises(ValueError, match='Train.test'):
+        train.fit(observer=lambda r: TrainingDecision.CONTINUE,
+                  reporting=TrainingReportConfig(interval=1, metrics=('test_score',)))
+
+
+def test_fit_exhausted_loader_reports_last_applied_update():
+    from romjax.train import TrainingDecision, TrainingReportConfig
+
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  dataloader=iter([{}, {}]), termination=10, diagnostics={'show_progress': False}, host_interval=None)
+    reports = []
+    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.CONTINUE,
+                       reporting=TrainingReportConfig(interval=4))
+    assert result.step == 2
+    assert result.stop_reason == 'dataloader'
+    assert result.metrics['loss'] == pytest.approx(0.8 ** 4)
+    assert len(reports) == 1 and reports[0].final
+
+
+def test_fit_records_gradient_tolerance_reason():
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
+                  termination={'max_steps': 10, 'grad_tol': 100}, diagnostics={'show_progress': False})
+    assert train.fit().stop_reason == 'grad_tol'

@@ -1,0 +1,4 @@
+!overrides:__parent__/serial.yml
+root: demo/optuna_study/output/mpi
+study_name: regression-mpi
+executor: {kind: mpi, max_in_flight: 4}
