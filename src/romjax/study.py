@@ -36,7 +36,7 @@ from romjax.execution import ExecutionAction, ExecutorConfig, TaskSpec
 from romjax.grid_search import MetricCallable, _SavePolicy
 from romjax.routine import Routine
 from romjax.study_worker import FeedbackConfig, TrialLaunchSpec, _FeedbackServer, _Mailbox, _StudyWorker
-from romjax.train import TrainingReport, TrainingReportConfig
+from romjax.train import TrainingReport
 from romjax.typing import CallableModel, DeferredThirdPartySpec, DictModel, ThirdPartyType, require_type
 
 
@@ -441,6 +441,15 @@ class _StudyCoordinator:
                         assignments.append(ConfigAssignment(path=('init_seed',), value=seed))
                         trial.set_user_attr('romjax_training_seed', seed)
                     source = self.template.render(assignments)
+                    template = YamlTemplate.from_source(source)
+                    node = template.source.node
+                    if not any(key.value == 'diagnostics' for key, _ in node.value):
+                        template = YamlTemplate.from_source(template.render([
+                            ConfigAssignment(path=('diagnostics',), value={})]))
+                    source = template.render([
+                        ConfigAssignment(path=('diagnostics', 'report_interval'), value=config.metric.report_interval),
+                        ConfigAssignment(path=('diagnostics', 'report_metrics'), value=[config.metric.name]),
+                    ])
                     source = YamlTemplate.from_source(source).snapshot(root / 'sources').source
                     text = romjax.YamlLoader._node_to_yaml(source.node)
                     (root / 'case.yml').write_text(text, encoding='utf-8')
@@ -450,10 +459,7 @@ class _StudyCoordinator:
                         [dict(item) for item in assignments], _preserve_yaml_sources=True))
                     key = f'trial_{number:05d}'
                     self.server.register(key, partial(self._report, number))
-                    spec = TrialLaunchSpec(key, root, self.control,
-                                           TrainingReportConfig(interval=config.metric.report_interval,
-                                                                metrics=(config.metric.name,)),
-                                           config.feedback, config.child_quiet)
+                    spec = TrialLaunchSpec(key, root, self.control, config.feedback, config.child_quiet)
                 yield TaskSpec(str(number), key, spec)
         except BaseException:
             self.server.cancel_all('Study preparation interrupted.')

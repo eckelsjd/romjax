@@ -131,17 +131,20 @@ parameter combinations and does not promise old GridSearch ordering.
 
 ## Training metrics and pruning
 
-`Train.fit(observer=..., reporting=TrainingReportConfig(...))` returns a
-`TrainingResult`. `Train()` continues to return parameters and `Train.run()` an
-exit code. Observers receive immutable `TrainingReport(step, metrics, final)`
-snapshots outside JAX transformations. `TrainingDecision.STOP` finalizes checkpoints
-and histories. Observer exceptions propagate after cleanup.
+`Train.fit(observer=...)` returns a `TrainingResult`; its `params` field contains
+trained parameters. `Train.run()` returns an exit code. Observers receive immutable
+`TrainingReport(step, metrics, final)` snapshots outside JAX transformations.
+`TrainingDecision.STOP` finalizes checkpoints and histories. Observer exceptions
+propagate after cleanup.
 
-The requested reporting interval adds host synchronization points independently
-of `host_interval`. `test_score` requires `Train.test` and is freshly evaluated at
-report steps, even when diagnostic validation uses a different cadence. Steps count
-completed optimizer updates. Final reports describe returned parameters and are
-notifications, not opportunities to prune already finished training.
+Optuna writes `report_interval` and `report_metrics` into each trial's Train
+diagnostics. A periodic report occurs only when its interval and `host_interval`
+are both due. Align them to obtain the desired pruning cadence: host interval 8
+and report interval 10 report every 40 steps. With `host_interval: null`, only a
+final report is sent and live pruning is unavailable. Validation requested by the
+test interval and a report is evaluated once when they coincide. Final reports
+describe returned parameters and cannot prune finished training. See
+[training diagnostics](training.md) for the complete interval behavior.
 
 `metric` fields:
 

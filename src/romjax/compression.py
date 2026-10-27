@@ -930,7 +930,7 @@ class BlockLinearCompression(Compression):
                 object.__setattr__(routine, "test", reconstruction_test)
                 if routine.diagnostics.test_interval is None:
                     object.__setattr__(routine.diagnostics, "test_interval", 1)
-            trained = routine()
+            trained = routine.fit().params
         if not isinstance(trained, BlockLinearAutoencoder):
             raise TypeError("BlockLinearCompression training did not return a BlockLinearAutoencoder.")
         latent = jax.vmap(trained.reduce)(vectors)

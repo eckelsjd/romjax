@@ -95,7 +95,7 @@ def run(method="linear"):
         # write_policy="reuse"
     )
 
-    approx_params = train()
+    approx_params = train.fit().params
 
     idx_train = jnp.argsort(xtrain)
     ytrain_true = true_model(xtrain[idx_train])
