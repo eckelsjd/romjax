@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import PyTree
-from orbax.checkpoint import v1 as ocp
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, NonNegativeFloat, PositiveInt, model_validator
 from pydantic_core import core_schema
 
@@ -18,6 +17,7 @@ from romjax.graph import FunctionGraph
 from romjax.nn import BlockLinearAutoencoder, LinearProjection
 from romjax.tree import ShapeDtypePyTree, is_shape_dtype
 from romjax.typing import from_yaml
+from romjax.utils import _create_checkpointer
 
 __all__ = ["BlockLinearCompression", "Compression", "SVD"]
 
@@ -554,7 +554,7 @@ class SVD(Compression):
         else:
             chkptable = params
 
-        with ocp.training.Checkpointer(Path(path).absolute()) as ckptr:
+        with _create_checkpointer(Path(path).absolute()) as ckptr:
             ckptr.save_checkpointables(
                 step=0,
                 checkpointables={"params": eqx.filter(chkptable, eqx.is_array)},
@@ -1021,7 +1021,8 @@ class BlockLinearCompression(Compression):
             self.orbax_template,
             is_leaf=lambda value: value is None,
         )
-        with ocp.training.Checkpointer(Path(path).absolute()) as ckptr:
+
+        with _create_checkpointer(Path(path).absolute()) as ckptr:
             ckptr.save_checkpointables(
                 step=0,
                 checkpointables={"params": eqx.filter(template, eqx.is_array)},

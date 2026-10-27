@@ -8,6 +8,7 @@ from typing import Any
 import h5py
 import jax.numpy as jnp
 import numpy as np
+from orbax.checkpoint import v1 as ocp
 from pydantic import BaseModel
 
 __all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'required_fields']
@@ -22,6 +23,19 @@ class _NullProgress:
         pass
     def text(self, msg):
         pass
+
+
+def _create_checkpointer(directory: Path, **kwargs: Any) -> Any:
+    """Create a checkpointer with synchronous directory setup.
+
+    Orbax's background directory creation relies on an event-loop wakeup
+    between threads. Synchronous setup avoids stalls on platforms where that
+    wakeup mechanism is unavailable while retaining asynchronous checkpoint
+    writes.
+    """
+    async_options = ocp.options.AsyncOptions(create_directories_asynchronously=False)
+    with ocp.Context(async_options=async_options):
+        return ocp.training.Checkpointer(directory, **kwargs)
     
 
 def required_fields(model_cls: type[BaseModel], inherited: bool = True) -> set[str]:
