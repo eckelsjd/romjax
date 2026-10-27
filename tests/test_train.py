@@ -12,7 +12,6 @@ import numpy as np
 import optax
 import optimistix as optx
 import pytest
-from orbax.checkpoint import v1 as ocp
 from pydantic import ValidationError
 
 from romjax import YamlLoader
@@ -30,6 +29,7 @@ from romjax.train import (
     DiagnosticsConfig,
     TerminationConfig,
     Train,
+    _create_checkpointer,
     resolve_orbax_params,
 )
 from romjax.tree import TreeRef, is_shape_dtype, pytree_norm, pytree_resolve_refs
@@ -356,7 +356,7 @@ def toy_graph() -> FunctionGraph:
     return FunctionGraph(edges={"toy": ToyLinearReconstructionEdge()})
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_diagnostics(tmp_path: Path) -> None:
     callback_calls: list[tuple[float, Path | None]] = []
     checkpoint_history_steps: list[int] = []
@@ -438,7 +438,7 @@ def test_diagnostics(tmp_path: Path) -> None:
     assert checkpoint_history_steps == [0, 0, 2]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_host_interval_gates_host_diagnostics(tmp_path: Path) -> None:
     callback_values: list[float] = []
     root = tmp_path.resolve() / "host_interval"
@@ -470,7 +470,7 @@ def test_train_host_interval_gates_host_diagnostics(tmp_path: Path) -> None:
     assert len(callback_values) == 4
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_host_interval_none_syncs_only_at_final_step(tmp_path: Path) -> None:
     root = tmp_path.resolve() / "host_interval_none"
     train = Train(
@@ -490,7 +490,7 @@ def test_train_host_interval_none_syncs_only_at_final_step(tmp_path: Path) -> No
     assert _history_csv(root / "test.csv")[0].tolist() == [4]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_checkpoint_interval_gates_orbax_save_checks(tmp_path: Path) -> None:
     root = tmp_path.resolve() / "checkpoint_interval"
     checkpointer = CheckpointerConfig(save_decision_policy=1, preservation_policy=1, step_name_format="step")
@@ -530,7 +530,7 @@ def test_train_checkpoint_interval_infers_fixed_orbax_save_policy() -> None:
     assert explicit.diagnostics.checkpoint_interval == 2
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_termination(tmp_path: Path) -> None:
     loss_tol_root = tmp_path.resolve() / "loss_tol"
     loss_tol_train = Train(
@@ -581,7 +581,7 @@ def test_termination(tmp_path: Path) -> None:
     assert _history_csv(runtime_root / "loss.csv")[0].tolist() == [0]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_and_restart(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -602,7 +602,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
 
     checkpoint_names = sorted(path.name for path in root.iterdir() if path.is_dir())
     assert checkpoint_names[:2] == ["train_000", "train_001"]
-    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+    with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
         assert ckptr.latest.step == 2
 
@@ -617,7 +617,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
     )
     assert resumed.run() == 0
     assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
-    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+    with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
         assert ckptr.latest.step == 4
 
@@ -660,7 +660,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -691,7 +691,7 @@ def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
     assert resumed.run() == 0
     assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
 
-    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+    with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
         assert ckptr.latest.step == 4
         loaded = ckptr.load_checkpointables(
@@ -704,7 +704,7 @@ def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
     assert hasattr(loaded["opt_state"][0], "mu")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -736,7 +736,7 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     assert resumed.run() == 0
     assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
 
-    with ocp.training.Checkpointer(root, **dict(checkpointer)) as ckptr:
+    with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
         loaded = ckptr.load_checkpointables(
             abstract_checkpointables={
@@ -751,10 +751,10 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
 
 
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "source"
-    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+    with _create_checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(
             step=0,
             checkpointables={"params": {"w": jnp.array(3.0)}},
@@ -776,13 +776,13 @@ def test_train_load_orbax_warm_starts_fresh_run(tmp_path: Path) -> None:
     assert _history_csv(root / "loss.csv")[1].tolist() == pytest.approx([4.0, 2.56])
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_train_load_orbax_uses_eqx_static_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "mlp_source"
     source_params = eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(0))
     init_params = eqx.nn.MLP(in_size=2, out_size=1, width_size=4, depth=2, key=jax.random.key(999))
 
-    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+    with _create_checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(
             step=0,
             checkpointables={"params": eqx.filter(source_params, eqx.is_array)},
@@ -804,7 +804,7 @@ def test_train_load_orbax_uses_eqx_static_template(tmp_path: Path) -> None:
 
 
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_resolve_orbax_params_accepts_shape_dtype_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "shape_dtype_template"
     source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
@@ -813,7 +813,7 @@ def test_resolve_orbax_params_accepts_shape_dtype_template(tmp_path: Path) -> No
         "b": jax.ShapeDtypeStruct(source_params["b"].shape, source_params["b"].dtype),
     }
 
-    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+    with _create_checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
 
     loaded_params = resolve_orbax_params(checkpoint_root, template)
@@ -824,13 +824,13 @@ def test_resolve_orbax_params_accepts_shape_dtype_template(tmp_path: Path) -> No
 
 
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_resolve_orbax_params_accepts_yaml_shape_dtype_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "yaml_shape_dtype_template"
     source_params = {"w": jnp.array([1.0, 2.0], dtype=jnp.float32), "b": jnp.array(3.0, dtype=jnp.float32)}
     template = {"w": {"shape": [2], "dtype": "float32"}, "b": {"shape": []}}
 
-    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+    with _create_checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
 
     loaded_params = resolve_orbax_params(checkpoint_root, template)
@@ -841,12 +841,12 @@ def test_resolve_orbax_params_accepts_yaml_shape_dtype_template(tmp_path: Path) 
 
 
 @pytest.mark.filterwarnings("ignore:Sharding info:UserWarning")
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_resolve_orbax_params_partially_overrides_template(tmp_path: Path) -> None:
     checkpoint_root = tmp_path.resolve() / "partial"
     source_params = {"weight": jnp.array(3.0)}
     template = {"left": {"weight": jnp.array(0.0)}, "right": {"weight": jnp.array(1.0)}}
-    with ocp.training.Checkpointer(checkpoint_root) as ckptr:
+    with _create_checkpointer(checkpoint_root) as ckptr:
         ckptr.save_checkpointables(step=0, checkpointables={"params": source_params}, force=True)
 
     params = resolve_orbax_params({"left": checkpoint_root, "right": None}, template)
@@ -1476,7 +1476,7 @@ def test_train_initialization_resolves_graph_rank_from_source_sampler(tmp_path: 
     assert train.graph.edges["galerkin"].resolve_rank() == 3
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     train_batch = {"toy": {"x": jnp.array([1.0, 2.0, 3.0])}}
     validation_root = tmp_path.resolve() / "validation_graph_train"
@@ -1524,7 +1524,7 @@ def test_run_graph_train(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     assert loss_values[-1] < 0.1 * loss_values[0]
     assert test_values[-1] < test_values[0]
 
-    with ocp.training.Checkpointer(root) as ckptr:
+    with _create_checkpointer(root) as ckptr:
         assert ckptr.latest is not None
         assert ckptr.latest.step == max_steps
         params = ckptr.load_checkpointables(
@@ -1559,7 +1559,7 @@ def test_path_error_loss_trains_through_optimistix_root_find_edge() -> None:
     assert float(params["root"]["weight"]) == pytest.approx(3.0, abs=0.03)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
     root = tmp_path.resolve() / "graph_loss_ema"
@@ -1613,7 +1613,7 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
     assert scaled_values[0, 2] == pytest.approx(expected_scales[1] * raw_values[0, 2])
     assert (root / "loss.pdf").exists()
 
-    with ocp.training.Checkpointer(root) as ckptr:
+    with _create_checkpointer(root) as ckptr:
         assert ckptr.latest is not None
         loaded = ckptr.load_checkpointables(
             abstract_checkpointables={
@@ -1628,7 +1628,7 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
     assert int(np.asarray(loaded["loss_state"]["step"])) == 1
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_graph_loss_ema_log_balancing_uses_geometric_normalization(tmp_path: Path, toy_graph: FunctionGraph) -> None:
     batch = {"toy": [{"x": jnp.array([1.0])}, {"x": jnp.array([2.0])}, {"x": jnp.array([3.0])}]}
     root = tmp_path.resolve() / "graph_loss_ema_log"
@@ -1696,7 +1696,7 @@ def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: Funct
     assert float(params["toy"]["weight"]) == pytest.approx(-0.001 * expected_grad, rel=1e-5)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
+# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 @pytest.mark.parametrize(
     ("shared_legend", "color_cycle"),
     [(False, None), (True, None), (True, "tab20"), (True, "viridis")],

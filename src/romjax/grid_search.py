@@ -33,6 +33,7 @@ from romjax.profiling import build_profile_env, profile_annotation, profile_trac
 from romjax.routine import Routine, RoutineError
 from romjax.tree import TreePath, coerce_tree_path, coerce_tree_paths, pytree_merge, set_subtree
 from romjax.typing import CallableModel, from_registry
+from romjax.utils import _create_checkpointer
 
 type WritePolicy = Literal["reuse", "overwrite", "error"]
 type ExitPolicy = Literal["all", "any", "ignore"]
@@ -267,9 +268,8 @@ def orbax_metric(case_root: Path, window: int = 10, file: str = "loss.csv") -> f
             return float(np.nanmean(recent_values))
 
     try:
-        from orbax.checkpoint import v1 as ocp
 
-        with ocp.training.Checkpointer(case_root.resolve()) as ckptr:
+        with _create_checkpointer(case_root.resolve()) as ckptr:
             latest = ckptr.latest
             metrics = getattr(latest, "metrics", None)
             if isinstance(metrics, Mapping) and "loss" in metrics:

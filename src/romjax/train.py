@@ -49,7 +49,7 @@ from romjax.tree import (
     pytree_resolve_refs,
 )
 from romjax.typing import DictModel, ThirdPartyType, from_yaml, require_type
-from romjax.utils import _NullProgress
+from romjax.utils import _NullProgress, _create_checkpointer
 
 __all__ = ["Train", "BatchLoader", "OrbaxRef", "resolve_orbax_params"]
 
@@ -267,7 +267,7 @@ def _contains_orbax_ref(value: Any) -> bool:
 
 def _load_orbax_checkpoint(path: Path, template: PyTree | None) -> PyTree | None:
     """Load one Orbax ``params`` checkpoint, recombining static template leaves."""
-    with ocp.training.Checkpointer(path.absolute()) as ckptr:
+    with _create_checkpointer(path.absolute()) as ckptr:
         if ckptr.latest is None:
             return None
         if template is None:
@@ -882,7 +882,7 @@ class Train(Routine):
         
         # Start dataloader from current training step if applicable
         if self.root is not None and hasattr(self.dataloader, "set_iterator"):
-            with ocp.training.Checkpointer(self.root, **dict(self.checkpointer)) as ckptr:
+            with _create_checkpointer(self.root, **dict(self.checkpointer)) as ckptr:
                 if ckptr.latest is not None:
                     self.dataloader.set_iterator(ckptr.latest.step)
         
@@ -1255,7 +1255,7 @@ class Train(Routine):
                 term_scales_hist.save(self.root / "loss_term_scales.csv")
         
         if self.root is not None:
-            checkpointer_context = ocp.training.Checkpointer(self.root, **dict(self.checkpointer))
+            checkpointer_context = _create_checkpointer(self.root, **dict(self.checkpointer))
         else:
             checkpointer_context = _NullCheckpointer()
 
