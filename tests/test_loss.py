@@ -598,9 +598,11 @@ def test_cyclic_path_payload_cache_batches_between_generated_terms() -> None:
     params = {}
     batch = {"li": jnp.array([0.0, 1.0, 2.0])}
 
-    value = loss(params, batch)
+    value, gradient = jax.value_and_grad(
+        lambda scale: loss(params, {"li": scale * batch["li"]})
+    )(jnp.array(1.0))
     assert jnp.isfinite(value)
-    assert jnp.isfinite(jax.grad(lambda scale: loss(params, {"li": scale * batch["li"]}))(jnp.array(1.0)))
+    assert jnp.isfinite(gradient)
 
 
 def test_cyclic_path_error_cache_ordering_limits_peak_cache_size() -> None:

@@ -104,8 +104,7 @@ def test_vlasov_solve_evaluate_and_autodiff() -> None:
     def solve_sum(alpha: jnp.ndarray) -> jnp.ndarray:
         return jnp.sum(model.solve({"initial": {"alpha": alpha}})["fields"]["vdf"])
 
-    value = jax.jit(solve_sum)(jnp.asarray(0.05))
-    grad = jax.grad(solve_sum)(jnp.asarray(0.05))
+    value, grad = jax.jit(jax.value_and_grad(solve_sum))(jnp.asarray(0.05))
     batched = jax.vmap(solve_sum)(jnp.asarray([0.0, 0.05]))
 
     assert jnp.isfinite(value)

@@ -150,39 +150,42 @@ def poisson_graph(size=8):
 
 
 @pytest.mark.parametrize("size", [8, 64])
-@pytest.mark.parametrize("preserve", [False, True])
-def test_poisson_graph_round_trip(size, preserve):
+def test_poisson_graph_round_trip(size):
     graph = poisson_graph(size)
-    text = romjax.YamlLoader.dump(graph, _preserve_model_types=preserve)
-    restored = romjax.load(text)
-    assert list(restored.nodes) == list(graph.nodes)
-    assert list(restored.edges) == list(graph.edges)
-    for name, edge in graph.edges.items():
-        other = restored.edges[name]
-        assert type(other) is type(edge)
-        assert other.model_dump() == edge.model_dump()
-        assert other.source is restored.nodes[edge.source.name]
-        assert other.target is restored.nodes[edge.target.name]
-    before, after = graph.edges["Fh"], restored.edges["Fh"]
-    assert to_module_spec(after.solver.solver) == to_module_spec(before.solver.solver)
-    assert type(after.solver.preconditioner) is type(before.solver.preconditioner)
-    # Defaults use their declared mapping serializers; grid coordinates are derived.
-    assert "!pd:romjax.pde.Inputs" not in text
-    assert "coords:" not in text
+    before = graph.edges["Fh"]
     if size == 8:
         key = jax.random.key(4)
         inputs = before.sample_inputs(key)
-        other_inputs = after.sample_inputs(key)
-        for left, right in zip(jax.tree.leaves(inputs), jax.tree.leaves(other_inputs), strict=True):
-            np.testing.assert_array_equal(left, right)
         outputs = before.solve(inputs)
-        other_outputs = after.solve(other_inputs)
-        for left, right in zip(jax.tree.leaves(outputs), jax.tree.leaves(other_outputs), strict=True):
-            np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
         residuals = before.evaluate(inputs, outputs)
-        other_residuals = after.evaluate(other_inputs, other_outputs)
-        for left, right in zip(jax.tree.leaves(residuals), jax.tree.leaves(other_residuals), strict=True):
-            np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
+
+    for preserve in (False, True):
+        text = romjax.YamlLoader.dump(graph, _preserve_model_types=preserve)
+        restored = romjax.load(text)
+        assert list(restored.nodes) == list(graph.nodes)
+        assert list(restored.edges) == list(graph.edges)
+        for name, edge in graph.edges.items():
+            other = restored.edges[name]
+            assert type(other) is type(edge)
+            assert other.model_dump() == edge.model_dump()
+            assert other.source is restored.nodes[edge.source.name]
+            assert other.target is restored.nodes[edge.target.name]
+        after = restored.edges["Fh"]
+        assert to_module_spec(after.solver.solver) == to_module_spec(before.solver.solver)
+        assert type(after.solver.preconditioner) is type(before.solver.preconditioner)
+        # Defaults use their declared mapping serializers; grid coordinates are derived.
+        assert "!pd:romjax.pde.Inputs" not in text
+        assert "coords:" not in text
+        if size == 8:
+            other_inputs = after.sample_inputs(key)
+            for left, right in zip(jax.tree.leaves(inputs), jax.tree.leaves(other_inputs), strict=True):
+                np.testing.assert_array_equal(left, right)
+            other_outputs = after.solve(other_inputs)
+            for left, right in zip(jax.tree.leaves(outputs), jax.tree.leaves(other_outputs), strict=True):
+                np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
+            other_residuals = after.evaluate(other_inputs, other_outputs)
+            for left, right in zip(jax.tree.leaves(residuals), jax.tree.leaves(other_residuals), strict=True):
+                np.testing.assert_allclose(left, right, rtol=1e-5, atol=1e-6)
 
 
 def test_poisson_remote_preparation(tmp_path):

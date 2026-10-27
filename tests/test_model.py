@@ -476,13 +476,16 @@ def test_block_linear_autoencoder_math_validation_and_transforms() -> None:
          z0 @ decoder_blocks[1][0].T + z1 @ decoder_blocks[1][1].T),
         axis=-1,
     ) + bias
-    assert jnp.allclose(jax.jit(jax.vmap(module.reduce))(samples), expected_latent)
-    assert jnp.allclose(jax.jit(jax.vmap(module.reconstruct))(expected_latent), expected_reconstruction)
+    def loss(current: BlockLinearAutoencoder) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        latent = jax.vmap(current.reduce)(samples)
+        reconstruction = jax.vmap(current.reconstruct)(latent)
+        return jnp.mean(reconstruction**2), (latent, reconstruction)
 
-    def loss(current: BlockLinearAutoencoder) -> jax.Array:
-        return jnp.mean(jax.vmap(current.reconstruct)(jax.vmap(current.reduce)(samples)) ** 2)
-
-    value, gradients = jax.value_and_grad(jax.jit(loss))(module)
+    (value, (latent, reconstruction)), gradients = jax.value_and_grad(
+        jax.jit(loss), has_aux=True
+    )(module)
+    assert jnp.allclose(latent, expected_latent)
+    assert jnp.allclose(reconstruction, expected_reconstruction)
     assert jnp.isfinite(value)
     assert gradients.encoder_blocks[0][1].shape == module.encoder_blocks[0][1].shape
     assert gradients.decoder_blocks[1][0].shape == module.decoder_blocks[1][0].shape

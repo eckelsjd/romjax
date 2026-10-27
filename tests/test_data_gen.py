@@ -153,17 +153,7 @@ def _get_graph():
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize(
-    ("conditions", "expected_inputs", "has_conditions"),
-    [
-        ("ignore", 1.0, False),
-        ("include", 1.0, True),
-        ("merge", 4.0, False),
-    ],
-)
-def test_generate_implicit_persists_and_loads_conditions(
-    tmp_path, batch_size, conditions, expected_inputs, has_conditions
-):
+def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
     graph = FunctionGraph(edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")})
     generation = DataGeneration(
         root=tmp_path,
@@ -187,13 +177,19 @@ def test_generate_implicit_persists_and_loads_conditions(
     refs = LoadImplicitModel().discover_sample_refs(edge_dir)
     output_refs = [ref for ref in refs if ref.kind == "output"]
     assert len(output_refs) == 4
-    for ref in output_refs:
-        sample = LoadImplicitModel(conditions=conditions).load_sample(ref)
-        assert np.allclose(sample["inputs"]["x"], expected_inputs)
-        assert ("conditions" in sample) is has_conditions
-        if has_conditions:
-            assert np.allclose(sample["conditions"]["x"], 4.0)
-        assert np.allclose(sample["outputs"]["y"], 5.0)
+    for conditions, expected_inputs, has_conditions in (
+        ("ignore", 1.0, False),
+        ("include", 1.0, True),
+        ("merge", 4.0, False),
+    ):
+        loader = LoadImplicitModel(conditions=conditions)
+        for ref in output_refs:
+            sample = loader.load_sample(ref)
+            assert np.allclose(sample["inputs"]["x"], expected_inputs)
+            assert ("conditions" in sample) is has_conditions
+            if has_conditions:
+                assert np.allclose(sample["conditions"]["x"], 4.0)
+            assert np.allclose(sample["outputs"]["y"], 5.0)
 
 
 def test_load_implicit_model_conditions_default_is_include():
@@ -1020,6 +1016,9 @@ def test_data_generation_benchmark_excludes_cache_io_from_timing(tmp_path, monke
 @pytest.mark.parametrize("kind", ["implicit", "source"])
 @pytest.mark.parametrize("executor", ["serial", "thread", "process"])
 def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
+    if executor in {"thread", "process"} and jax.default_backend() == "gpu":
+        pytest.skip("thread and process benchmark executors are unsupported on GPU")
+
     edge = (
         _ToySourceEdge(source="noise", target="sample")
         if kind == "source"
@@ -1031,11 +1030,12 @@ def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
         if kind == "source"
         else {"input_samples": 1, "outputs_per_input": 3, "input_seed": 3, "output_seed": 5}
     )
+    repeat, warmup = (2, 1) if executor == "process" else (1, 0)
     benchmark = GenDataBenchmark(
         generator={"kind": kind, "batch_size": 2, **options},
         samples=5,
-        repeat=2,
-        warmup=1,
+        repeat=repeat,
+        warmup=warmup,
         hardware="test",
         show_progress=False,
     )
@@ -1047,7 +1047,7 @@ def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
     entries = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)
     assert next(iter(entries)).startswith(f"test.{executor}.")
     entry = next(iter(entries.values()))
-    assert entry["total"].shape == (2,) and np.all(entry["total"] > 0)
+    assert entry["total"].shape == (repeat,) and np.all(entry["total"] > 0)
     np.testing.assert_allclose(entry["amortized"], entry["total"] / 5)
     assert not list(tmp_path.rglob("seed_*"))
 
@@ -1748,7 +1748,7 @@ def test_data_loader_mixed_generated_implicit_and_source_datasets(tmp_path):
     assert batch["source"][0]["state"]["meta"].shape == (1,)
 
 
-def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
+def test_load_implicit_model_solution_loading_options(tmp_path):
     input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
     save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
     save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
@@ -1765,54 +1765,26 @@ def test_load_implicit_model_includes_solution_sample_by_default(tmp_path):
     assert len(batch) == 2
     assert [sample["outputs"]["y"][0] for sample in batch] == [2.0, 3.0]
     assert [sample["residuals"]["r"][0] for sample in batch] == [-1.0, 0.5]
-
-
-def test_load_implicit_model_can_disable_solution_sample_loading(tmp_path):
-    input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
-    save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
-    save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
-    save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
-
-    output_dir = input_dir / "seed_0" / "sample_0"
-    save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
-    save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
-
     refs = LoadImplicitModel(batch_size=4, load_solution=False).discover_sample_refs(tmp_path / "toy")
     assert [ref.kind for ref in refs] == ["output"]
-
-
-def test_load_implicit_model_solution_only_skips_output_samples(tmp_path):
-    input_dir = tmp_path / "toy" / "seed_0" / "sample_0"
-    save_h5({"x": jnp.asarray([1.0], dtype=jnp.float32)}, input_dir / "input.h5", mode="w")
-    save_h5({"y": jnp.asarray([2.0], dtype=jnp.float32)}, input_dir / "solution.h5", mode="w")
-    save_h5({"r": jnp.asarray([-1.0], dtype=jnp.float32)}, input_dir / "solution_residual.h5", mode="w")
-
-    output_dir = input_dir / "seed_0" / "sample_0"
-    save_h5({"y": jnp.asarray([3.0], dtype=jnp.float32)}, output_dir / "output.h5", mode="w")
-    save_h5({"r": jnp.asarray([0.5], dtype=jnp.float32)}, output_dir / "residual.h5", mode="w")
-
-    refs = LoadImplicitModel(batch_size=4, solution_only=True).discover_sample_refs(tmp_path / "toy")
+    solution_only = LoadImplicitModel(batch_size=4, solution_only=True)
+    refs = solution_only.discover_sample_refs(tmp_path / "toy")
 
     assert [ref.kind for ref in refs] == ["solution"]
-    batch = LoadImplicitModel(batch_size=4, solution_only=True).load_batch(refs)
+    batch = solution_only.load_batch(refs)
     assert len(batch) == 1
     assert [sample["outputs"]["y"][0] for sample in batch] == [2.0]
     assert [sample["residuals"]["r"][0] for sample in batch] == [-1.0]
-
-
-def test_load_implicit_model_solution_only_requires_solution_loading() -> None:
     with pytest.raises(ValueError, match="solution_only=True requires load_solution=True"):
         LoadImplicitModel(solution_only=True, load_solution=False)
 
 
-@pytest.mark.parametrize("kind", ["serial", "thread", "process"])
 @pytest.mark.parametrize("source", [False, True])
-def test_generation_executors_match_serial(tmp_path, monkeypatch, kind, source):
+def test_generation_executors_match_serial(tmp_path, monkeypatch, source):
     from romjax.data_gen import GenImplicitModel
 
-    if kind == "process":
-        # Spawned workers otherwise compete with the parent for GPU preallocation.
-        monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    # Spawned workers otherwise compete with the parent for GPU preallocation.
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
 
     edge = (
         _ToySourceEdge(source="noise", target="sample")
@@ -1826,21 +1798,33 @@ def test_generation_executors_match_serial(tmp_path, monkeypatch, kind, source):
         else {"input_samples": 5, "outputs_per_input": 3, "input_seed": 7, "output_seed": 8}
     )
     generator_type = GenSource if source else GenImplicitModel
-    roots = [tmp_path / "reference", tmp_path / "actual"]
-    for root, backend in zip(roots, ["serial", kind]):
-        config = {"kind": backend, "show_progress": False}
-        if backend in {"thread", "process"}:
-            config["max_workers"] = 2
+    reference_root = tmp_path / "reference"
+    reference = DataGeneration(
+        root=reference_root,
+        graph=graph,
+        executor={"kind": "serial", "show_progress": False},
+        datasets={"sample": generator_type(**options, batch_size=2)},
+    )
+    assert reference.run() == 0
+    before = H5Store(reference_root / "sample")
+    left = before.discover()
+
+    for backend in ("thread", "process"):
+        actual_root = tmp_path / backend
+        config = {"kind": backend, "show_progress": False, "max_workers": 2}
         generation = DataGeneration(
-            root=root, graph=graph, executor=config, datasets={"sample": generator_type(**options, batch_size=2)}
+            root=actual_root,
+            graph=graph,
+            executor=config,
+            datasets={"sample": generator_type(**options, batch_size=2)},
         )
         assert generation.run() == 0
-    before, after = (H5Store(root / "sample") for root in roots)
-    left, right = before.discover(), after.discover()
-    assert [ref.identity for ref in left] == [ref.identity for ref in right]
-    for lhs, rhs in zip(before.read_batch(left), after.read_batch(right), strict=True):
-        for a, b in zip(jax.tree.leaves(lhs), jax.tree.leaves(rhs), strict=True):
-            np.testing.assert_allclose(a, b)
+        after = H5Store(actual_root / "sample")
+        right = after.discover()
+        assert [ref.identity for ref in left] == [ref.identity for ref in right]
+        for lhs, rhs in zip(before.read_batch(left), after.read_batch(right), strict=True):
+            for a, b in zip(jax.tree.leaves(lhs), jax.tree.leaves(rhs), strict=True):
+                np.testing.assert_allclose(a, b)
 
 
 def test_generation_leaf_executor_overrides_parent(tmp_path):

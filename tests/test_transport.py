@@ -321,10 +321,11 @@ def test_transport_evaluate_and_autodiff() -> None:
         }
         return jnp.sum(model.evaluate(local_inputs, {"phi": phi})["phi_residual"])
 
-    jax.jit(eval_sum)(inputs["forcing"]["A0"], phi0)
-    grad_forcing = jax.grad(lambda a0: eval_sum(a0, phi0))(inputs["forcing"]["A0"])
-    grad_phi = jax.grad(lambda p: eval_sum(inputs["forcing"]["A0"], p))(phi0)
+    value, (grad_forcing, grad_phi) = jax.jit(
+        jax.value_and_grad(eval_sum, argnums=(0, 1))
+    )(inputs["forcing"]["A0"], phi0)
 
+    assert jnp.isfinite(value)
     assert jnp.isfinite(grad_forcing)
     assert jnp.isfinite(grad_phi).all()
     assert grad_phi.shape == phi0.shape
