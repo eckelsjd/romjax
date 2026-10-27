@@ -49,7 +49,7 @@ from romjax.tree import (
     pytree_resolve_refs,
 )
 from romjax.typing import DictModel, ThirdPartyType, from_yaml, require_type
-from romjax.utils import _NullProgress, _create_checkpointer
+from romjax.utils import _create_checkpointer, _NullProgress
 
 __all__ = ["Train", "BatchLoader", "OrbaxRef", "resolve_orbax_params"]
 

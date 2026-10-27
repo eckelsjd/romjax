@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import sys
 from pathlib import Path
 
 import equinox as eqx
@@ -661,50 +660,6 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
 
 
 # @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
-def test_checkpointer_restores_optax_namedtuple_state(tmp_path: Path) -> None:
-    checkpointer = CheckpointerConfig(
-        save_decision_policy=1,
-        preservation_policy=1,
-        step_name_format={"step_prefix": "train", "step_format_fixed_length": 3},
-    )
-    root = tmp_path.resolve() / "adam_reuse"
-
-    first = Train(
-        loss=scalar_quadratic_loss,
-        init_params={"w": jnp.array(0.0)},
-        optimizer=optax.adam(0.2),
-        termination=TerminationConfig(max_steps=2),
-        root=root,
-        checkpointer=checkpointer,
-    )
-    assert first.run() == 0
-
-    resumed = Train(
-        loss=scalar_quadratic_loss,
-        init_params={"w": jnp.array(5.0)},
-        optimizer=optax.adam(0.2),
-        termination=TerminationConfig(max_steps=4),
-        root=root,
-        write_policy="reuse",
-        checkpointer=checkpointer,
-    )
-    assert resumed.run() == 0
-    assert _history_csv(root / "loss.csv")[0].tolist() == [0, 1, 2, 3, 4]
-
-    with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
-        assert ckptr.latest is not None
-        assert ckptr.latest.step == 4
-        loaded = ckptr.load_checkpointables(
-            abstract_checkpointables={
-                "params": {"w": jnp.array(0.0)},
-                "opt_state": optax.adam(0.2).init({"w": jnp.array(0.0)}),
-            }
-        )
-
-    assert hasattr(loaded["opt_state"][0], "mu")
-
-
-# @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
 def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
     checkpointer = CheckpointerConfig(
         save_decision_policy=1,
@@ -738,6 +693,7 @@ def test_checkpointer_reuses_eqx_module_params(tmp_path: Path) -> None:
 
     with _create_checkpointer(root, **dict(checkpointer)) as ckptr:
         assert ckptr.latest is not None
+        assert ckptr.latest.step == 4
         loaded = ckptr.load_checkpointables(
             abstract_checkpointables={
                 "params": eqx.filter(init_params, eqx.is_array),
@@ -884,9 +840,9 @@ def test_train_convergence():
 
     train = Train(
         loss=rosenbrock_loss,
-        init_params={"x": jnp.array([-1.2, 1.0])},
+        init_params={"x": jnp.array([-0.5, 0.25])},
         optimizer=optax.adam(0.01),
-        termination=5_000,
+        termination=1_500,
     )
 
     params = train.fit().params

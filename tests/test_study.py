@@ -75,7 +75,7 @@ loss: !!python/name:tests.study_helpers.loss
 init_params: !pd:tests.study_helpers.Initial {}
 optimizer: {name: optax.sgd, kwargs: {learning_rate: 0.1}}
 test: !!python/name:tests.study_helpers.score
-termination: {max_steps: 4}
+termination: {max_steps: 2}
 diagnostics: {show_progress: false}
 ''')
     return path
@@ -96,7 +96,7 @@ def test_study_runs_and_reuses_trials(base_train, tmp_path, executor):
     assert len(study.trials) == 2
     assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
     for trial in study.trials:
-        assert trial.value == pytest.approx((1 - 2 * trial.params['lr']) ** 8, rel=1e-5)
+        assert trial.value == pytest.approx((1 - 2 * trial.params['lr']) ** 4, rel=1e-5)
     config.n_trials = 1
     assert config.run() == 0
     assert len(study.get_trials()) == 3
