@@ -16,8 +16,8 @@ held-out validation, TPE sampling, and ASHA pruning. It tunes learning rate,
 regularization weight, and a string-valued penalty family. The conditional example
 instead chooses Adam or SGD and only suggests momentum for SGD.
 
-Reports use completed optimizer steps. Validation runs every ten steps even though
-`host_interval` is null. ASHA first considers pruning at step 20; Train limits each
+Reports use completed optimizer steps. The host gate and report interval are both ten steps, so validation
+runs at each report step. ASHA first considers pruning at step 20; Train limits each
 trial to 180 updates. The number pruned varies with ordering and sampled parameters.
 
 Each run adds 40 attempts to its named journal-backed study. To make a short run,

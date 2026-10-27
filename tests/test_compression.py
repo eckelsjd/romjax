@@ -13,7 +13,7 @@ from romjax.graph import FunctionGraph
 from romjax.nn import BlockLinearAutoencoder, LinearProjection
 from romjax.pde import ImplicitAffine
 from romjax.rng import CompressionSampler, PyTreeSampler
-from romjax.train import BatchLoader, TerminationConfig, Train, resolve_orbax_params
+from romjax.train import BatchLoader, TerminationConfig, Train, TrainingResult, resolve_orbax_params
 from romjax.tree import TreeRef
 
 
@@ -477,9 +477,9 @@ def test_block_linear_compression_pod_initializes_train(monkeypatch) -> None:
 
     def fake_train(routine):
         captured["params"] = routine.init_params
-        return routine.init_params
+        return TrainingResult(routine.init_params, 0, {}, "max_steps")
 
-    monkeypatch.setattr(Train, "__call__", fake_train)
+    monkeypatch.setattr(Train, "fit", fake_train)
     compression = BlockLinearCompression(
         fit_mode="pod_then_train", train=train, show_progress=False,
     ).fit(list(vectors))
@@ -560,9 +560,9 @@ def test_block_linear_compression_train_mapping_adds_defaults_and_diagnostics(mo
 
     def fake_train(routine):
         captured["routine"] = routine
-        return routine.init_params
+        return TrainingResult(routine.init_params, 0, {}, "max_steps")
 
-    monkeypatch.setattr(Train, "__call__", fake_train)
+    monkeypatch.setattr(Train, "fit", fake_train)
     compression.fit(samples)
 
     routine = captured["routine"]

@@ -47,7 +47,6 @@ def test_supervisor_terminates_child_when_controller_lease_expires(tmp_path, mon
 
     from romjax.execution import TaskContext
     from romjax.study_worker import TrialLaunchSpec, _StudyWorker
-    from romjax.train import TrainingReportConfig
 
     root = tmp_path / 'trial'
     control = tmp_path / 'control'
@@ -62,7 +61,7 @@ def test_supervisor_terminates_child_when_controller_lease_expires(tmp_path, mon
         return process
 
     monkeypatch.setattr(subprocess, 'Popen', sleeping_child)
-    result = _StudyWorker().run(TrialLaunchSpec('trial', root, control, TrainingReportConfig(),
+    result = _StudyWorker().run(TrialLaunchSpec('trial', root, control,
                                               FeedbackConfig(poll_interval=0.01, shutdown_grace=0.1)),
                                 TaskContext('test'))
     assert result.state == 'failed' and 'Controller lease' in result.error

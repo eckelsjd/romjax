@@ -261,7 +261,7 @@ def test_train_records_unavailable_test_values_as_nan(tmp_path: Path, test) -> N
         root=root,
     )
 
-    train()
+    train.fit().params
 
     steps, values = _history_csv(root / "test.csv")
     assert steps.tolist() == [0, 1, 2]
@@ -282,7 +282,7 @@ def test_train_records_test_exception_as_nan_when_configured(tmp_path: Path) -> 
         root=root,
     )
 
-    train()
+    train.fit().params
 
     steps, values = _history_csv(root / "test.csv")
     assert steps.tolist() == [0, 1, 2]
@@ -303,7 +303,7 @@ def test_train_raises_for_test_exception_by_default(tmp_path: Path) -> None:
     )
 
     with pytest.raises(RoutineError, match="Test evaluation failure"):
-        train()
+        train.fit().params
 
     assert root.joinpath("test.csv").read_text(encoding="utf-8") == "Iteration,Value\n"
 
@@ -500,7 +500,7 @@ def test_train_checkpoint_interval_gates_orbax_save_checks(tmp_path: Path) -> No
         init_params={"w": jnp.array(0.0)},
         optimizer=optax.sgd(0.2),
         termination=5,
-        checkpoint_interval=2,
+        diagnostics={"checkpoint_interval": 2},
         root=root,
         checkpointer=checkpointer,
     )
@@ -522,12 +522,12 @@ def test_train_checkpoint_interval_infers_fixed_orbax_save_policy() -> None:
         loss=scalar_quadratic_loss,
         init_params={"w": jnp.array(0.0)},
         optimizer=optax.sgd(0.2),
-        checkpoint_interval=2,
+        diagnostics={"checkpoint_interval": 2},
         checkpointer=CheckpointerConfig(save_decision_policy=3),
     )
 
-    assert train.checkpoint_interval == 3
-    assert explicit.checkpoint_interval == 2
+    assert train.diagnostics.checkpoint_interval == 3
+    assert explicit.diagnostics.checkpoint_interval == 2
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
@@ -796,7 +796,7 @@ def test_train_load_orbax_uses_eqx_static_template(tmp_path: Path) -> None:
         termination=TerminationConfig(max_steps=1),
         load_orbax={"params": checkpoint_root},
     )
-    loaded_params = train()
+    loaded_params = train.fit().params
 
     assert isinstance(loaded_params, eqx.nn.MLP)
     np.testing.assert_allclose(loaded_params.layers[0].weight, source_params.layers[0].weight)
@@ -889,7 +889,7 @@ def test_train_convergence():
         termination=5_000,
     )
 
-    params = train()
+    params = train.fit().params
     expected = {"x": jnp.array([1.0, 1.0])}
     assert jnp.allclose(params["x"], expected["x"], atol=1e-3)
     assert float(rosenbrock_loss(params, None)) == pytest.approx(0.0, abs=1e-6)
@@ -904,7 +904,7 @@ def test_train_freeze_params_uses_optax_transforms() -> None:
         termination=TerminationConfig(max_steps=3),
     )
 
-    params = train()
+    params = train.fit().params
 
     assert float(params["frozen"]) == 0.0
     assert float(params["train"]) > 0.0
@@ -919,7 +919,7 @@ def test_train_freezes_parameter_after_configured_step() -> None:
         termination=TerminationConfig(max_steps=3),
     )
 
-    params = train()
+    params = train.fit().params
 
     assert float(params["frozen"]) == pytest.approx(0.4)
     assert float(params["train"]) > float(params["frozen"])
@@ -963,7 +963,7 @@ def test_train_recompiles_at_ramp_start_and_completes_scheduled_ramp(toy_graph: 
         diagnostics=DiagnosticsConfig(show_progress=False),
     )
 
-    params = train()
+    params = train.fit().params
     # The always-active term is traced once before activation and once when the scheduled term changes the static
     # active-term tuple at iteration two. The scheduled term is first traced at that activation boundary only.
     assert trace_counts == {"baseline": 2, "scheduled": 1}
@@ -1009,7 +1009,7 @@ def test_train_recompiles_and_continues_for_scheduled_cyclic_path_terms() -> Non
         diagnostics=DiagnosticsConfig(show_progress=True),
     )
 
-    params = train()
+    params = train.fit().params
 
     # Generated cyclic terms containing ab forward enter together at iteration two, requiring one recompilation of
     # the otherwise unchanged baseline graph-loss path.
@@ -1554,7 +1554,7 @@ def test_path_error_loss_trains_through_optimistix_root_find_edge() -> None:
         diagnostics=DiagnosticsConfig(show_progress=False),
     )
 
-    params = train()
+    params = train.fit().params
 
     assert float(params["root"]["weight"]) == pytest.approx(3.0, abs=0.03)
 
@@ -1625,7 +1625,7 @@ def test_graph_loss_ema_balancing_logs_and_plots_terms(tmp_path: Path, toy_graph
                 }
             }
         )
-    assert int(np.asarray(loaded["loss_state"]["step"])) >= 2
+    assert int(np.asarray(loaded["loss_state"]["step"])) == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")
@@ -1686,7 +1686,7 @@ def test_graph_loss_ema_bootstrap_balances_first_optimizer_step(toy_graph: Funct
         diagnostics=DiagnosticsConfig(show_progress=False),
     )
 
-    params = train()
+    params = train.fit().params
 
     raw_small = np.mean(np.array([1.0, 2.0, 3.0]) ** 2)
     raw_large = 100.0 * raw_small
@@ -1769,18 +1769,19 @@ def test_term_plot_shared_legend(
 
 
 def test_fit_reports_current_metrics_and_stops_cleanly(tmp_path):
-    from romjax.train import TrainingDecision, TrainingReportConfig
+    from romjax.train import TrainingDecision
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
                   test=lambda p: p['w'] ** 2, root=tmp_path, termination={'max_steps': 6},
-                  host_interval=None, diagnostics={'show_progress': False})
+                  host_interval=2, diagnostics={'show_progress': False, 'report_interval': 2,
+                                                'report_metrics': ('loss', 'test_score')})
     reports = []
 
     def observe(report):
         reports.append(report)
         return TrainingDecision.STOP if report.step == 4 else TrainingDecision.CONTINUE
 
-    result = train.fit(observer=observe, reporting=TrainingReportConfig(interval=2, metrics=('loss', 'test_score')))
+    result = train.fit(observer=observe)
     assert result.step == 4
     assert result.stop_reason == 'observer'
     assert float(result.params['w']) == pytest.approx(0.8 ** 4)
@@ -1791,13 +1792,13 @@ def test_fit_reports_current_metrics_and_stops_cleanly(tmp_path):
 
 
 def test_fit_final_report_without_periodic_report():
-    from romjax.train import TrainingDecision, TrainingReportConfig
+    from romjax.train import TrainingDecision
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
-                  termination={'max_steps': 3}, diagnostics={'show_progress': False}, host_interval=None)
+                  termination={'max_steps': 3}, diagnostics={'show_progress': False, 'report_interval': 10},
+                  host_interval=None)
     reports = []
-    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.STOP,
-                       reporting=TrainingReportConfig(interval=10))
+    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.STOP)
     assert result.step == 3
     assert result.stop_reason == 'max_steps'
     assert len(reports) == 1 and reports[0].final
@@ -1805,38 +1806,37 @@ def test_fit_final_report_without_periodic_report():
 
 
 def test_fit_observer_failure_saves_and_propagates(tmp_path):
-    from romjax.train import TrainingReportConfig
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
-                  root=tmp_path, termination=4, diagnostics={'show_progress': False},
+                  root=tmp_path, termination=4, diagnostics={'show_progress': False, 'report_interval': 1},
                   test_failure_policy='record_nan')
 
     def broken(report):
         raise RuntimeError('observer unavailable')
 
     with pytest.raises(RuntimeError, match='observer unavailable'):
-        train.fit(observer=broken, reporting=TrainingReportConfig(interval=1))
+        train.fit(observer=broken)
     assert (tmp_path / 'loss.csv').exists()
 
 
 def test_fit_requires_validation_for_requested_score():
-    from romjax.train import TrainingDecision, TrainingReportConfig
+    from romjax.train import TrainingDecision
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
-                  termination=2, diagnostics={'show_progress': False})
+                  termination=2, diagnostics={'show_progress': False, 'report_interval': 1,
+                                              'report_metrics': ('test_score',)})
     with pytest.raises(ValueError, match='Train.test'):
-        train.fit(observer=lambda r: TrainingDecision.CONTINUE,
-                  reporting=TrainingReportConfig(interval=1, metrics=('test_score',)))
+        train.fit(observer=lambda r: TrainingDecision.CONTINUE)
 
 
 def test_fit_exhausted_loader_reports_last_applied_update():
-    from romjax.train import TrainingDecision, TrainingReportConfig
+    from romjax.train import TrainingDecision
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
-                  dataloader=iter([{}, {}]), termination=10, diagnostics={'show_progress': False}, host_interval=None)
+                  dataloader=iter([{}, {}]), termination=10,
+                  diagnostics={'show_progress': False, 'report_interval': 4}, host_interval=None)
     reports = []
-    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.CONTINUE,
-                       reporting=TrainingReportConfig(interval=4))
+    result = train.fit(observer=lambda r: reports.append(r) or TrainingDecision.CONTINUE)
     assert result.step == 2
     assert result.stop_reason == 'dataloader'
     assert result.metrics['loss'] == pytest.approx(0.8 ** 4)
@@ -1847,3 +1847,41 @@ def test_fit_records_gradient_tolerance_reason():
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
                   termination={'max_steps': 10, 'grad_tol': 100}, diagnostics={'show_progress': False})
     assert train.fit().stop_reason == 'grad_tol'
+
+
+def test_final_only_host_does_not_advance_ema(toy_graph, monkeypatch):
+    steps = []
+    original = train_module._GraphLossEmaState.checkpoint_tree
+
+    def capture(state):
+        steps.append(state.step)
+        return original(state)
+
+    monkeypatch.setattr(train_module._GraphLossEmaState, 'checkpoint_tree', capture)
+    batch = {'toy': [{'x': jnp.array([1.0])}]}
+    train = Train(loss=GraphLoss(terms=[{'name': 'small', 'term': graph_batch_squared_error, 'dataset': 'toy'}],
+                                 balancing={'kind': 'ema'}, graph=toy_graph),
+                  init_params={'toy': {'weight': jnp.array(0.0)}}, optimizer=optax.sgd(0.0),
+                  dataloader=RepeatBatchLoader(batch), termination=2, host_interval=None,
+                  diagnostics={'show_progress': False})
+    train.fit()
+    assert steps[-1] == 0
+
+
+def test_final_validation_updates_plot(monkeypatch):
+    captured = {}
+    original = train_module.gridplot
+
+    def capture(*args, **kwargs):
+        fig, axes = original(*args, **kwargs)
+        captured['axes'] = axes
+        return fig, axes
+
+    monkeypatch.setattr(train_module, 'gridplot', capture)
+    train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.)}, optimizer=optax.sgd(.1),
+                  test=lambda params: params['w'] ** 2, termination=2, host_interval=None,
+                  diagnostics={'show_progress': False, 'plot_interval': 10})
+    result = train.fit()
+    line = captured['axes'].ravel()[1].lines[0]
+    assert list(line.get_xdata()) == [2]
+    assert list(line.get_ydata()) == pytest.approx([result.metrics['test_score']])

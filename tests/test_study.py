@@ -317,3 +317,26 @@ def test_grpc_storage_when_configured(base_train, tmp_path):
         assert study.trials[0].state == optuna.trial.TrialState.COMPLETE
     finally:
         optuna.delete_study(study_name=config.study_name, storage=storage)
+
+
+def test_generated_case_contains_study_reporting_and_preserves_host_gate(base_train, tmp_path):
+    import hashlib
+
+    import yaml
+
+    base_train.write_text(base_train.read_text().replace('diagnostics: {show_progress: false}',
+                                                        'host_interval: 2\ndiagnostics: {show_progress: false}'))
+    config = OptunaStudy(root=tmp_path / 'configured', base=base_train, n_trials=1, jax_platforms='cpu',
+                         metric={'name': 'test_score', 'report_interval': 3},
+                         executor={'show_progress': False})
+    assert config.run() == 0
+    case = config.root / 'trials' / 'trial_00000' / 'case.yml'
+    node = yaml.compose(case.read_text())
+    fields = {key.value: value for key, value in node.value}
+    diagnostics = {key.value: value for key, value in fields['diagnostics'].value}
+    assert fields['host_interval'].value == '2'
+    assert diagnostics['report_interval'].value == '3'
+    assert [item.value for item in diagnostics['report_metrics'].value] == ['test_score']
+    assert diagnostics['show_progress'].value == 'false'
+    manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
+    assert manifest['trials'][0]['user_attrs']['romjax_config_sha256'] == hashlib.sha256(case.read_bytes()).hexdigest()

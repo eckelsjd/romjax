@@ -462,7 +462,7 @@ class TermPlotConfig(BaseModel):
         return tuple(name for name in names if name in included and name not in excluded)
 
 
-class DiagnosticsConfig(BaseModel):
+class DiagnosticsConfig(DictModel):
     """
     Configuration for logging, plotting, and callback diagnostics during training.
 
@@ -472,6 +472,9 @@ class DiagnosticsConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True)
 
+    report_interval: PositiveInt | None = None
+    report_metrics: tuple[Literal['loss', 'test_score'], ...] = ('loss',)
+    checkpoint_interval: PositiveInt | None = 1
     log_interval: PositiveInt | None = None
     plot_interval: PositiveInt | None = None
     test_interval: PositiveInt | None = None
@@ -488,6 +491,22 @@ class DiagnosticsConfig(BaseModel):
     terms_color_cycle: str | None = None
     loss_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Loss", "g"))
     test_plot: PlotSpec = Field(default_factory=lambda: _default_plot_spec("Test", "orange"))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_obsolete_reporting(cls, value):
+        if isinstance(value, Mapping):
+            obsolete = {'reporting', 'loss_interval', 'termination_interval'} & value.keys()
+            if obsolete:
+                raise ValueError(f"Unsupported diagnostics fields: {sorted(obsolete)}")
+        return value
+
+    @field_validator('report_metrics')
+    @classmethod
+    def _report_metrics(cls, value):
+        if not value or len(value) != len(set(value)):
+            raise ValueError('report_metrics must be nonempty and unique.')
+        return value
 
     @field_validator("save_plot", mode="before")
     @classmethod
@@ -739,18 +758,6 @@ class TrainingDecision(Enum):
     STOP = 'stop'
 
 
-class TrainingReportConfig(DictModel):
-    """Metrics requested by a host observer.
-
-    :param interval: completed optimizer updates between reports
-    :param metrics: names of fresh metrics to evaluate at report steps
-    """
-
-    model_config = ConfigDict(extra='forbid')
-    interval: PositiveInt = 1
-    metrics: tuple[Literal['loss', 'test_score'], ...] = ('loss',)
-
-
 @dataclass(frozen=True)
 class TrainingReport:
     """Host metric snapshot at a completed optimizer step.
@@ -799,7 +806,6 @@ class Train(Routine):
     :param termination: stopping criteria
     :param diagnostics: configs for plotting and logging
     :param host_interval: global host synchronization interval; ``None`` synchronizes only at the final iteration
-    :param checkpoint_interval: outer checkpoint check interval; ``None`` checks only at the final iteration
     :param freeze_params: a partial tree indicating true, false, or iteration at which a params subtree should be frozen
 
     :param root: run directory for checkpoints, logs, and history (optional)
@@ -823,7 +829,6 @@ class Train(Routine):
     termination: TerminationConfig = Field(default_factory=TerminationConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     host_interval: PositiveInt | None = 1
-    checkpoint_interval: PositiveInt | None = 1
     freeze_params: PyTree | None = None
 
     # Persistence
@@ -836,13 +841,27 @@ class Train(Routine):
     init_seed: int = 0
     graph: Annotated[FunctionGraph | None, BeforeValidator(from_yaml)] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_old_checkpoint_interval(cls, value):
+        if isinstance(value, Mapping):
+            if 'checkpoint_interval' in value:
+                raise ValueError('Move checkpoint_interval to diagnostics.checkpoint_interval.')
+            obsolete = {'reporting', 'loss_interval', 'termination_interval'} & value.keys()
+            if obsolete:
+                raise ValueError(f"Unsupported Train fields: {sorted(obsolete)}")
+            if 'diagnostics' in value:
+                value = dict(value)
+                value['diagnostics'] = DiagnosticsConfig.model_validate(value['diagnostics'])
+        return value
+
     @model_validator(mode="after")
     def _infer_train_intervals(self):
         """Infer cheap outer checkpoint cadence from a fixed-interval Orbax policy when possible."""
-        if "checkpoint_interval" not in self.model_fields_set:
+        if "checkpoint_interval" not in self.diagnostics.model_fields_set:
             interval = getattr(self.checkpointer.save_decision_policy, "interval", None)
             if isinstance(interval, int) and interval > 0:
-                self.checkpoint_interval = interval
+                self.diagnostics.checkpoint_interval = interval
         return self
 
     @model_validator(mode="after")
@@ -976,25 +995,18 @@ class Train(Routine):
     
     def run(self) -> int:
         """For compatibility with Routine."""
-        self.__call__()
+        self.fit()
         return 0
-
-    def __call__(self) -> PyTree:
-        """Train and return the final parameter PyTree."""
-        return self.fit().params
 
     def fit(
         self, *, observer: Callable[[TrainingReport], TrainingDecision] | None = None,
-        reporting: TrainingReportConfig | None = None,
     ) -> TrainingResult:
         """Train with optional host-side metric reports and orderly stopping.
 
         :param observer: host callback; STOP finalizes artifacts before returning
-        :param reporting: requested metrics and cadence, independent of diagnostics
         :return: parameters, final metrics, and termination reason
         """
-        reporting = reporting or TrainingReportConfig()
-        if observer is not None and 'test_score' in reporting.metrics and self.test is None:
+        if observer is not None and 'test_score' in self.diagnostics.report_metrics and self.test is None:
             raise ValueError('Reporting test_score requires Train.test.')
         stop_reason = 'max_steps'
         metric_step = -1
@@ -1446,6 +1458,19 @@ class Train(Routine):
                                 line.set_data(*scaled_terms_hist.term_series(name))
                 
                 def _save_final(metrics=None):
+                    if fig is not None:
+                        lines[0].set_data(*loss_hist.series())
+                        if test_fn is not None:
+                            lines[1].set_data(*test_hist.series())
+                        if raw_terms_hist is not None:
+                            for name, line in raw_term_lines.items():
+                                line.set_data(*raw_terms_hist.term_series(name))
+                        if scaled_terms_hist is not None:
+                            for name, line in scaled_term_lines.items():
+                                line.set_data(*scaled_terms_hist.term_series(name))
+                        for ax in axs.ravel():
+                            ax.relim()
+                            ax.autoscale_view()
                     if 0 < plot_interval < float('inf') and self.diagnostics.live_plot:
                         plt.ioff()
                         plt.show()
@@ -1463,6 +1488,8 @@ class Train(Routine):
 
                 t_start = time.time()
                 metrics = None
+                cached_stats = ""
+                cached_step = None
 
                 def _interval_active(interval: int | None, step: int) -> bool:
                     """Return whether host work for an interval should run at this optimizer step."""
@@ -1488,8 +1515,13 @@ class Train(Routine):
                             break
 
                         ## LOSS/VALIDATION EVALUATION
-                        report_active = observer is not None and curr_step > 0 and curr_step % reporting.interval == 0
-                        host_active = _interval_active(self.host_interval, curr_step) or report_active or final_batch
+                        host_active = _interval_active(self.host_interval, curr_step) or final_batch
+                        balancing_active = (self.host_interval is not None
+                                            and curr_step % self.host_interval == 0
+                                            and curr_step < self.termination.max_steps and not final_batch)
+                        report_active = (host_active and observer is not None and curr_step > 0
+                                         and self.diagnostics.report_interval is not None
+                                         and curr_step % self.diagnostics.report_interval == 0)
                         active_terms = (
                             graph_loss.active_term_names(curr_step) if scheduled_graph_loss else term_names
                         )
@@ -1499,7 +1531,7 @@ class Train(Routine):
 
                         try:
                             if (
-                                host_active
+                                balancing_active
                                 and
                                 ema_enabled
                                 and graph_loss.balancing.bootstrap
@@ -1580,7 +1612,8 @@ class Train(Routine):
                                 scaled_terms_hist.record(curr_step, scaled_terms)
                             if term_scales_hist is not None:
                                 term_scales_hist.record(curr_step, _current_scales())
-                            if raw_terms is not None and _update_ema_state(raw_terms, active_terms):
+                            if (balancing_active and not runtime_reached and raw_terms is not None
+                                    and _update_ema_state(raw_terms, active_terms)):
                                 current_scale_arrays = _current_scale_arrays()
 
                             metrics = {"loss": loss_value}
@@ -1591,7 +1624,7 @@ class Train(Routine):
                                 and (
                                     (0 < test_interval < float('inf') and (curr_step % test_interval == 0
                                                                          or curr_step >= self.termination.max_steps))
-                                    or (observer is not None and 'test_score' in reporting.metrics
+                                    or (observer is not None and 'test_score' in self.diagnostics.report_metrics
                                         and (report_active or runtime_reached or final_batch
                                              or curr_step >= self.termination.max_steps))
                                 )
@@ -1626,8 +1659,7 @@ class Train(Routine):
                                     )
                                     test_score = float("nan")
                                 test_hist.record(curr_step, test_score)
-                                if np.isfinite(test_score):
-                                    metrics["test_score"] = test_score
+                                metrics["test_score"] = test_score
 
                             if self.termination.grad_tol and grad_norm_device is not None:
                                 grad_norm = float(grad_norm_device)
@@ -1635,7 +1667,7 @@ class Train(Routine):
 
                             with profile_annotation("checkpoint_save", env=os.environ):
                                 if (
-                                    _interval_active(self.checkpoint_interval, curr_step)
+                                    _interval_active(self.diagnostics.checkpoint_interval, curr_step)
                                     and self.checkpointer.save_decision_policy is not None
                                     and curr_step not in existing_checkpoint_steps
                                 ):
@@ -1655,13 +1687,15 @@ class Train(Routine):
                             if grad_norm is not None:
                                 stats_str += f" grad={grad_norm:.2e}"
                         
-                        bar.text = stats_str
+                        if host_active:
+                            cached_stats, cached_step = stats_str, curr_step
+                        bar.text = cached_stats or stats_str
 
-                        if host_active and curr_step % log_interval == 0:
+                        if log_interval < float('inf') and curr_step % log_interval == 0:
                             logger.debug(f"Elapsed: {_prettify_timedelta(time.time() - t_start)} "
-                                        f"| step={curr_step} {stats_str}")
+                                        f"| step={curr_step} metrics_step={cached_step} {cached_stats}")
                         
-                        if host_active and (
+                        if (
                             0 < plot_interval < float('inf')
                             and (curr_step % plot_interval == 0 or curr_step >= self.termination.max_steps)
                         ):
@@ -1764,32 +1798,29 @@ class Train(Routine):
                             batch = next_batch
                 
                 logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
-                if observer is not None:
-                    try:
-                        if metric_step != curr_step:
-                            metrics = {}
-                            if last_batch is not None:
-                                if term_diagnostics_enabled:
-                                    evaluated = _graph_train_step(params, opt_state, last_batch, current_scale_arrays,
-                                                                  jnp.asarray(curr_step), active_terms)
-                                else:
-                                    evaluated = _train_step(params, opt_state, last_batch, jnp.asarray(curr_step))
-                                metrics['loss'] = float(evaluated[2])
-                                loss_hist.record(curr_step, metrics['loss'])
-                        if 'test_score' in reporting.metrics and 'test_score' not in (metrics or {}):
-                            try:
-                                score = test_fn(params)
-                                score = float(score) if score is not None else float('nan')
-                            except Exception:
-                                if self.test_failure_policy == 'raise':
-                                    raise
-                                score = float('nan')
-                            metrics = dict(metrics or {}, test_score=score)
-                            test_hist.record(curr_step, score)
+                try:
+                    if metric_step != curr_step:
+                        metrics = {}
+                        if last_batch is not None:
+                            if term_diagnostics_enabled:
+                                evaluated = _graph_train_step(params, opt_state, last_batch, current_scale_arrays,
+                                                              jnp.asarray(curr_step), active_terms)
+                            else:
+                                evaluated = _train_step(params, opt_state, last_batch, jnp.asarray(curr_step))
+                            metrics['loss'] = float(evaluated[2])
+                            loss_hist.record(curr_step, metrics['loss'])
+                    if test_fn is not None and 'test_score' not in (metrics or {}):
+                        try:
+                            score = test_fn(params)
+                            score = float(score) if score is not None else float('nan')
+                        except Exception:
+                            if self.test_failure_policy == 'raise':
+                                raise
+                            score = float('nan')
+                        metrics = dict(metrics or {}, test_score=score)
+                        test_hist.record(curr_step, score)
+                    if observer is not None:
                         observer(TrainingReport(curr_step, metrics or {}, final=True))
-                    finally:
-                        _save_final(metrics)
-                else:
+                finally:
                     _save_final(metrics)
-
         return TrainingResult(params, curr_step, dict(metrics or {}), stop_reason)
