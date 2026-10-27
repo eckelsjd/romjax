@@ -25,10 +25,10 @@ create an `!overrides:...` YAML setting `n_trials: 4`; change `root` and `study_
 for a new experiment. `write_policy: overwrite` resets only that owned study.
 Serial/process/MPI examples have different roots and names.
 
-Inspect `study_manifest.yml`, `best.json`, and `trials/trial_*/trial.yml` under the
-configured root. Each trial retains `case.yml` and referenced YAML snapshots. The
-best three completed trials retain their full artifacts; unsuccessful trials are
-also retained by default. Child stdout/stderr are captured in their trial folders.
+Inspect `study_manifest.yml`, `best/`, and `trials/trial_*/trial.yml` under the
+configured root. All trial artifacts are retained. The `best/` directory is a copy
+of the best completed trial, including its configuration and checkpoints. Child
+stdout/stderr are captured in their trial folders.
 
 A process worker supervises one isolated training subprocess. Four workers can
 train concurrently; choose capacity to fit CPU/GPU memory. The MPI example uses

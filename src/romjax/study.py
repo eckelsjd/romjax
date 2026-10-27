@@ -33,7 +33,6 @@ from pydantic import (
 import romjax
 from romjax.configuration import ConfigAssignment, YamlTemplate
 from romjax.execution import ExecutionAction, ExecutorConfig, TaskSpec
-from romjax.grid_search import MetricCallable, _SavePolicy
 from romjax.routine import Routine
 from romjax.study_worker import FeedbackConfig, TrialLaunchSpec, _FeedbackServer, _Mailbox, _StudyWorker
 from romjax.train import TrainingReport
@@ -126,11 +125,10 @@ class ParameterConfig(ConfigAssignment):
 
 
 class MetricConfig(DictModel):
-    """Live objective selection, reduction, cadence, and missing-value policy."""
+    """Objective selection, reduction, and missing-value policy for training reports."""
 
     model_config = ConfigDict(extra='forbid')
     name: Literal['loss', 'test_score'] = 'loss'
-    report_interval: PositiveInt = 10
     reduction: Literal['last', 'best', 'mean'] = 'last'
     window: PositiveInt = 10
     invalid: Literal['fail', 'skip'] = 'fail'
@@ -203,14 +201,11 @@ class OptunaStudy(Routine):
     pruner: Pruner = Field(default_factory=optuna.pruners.NopPruner)
     storage: Any = 'journal'
     metric: MetricConfig = Field(default_factory=MetricConfig)
-    final_metric: MetricCallable | None = None
     executor: Annotated[ExecutorConfig, BeforeValidator(ExecutorConfig.from_dict)] = Field(
         default_factory=ExecutorConfig
     )
     write_policy: Literal['reuse', 'overwrite', 'error'] = 'reuse'
-    save_policy: _SavePolicy = Field(default_factory=_SavePolicy)
     exit_policy: Literal['any', 'all', 'ignore'] = 'any'
-    retain_unsuccessful: bool = True
     case_root_path: tuple[tuple[str | int, ...], ...] = (('root',),)
     child_env: dict[str, str] = Field(default_factory=dict)
     child_quiet: bool = True
@@ -218,8 +213,8 @@ class OptunaStudy(Routine):
     user_attrs: dict[str, Any] = Field(default_factory=dict)
     enqueue_trials: tuple[dict[str, Any], ...] = ()
     gc_after_trial: bool = False
-    training_seed: int | None = None
-    seed_policy: Literal['fixed', 'trial'] = 'fixed'
+    training_seed: int | None = None                    # To override Train.init_seed
+    seed_policy: Literal['fixed', 'trial'] = 'fixed'    # Use fixed seed or add trial number to each init_seed
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
 
     @field_validator('base', mode='before')
@@ -236,10 +231,14 @@ class OptunaStudy(Routine):
             return value
         return DeferredThirdPartySpec.model_validate(value)
 
-    @field_validator('save_policy', mode='before')
+    @model_validator(mode='before')
     @classmethod
-    def _save_policy(cls, value: Any) -> _SavePolicy:
-        return _SavePolicy.model_validate(value)
+    def _reject_removed_options(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            removed = {'save_policy', 'retain_unsuccessful', 'final_metric'} & value.keys()
+            if removed:
+                raise ValueError(f'Unsupported study fields: {sorted(removed)}')
+        return value
 
     @model_validator(mode='after')
     def _validate_study(self) -> OptunaStudy:
@@ -320,7 +319,7 @@ class _StudyCoordinator:
         return value
 
     def _fingerprint(self) -> str:
-        fields = {'override', 'search_space', 'metric', 'final_metric', 'direction', 'sampler', 'pruner',
+        fields = {'override', 'search_space', 'metric', 'direction', 'sampler', 'pruner',
                   'case_root_path', 'training_seed', 'seed_policy'}
         dumped = self.config.model_dump(include=fields)
         text = romjax.YamlLoader.dump(dumped, sort_keys=True, _preserve_yaml_sources=True)
@@ -378,10 +377,12 @@ class _StudyCoordinator:
                 existing = None
         _Mailbox.write(identity_path, identity)
         if config.write_policy == 'overwrite':
-            if (self.root / 'trials').exists():
-                shutil.rmtree(self.root / 'trials')
-            manifest.unlink(missing_ok=True)
-            (self.root / 'best.json').unlink(missing_ok=True)
+            archive = self.root / 'archive' / uuid4().hex
+            for path in (self.root / 'trials', self.root / 'best', manifest, self.root / 'best.json',
+                         self.root / '.best-backup'):
+                if path.exists():
+                    archive.mkdir(parents=True, exist_ok=True)
+                    path.rename(archive / path.name)
         created = optuna.create_study(study_name=config.study_name, storage=storage,
                                       sampler=config.sampler, pruner=config.pruner, direction=config.direction,
                                       load_if_exists=config.write_policy == 'reuse')
@@ -441,15 +442,6 @@ class _StudyCoordinator:
                         assignments.append(ConfigAssignment(path=('init_seed',), value=seed))
                         trial.set_user_attr('romjax_training_seed', seed)
                     source = self.template.render(assignments)
-                    template = YamlTemplate.from_source(source)
-                    node = template.source.node
-                    if not any(key.value == 'diagnostics' for key, _ in node.value):
-                        template = YamlTemplate.from_source(template.render([
-                            ConfigAssignment(path=('diagnostics',), value={})]))
-                    source = template.render([
-                        ConfigAssignment(path=('diagnostics', 'report_interval'), value=config.metric.report_interval),
-                        ConfigAssignment(path=('diagnostics', 'report_metrics'), value=[config.metric.name]),
-                    ])
                     source = YamlTemplate.from_source(source).snapshot(root / 'sources').source
                     text = romjax.YamlLoader._node_to_yaml(source.node)
                     (root / 'case.yml').write_text(text, encoding='utf-8')
@@ -480,8 +472,7 @@ class _StudyCoordinator:
                         state = optuna.trial.TrialState.PRUNED
                     elif result.state == 'complete' and result.exit_code == 0:
                         try:
-                            value = (self.config.final_metric(outcome.task.payload.root)
-                                     if self.config.final_metric else self.reducers[number].final_value())
+                            value = self.reducers[number].final_value()
                             if not math.isfinite(value):
                                 raise ValueError('Final objective is nonfinite.')
                             state = optuna.trial.TrialState.COMPLETE
@@ -511,12 +502,8 @@ class _StudyCoordinator:
         self.server.unregister(key)
         self.finished += 1
         self.failed += state == optuna.trial.TrialState.FAIL
-        root = self.root / 'trials' / key
-        if root.exists():
-            _Mailbox.write(root / 'retained.json', {'retained': True})
         self._manifest()
-        if self.config.save_policy.mode == 'rolling':
-            self._retain()
+        self._update_best()
         for callback in self.config.callbacks:
             callback(self.study, frozen)
 
@@ -525,45 +512,53 @@ class _StudyCoordinator:
         for trial in self.study.get_trials():
             root = self.root / 'trials' / f'trial_{trial.number:05d}'
             record = {'number': trial.number, 'state': trial.state.name, 'params': trial.params,
-                      'value': trial.value, 'user_attrs': trial.user_attrs,
-                      'retained': root.exists() and (root / 'retained.json').exists()}
+                      'value': trial.value, 'user_attrs': trial.user_attrs}
             trials.append(record)
             if root.exists():
                 # JSON is also valid YAML and permits atomic writes with one shared primitive.
                 _Mailbox.write(root / 'trial.yml', record)
         _Mailbox.write(self.root / 'study_manifest.yml', {'study_name': self.study.study_name, 'trials': trials})
 
-    def _retain(self) -> None:
-        policy = self.config.save_policy
-        complete = sorted((t for t in self.study.get_trials() if t.state == optuna.trial.TrialState.COMPLETE),
-                          key=lambda t: ((t.value if self.config.direction == 'minimize' else -t.value), t.number))
-        keep = {t.number for t in complete[:policy.count]} if policy.mode != 'all' else {t.number for t in complete}
-        for trial in self.study.get_trials():
-            if not trial.state.is_finished():
-                continue
-            if trial.state != optuna.trial.TrialState.COMPLETE and self.config.retain_unsuccessful:
-                continue
-            if trial.number in keep:
-                continue
-            root = self.root / 'trials' / f'trial_{trial.number:05d}'
-            if root.exists():
-                for child in root.iterdir():
-                    if child.name in ('case.yml', 'trial.yml', 'sources'):
-                        continue
-                    if child.is_dir():
-                        shutil.rmtree(child)
-                    else:
-                        child.unlink()
-        if complete:
-            best = complete[0]
-            _Mailbox.write(self.root / 'best.json', {'number': best.number, 'value': best.value, 'params': best.params,
-                                                   'config': f'trials/trial_{best.number:05d}/case.yml'})
-        self._manifest()
+    def _update_best(self) -> None:
+        """Copy the best completed trial, preserving the previous copy on failure."""
+        best_dir = self.root / 'best'
+        backup = self.root / '.best-backup'
+        if backup.exists():
+            if best_dir.exists():
+                shutil.rmtree(backup)
+            else:
+                backup.rename(best_dir)
+        complete = self.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+        if not complete:
+            return
+        best = self.study.best_trial
+        current = _Mailbox.read(best_dir / 'trial.yml')
+        if current is not None and current.get('number') == best.number:
+            return
+        source = self.root / 'trials' / f'trial_{best.number:05d}'
+        temporary = self.root / f'.best-{uuid4().hex}.tmp'
+        try:
+            shutil.copytree(source, temporary)
+            if best_dir.exists():
+                best_dir.rename(backup)
+            try:
+                temporary.rename(best_dir)
+            except BaseException:
+                if backup.exists():
+                    backup.rename(best_dir)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
 
     def run(self) -> int:
         self.template = YamlTemplate.from_source(self.config.base)
         with self._ownership():
             self._open_study()
+            self._manifest()
+            self._update_best()
             self.server = _FeedbackServer(self.control, self.config.feedback)
             try:
                 with self.server:
@@ -591,7 +586,8 @@ class _StudyCoordinator:
                             except BaseException as exc:
                                 cleanup_error = cleanup_error or exc
                     self.study.active = False
-                    self._retain()
+                    self._manifest()
+                    self._update_best()
                     if cleanup_error is not None and original_error is None:
                         raise cleanup_error
             failed = self.failed > 0 if self.config.exit_policy == 'any' else self.failed == self.finished > 0

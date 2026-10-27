@@ -20,7 +20,7 @@ sampler:
 pruner:
   name: optuna.pruners.SuccessiveHalvingPruner
   kwargs: {min_resource: 20, reduction_factor: 3}
-metric: {name: test_score, report_interval: 10}
+metric: {name: test_score}
 override:
   - name: learning_rate
     path: [optimizer, kwargs, learning_rate]
@@ -137,29 +137,23 @@ trained parameters. `Train.run()` returns an exit code. Observers receive immuta
 `TrainingDecision.STOP` finalizes checkpoints and histories. Observer exceptions
 propagate after cleanup.
 
-Optuna writes `report_interval` and `report_metrics` into each trial's Train
-diagnostics. A periodic report occurs only when its interval and `host_interval`
-are both due. Align them to obtain the desired pruning cadence: host interval 8
-and report interval 10 report every 40 steps. With `host_interval: null`, only a
-final report is sent and live pruning is unavailable. Validation requested by the
-test interval and a report is evaluated once when they coincide. Final reports
-describe returned parameters and cannot prune finished training. See
-[training diagnostics](training.md) for the complete interval behavior.
+Train's `diagnostics.report_interval` and `diagnostics.report_metrics` determine
+when and what is reported. Set them in the base Train configuration or via
+explicit overrides. A periodic report occurs only when its interval and
+`host_interval` are both due. With `report_interval: null` or `host_interval: null`,
+only a final report is sent and live pruning is unavailable. Final reports describe
+returned parameters and cannot prune finished training. See [training diagnostics](training.md).
 
-`metric` fields:
+`metric` selects and reduces reports:
 
 - `name`: `loss` (default) or `test_score`.
-- `report_interval`: positive update interval (default 10).
 - `reduction`: `last` (default), `best` (direction-aware), or `mean` over `window`
-  (default 10 reports). The same reduction is used for intermediate/final values.
-- `invalid`: `fail` (default) or `skip`. Missing/nonfinite scores never become stale
-  validation scores; a trial with no finite objective fails.
+  (default 10 reports). The same reduction is used for intermediate and final values.
+- `invalid`: `fail` (default) or `skip`. A trial with no finite objective fails.
 
-Optional `final_metric` accepts the existing `MetricCallable(Path) -> float`
-configuration, including `orbax`, to rank completed trial artifacts. It overrides
-only the final objective; pruning still uses `metric`. Choose these deliberately
-because different live/final metrics can optimize different objectives. The legacy
-orbax metric averages the trailing loss window; it is not a best-validation metric.
+Configure Train to report the selected metric for periodic pruning; `test_score`
+requires `Train.test`. A final report at a previously observed step replaces that
+step's observation in the reducer.
 
 ASHA is `SuccessiveHalvingPruner`; Train's termination settings impose maximum
 resource. Pruning yields Optuna `PRUNED`, not a failed subprocess or failed exit
@@ -208,12 +202,12 @@ After lease expiry, owned orphan
 RUNNING trials become FAIL. Retrying means a new trial, optionally with enqueued old
 parameters; checkpoint continuation of an interrupted Optuna trial is not automatic.
 
-`save_policy` accepts `all`, `best`, `{best: N}`, and `{rolling: N}`. Retention ranks
-finite COMPLETE objectives with direction-aware ties broken by trial number.
-`retain_unsuccessful: true` keeps PRUNED/FAIL artifacts by default. Discarding heavy
-artifacts preserves each trial's `case.yml`, referenced YAML snapshots, and
-`trial.yml`. `best.json` points to the best configuration; no best record is created
-when no trial completes. `study_manifest.yml` mirrors authoritative study storage.
+All trial artifacts are preserved, including unsuccessful trials. `best/` contains
+a copy of the best COMPLETE trial directory, including its configuration and
+checkpoints. It is updated as better trials finish and restored on reuse if missing.
+`study_manifest.yml` mirrors the study's trial states and metadata, including all
+completed cases. On `write_policy: overwrite`, existing trial and best directories
+are moved into a uniquely named `archive/` directory before the study is reset.
 
 `exit_policy: any` returns nonzero if any trial fails; `all` only when all attempts
 fail; `ignore` ignores trial failures. Canceled queued trials become FAIL and invoke
@@ -233,10 +227,10 @@ parallel or interrupted-versus-uninterrupted studies.
 | base / path overrides | same raw-YAML base, named distributions instead of cases |
 | Cartesian enumeration | GridSampler with finite distributions, or adaptive sampler |
 | case root paths / child environment | case_root_path / child_env |
-| metric callable | final_metric; metric selects live Train score |
+| metric callable | metric reduces Train reports into an Optuna objective |
 | reuse / overwrite / error | named-study lifecycle plus config fingerprint |
 | serial/process/MPI/hybrid | same ExecutorConfig |
-| save/exit policies | same top-level forms; PRUNED is distinct from FAIL |
+| exit policy | similar top-level form; PRUNED is distinct from FAIL |
 
 GridSearch remains supported. Existing arbitrary non-Train GridSearch routines do
 not automatically become prunable OptunaStudy objectives.
