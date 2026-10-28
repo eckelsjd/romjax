@@ -19,9 +19,10 @@ dependencies = [
     "networkx>=3.6.1",
     "alive-progress>=3.3.0",
     "jax>=0.9.1",
-    "orbax-checkpoint>=0.11.39",
+    "orbax-checkpoint>=0.12.8",
     "loguru>=0.7.3",
     "diffrax>=0.7.2",
+    "optuna>=5.0.0",
 ]
 requires-python = ">=3.12"
 readme = "README.md"
@@ -48,9 +49,6 @@ cuda12 = [
 ]
 cuda13 = [
     "jax[cuda13]>=0.9.1",
-]
-optuna = [
-    "optuna>=5.0,<5.1",
 ]
 
 [build_system]

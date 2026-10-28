@@ -1,6 +1,11 @@
 """Module for assorted processing utilities."""
+import asyncio
+import socket
 import subprocess
+import sys
 import threading
+from contextlib import contextmanager
+from functools import wraps
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -12,6 +17,79 @@ from orbax.checkpoint import v1 as ocp
 from pydantic import BaseModel
 
 __all__ = ['get_gpu_memory', 'print_gpu_memory', 'monitor_gpu_memory', 'save_h5', 'load_h5', 'required_fields']
+
+_ASYNCIO_WAKEUP_CHECKED = False
+_ASYNCIO_WAKEUP_BLOCKED = False
+_ASYNCIO_LOOP_FACTORY_LOCK = threading.RLock()
+
+
+def _get_uvloop() -> Any | None:
+    """Import uvloop when available."""
+    try:
+        import uvloop
+    except ImportError:
+        return None
+    return uvloop
+
+
+def _check_asyncio_thread_wakeup() -> Any | None:
+    """Return uvloop when local socket wakeups are denied by the runtime.
+
+    Orbax's background runner schedules work onto a selector event loop from
+    another thread. In restricted Linux runtimes, socketpair sends can fail,
+    leaving checkpoint operations waiting for callbacks that never wake the
+    loop. uvloop uses a different wakeup mechanism. Its loop factories are
+    applied only around synchronous Checkpointer methods.
+    """
+    global _ASYNCIO_WAKEUP_CHECKED, _ASYNCIO_WAKEUP_BLOCKED
+    if _ASYNCIO_WAKEUP_CHECKED or sys.platform == "win32":
+        return _get_uvloop() if _ASYNCIO_WAKEUP_BLOCKED else None
+    _ASYNCIO_WAKEUP_CHECKED = True
+
+    try:
+        reader, writer = socket.socketpair()
+        try:
+            writer.send(b"x")
+            reader.recv(1)
+        finally:
+            reader.close()
+            writer.close()
+    except OSError:
+        _ASYNCIO_WAKEUP_BLOCKED = True
+        return _get_uvloop()
+    return None
+
+
+@contextmanager
+def _uvloop_checkpoint_call(uvloop: Any):
+    """Run one Orbax call with uvloop factories, restoring asyncio afterward."""
+    with _ASYNCIO_LOOP_FACTORY_LOCK:
+        original_run = asyncio.run
+        original_new_loop = asyncio.new_event_loop
+        original_events_new_loop = asyncio.events.new_event_loop
+        asyncio.run = uvloop.run
+        asyncio.new_event_loop = uvloop.new_event_loop
+        asyncio.events.new_event_loop = uvloop.new_event_loop
+        try:
+            yield
+        finally:
+            asyncio.run = original_run
+            asyncio.new_event_loop = original_new_loop
+            asyncio.events.new_event_loop = original_events_new_loop
+
+
+def _wrap_checkpointer_method(checkpointer: Any, name: str, uvloop: Any) -> None:
+    """Use a wakeup-compatible event loop for one synchronous Orbax method."""
+    method = getattr(checkpointer, name, None)
+    if method is None:
+        return
+
+    @wraps(method)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _uvloop_checkpoint_call(uvloop):
+            return method(*args, **kwargs)
+
+    setattr(checkpointer, name, wrapped)
 
 
 class _NullProgress:
@@ -33,9 +111,28 @@ def _create_checkpointer(directory: Path, **kwargs: Any) -> Any:
     wakeup mechanism is unavailable while retaining asynchronous checkpoint
     writes.
     """
-    async_options = ocp.options.AsyncOptions(create_directories_asynchronously=False)
-    with ocp.Context(async_options=async_options):
-        return ocp.training.Checkpointer(directory, **kwargs)
+    uvloop = _check_asyncio_thread_wakeup()
+
+    context = ocp.Context()
+    if hasattr(context, "asynchronous"):
+        context.asynchronous.create_directories_asynchronously = False
+    else:
+        # Orbax versions before the mutable Context configuration API require
+        # options to be passed at construction.
+        context = ocp.Context(
+            async_options=ocp.options.AsyncOptions(create_directories_asynchronously=False)
+        )
+
+    with context:
+        if uvloop is None:
+            checkpointer = ocp.training.Checkpointer(directory, **kwargs)
+        else:
+            with _uvloop_checkpoint_call(uvloop):
+                checkpointer = ocp.training.Checkpointer(directory, **kwargs)
+    if uvloop is not None:
+        for method_name in ("save_checkpointables", "load_checkpointables", "close"):
+            _wrap_checkpointer_method(checkpointer, method_name, uvloop)
+    return checkpointer
     
 
 def required_fields(model_cls: type[BaseModel], inherited: bool = True) -> set[str]:
