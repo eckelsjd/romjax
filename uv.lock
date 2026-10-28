@@ -1551,7 +1551,7 @@ wheels = [
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.39"
+version = "0.12.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -1562,6 +1562,7 @@ dependencies = [
     { name = "msgpack" },
     { name = "nest-asyncio", marker = "sys_platform == 'win32'" },
     { name = "numpy" },
+    { name = "prometheus-client" },
     { name = "protobuf" },
     { name = "psutil" },
     { name = "pyyaml" },
@@ -1570,9 +1571,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/da/f0/0da3a8af4d348b906ad659b24ddcdfd5c2aa2def72a9a4f386ae087060a6/orbax_checkpoint-0.11.39.tar.gz", hash = "sha256:047f5078c4e6baa823efd1341886f690931d2c7a58c69e7b8aa3da08b37cfae2", size = 621347, upload-time = "2026-05-06T19:19:12.206Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/a7/e9d8edd627fcdee178a8fdd916a93c3e0c0d4304e6fecc118e082123454c/orbax_checkpoint-0.12.8.tar.gz", hash = "sha256:fd9594cfc6dbd7881a8ce37ee9379b2a14c0e11ed49c774df1578c5ef4c6259a", size = 786754, upload-time = "2026-10-20T19:25:33.034Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/1b/6a69800c82bffaee8d10bd6f063da1ec9d745b20826daba22a87acff778d/orbax_checkpoint-0.11.39-py3-none-any.whl", hash = "sha256:6bf22a6d4d20ed98f4e576248e4f53adb85b5a18353f08f323e29f2fc79fd2d1", size = 1177559, upload-time = "2026-05-06T19:19:10.371Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/be/eaec5cd4340282df0d7ec4ad9f20ee30cba6721e4d05a7b69cf3c4dfa00e/orbax_checkpoint-0.12.8-py3-none-any.whl", hash = "sha256:6a42c005db85bf412ae39598a008c894070fd69ca94ee39e2cca02c7ccc28d1f", size = 1420367, upload-time = "2026-10-20T19:25:31.026Z" },
 ]
 
 [[package]]
@@ -1685,6 +1686,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/40/f1/6d86a29246dfd2e9b6237f0b5823717f60cad94d47ddc26afa916d21f525/pre_commit-4.5.1.tar.gz", hash = "sha256:eb545fcff725875197837263e977ea257a402056661f09dae08e4b149b030a61", size = 198232, upload-time = "2025-12-16T21:14:33.552Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5d/19/fd3ef348460c80af7bb4669ea7926651d1f95c23ff2df18b9d24bab4f3fa/pre_commit-4.5.1-py2.py3-none-any.whl", hash = "sha256:3b3afd891e97337708c1674210f8eba659b52a38ea5f822ff142d10786221f77", size = 226437, upload-time = "2025-12-16T21:14:32.409Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/73/f1334c29c2af4cd9dba6c7817e61b611bd0215e2eb5565c6064a4de18802/prometheus_client-0.26.0.tar.gz", hash = "sha256:04a91bcf94e2cf74a44a1a874d651a2e853ed354b6e822f3b7487751465d5c2b", size = 92910, upload-time = "2026-07-24T19:36:41.893Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/a3/b69efbf4143b5b9859b977770bbbabcc2796b702fa69dc40271e45cd5a56/prometheus_client-0.26.0-py3-none-any.whl", hash = "sha256:fa93d06737aa02bacd05794768508bb97d2fbee28cb3bca04eaae92f0ca953d6", size = 64494, upload-time = "2026-07-24T19:36:40.854Z" },
 ]
 
 [[package]]
@@ -1989,6 +1999,7 @@ dependencies = [
     { name = "numpy" },
     { name = "optax" },
     { name = "optimistix" },
+    { name = "optuna" },
     { name = "orbax-checkpoint" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -2003,9 +2014,6 @@ cuda13 = [
 ]
 mpi = [
     { name = "mpi4py" },
-]
-optuna = [
-    { name = "optuna" },
 ]
 
 [package.dev-dependencies]
@@ -2038,12 +2046,12 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "optimistix", specifier = ">=0.1.0" },
-    { name = "optuna", marker = "extra == 'optuna'", specifier = ">=5.0,<5.1" },
-    { name = "orbax-checkpoint", specifier = ">=0.11.39" },
+    { name = "optuna", specifier = ">=5.0.0" },
+    { name = "orbax-checkpoint", specifier = ">=0.12.8" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
-provides-extras = ["mpi", "cuda12", "cuda13", "optuna"]
+provides-extras = ["mpi", "cuda12", "cuda13"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2279,33 +2287,33 @@ wheels = [
 
 [[package]]
 name = "tensorstore"
-version = "0.1.83"
+version = "0.1.86"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ml-dtypes" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/04/c8/ff9258c98d7a5646e349b762bd1cf2ea3839dbe81bed0db3486a53971df0/tensorstore-0.1.83.tar.gz", hash = "sha256:7ed3249c9a9d21ba24005095db15c178f250755a24cd996db0a265a0d183031e", size = 7191104, upload-time = "2026-05-06T16:25:44.709Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/be/f31a935f31f51e378420af6f0e34510fb136a55ea87d392be6871d2949a3/tensorstore-0.1.86.tar.gz", hash = "sha256:1056ab91bc9e4250f01faa1350930bb3a1a16efebba18795cdf405d3c4a1b8a4", size = 7467686, upload-time = "2026-10-26T20:05:57.912Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/30/76323682290b01eba4afc029f79fdf01941f2ba9249bba4c52e07df5ce64/tensorstore-0.1.83-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:0670fd109dfbc1b01fb4fda5a118e66a55719c45d1cfbdf0bbe33c805e64c731", size = 16570921, upload-time = "2026-05-06T16:24:53.827Z" },
-    { url = "https://files.pythonhosted.org/packages/09/d1/e286cd2f29c18405fa4fe1d500eb9b7a35aa1fe47627c459d6b2f0ceb374/tensorstore-0.1.83-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:82c9d42eb68d2f38396d21462702d553421e054e68b3fb729b1037f28d5264e5", size = 14905214, upload-time = "2026-05-06T16:24:56.356Z" },
-    { url = "https://files.pythonhosted.org/packages/e9/4f/0925698c74ec33646669b68d0c2274d269a94ae36c1d3831228bbee16a92/tensorstore-0.1.83-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9c005e49e63a07455499c146923fdb2c101b28b1d28ce1edb92ed98739570ca8", size = 19344650, upload-time = "2026-05-06T16:24:59.082Z" },
-    { url = "https://files.pythonhosted.org/packages/d1/14/7688e984cdd0be1438779825640b943574b89946ed868d76497b3cffb3d5/tensorstore-0.1.83-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:13f0925b956a5600989139ea1863d4627d469333db95f771e94110a32107d07d", size = 20968336, upload-time = "2026-05-06T16:25:01.55Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/e2/3c38af5d0f31bdd40712810c66c53b37f987282304f388ab9977b2056443/tensorstore-0.1.83-cp312-cp312-win_amd64.whl", hash = "sha256:73d117df4e9ddccd62a59e40d07e7bd37d9786702210d54d5e5cbb315796f69b", size = 13396070, upload-time = "2026-05-06T16:25:03.896Z" },
-    { url = "https://files.pythonhosted.org/packages/bd/7a/3d1344c33cbc46c8b6ea4ab4e7654f5a3e77e6924b82fcdd624e5ebc5a80/tensorstore-0.1.83-cp313-cp313-macosx_10_14_x86_64.whl", hash = "sha256:10442610bb6e380a92ffc2bada86abf80741a13d3afa000aeb8c6446f5543df1", size = 16570684, upload-time = "2026-05-06T16:25:06.585Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/9a/289ac8c4ec3b88e39baec40149cd29cfa03904957a45460865df7ffa5749/tensorstore-0.1.83-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:cb6a5d29b02f77fac2ae56854846ded8c19ae18b99b6b9e1c3920478e3b07035", size = 14905179, upload-time = "2026-05-06T16:25:09.401Z" },
-    { url = "https://files.pythonhosted.org/packages/fa/fd/1c4e3e96497e885030f0bbd3ade7d00aa58de545e447ceb051998448d71c/tensorstore-0.1.83-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:906ef45e0632de1562a8f24a19c6267ba1e3c3076fb1f5eacc534a24bdb134c4", size = 19344442, upload-time = "2026-05-06T16:25:12.133Z" },
-    { url = "https://files.pythonhosted.org/packages/dd/3f/3451393e50796cf62e4b99db3fd52e7188d3f7480c24f3a5b5c1dc042645/tensorstore-0.1.83-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5ca8a5aaff3dcf2a0981f1a94e7c3659ccc7c54da429eb06556735706707e6b9", size = 20967873, upload-time = "2026-05-06T16:25:14.851Z" },
-    { url = "https://files.pythonhosted.org/packages/db/74/2c54d5b68f726eea14dd498c9e5fde8f56f5e142a775620395041a9e90d4/tensorstore-0.1.83-cp313-cp313-win_amd64.whl", hash = "sha256:af38b6f281e8d0b642ff91750e48c422e1ac2c3bce8638882741e66a9191be95", size = 13396229, upload-time = "2026-05-06T16:25:17.199Z" },
-    { url = "https://files.pythonhosted.org/packages/1c/b3/2d186dd7c16016141e7ae01275730abe21b376adb2a4bfcbead366499e23/tensorstore-0.1.83-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:3c96fcc3d7907e51b871d1808fdefccc579764d04b9bd4df6f5c7768b2a907b0", size = 16576897, upload-time = "2026-05-06T16:25:19.638Z" },
-    { url = "https://files.pythonhosted.org/packages/e0/c9/8e60d560e24f85d022bb11395c585139c92dc1aab975323b5a7934604e8f/tensorstore-0.1.83-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:5c5e43ff9643b37e79d56b283eb2f6a668ed3792fc22aa89604037066820ec46", size = 14907978, upload-time = "2026-05-06T16:25:22.348Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/8d/fc544e9444c89743382128460fb54ef79df66a3c3d8c2c1d4e6c397f5883/tensorstore-0.1.83-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:587418b56856a113ee5136c92a724f8cb935230368a27a46c8ad86fc83c8a48c", size = 19346925, upload-time = "2026-05-06T16:25:25.178Z" },
-    { url = "https://files.pythonhosted.org/packages/0b/32/dc17e3e72bd0254a5fe3e02788045db6c71c6ea3ea0513de671005967000/tensorstore-0.1.83-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a5bf524d41445055d281e07ed32192f6aecaf4ab0b1c1c3ceb296c0d81ed2ae4", size = 20969764, upload-time = "2026-05-06T16:25:27.916Z" },
-    { url = "https://files.pythonhosted.org/packages/fa/71/b6bf25cf8a90815f17a3c17fd538b25e1743d8abd3193e815047bdfac336/tensorstore-0.1.83-cp314-cp314-win_amd64.whl", hash = "sha256:1df24d5f103faacc5ac30a801d5c562e9c7e4217770b4f5227d6aaaae1adf2c1", size = 13786016, upload-time = "2026-05-06T16:25:30.683Z" },
-    { url = "https://files.pythonhosted.org/packages/48/05/c621e719fe370d65bdc869afe34f0e5f5f2a5f0035ea0138d00c9c441dd4/tensorstore-0.1.83-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:46b003dcd4a6ecfeb5dd1e572fed514d08603682206594f072a4f078736a9c95", size = 16651989, upload-time = "2026-05-06T16:25:33.073Z" },
-    { url = "https://files.pythonhosted.org/packages/f4/d5/f4ec4422151e2df6d6b5417244031c604ed72b8e61e3faaa40d4744bed11/tensorstore-0.1.83-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:e4322807bad10a92604844ad485df9102e1cebb02f5f6b716da4c048ec10b843", size = 14990073, upload-time = "2026-05-06T16:25:35.572Z" },
-    { url = "https://files.pythonhosted.org/packages/51/71/10e27d4cefa11a29c56c005f70ad5c835ba0ac8c566e1b7ffc836a7cc895/tensorstore-0.1.83-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f48765dcfc854de17742c63c80b163c9b2bf23dcc5b9c64a56126f99a20dbcc5", size = 19365346, upload-time = "2026-05-06T16:25:39.016Z" },
-    { url = "https://files.pythonhosted.org/packages/01/6b/7137aa7b959917e04b55505c009decc7f5de7207cbfbfdd16d7b56e3b844/tensorstore-0.1.83-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:af95e021aee9fd138fb67901999f91e0787a22ec32c725df7d5f3892046bf7dd", size = 20984848, upload-time = "2026-05-06T16:25:41.994Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/32/c468c8bc8398c0e87ab33000a7f66737e5e934ef9b4c87d98e1eb43270c6/tensorstore-0.1.86-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:70cba3af8b0880178154025e83115e10e0ee5fc884920608bd968d980863c52e", size = 17197726, upload-time = "2026-10-26T20:05:18.666Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/91/612d62d9e3b279f788029f5417a7d43acc493698e9365ff0253949a449dd/tensorstore-0.1.86-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:bda74b1158f22c5930dc59f378b1a340e65c8b79e2b62da4eccd3ef796646ac0", size = 15595049, upload-time = "2026-10-26T20:05:20.576Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/b3/e7ccc8e91eba61c3f8fbf87c65e16b0413d85cb65acdd80b55d4c68a1e6c/tensorstore-0.1.86-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:576d0a47c08c008d398aee35959c1ff69edeae0982c6bd3264ce6a315f8a3b96", size = 20199600, upload-time = "2026-10-26T20:05:22.761Z" },
+    { url = "https://files.pythonhosted.org/packages/18/c1/d81918c841511d4d8503b87d7f0ea078f6778642dad1bbf09827596d5aa5/tensorstore-0.1.86-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8440d8f5b7721f51a274d7190d763640a48a11b56fa48fffa5c2fc009192546a", size = 21801602, upload-time = "2026-10-26T20:05:24.709Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/54/fd8910159ac163fa7c334538b1485116751ad0e709c78ac3004d6e90dca6/tensorstore-0.1.86-cp312-cp312-win_amd64.whl", hash = "sha256:0427ff42e1273909927abe54424dabd93f2178029cc2335be57513aa5a9477b4", size = 14251891, upload-time = "2026-10-26T20:05:26.792Z" },
+    { url = "https://files.pythonhosted.org/packages/73/cb/a1225bdd56740fc02c882ea70f080df68a2d73b9c155d33fdcad14633732/tensorstore-0.1.86-cp313-cp313-macosx_10_14_x86_64.whl", hash = "sha256:667bda8fe8998d11e36d47de67fa167faf4fd97b4a89021a745b01c1f2f4cfd9", size = 17197944, upload-time = "2026-10-26T20:05:28.89Z" },
+    { url = "https://files.pythonhosted.org/packages/00/0d/c6e2af1025e9a2d871509c83f05a172418655b3ba8a9d72579cb1a775250/tensorstore-0.1.86-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e04d9b0cb0e1962acca27fc9786c1a6cfa76b62ef21b623ac81545c88205a0c6", size = 15594673, upload-time = "2026-10-26T20:05:30.976Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/0e/786cc31a76a16b01175bf09b81f5a37a920aa23008a21664b5cb215174d2/tensorstore-0.1.86-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e0d39e51dcc046a2f45b17f854caaf6583bf2fc99a8ea8d549718a71b9baf1cc", size = 20197812, upload-time = "2026-10-26T20:05:32.788Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/5c/4791e9a74890ea6b312899dd56e5b0140b66ad98b004ab4bc1b239991d9a/tensorstore-0.1.86-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6948426ef075e7b906f9df1d27af8ac8aacc2a2080762e1a5300496fce09cc7e", size = 21800705, upload-time = "2026-10-26T20:05:34.802Z" },
+    { url = "https://files.pythonhosted.org/packages/82/92/680a225906a099de2f8007ba7aefb4cf833ac57de4bf661d3bf29a2feb2d/tensorstore-0.1.86-cp313-cp313-win_amd64.whl", hash = "sha256:e3c84964e3384d84cb46be4b02e1a11c7cb7220254dedd138724dd591c003964", size = 14252015, upload-time = "2026-10-26T20:05:37.079Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/dc/3f04f326563bc9d64e18d0820b91f9b39b3005d2a5f2fa2c4fc092022d43/tensorstore-0.1.86-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:2d016c0e04da5348d05c6afe9a0f1256c46da059ae253ecbe4b7891e8b7d18b0", size = 17201318, upload-time = "2026-10-26T20:05:39.197Z" },
+    { url = "https://files.pythonhosted.org/packages/35/eb/185ddb74fbe5644081bd535800143e3d647850b3eff1d43de6c8d5d7eab8/tensorstore-0.1.86-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f9cc2bb4398aaa0b155c9205528bf6e5fb63720926c6b6555d1a5ba01d9d9fb0", size = 15595206, upload-time = "2026-10-26T20:05:41.167Z" },
+    { url = "https://files.pythonhosted.org/packages/21/73/11a095c8bdd9934be04e540304e0830fa8015b01892412b734c345f2eed7/tensorstore-0.1.86-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:636a9b4fe66a049e2d273f4db9932a518bc2dbae68517674d353010bf208e89e", size = 20202494, upload-time = "2026-10-26T20:05:43.296Z" },
+    { url = "https://files.pythonhosted.org/packages/51/26/1a2d5d31bd4bb81330fb71600259076c13d8d3049bd927fe04304c34d67d/tensorstore-0.1.86-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a7667b327abfca8f70a5d8bec08cb1d2556a0a9898e7a8ee082bbb539f32e4cb", size = 21803833, upload-time = "2026-10-26T20:05:45.294Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/20/aaf8cb3580ff77f3e1fc5e1363c18195e9496cd37f1c0876e6d322a7acd5/tensorstore-0.1.86-cp314-cp314-win_amd64.whl", hash = "sha256:53fc342292135abe0f6d972e070359817899056c54917650b909d8ed1f49617b", size = 14661947, upload-time = "2026-10-26T20:05:47.52Z" },
+    { url = "https://files.pythonhosted.org/packages/23/37/bc4452a6b7125c10bc58f5ee00229d04aaff253d9b065e3bea5996e268e9/tensorstore-0.1.86-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:a2892767a34d95a785561207a95a299bfc541c5d140cdde20e52a2673db31939", size = 17278602, upload-time = "2026-10-26T20:05:49.559Z" },
+    { url = "https://files.pythonhosted.org/packages/66/5b/3d17038c7378fbe87f68836e3b7bad368dd1dee071990ed641fe7cf19e9a/tensorstore-0.1.86-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:f5a5ebf797b04ee9dec74c8a98d78eaa646ae76b5eb10809c5bbc836c61144c5", size = 15675157, upload-time = "2026-10-26T20:05:51.661Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/06/ec7948f42b68c94c7d1857c88c92c877a46a94ded09c32664e61050bf6da/tensorstore-0.1.86-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a84d49131947a662a8aed42e66d5fd6caef021a8a736a798ab2f0e4ce23c4840", size = 20212864, upload-time = "2026-10-26T20:05:53.751Z" },
+    { url = "https://files.pythonhosted.org/packages/03/12/5d04e3e3009b8478b2c55762e6e269148ae80a95573108386eba18f46aea/tensorstore-0.1.86-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:38fd8190f7c353687ed4aad655d0592f3383b761c0ba17f5002279c126deda20", size = 21816193, upload-time = "2026-10-26T20:05:55.869Z" },
 ]
 
 [[package]]
