@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated, Any
 
+import equinox as eqx
 import h5py
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ from romjax.data_gen import (
     DataLoader,
     GenDataBenchmark,
     GenDataConfig,
+    GenImplicitModel,
     GenLatent,
     GenNorm,
     GenSource,
@@ -29,7 +31,8 @@ from romjax.model import Edge, ImplicitSampleable, SourceSampleable
 from romjax.norm import NormTree
 from romjax.rng import CompressionSampler
 from romjax.routine import RoutineError
-from romjax.storage import H5Store
+from romjax.storage import ComponentStatus, H5Store, Record
+from romjax.tree import pytree_stack
 from romjax.typing import from_yaml
 from romjax.utils import load_h5
 from tests.storage_helpers import write_component as save_h5
@@ -111,6 +114,227 @@ class _ConditionedSampleableEdge(Edge, ImplicitSampleable):
         assert conditions is not None
         augmented_inputs = {**inputs, **conditions}
         return self.solve(augmented_inputs)
+
+
+class _FamilySampleableEdge(_ToySampleableEdge):
+    """Make every family, output key, and condition visible in the result."""
+
+    def sample_conditions(self, key):
+        return {"offset": jax.random.normal(key, (1,))}
+
+    def sample_outputs(self, key, inputs=None, solution=None, conditions=None):
+        base = inputs["x"] if solution is None else solution["y"]
+        return {"y": base + conditions["offset"] + jax.random.uniform(key, (1,))}
+
+
+@pytest.mark.parametrize("width", [0, 1, 2])
+@pytest.mark.parametrize("mix", [False, True])
+@pytest.mark.parametrize(
+    "edge_type,solve,count",
+    [
+        (_FamilySampleableEdge, True, 3),
+        (_FamilySampleableEdge, False, 3),
+        (_ToySampleableEdge, True, 3),
+        (_NoneInputEdge, False, 3),
+        (_FamilySampleableEdge, True, 0),
+    ],
+)
+def test_family_kernel_matches_scalar_calls(tmp_path, width, mix, edge_type, solve, count):
+    model = edge_type(source="inputs", target="sample")
+    generator = GenImplicitModel(
+        graph=FunctionGraph(edges={"sample": model}),
+        input_samples=3,
+        outputs_per_input=count,
+        input_seed=3,
+        output_seed=5,
+        mix_output_seed=mix,
+        map_batch_size=width,
+    )
+    conditioned = isinstance(model, _FamilySampleableEdge)
+    evaluate = hasattr(model, "evaluate")
+    keys = pytree_stack([jax.random.fold_in(jax.random.key(3), i) for i in (2, 4, 7)])
+    output_keys = GenDataBenchmark._output_keys(generator, keys)
+    expected_inputs, expected_outputs = [], []
+    for i, key in enumerate(keys):
+        inputs = model.sample_inputs(key)
+        solution = model.solve(inputs) if solve else None
+        residual = model.evaluate(inputs, solution) if solve and evaluate else None
+        expected_inputs.append((inputs, solution, residual))
+        family = []
+        for j in range(count):
+            out_key = output_keys[i, j]
+            conditions = model.sample_conditions(out_key) if conditioned else None
+            kwargs = {"conditions": conditions} if conditioned else {}
+            outputs = model.sample_outputs(out_key, inputs=inputs, solution=solution, **kwargs)
+            family.append((conditions, outputs, model.evaluate(inputs, outputs) if evaluate else None))
+        if count:
+            expected_outputs.append(pytree_stack(family))
+    expected = (pytree_stack(expected_inputs), pytree_stack(expected_outputs) if count else None)
+    kernel = generator._family_kernel(
+        tmp_path / "sample",
+        (True, solve, solve and evaluate),
+        (conditioned, True, evaluate) if count else None,
+    )
+    actual = jax.block_until_ready(kernel(keys, (None, None, None), output_keys, (None, None, None)))
+    assert jax.tree.structure(actual) == jax.tree.structure(expected)
+    for lhs, rhs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_allclose(lhs, rhs, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("width", [0, 1, 2])
+def test_generation_submits_complete_family_batches(tmp_path, monkeypatch, width):
+    generator = GenImplicitModel(
+        graph=FunctionGraph(edges={"sample": _FamilySampleableEdge(source="inputs", target="sample")}),
+        input_samples=5,
+        outputs_per_input=3,
+        input_seed=3,
+        output_seed=5,
+        batch_size=3,
+        map_batch_size=width,
+        executor={"show_progress": False},
+    )
+    reference = generator.model_copy(update={"throw": False}, deep=True)
+    reference.generate(tmp_path / "scalar" / "sample", "h5", "overwrite")
+    calls = []
+    original = generator._family_kernel
+
+    def counted(*args):
+        kernel = original(*args)
+
+        def run(*values):
+            calls.append(len(values[0]))
+            return kernel(*values)
+
+        return run
+
+    monkeypatch.setattr(generator, "_family_kernel", counted)
+    generator.generate(tmp_path / "mapped" / "sample", "h5", "overwrite")
+    assert calls == [3, 2]
+    left, right = [H5Store(tmp_path / kind / "sample") for kind in ("scalar", "mapped")]
+    refs = [store.discover(include_incomplete=True) for store in (left, right)]
+    assert [ref.identity for ref in refs[0]] == [ref.identity for ref in refs[1]]
+    for a, b in zip(left.read_components(refs[0]), right.read_components(refs[1]), strict=True):
+        assert jax.tree.structure(a) == jax.tree.structure(b)
+        for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True):
+            np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-6)
+    for ref in refs[0]:
+        assert left.status(ref.seed, ref.input_index, ref.output_seed, ref.output_index) == right.status(
+            ref.seed, ref.input_index, ref.output_seed, ref.output_index
+        )
+    calls.clear()
+    generator.generate(tmp_path / "mapped" / "sample", "h5", "reuse")
+    assert calls == []
+
+
+def test_family_generation_partial_reuse(tmp_path):
+    generator = GenImplicitModel(
+        graph=FunctionGraph(edges={"sample": _FamilySampleableEdge(source="inputs", target="sample")}),
+        input_samples=4,
+        outputs_per_input=3,
+        input_seed=3,
+        output_seed=5,
+        batch_size=4,
+        executor={"show_progress": False},
+    )
+    path = tmp_path / "sample"
+    generator.generate(path, "h5", "overwrite")
+    store = H5Store(path)
+    refs = [ref for ref in store.discover(include_incomplete=True) if ref.kind != "solution"]
+    before = {ref.identity: data for ref, data in zip(refs, store.read_components(refs), strict=True)}
+    # One ragged family, one residual-only family, one missing solve, and one complete family.
+    store.write(
+        [
+            Record(3, 0, "output", {}, 5, 0, {"values": ComponentStatus.STALE}),
+            Record(3, 0, "output", {}, 5, 2, {"residuals": ComponentStatus.STALE}),
+            Record(3, 1, "output", {}, 5, 2, {"residuals": ComponentStatus.STALE}),
+            Record(3, 2, "input", {}, states={"solutions": ComponentStatus.STALE}),
+            # A changed parent invalidates its dependent conditions in the storage contract.
+            *[Record(3, 2, "output", {}, 5, j, {"conditions": ComponentStatus.STALE}) for j in range(3)],
+        ]
+    )
+    plans = generator._plans(store, range(4), "reuse")
+    assert [plan["index"] for plan in plans] == [0, 1, 2]
+    assert [output["index"] for output in plans[0]["outputs"]] == [0, 2]
+    expected = generator._compute(path, plans, mapped=False)
+    actual = generator._compute(path, plans)
+    assert actual.fatal is None
+    assert [(r.input_index, r.output_index) for r in actual.records] == [
+        (r.input_index, r.output_index) for r in expected.records
+    ]
+    for a, b in zip(actual.records, expected.records, strict=True):
+        assert a.states == b.states
+        assert jax.tree.structure(a.components) == jax.tree.structure(b.components)
+        for x, y in zip(jax.tree.leaves(a.components), jax.tree.leaves(b.components), strict=True):
+            np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-6)
+    store.write(actual.records)
+    for ref, data in zip(refs, store.read_components(refs), strict=True):
+        for x, y in zip(jax.tree.leaves(data), jax.tree.leaves(before[ref.identity]), strict=True):
+            np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-6)
+    assert generator._plans(store, range(4), "reuse") == []
+
+
+class _FailingFamilyEdge(_FamilySampleableEdge):
+    fail_input: float
+
+    def sample_outputs(self, key, inputs=None, solution=None, conditions=None):
+        outputs = super().sample_outputs(key, inputs, solution, conditions)
+        return eqx.error_if(outputs, jnp.isclose(inputs["x"][0], self.fail_input), "family output failure")
+
+
+@pytest.mark.parametrize("throw", [False, True])
+def test_family_failure_recovers_original_identity(tmp_path, throw):
+    fail_input = float(jax.random.uniform(jax.random.fold_in(jax.random.key(3), 1)))
+    generator = GenImplicitModel(
+        graph=FunctionGraph(
+            edges={
+                "sample": _FailingFamilyEdge(
+                    source="inputs",
+                    target="sample",
+                    fail_input=fail_input,
+                )
+            }
+        ),
+        input_samples=3,
+        outputs_per_input=2,
+        input_seed=3,
+        output_seed=5,
+        batch_size=3,
+        throw=throw,
+        map_batch_size=2,
+    )
+    path = tmp_path / "sample"
+    store = H5Store(path, "implicit")
+    plans = generator._plans(store, range(3), "overwrite")
+    result = generator._compute(path, plans)
+    failed = [record for record in result.records if record.failure]
+    assert [(r.input_index, r.output_index, r.kind) for r in failed] == (
+        [(1, 0, "output")] if throw else [(1, 0, "output"), (1, 1, "output")]
+    )
+    assert all("family output failure" in record.failure for record in failed)
+    assert bool(result.fatal) is throw
+    successful_outputs = [
+        (r.input_index, r.output_index) for r in result.records if r.kind == "output" and not r.failure
+    ]
+    assert successful_outputs == ([(0, 0), (0, 1)] if throw else [(0, 0), (0, 1), (2, 0), (2, 1)])
+
+
+def test_family_transform_failure_is_not_silently_ignored(tmp_path, monkeypatch):
+    generator = GenImplicitModel(
+        graph=FunctionGraph(edges={"sample": _ToySampleableEdge(source="inputs", target="sample")}),
+        input_samples=2,
+        outputs_per_input=1,
+        input_seed=3,
+        output_seed=5,
+    )
+    path = tmp_path / "sample"
+    plans = generator._plans(H5Store(path, "implicit"), range(2), "overwrite")
+
+    def fail(*args):
+        raise ValueError("mapped-only failure")
+
+    monkeypatch.setattr(generator, "_family_kernel", fail)
+    with pytest.raises(RuntimeError, match="individual samples succeeded: mapped-only failure"):
+        generator._compute(path, plans)
 
 
 class _CompressionSampleableEdge(Edge, ImplicitSampleable):
@@ -1075,40 +1299,77 @@ def test_data_generation_benchmark_cache_identity_and_leaf_override(tmp_path):
     assert set(load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)) == labels
 
 
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("edge_type", [_ConditionedSampleableEdge, _RandomOutputEdge, _NoneInputEdge])
-@pytest.mark.parametrize("skip", [False, True])
-def test_data_generation_benchmark_matches_generation_numerics(tmp_path, batch_size, edge_type, skip):
-    """A benchmark must execute the same numerical workload, including output tails."""
+@pytest.mark.parametrize(
+    "width,mix,count,skip_solve,skip_evaluate",
+    [
+        (0, True, 3, False, False),
+        (1, False, 3, False, True),
+        (2, True, 3, True, False),
+        (2, False, 0, False, False),
+        (0, False, 3, True, True),
+    ],
+)
+@pytest.mark.parametrize("edge_type", [_FamilySampleableEdge, _RandomOutputEdge, _NoneInputEdge])
+def test_data_generation_benchmark_matches_generation_numerics(
+    tmp_path, monkeypatch, width, mix, count, skip_solve, skip_evaluate, edge_type
+):
+    """Compare each component at its family/output identity, including task tails."""
     graph = FunctionGraph(edges={"sample": edge_type(source="inputs", target="sample")})
-    options = dict(
-        input_samples=3,
-        outputs_per_input=3,
+    generator = GenImplicitModel(
+        graph=graph,
+        input_samples=5,
+        outputs_per_input=count,
         input_seed=3,
         output_seed=5,
-        batch_size=batch_size,
-        skip_solve=skip,
-        skip_evaluate=skip,
+        batch_size=3,
+        map_batch_size=width,
+        mix_output_seed=mix,
+        skip_solve=skip_solve,
+        skip_evaluate=skip_evaluate,
+        executor={"show_progress": False},
     )
-    generation = DataGeneration(
-        root=tmp_path / "reference", graph=graph, executor={"show_progress": False}, datasets={"sample": options}
-    )
-    generation.run()
-    benchmark = GenDataBenchmark(
-        generator={"kind": "implicit", "graph": graph, **options}, samples=3, repeat=1, warmup=0, show_progress=False
-    )
+    generator.generate(tmp_path / "reference" / "sample", "h5", "overwrite")
+    benchmark = GenDataBenchmark(generator=generator, samples=5, repeat=1, warmup=0, show_progress=False)
+    kernels = []
+    original = generator._family_kernel
+
+    def capture(*args):
+        kernel = original(*args)
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(generator, "_family_kernel", capture)
     workload, batches = benchmark._workload(tmp_path / "sample")
-    numerical = [
-        np.asarray(leaf).reshape(-1)
-        for args in batches
-        for leaf in jax.tree.leaves(jax.block_until_ready(workload(*args)))
-    ]
+    assert kernels == [workload]
+    assert not (tmp_path / "sample").exists()
+    numerical = {}
+    for batch_index, args in enumerate(batches):
+        inputs, outputs = jax.block_until_ready(workload(*args))
+        for i in range(len(args[0])):
+            index = batch_index * generator.batch_size + i
+            numerical["input", 3, index, None, None] = dict(
+                zip(
+                    ("inputs", "solutions", "solution_residuals"),
+                    jax.tree.map(lambda x: x[i], inputs),
+                    strict=True,
+                )
+            )
+            for j in range(count):
+                numerical["output", 3, index, 5, j] = dict(
+                    zip(
+                        ("conditions", "values", "residuals"),
+                        jax.tree.map(lambda x: x[i, j], outputs),
+                        strict=True,
+                    )
+                )
     store = H5Store(tmp_path / "reference" / "sample")
     refs = [ref for ref in store.discover(include_incomplete=True) if ref.kind != "solution"]
-    persisted = [
-        np.asarray(leaf).reshape(-1) for record in store.read_components(refs) for leaf in jax.tree.leaves(record)
-    ]
-    np.testing.assert_allclose(np.sort(np.concatenate(numerical)), np.sort(np.concatenate(persisted)))
+    assert set(numerical) == {ref.identity for ref in refs}
+    for ref, persisted in zip(refs, store.read_components(refs), strict=True):
+        actual = numerical[ref.identity]
+        assert jax.tree.structure(actual) == jax.tree.structure(persisted)
+        for x, y in zip(jax.tree.leaves(actual), jax.tree.leaves(persisted), strict=True):
+            np.testing.assert_allclose(x, y, rtol=1e-6, atol=1e-6)
 
 
 def test_data_generation_benchmark_rejects_old_schema_at_executor_label(tmp_path):
@@ -1124,7 +1385,10 @@ def test_data_generation_benchmark_rejects_old_schema_at_executor_label(tmp_path
     benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
     path = tmp_path / "sample" / "timings.h5"
     cached = load_h5({}, path, jax=False)
-    next(iter(cached.values()))["_benchmark"]["schema_version"] = np.asarray(2)
+    metadata = next(iter(cached.values()))["_benchmark"]
+    assert metadata["schema_version"] == 5
+    metadata["schema_version"] = np.asarray(4)
+    metadata["compute_policy"] = np.bytes_("lax_map_staged")
     save_h5(cached, path, mode="w")
     with pytest.raises(RoutineError, match="incompatible"):
         benchmark.generate(tmp_path / "sample", format="h5", write_policy="reuse")
