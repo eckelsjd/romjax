@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -593,7 +594,7 @@ class ExecutorConfig(DictModel):
         environment.update(jax_env or {})
         workers = self._pass_worker_count(len(tasks))
         units = sum(task.units for task in tasks)
-        total_units = units * (workers * warmup + repeat)
+        total_units = units * repeat
         options = {**(progress_bar or {}), **dict(self.progress_bar)}
         manual = config_handler(**options).manual if self.show_progress else False
         progress = alive_bar(total_units, **options) if self.show_progress else _NullProgress()
@@ -605,33 +606,42 @@ class ExecutorConfig(DictModel):
             bootstrap = _PassBootstrap(prepared, tasks, warmup, self.kind == 'mpi')
             context = TaskContext(run_id, environment)
             initialized = False
+            warmup_stop = threading.Event()
+            warmup_thread = None
+            warmup_start = time.monotonic()
+            if warmup and self.show_progress:
+                bar.text = 'Warming up...'
+
+                def update_warmup_text() -> None:
+                    while not warmup_stop.wait(1):
+                        elapsed = int(time.monotonic() - warmup_start)
+                        bar.text = f'Warming up... ({elapsed}s)'
+
+                warmup_thread = threading.Thread(target=update_warmup_text, daemon=True)
+                warmup_thread.start()
             try:
                 results = self._bootstrap_pass_workers(pool, workers, bootstrap, context, remote)
                 initialized = True
                 for result in results:
                     if result.error is not None:
                         raise result.error
-                completed = units * workers * warmup
-                if warmup and self.show_progress:
-                    bar.text = f'Warmup complete ({workers} workers)'
-                    fraction = completed / total_units if total_units else 1.
-                    bar(fraction if manual else completed)
+                if warmup:
+                    warmup_elapsed = time.monotonic() - warmup_start
+                    warmup_stop.set()
+                    if warmup_thread is not None:
+                        warmup_thread.join()
+                    # logger.debug('Benchmark warmup completed in {:.3f}s.', warmup_elapsed)
                 dispatcher = _PassDispatch()
                 for index in range(repeat):
-                    # alive_bar renders on a background thread in interactive
-                    # terminals. Pausing stops that renderer as well as deferring
-                    # updates, keeping its work outside the measured interval.
-                    with bar.pause() if self.show_progress else nullcontext():
-                        start = time.perf_counter()
-                        self._execute(pool, capacity, dispatcher, tasks, run_id, environment, (), remote,
-                                      None, False, units, None, 'raise', False)
-                        durations.append(time.perf_counter() - start)
-                    completed += units
-                    if self.show_progress:
-                        bar.text = f'Repeat {index + 1}/{repeat}; {len(tasks)} batches complete'
-                        fraction = completed / total_units if total_units else 1.
-                        bar(fraction if manual else units)
+                    bar.text = f'Repeat {index + 1}/{repeat}' if self.show_progress else ''
+                    start = time.perf_counter()
+                    self._execute(pool, capacity, dispatcher, tasks, run_id, environment, (), remote,
+                                  bar if self.show_progress else None, manual, total_units, None, 'raise', False)
+                    durations.append(time.perf_counter() - start)
             finally:
+                warmup_stop.set()
+                if warmup_thread is not None:
+                    warmup_thread.join()
                 if self.kind == 'mpi' and initialized:
                     cleanup = _PassBootstrap(None, (), 0, mpi=True, cleanup=True)
                     results = self._bootstrap_pass_workers(pool, workers, cleanup, context, remote)

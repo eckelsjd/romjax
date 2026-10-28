@@ -936,26 +936,23 @@ def test_data_generation_benchmark_times_full_pass_and_reports_progress(tmp_path
         return next(ticks)
 
     monkeypatch.setattr(execution.time, "perf_counter", clock)
-    progress = {"updates": 0, "messages": []}
+    progress = {"updates": [], "messages": [], "pauses": 0}
 
     class FakeProgress:
         def __enter__(self):
             return self
 
         def __exit__(self, *args):
-            assert not clock_state["timing"]
             return False
 
         def __setattr__(self, name, value):
-            assert not clock_state["timing"]
             progress["messages"].append(value)
 
         def __call__(self, units):
-            assert not clock_state["timing"]
-            progress["updates"] += units
+            progress["updates"].append(units)
 
         def pause(self):
-            assert not clock_state["timing"]
+            progress["pauses"] += 1
             return nullcontext()
 
     def progress_factory(total, **kwargs):
@@ -967,9 +964,10 @@ def test_data_generation_benchmark_times_full_pass_and_reports_progress(tmp_path
     totals = benchmark._benchmark(tmp_path / "sample")
     np.testing.assert_allclose(totals, [4.0, 12.0])
     assert workload_calls == [1, 2] * 3
-    assert progress["total"] == 6 and progress["updates"] == 6
+    assert progress["total"] == 4 and progress["updates"] == [1, 1, 1, 1]
     assert progress["title"] == "sample"
-    assert any("Repeat 2/2" in message for message in progress["messages"])
+    assert "Warming up..." in progress["messages"]
+    assert progress["pauses"] == 0
 
 
 def test_data_generation_benchmark_excludes_cache_io_from_timing(tmp_path, monkeypatch):
