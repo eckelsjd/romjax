@@ -11,3 +11,4 @@ split_latent
 *.npz
 *.json
 mpi_grid_search/output
+implicit_batching_results/

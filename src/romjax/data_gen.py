@@ -220,7 +220,10 @@ class GenGraph(GenDataConfig, ABC):
     """Graph sampling with independent task, compute, and storage batch sizes.
 
     :param batch_size: source samples or complete input families per executor task
-    :param map_batch_size: lax.map vectorization width; zero maps the full axis
+    :param map_batch_size: source/family vectorization width; zero maps the full axis.
+        Implicit outputs are vectorized within each family. Positive widths bound
+        concurrent families, not the memory occupied by the returned batch. Irregular
+        cached output plans retain staged mapping with this width for each stage.
     :param storage: settings for newly created files; inherits the routine default
     :param executor: task executor; inherits the routine executor
     """
@@ -300,6 +303,34 @@ class GenGraph(GenDataConfig, ABC):
         self._compiled[cache_key] = result
         return result
 
+    def _family_kernel(
+        self, path: Path, input_flags: tuple[bool, ...], output_flags: tuple[bool, ...] | None
+    ) -> Callable[..., PyTree]:
+        """Compile complete families, keeping input-to-output context on the device."""
+        cache_key = id(self._edge_from_path(path)), "family", input_flags, output_flags, self.map_batch_size
+        if cache_key in self._compiled:
+            return self._compiled[cache_key]
+        input_kernel = self._kernel(path, "input", input_flags, False)
+        output_kernel = None if output_flags is None else self._kernel(path, "output", output_flags, False)
+        width = self.map_batch_size
+
+        def family(item):
+            key, input_values, output_keys, output_values = item
+            inputs, solution, residual = input_kernel(key, *input_values)
+            outputs = None
+            if output_kernel is not None:
+                outputs = jax.vmap(output_kernel, in_axes=(0, 0, 0, 0, None, None))(
+                    output_keys, *output_values, inputs, solution
+                )
+            return (inputs, solution, residual), outputs
+
+        @eqx.filter_jit
+        def workload(input_keys, input_values, output_keys, output_values):
+            return jax.lax.map(family, (input_keys, input_values, output_keys, output_values), batch_size=width)
+
+        self._compiled[cache_key] = workload
+        return workload
+
     @staticmethod
     def _unstack(tree: PyTree, count: int) -> list[PyTree]:
         return [jax.tree.map(lambda leaf: leaf[i], tree) for i in range(count)]
@@ -331,6 +362,106 @@ class GenGraph(GenDataConfig, ABC):
         return result
 
     def _compute(self, path: Path, plans: Sequence[dict[str, Any]], *, mapped: bool = True) -> _GeneratedBatch:
+        """Compute mapped implicit families, replaying scalar work to identify failures."""
+        if not mapped or not self.throw or isinstance(self, GenSource):
+            return self._compute_staged(path, plans, mapped=mapped)
+        try:
+            return self._compute_families(path, plans)
+        except Exception as exc:
+            return self._recover_families(path, plans, exc)
+
+    def _recover_families(self, path: Path, plans: Sequence[dict[str, Any]], failure: Exception) -> _GeneratedBatch:
+        """Replay pure kernels to identify the failing identity and salvage records."""
+        recovered = []
+        for plan in plans:
+            result = self._compute(path, [plan], mapped=False)
+            recovered.extend(result.records)
+            if result.fatal:
+                return _GeneratedBatch(recovered, result.fatal)
+        raise RuntimeError(f"Mapped generation failed although individual samples succeeded: {failure}") from failure
+
+    def _input_record(self, model: Edge, plan: dict[str, Any], values: PyTree) -> Record:
+        """Build only the input component updates requested by a plan."""
+        components = {
+            name: value
+            for name, value, needed in zip(
+                ("inputs", "solutions", "solution_residuals"), values, plan["flags"], strict=True
+            )
+            if needed
+        }
+        states = {}
+        for name, skip in (
+            ("solutions", self.skip_solve or not hasattr(model, "solve")),
+            ("solution_residuals", self.skip_evaluate or not hasattr(model, "evaluate")),
+        ):
+            if skip and (plan["overwrite"] or name not in plan["old"]):
+                components[name], states[name] = None, ComponentStatus.SKIPPED
+        return Record(self.input_seed, plan["index"], "input", components, states=states)
+
+    def _output_record(self, model: Edge, index: int, output: dict[str, Any], values: PyTree) -> Record:
+        """Build an output update with the existing skipped/absent component states."""
+        fields = {
+            name: value
+            for name, value, needed in zip(("conditions", "values", "residuals"), values, output["flags"], strict=True)
+            if needed
+        }
+        states = {}
+        if self.skip_evaluate or not hasattr(model, "evaluate"):
+            fields["residuals"], states["residuals"] = None, ComponentStatus.SKIPPED
+        if not _has_custom_sample_conditions(model):
+            fields["conditions"], states["conditions"] = None, ComponentStatus.NONE
+        return Record(self.input_seed, index, "output", fields, self.output_seed, output["index"], states)
+
+    def _compute_families(self, path: Path, plans: Sequence[dict[str, Any]]) -> _GeneratedBatch:
+        """Batch compatible plans; retain staged execution for irregular cached outputs."""
+        model = self._edge_from_path(path)
+        groups, by_index = {}, {}
+        for plan in plans:
+            outputs = plan["outputs"]
+            signatures = [self._group_key(item["flags"], item["values"]) for item in outputs]
+            if signatures and any(signature != signatures[0] for signature in signatures[1:]):
+                result = self._compute_staged(path, [plan])
+                if result.fatal:
+                    # Let the caller replay in original plan order, including earlier families.
+                    raise RuntimeError(result.fatal)
+                by_index[plan["index"]] = result.records
+                continue
+            group_key = self._group_key(plan["flags"], plan["values"]), len(outputs), tuple(signatures[:1])
+            groups.setdefault(group_key, []).append(plan)
+        for group in groups.values():
+            first = group[0]
+            has_outputs = bool(first["outputs"])
+            keys = [jax.random.fold_in(jax.random.key(self.input_seed), plan["index"]) for plan in group]
+            output_keys = None
+            output_values = (None, None, None)
+            if has_outputs:
+                output_keys = pytree_stack(
+                    [
+                        pytree_stack([self._output_key(key, item["index"]) for item in plan["outputs"]])
+                        for key, plan in zip(keys, group, strict=True)
+                    ]
+                )
+                output_values = pytree_stack(
+                    [pytree_stack([item["values"] for item in plan["outputs"]]) for plan in group]
+                )
+            kernel = self._family_kernel(path, first["flags"], first["outputs"][0]["flags"] if has_outputs else None)
+            result = kernel(
+                pytree_stack(keys), pytree_stack([plan["values"] for plan in group]), output_keys, output_values
+            )
+            # One transfer for the whole group, after input-to-output dependencies finish on device.
+            for plan, (inputs, outputs) in zip(group, self._unstack(jax.device_get(result), len(group)), strict=True):
+                records = [self._input_record(model, plan, inputs)]
+                if has_outputs:
+                    records.extend(
+                        self._output_record(model, plan["index"], output, values)
+                        for output, values in zip(
+                            plan["outputs"], self._unstack(outputs, len(plan["outputs"])), strict=True
+                        )
+                    )
+                by_index[plan["index"]] = records
+        return _GeneratedBatch([record for plan in plans for record in by_index[plan["index"]]])
+
+    def _compute_staged(self, path: Path, plans: Sequence[dict[str, Any]], *, mapped: bool = True) -> _GeneratedBatch:
         """Compute independent families; this method has no target-file access."""
         model = self._edge_from_path(path)
         records: list[Record] = []
@@ -369,21 +500,7 @@ class GenGraph(GenDataConfig, ABC):
                         records.append(Record(seed, index, "source", {"values": value}))
                         continue
                     inputs, solution, residual = value
-                    components = {
-                        name: val
-                        for name, val, needed in zip(
-                            ("inputs", "solutions", "solution_residuals"), value, flags, strict=True
-                        )
-                        if needed
-                    }
-                    states = {}
-                    for name, skip in (
-                        ("solutions", self.skip_solve or not hasattr(model, "solve")),
-                        ("solution_residuals", self.skip_evaluate or not hasattr(model, "evaluate")),
-                    ):
-                        if skip and (plan["overwrite"] or name not in plan["old"]):
-                            components[name], states[name] = None, ComponentStatus.SKIPPED
-                    records.append(Record(seed, index, "input", components, states=states))
+                    records.append(self._input_record(model, plan, value))
                     out_groups = {}
                     for output in plan["outputs"]:
                         group_key = self._group_key(output["flags"], output["values"])
@@ -423,21 +540,7 @@ class GenGraph(GenDataConfig, ABC):
                                 return _GeneratedBatch(records, message)
                             continue
                         for output, result in zip(outputs, results, strict=True):
-                            fields = {
-                                name: val
-                                for name, val, needed in zip(
-                                    ("conditions", "values", "residuals"), result, output["flags"], strict=True
-                                )
-                                if needed
-                            }
-                            states = {}
-                            if self.skip_evaluate or not hasattr(model, "evaluate"):
-                                fields["residuals"], states["residuals"] = None, ComponentStatus.SKIPPED
-                            if not _has_custom_sample_conditions(model):
-                                fields["conditions"], states["conditions"] = None, ComponentStatus.NONE
-                            records.append(
-                                Record(seed, index, "output", fields, self.output_seed, output["index"], states)
-                            )
+                            records.append(self._output_record(model, index, output, result))
             return _GeneratedBatch(records)
         except Exception as exc:
             if not mapped:
@@ -454,14 +557,7 @@ class GenGraph(GenDataConfig, ABC):
                     )
                 )
                 return _GeneratedBatch(records, message if self.throw else None)
-            # Replay pure kernels to identify the failing identity and salvage completed records.
-            recovered = []
-            for plan in plans:
-                result = self._compute(path, [plan], mapped=False)
-                recovered.extend(result.records)
-                if result.fatal:
-                    return _GeneratedBatch(recovered, result.fatal)
-            raise RuntimeError(f"Mapped generation failed although individual samples succeeded: {exc}") from exc
+            return self._recover_families(path, plans, exc)
 
     def _plans(self, store: H5Store, indices: Sequence[int], policy: str) -> list[dict[str, Any]]:
         source = isinstance(self, GenSource)
@@ -980,14 +1076,14 @@ class GenDataBenchmark(GenDataConfig):
         numerical = generator.model_copy(update={"executor": None, "name_depth": 3, "storage": None})
         serialized = romjax.YamlLoader.dump(numerical, sort_keys=True, _preserve_yaml_sources=True)
         return {
-            "schema_version": np.asarray(4),
+            "schema_version": np.asarray(5),
             "timing": np.bytes_("full_pass_wall"),
             "samples": np.asarray(int(self.samples)),
             "repeat": np.asarray(int(self.repeat)),
             "warmup": np.asarray(int(self.warmup)),
             "batch_size": np.asarray(int(generator.batch_size)),
             "map_batch_size": np.asarray(int(generator.map_batch_size)),
-            "compute_policy": np.bytes_("lax_map_staged"),
+            "compute_policy": np.bytes_("lax_map_families_vmap_outputs"),
             "generator": np.bytes_(type(generator).__name__),
             "generator_hash": np.bytes_(hashlib.sha256(serialized.encode()).hexdigest()),
         }
@@ -1030,20 +1126,11 @@ class GenDataBenchmark(GenDataConfig):
             return generator._kernel(path, "source", (), True), tuple((keys,) for keys in batches)
         solve = hasattr(model, "solve") and not generator.skip_solve
         evaluate = hasattr(model, "evaluate") and not generator.skip_evaluate
-        input_kernel = generator._kernel(path, "input", (True, solve, solve and evaluate), True)
-        output_kernel = generator._kernel(path, "output", (_has_custom_sample_conditions(model), True, evaluate), True)
-
-        def workload(keys, output_keys):
-            inputs, solutions, residuals = input_kernel(keys, None, None, None)
-            results = [inputs, solutions, residuals]
-            if output_keys is not None:
-                for i in range(len(keys)):
-                    one_input = jax.tree.map(lambda value: value[i], inputs)
-                    one_solution = jax.tree.map(lambda value: value[i], solutions)
-                    results.extend(output_kernel(output_keys[i], None, None, None, one_input, one_solution))
-            return results
-
-        args = tuple((keys, self._output_keys(generator, keys)) for keys in batches)
+        output_flags = (_has_custom_sample_conditions(model), True, evaluate) if generator.outputs_per_input else None
+        workload = generator._family_kernel(path, (True, solve, solve and evaluate), output_flags)
+        args = tuple(
+            (keys, (None, None, None), self._output_keys(generator, keys), (None, None, None)) for keys in batches
+        )
         jax.block_until_ready(args)
         return workload, args
 
