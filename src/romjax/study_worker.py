@@ -199,7 +199,10 @@ class _StudyWorker(TaskWorker):
         with ExitStack() as stack:
             streams = {}
             if spec.quiet:
-                streams = {key: stack.enter_context((spec.root / f'{key}.log').open('w'))
+                # Python otherwise keeps the Windows console code page after
+                # stdio is redirected, while progress bars may emit Unicode.
+                environment['PYTHONIOENCODING'] = 'utf-8'
+                streams = {key: stack.enter_context((spec.root / f'{key}.log').open('w', encoding='utf-8'))
                            for key in ('stdout', 'stderr')}
             # Start the lease clock at launch; queued tasks cannot become stale.
             (mailbox / 'child.lease').touch()
