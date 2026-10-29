@@ -626,11 +626,10 @@ class ExecutorConfig(DictModel):
                     if result.error is not None:
                         raise result.error
                 if warmup:
-                    warmup_elapsed = time.monotonic() - warmup_start
                     warmup_stop.set()
                     if warmup_thread is not None:
                         warmup_thread.join()
-                    # logger.debug('Benchmark warmup completed in {:.3f}s.', warmup_elapsed)
+                    # logger.debug('Benchmark warmup completed in {:.3f}s.', time.monotonic() - warmup_start)
                 dispatcher = _PassDispatch()
                 for index in range(repeat):
                     bar.text = f'Repeat {index + 1}/{repeat}' if self.show_progress else ''

@@ -1761,6 +1761,70 @@ def test_fit_final_report_without_periodic_report():
     assert result.metrics['loss'] == pytest.approx(0.8 ** 6)
 
 
+def test_train_in_flight_configuration():
+    options = dict(loss=scalar_zero_loss, init_params={'w': jnp.array(1.)}, optimizer=optax.sgd(.1))
+    assert Train(**options).max_in_flight_steps == 2
+    for value in (0, -1):
+        with pytest.raises(ValidationError, match='max_in_flight_steps'):
+            Train(**options, max_in_flight_steps=value)
+
+
+@pytest.mark.parametrize('host_interval', [None, 3])
+@pytest.mark.parametrize('batch_count', [4, 10])
+def test_in_flight_steps_preserve_final_train_result(host_interval, batch_count):
+    batches = [{'x': jnp.array([i + 1., i + 2.]), 'y': jnp.array([i * .3, i * .2])}
+               for i in range(batch_count)]
+
+    def loss(params, batch):
+        return jnp.mean((params['w'] * batch['x'] + params['b'] - batch['y']) ** 2)
+
+    results = []
+    for depth in (1, 2, 4, 16):
+        train = Train(
+            loss=loss, init_params={'w': jnp.array(.5), 'b': jnp.array(-.2)}, optimizer=optax.adam(.01),
+            dataloader=iter(batches), termination=7, host_interval=host_interval, max_in_flight_steps=depth,
+            diagnostics={'show_progress': False},
+        )
+        results.append(train.fit())
+    reference = results[0]
+    assert reference.step == min(batch_count, 7)
+    assert reference.stop_reason == ('dataloader' if batch_count < 7 else 'max_steps')
+    for result in results[1:]:
+        assert (result.step, result.stop_reason) == (reference.step, reference.stop_reason)
+        for actual, expected in zip(jax.tree.leaves(result.params), jax.tree.leaves(reference.params), strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+        assert result.metrics == pytest.approx(reference.metrics)
+
+
+@pytest.mark.parametrize('depth', [1, 2, 4])
+def test_in_flight_steps_bound_submission_and_drain_at_completion(monkeypatch, depth):
+    loaded = 0
+    fences = []
+    original = jax.block_until_ready
+
+    def batches():
+        nonlocal loaded
+        for _ in range(8):
+            loaded += 1
+            yield {}
+
+    def wait(result):
+        fences.append(loaded)
+        return original(result)
+
+    monkeypatch.setattr(train_module.jax, 'block_until_ready', wait)
+    train = Train(
+        loss=scalar_zero_loss, init_params={'w': jnp.array(1.)}, optimizer=optax.sgd(.1),
+        dataloader=batches(), termination=6, host_interval=None, max_in_flight_steps=depth,
+        diagnostics={'show_progress': False},
+    )
+    train.fit()
+    # One next-batch lookahead; only the oldest result is waited on at capacity.
+    assert fences[0] == depth + 1
+    assert len(fences) == 7  # Six applied updates and the final metric evaluation.
+    assert all(count <= i + depth + 1 for i, count in enumerate(fences))
+
+
 def test_fit_observer_failure_saves_and_propagates(tmp_path):
 
     train = Train(loss=scalar_zero_loss, init_params={'w': jnp.array(1.0)}, optimizer=optax.sgd(0.1),
