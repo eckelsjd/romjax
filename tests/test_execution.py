@@ -407,7 +407,7 @@ def test_native_process_serialization_failure_is_fatal_even_when_collecting():
     worker = SquareWorker()
     worker.nonserializable = lambda: None
     config = ExecutorConfig(kind='process', max_workers=1, show_progress=False)
-    with pytest.raises(Exception, match='pickle|pickl'):
+    with pytest.raises(Exception, match=r"pickle|pickl|local object"):
         config.execute(tasks(1), worker, error_policy='collect')
 
 
