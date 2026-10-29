@@ -982,7 +982,8 @@ def test_symlink_dataset_config_supports_absolute_artifact_path(tmp_path):
     GenSymlink(symlink=source).generate(destination, format="h5", write_policy="overwrite")
 
     assert destination.is_symlink()
-    assert destination.readlink() == source
+    assert destination.resolve() == source.resolve()
+    assert destination.readlink().as_posix().removeprefix("//?/") == source.as_posix()
 
 
 def test_symlink_dataset_config_reports_permission_errors(tmp_path, monkeypatch):
