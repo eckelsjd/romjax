@@ -240,8 +240,8 @@ def test_composite_sequence_runs_array_children_without_snapshots(tmp_path: Path
         )
         composite = romjax.load(
             "!romx:CompositeRoutine\nexecutor: {show_progress: false}\nroutines:\n"
-            f"  - !overrides:{child_path}\n    name: first\n"
-            f"  - !overrides:{child_path}\n    name: second\n"
+            f"  - !overrides:{child_path.as_posix()}\n    name: first\n"
+            f"  - !overrides:{child_path.as_posix()}\n    name: second\n"
         )
     else:
         composite = CompositeRoutine(

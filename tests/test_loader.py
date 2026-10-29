@@ -505,8 +505,8 @@ def test_reconstruction_preserves_deferred_source_directory(tmp_path):
     source = YamlSource(yaml.compose('artifact: __parent__/data.h5'), inner)
     text = YamlLoader.dump(source, _preserve_yaml_sources=True, _preserve_model_types=True)
     restored = YamlLoader.load(text)
-    assert YamlLoader.load(restored)['artifact'] == str(inner.parent / 'data.h5')
+    assert Path(YamlLoader.load(restored)['artifact']) == inner.parent / 'data.h5'
     outer = tmp_path / 'outer.yml'
     outer.write_text(text, encoding='utf-8')
     restored = YamlLoader.load(outer)
-    assert YamlLoader.load(restored)['artifact'] == str(inner.parent / 'data.h5')
+    assert Path(YamlLoader.load(restored)['artifact']) == inner.parent / 'data.h5'
