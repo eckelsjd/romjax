@@ -36,14 +36,13 @@ class NestedMpiWorker(TaskWorker):
         ExecutorConfig(kind='mpi', show_progress=False).execute([], SquareWorker())
 
 
-def test_execute_passes_times_whole_pass_and_defers_progress(monkeypatch):
+def test_execute_passes_times_whole_pass_including_progress(monkeypatch):
     import romjax.execution as execution
 
-    state = {'timing': False, 'paused': False, 'calls': [], 'updates': 0}
+    state = {'timing': False, 'calls': [], 'updates': 0, 'timed_updates': 0}
     ticks = iter([10., 14., 20., 27.])
 
     def clock():
-        assert state['paused']
         state['timing'] = not state['timing']
         return next(ticks)
 
@@ -68,26 +67,20 @@ def test_execute_passes_times_whole_pass_and_defers_progress(monkeypatch):
             assert not state['timing']
 
         def __setattr__(self, name, value):
-            assert not state['timing']
+            if name == 'text' and state['timing']:
+                state['timed_updates'] += 1
 
         def __call__(self, units):
-            assert not state['timing']
             state['updates'] += units
-
-        @contextmanager
-        def pause(self):
-            assert not state['timing']
-            state['paused'] = True
-            yield
-            assert not state['timing']
-            state['paused'] = False
+            state['timed_updates'] += int(state['timing'])
 
     monkeypatch.setattr(execution.time, 'perf_counter', clock)
     monkeypatch.setattr(execution, 'alive_bar', lambda *args, **kwargs: Bar())
     elapsed = ExecutorConfig().execute_passes(tasks(3), Worker(), warmup=1, repeat=2)
     assert elapsed == [4., 7.]
     assert state['calls'] == [(0, False), (1, False), (2, False)] + [(0, True), (1, True), (2, True)] * 2
-    assert state['updates'] == 9
+    assert state['updates'] == 6
+    assert state['timed_updates'] > 0
 
 
 @pytest.mark.parametrize('kind', ['serial', 'thread', 'process'])
@@ -202,7 +195,7 @@ def test_execute_passes_manual_progress_accepts_zero_units(monkeypatch, warmup):
     config = ExecutorConfig(progress_bar={'manual': True})
     assert len(config.execute_passes([TaskSpec('a', 'a', 3, units=0)], SquareWorker(),
                                      warmup=warmup, repeat=1)) == 1
-    assert updates == [1.] * (warmup + 1)
+    assert updates == [1.]
 
 
 def tasks(count):

@@ -2,6 +2,7 @@
 import os
 import shutil
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -805,7 +806,10 @@ class Train(Routine):
     :param dataloader: Optionally load extra data for the loss function
     :param termination: stopping criteria
     :param diagnostics: configs for plotting and logging
-    :param host_interval: global host synchronization interval; ``None`` synchronizes only at the final iteration
+    :param host_interval: interval for host metrics and diagnostics; ``None`` runs these only at the final iteration.
+        Queued work still synchronizes when reaching ``max_in_flight_steps`` or stopping.
+    :param max_in_flight_steps: maximum queued training calls before waiting for the oldest result (default: 2).
+        Does not limit cached dataset memory or the loader's one-batch lookahead.
     :param freeze_params: a partial tree indicating true, false, or iteration at which a params subtree should be frozen
 
     :param root: run directory for checkpoints, logs, and history (optional)
@@ -829,6 +833,7 @@ class Train(Routine):
     termination: TerminationConfig = Field(default_factory=TerminationConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     host_interval: PositiveInt | None = 1
+    max_in_flight_steps: PositiveInt = 2
     freeze_params: PyTree | None = None
 
     # Persistence
@@ -1490,6 +1495,13 @@ class Train(Routine):
                 metrics = None
                 cached_stats = ""
                 cached_step = None
+                pending_steps: deque[PyTree] = deque()
+
+                def _wait_pending_steps(*, drain: bool = False) -> None:
+                    """Bound dispatch run-ahead and release completed result references."""
+                    while pending_steps and (drain or len(pending_steps) >= self.max_in_flight_steps):
+                        jax.block_until_ready(pending_steps[0])
+                        pending_steps.popleft()
 
                 def _interval_active(interval: int | None, step: int) -> bool:
                     """Return whether host work for an interval should run at this optimizer step."""
@@ -1566,6 +1578,7 @@ class Train(Routine):
                                         )
                                     else:
                                         train_result = _train_step(params, opt_state, batch, iteration)
+                            pending_steps.append(train_result)
 
                             if curr_step < self.termination.max_steps and not final_batch:
                                 try:
@@ -1575,7 +1588,12 @@ class Train(Routine):
                                 else:
                                     last_batch = next_batch
 
-                            train_result = jax.block_until_ready(train_result)
+                            _wait_pending_steps(drain=host_active)
+                            t_diff = time.time() - t_start
+                            runtime_reached = t_diff >= self.termination.max_runtime.total_seconds()
+                            host_active = host_active or runtime_reached
+                            if runtime_reached:
+                                _wait_pending_steps(drain=True)
                             if term_diagnostics_enabled:
                                 next_params, next_opt_state, loss, raw_terms, scaled_terms, grad_norm_device = (
                                     train_result
@@ -1592,9 +1610,6 @@ class Train(Routine):
                             raise RoutineError("Train step failure") from exc
                         
                         ## METRICS AND CHECKPOINT
-                        t_diff = time.time() - t_start
-                        runtime_reached = t_diff >= self.termination.max_runtime.total_seconds()
-                        host_active = host_active or runtime_reached
                         # The final dataloader state must have fresh metrics even without a host interval.
                         host_active = host_active or (dataloader_stopped and curr_step >= self.termination.max_steps)
                         test_score, grad_norm = None, None
@@ -1799,6 +1814,7 @@ class Train(Routine):
                 
                 logger.debug(f"Train finished. Elapsed: {_prettify_timedelta(time.time()-t_start)}")
                 try:
+                    _wait_pending_steps(drain=True)
                     if metric_step != curr_step:
                         metrics = {}
                         if last_batch is not None:
