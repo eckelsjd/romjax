@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
@@ -169,7 +170,8 @@ class GenSymlink(GenDataConfig):
     """Create a symbolic link to an existing dataset or artifact.
 
     Relative source paths are interpreted from the working directory when
-    :meth:`generate` is called.
+    :meth:`generate` is called. On Windows, link creation requires Developer
+    Mode or an elevated process.
 
     :param symlink: existing file or directory to use as the link target
     """
@@ -213,7 +215,15 @@ class GenSymlink(GenDataConfig):
         link_target = source
         if not configured_source.is_absolute():
             link_target = Path(os.path.relpath(source, start=destination.parent.resolve()))
-        destination.symlink_to(link_target, target_is_directory=source.is_dir())
+        try:
+            destination.symlink_to(link_target, target_is_directory=source.is_dir())
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314 or error.errno in {errno.EACCES, errno.EPERM}:
+                raise RoutineError(
+                    f"Unable to create symbolic link at {destination}: permission denied. "
+                    "On Windows, enable Developer Mode or run from an elevated process."
+                ) from error
+            raise
 
 
 class GenGraph(GenDataConfig, ABC):

@@ -98,11 +98,9 @@ override:
     case_root = search.root / "cases" / "case_0000"
     config = search._write_case_config(case_root, search._case_values()[0])
 
-    assert romjax.YamlLoader.load(config) == {
-        "root": str(case_root),
-        "options": {"keep": 1},
-        "items": [1, 3],
-    }
+    loaded = romjax.YamlLoader.load(config)
+    assert Path(loaded.pop("root")) == case_root
+    assert loaded == {"options": {"keep": 1}, "items": [1, 3]}
 
 
 def test_yaml_path_text_normalizes_windows_paths() -> None:

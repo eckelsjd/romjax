@@ -1,15 +1,36 @@
 import logging
 import re
+import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
 import coverage
+import pytest
 from coverage import Coverage
 
 PROJECT_DIR = Path(__file__).parent.parent
 PYTEST_STATUS_FILE = PROJECT_DIR / '.pytest_status'
 README_FILE = PROJECT_DIR / 'README.md'
 COVERAGE_FILE = PROJECT_DIR / '.coverage'
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep Windows test files out of the shared, permission-sensitive temp root.
+
+    Pytest normally creates ``tmp_path`` directories below the user's system
+    temporary directory.  On Windows that directory can be held by another
+    pytest process, an antivirus scanner, or a process with different ACLs.
+    Use a fresh directory created directly in the OS temp root unless the
+    caller explicitly selected one with ``--basetemp``. This avoids both the
+    shared pytest cleanup lock and repository directories with inherited ACLs.
+
+    :param config: active pytest configuration
+    """
+    if sys.platform != 'win32' or config.option.basetemp is not None:
+        return
+
+    config.option.basetemp = Path(tempfile.mkdtemp(prefix='romjax-pytest-'))
 
 
 def update_readme_coverage_badge():

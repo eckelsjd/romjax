@@ -57,6 +57,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.pytest-temp/
+.uv-cache/
 cover/
 .pytest_status
 

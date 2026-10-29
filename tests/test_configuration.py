@@ -11,6 +11,10 @@ def template(text: str, source: Path | None = None) -> YamlTemplate:
     return YamlTemplate.from_source(romjax.YamlSource(yaml.compose(text), source))
 
 
+def normalized_path(value: str | Path) -> str:
+    return Path(value).as_posix()
+
+
 @pytest.mark.parametrize('value', [None, True, 2, 0.001, 'null', 'false', '1e-3'])
 def test_exact_assignment_preserves_types_and_neighbors(value):
     base = template('items: [1, 2, 3]\noptimizer: {kwargs: {}}')
@@ -26,7 +30,7 @@ def test_add_leaf_preserve_tag_and_source(tmp_path):
     source = base.render([ConfigAssignment(path=['optimizer', 'kwargs', 'learning_rate'], value=0.01)])
     assert source.node.tag == '!romx:Train'
     text = romjax.YamlLoader._node_to_yaml(source.node)
-    assert str(tmp_path / 'data.h5') in text
+    assert normalized_path(tmp_path / 'data.h5') in text.replace('\\', '/')
     assert 'learning_rate: 0.01' in text
 
 
@@ -63,8 +67,8 @@ def test_override_chain_retains_each_declaring_source(tmp_path):
     path = overlay / 'base.yml'
     path.write_text('!overrides:__parent__/../original/base.yml\nextra: __parent__/extra.h5')
     value = romjax.load(YamlTemplate.from_source(path).render([]))
-    assert value['data'] == str(original / 'data.h5')
-    assert value['extra'] == str(overlay / 'extra.h5')
+    assert normalized_path(value['data']) == normalized_path(original / 'data.h5')
+    assert normalized_path(value['extra']) == normalized_path(overlay / 'extra.h5')
 
 
 def test_inline_override_preserves_base_origin(tmp_path):
@@ -75,7 +79,8 @@ def test_inline_override_preserves_base_origin(tmp_path):
     path.write_text('base: !overrides:__parent__/base/base.yml\n  value: 2')
     source = romjax.load(path)['base']
     actual = romjax.load(YamlTemplate.from_source(source).render([]))
-    assert actual == {'data': str(folder / 'data.h5'), 'value': 2}
+    assert actual['value'] == 2
+    assert normalized_path(actual['data']) == normalized_path(folder / 'data.h5')
 
 
 def test_referenced_yaml_is_fingerprinted_and_snapshotted(tmp_path):
@@ -88,4 +93,4 @@ def test_referenced_yaml_is_fingerprinted_and_snapshotted(tmp_path):
     graph.write_text('width: 16')
     assert base.fingerprint() != original
     assert romjax.load(snap_path)['width'] == 8
-    assert romjax.load(snap_path)['data'] == str(tmp_path / 'data.h5')
+    assert normalized_path(romjax.load(snap_path)['data']) == normalized_path(tmp_path / 'data.h5')

@@ -56,6 +56,26 @@ git rebase -i main your-branch  # for example
 
 You can also find a good tutorial [here](https://github.com/firstcontributions/first-contributions/tree/main).
 
+## Testing on Windows
+
+The test configuration automatically creates a fresh pytest ``tmp_path`` base
+directory directly under the Windows temp root. This avoids permission and
+cleanup-lock failures in the shared ``%LOCALAPPDATA%\\Temp\\pytest-of-<user>``
+directory, and does not rely on workspace ACLs. An explicit ``--basetemp``
+takes precedence when a different location is needed.
+
+If uv reports that its shared cache lock is unavailable, use a repository-local
+cache for the current PowerShell session:
+
+```powershell
+$env:UV_CACHE_DIR = "$PWD\.uv-cache"
+uv run pytest tests/test_data_gen.py
+```
+
+Windows symlink creation requires Developer Mode or an elevated process. The
+symlink tests skip only when Windows returns privilege error 1314; other
+filesystem errors still fail so regressions remain visible.
+
 ## Report bugs using issues
 Open a new issue and describe your problem using the template. Provide screenshots where possible and example log files.
 Add labels to help categorize and describe your issue.

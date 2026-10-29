@@ -1,4 +1,6 @@
+import errno
 import json
+import re
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated, Any
@@ -36,6 +38,21 @@ from romjax.tree import pytree_stack
 from romjax.typing import from_yaml
 from romjax.utils import load_h5
 from tests.storage_helpers import write_component as save_h5
+
+
+def require_symlink_capability(tmp_path: Path) -> None:
+    """Skip a test only when its Windows account cannot create symbolic links."""
+    target = tmp_path / ".symlink-target"
+    link = tmp_path / ".symlink-probe"
+    target.mkdir()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if error.winerror == 1314:
+            pytest.skip("Creating symlinks requires Windows Developer Mode or elevated privileges")
+        raise
+    link.unlink()
+    target.rmdir()
 
 
 class _ToySampleableEdge(Edge, ImplicitSampleable):
@@ -936,6 +953,7 @@ def test_custom_dataset_config_leaf(tmp_path):
 
 
 def test_symlink_dataset_config_resolves_source_from_working_directory(tmp_path, monkeypatch):
+    require_symlink_capability(tmp_path)
     monkeypatch.chdir(tmp_path)
     source = tmp_path / "existing" / "dataset"
     source.mkdir(parents=True)
@@ -956,6 +974,7 @@ def test_symlink_dataset_config_resolves_source_from_working_directory(tmp_path,
 
 
 def test_symlink_dataset_config_supports_absolute_artifact_path(tmp_path):
+    require_symlink_capability(tmp_path)
     source = tmp_path / "existing.h5"
     source.touch()
     destination = tmp_path / "generated" / "linked.h5"
@@ -966,15 +985,31 @@ def test_symlink_dataset_config_supports_absolute_artifact_path(tmp_path):
     assert destination.readlink() == source
 
 
+def test_symlink_dataset_config_reports_permission_errors(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "linked"
+
+    def deny_symlink(*args, **kwargs):
+        del args, kwargs
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(Path, "symlink_to", deny_symlink)
+
+    with pytest.raises(RoutineError, match="permission denied"):
+        GenSymlink(symlink=source).generate(destination, format="h5", write_policy="overwrite")
+
+
 def test_symlink_dataset_config_requires_existing_source(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     destination = tmp_path / "generated" / "linked"
 
-    with pytest.raises(RoutineError, match=str(tmp_path / "missing")):
+    with pytest.raises(RoutineError, match=re.escape(str(tmp_path / "missing"))):
         GenSymlink(symlink="missing").generate(destination, format="h5", write_policy="overwrite")
 
 
 def test_symlink_dataset_config_write_policies(tmp_path):
+    require_symlink_capability(tmp_path)
     first_source = tmp_path / "first"
     second_source = tmp_path / "second"
     first_source.mkdir()
@@ -1013,6 +1048,7 @@ def test_symlink_dataset_config_does_not_overwrite_real_destination(tmp_path, de
 
 
 def test_symlink_dataset_config_handles_dangling_destination(tmp_path):
+    require_symlink_capability(tmp_path)
     source = tmp_path / "source"
     source.mkdir()
     destination = tmp_path / "linked"
