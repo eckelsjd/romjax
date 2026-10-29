@@ -288,26 +288,55 @@ class _StudyCoordinator:
 
     @contextmanager
     def _ownership(self):
-        # Advisory locks are released by the OS on controller death. On multi-node
-        # filesystems the lock service must support POSIX advisory locking.
-        import fcntl
+        """Exclusively own the study root for this controller invocation.
+
+        POSIX uses an advisory ``flock`` while Windows locks the first byte of
+        the lock file with ``msvcrt.locking``. Both locks are released by the
+        operating system if the controller process exits unexpectedly. On a
+        multi-node filesystem, the underlying lock service must support the
+        selected platform's file-locking primitive.
+
+        :raises RuntimeError: if another controller owns this study root
+        """
 
         self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / '.study.lock').open('a') as owner:
+        with (self.root / '.study.lock').open('a+b') as owner:
+            owner.seek(0, 2)
+            if owner.tell() == 0:
+                owner.write(b'\\0')
+                owner.flush()
+            owner.seek(0)
             try:
-                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
+                if sys.platform == 'win32':
+                    import msvcrt
+
+                    msvcrt.locking(owner.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
                 raise RuntimeError('Study root has an active controller.') from exc
             try:
                 yield
             finally:
-                fcntl.flock(owner, fcntl.LOCK_UN)
+                owner.seek(0)
+                if sys.platform == 'win32':
+                    import msvcrt
+
+                    msvcrt.locking(owner.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(owner, fcntl.LOCK_UN)
 
     def _storage(self):
         value = self.config.storage
         if value == 'journal':
+            journal = str(self.root / 'study.journal')
+            lock = optuna.storages.journal.JournalFileOpenLock(journal) if sys.platform == 'win32' else None
             value = optuna.storages.JournalStorage(
-                optuna.storages.journal.JournalFileBackend(str(self.root / 'study.journal')))
+                optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
         elif isinstance(value, DeferredThirdPartySpec):
             value = value.build()
         if value is None:
@@ -444,8 +473,9 @@ class _StudyCoordinator:
                     source = self.template.render(assignments)
                     source = YamlTemplate.from_source(source).snapshot(root / 'sources').source
                     text = romjax.YamlLoader._node_to_yaml(source.node)
-                    (root / 'case.yml').write_text(text, encoding='utf-8')
-                    trial.set_user_attr('romjax_config_sha256', hashlib.sha256(text.encode()).hexdigest())
+                    case_path = root / 'case.yml'
+                    case_path.write_text(text, encoding='utf-8')
+                    trial.set_user_attr('romjax_config_sha256', hashlib.sha256(case_path.read_bytes()).hexdigest())
                     # Store YAML text because assignments can contain tagged non-JSON fragments.
                     trial.set_user_attr('romjax_assignments', romjax.YamlLoader.dump(
                         [dict(item) for item in assignments], _preserve_yaml_sources=True))

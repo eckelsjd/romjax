@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,13 @@ except ImportError:
 import romjax
 from romjax.study import MetricConfig, OptunaStudy, ParameterConfig
 from romjax.train import TrainingReport
+
+
+def journal_storage(path: Path) -> optuna.storages.JournalStorage:
+    """Create the same cross-platform journal storage as ``OptunaStudy``."""
+    journal = str(path)
+    lock = optuna.storages.journal.JournalFileOpenLock(journal) if sys.platform == 'win32' else None
+    return optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
 
 
 def test_parameter_sampling_preserves_categories():
@@ -101,8 +109,7 @@ def test_study_runs_and_reuses_trials(base_train, tmp_path, executor):
                                     'distribution': {'kind': 'float', 'low': 0.05, 'high': 0.15}}])
     config.executor.show_progress = False
     assert config.run() == 0
-    storage = optuna.storages.JournalStorage(
-        optuna.storages.journal.JournalFileBackend(str(config.root / 'study.journal')))
+    storage = journal_storage(config.root / 'study.journal')
     study = optuna.load_study(study_name=config.study_name, storage=storage)
     assert len(study.trials) == 2
     assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
@@ -288,8 +295,7 @@ def test_recovery_fails_owned_orphan_and_preserves_other_studies(base_train, tmp
     config = OptunaStudy(root=tmp_path / 'recover', base=base_train, n_trials=1, jax_platforms='cpu',
                          executor={'show_progress': False})
     assert config.run() == 0
-    storage = optuna.storages.JournalStorage(
-        optuna.storages.journal.JournalFileBackend(str(config.root / 'study.journal')))
+    storage = journal_storage(config.root / 'study.journal')
     study = optuna.load_study(study_name=config.study_name, storage=storage)
     orphan = study.ask()
     orphan.set_user_attr('romjax_root', str(config.root))
@@ -361,6 +367,34 @@ def test_root_cannot_be_reassigned_to_another_study(base_train, tmp_path):
         with coordinator._ownership():
             coordinator._open_study()
     assert artifact.read_text() == 'preserve'
+
+
+def test_study_controller_ownership_is_exclusive(base_train, tmp_path):
+    from romjax.study import _StudyCoordinator
+
+    config = OptunaStudy(root=tmp_path / 'owned', base=base_train)
+    first = _StudyCoordinator(config)
+    second = _StudyCoordinator(config)
+
+    with first._ownership(), pytest.raises(RuntimeError, match='active controller'):
+        with second._ownership():
+            pass
+    with second._ownership():
+        pass
+
+
+def test_default_journal_storage_uses_platform_lock(tmp_path):
+    from romjax.study import _StudyCoordinator
+
+    coordinator = _StudyCoordinator(OptunaStudy(root=tmp_path, base=Path('unused')))
+    storage = coordinator._storage()
+    lock = storage._backend._lock
+    expected = (
+        optuna.storages.journal.JournalFileOpenLock
+        if sys.platform == 'win32'
+        else optuna.storages.journal.JournalFileSymlinkLock
+    )
+    assert isinstance(lock, expected)
 
 
 def test_assignment_yaml_contents_affect_fingerprint(base_train, tmp_path):
