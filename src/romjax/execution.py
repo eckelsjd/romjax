@@ -315,7 +315,7 @@ class HybridGpuConfig(DictModel):
     
     def get_env(self, device_index: int) -> dict[str, str]:
         """Return child environment overrides for one GPU slot."""
-        env = {"CUDA_VISIBLE_DEVICES": str(device_index), "JAX_PLATFORMS": "gpu"}
+        env = {"CUDA_VISIBLE_DEVICES": str(device_index), "JAX_PLATFORMS": "cuda"}
         if self.memory_fraction is not None:
             env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(self.memory_fraction)
         if self.preallocate is not None:

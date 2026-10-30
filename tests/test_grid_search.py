@@ -441,7 +441,7 @@ def test_build_hybrid_slots_for_explicit_gpus_and_cpu() -> None:
     ]
     assert slots[0].env == {
         "CUDA_VISIBLE_DEVICES": "2",
-        "JAX_PLATFORMS": "gpu",
+        "JAX_PLATFORMS": "cuda",
         "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.75",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
     }
@@ -721,7 +721,7 @@ def test_hybrid_grid_search_dynamically_reuses_finished_slots(tmp_path: Path, mo
 
     assert launched["case_0000"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert launched["case_0000"]["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.5"
-    assert launched["case_0000"]["JAX_PLATFORMS"] == "gpu"
+    assert launched["case_0000"]["JAX_PLATFORMS"] == "cuda"
     assert launched["case_0001"]["JAX_PLATFORMS"] == "cpu"
     assert launched["case_0002"]["JAX_PLATFORMS"] == "cpu"
     assert all(env["ROMJAX_TEST"] == "1" for env in launched.values())
