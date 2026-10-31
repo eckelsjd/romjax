@@ -13,12 +13,15 @@ from romjax.execution import ExecutionError
 
 _MPI_LAUNCH_KEYS = (
     "OMPI_COMM_WORLD_SIZE",
+    "OMPI_COMM_WORLD_RANK",
     "PMI_SIZE",
     "PMI_RANK",
-    "PMIX_RANK",
     "MV2_COMM_WORLD_SIZE",
-    "SLURM_PROCID",
+    "MV2_COMM_WORLD_RANK",
+    "PMIX_NAMESPACE",
+    "PMIX_RANK",
 )
+_MPI_MODES = frozenset({"auto", "off", "on"})
 _active_executor: Executor | None = None
 _active_size = 0
 
@@ -31,6 +34,41 @@ def active_executor() -> Executor | None:
 def active_size() -> int:
     """Return the active MPI world size."""
     return _active_size
+
+
+def _mpi_mode() -> str:
+    """Return the user-selected MPI launch policy."""
+    mode = os.environ.get("ROMJAX_MPI", "auto").strip().lower()
+    if mode not in _MPI_MODES:
+        choices = ", ".join(sorted(_MPI_MODES))
+        raise ExecutionError(f"ROMJAX_MPI must be one of: {choices}.")
+    return mode
+
+
+def _has_parallel_world(size_key: str, rank_key: str) -> bool:
+    """Return whether a complete launcher signature describes more than one rank."""
+    size = os.environ.get(size_key)
+    rank = os.environ.get(rank_key)
+    if size is None or rank is None:
+        return False
+    try:
+        return int(size) > 1 and int(rank) >= 0
+    except ValueError:
+        return False
+
+
+def _has_mpi_launcher_environment() -> bool:
+    """Return whether the environment contains a complete MPI launcher signature.
+
+    Slurm allocation and task variables are intentionally excluded: they identify
+    scheduled processes, not whether an application will use MPI.
+    """
+    return (
+        _has_parallel_world("OMPI_COMM_WORLD_SIZE", "OMPI_COMM_WORLD_RANK")
+        or _has_parallel_world("PMI_SIZE", "PMI_RANK")
+        or _has_parallel_world("MV2_COMM_WORLD_SIZE", "MV2_COMM_WORLD_RANK")
+        or all(os.environ.get(key) for key in ("PMIX_NAMESPACE", "PMIX_RANK"))
+    )
 
 
 def _require_mpi() -> tuple[Any, Any]:
@@ -51,7 +89,10 @@ def mpi_context() -> Iterator[bool]:
 
     Enter this context on every launched rank, before loading routine configuration.
     Only the controller should load configurations or call ``run()``. Outside an
-    MPI launch it yields ``True`` without creating a pool.
+    MPI launch it yields ``True`` without creating a pool. Control detection with
+    ``ROMJAX_MPI``: ``"auto"`` (the default) recognizes complete implementation-
+    specific signatures, ``"on"`` always initializes MPI, and ``"off"`` never
+    initializes MPI. Slurm variables alone never trigger MPI initialization.
 
     :return: ``True`` on the controlling rank, ``False`` on workers
     """
@@ -61,7 +102,12 @@ def mpi_context() -> Iterator[bool]:
         yield True
         return
 
-    if os.environ.get("ROMJAX_MPI_CASE_CHILD") == "1" or not any(key in os.environ for key in _MPI_LAUNCH_KEYS):
+    mode = _mpi_mode()
+    if (
+        os.environ.get("ROMJAX_MPI_CASE_CHILD") == "1"
+        or mode == "off"
+        or (mode == "auto" and not _has_mpi_launcher_environment())
+    ):
         yield True
         return
 
