@@ -1,4 +1,6 @@
 """Importable tiny training functions for isolated study integration tests."""
+import math
+
 import jax.numpy as jnp
 import optuna
 
@@ -29,6 +31,15 @@ def stop_after_first(study, trial):
 
 def broken_loss(params, batch):
     raise ValueError('loss failed')
+
+
+def nan_loss(params, batch):
+    return jnp.array(jnp.nan)
+
+
+class PruneNaN(optuna.pruners.BasePruner):
+    def prune(self, study, trial):
+        return math.isnan(trial.intermediate_values[trial.last_step])
 
 
 def broken_callback(study, trial):

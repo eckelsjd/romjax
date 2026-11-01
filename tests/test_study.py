@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -121,6 +122,15 @@ def test_rolling_reducer_replaces_final_step_and_skips_invalid():
         MetricConfig(invalid='skip').reducer('minimize').final_value()
 
 
+def test_prune_policy_retains_nonfinite_reports_and_invalidates_mean_window():
+    reducer = MetricConfig(reduction='mean', window=2, invalid='prune').reducer('minimize')
+    assert reducer.observe(TrainingReport(1, {'loss': 2.0})) == 2.0
+    assert math.isnan(reducer.observe(TrainingReport(2, {'loss': float('nan')})))
+    assert math.isnan(reducer.observe(TrainingReport(3, {'loss': 4.0})))
+    assert reducer.observe(TrainingReport(4, {'loss': 6.0})) == 5.0
+    assert reducer.invalid_history == {2: 'nan'}
+
+
 @pytest.fixture
 def base_train(tmp_path):
     path = tmp_path / 'base.yml'
@@ -166,6 +176,31 @@ def test_pruned_trials_are_not_failures(base_train, tmp_path):
     import yaml
     manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
     assert manifest['trials'][0]['state'] == 'PRUNED'
+
+
+def test_prune_policy_delegates_nonfinite_reports_to_configured_pruner(base_train, tmp_path):
+    from tests.study_helpers import PruneNaN
+
+    base_train.write_text(base_train.read_text().replace('tests.study_helpers.loss', 'tests.study_helpers.nan_loss'))
+    config = OptunaStudy(root=tmp_path / 'nan-pruned', base=base_train, n_trials=1, pruner=PruneNaN(),
+                         metric={'invalid': 'prune'}, jax_platforms='cpu', executor={'show_progress': False})
+    assert config.run() == 0
+    study = optuna.load_study(study_name=config.study_name, storage=journal_storage(config.root / 'study.journal'))
+    assert study.trials[0].state == optuna.trial.TrialState.PRUNED
+    assert study.trials[0].user_attrs['romjax_invalid_metrics'] == [{'step': 1, 'kind': 'nan'}]
+
+
+def test_prune_policy_penalizes_nonfinite_final_objective(base_train, tmp_path):
+    base_train.write_text(base_train.read_text().replace('tests.study_helpers.loss', 'tests.study_helpers.nan_loss'))
+    config = OptunaStudy(root=tmp_path / 'nan-penalty', base=base_train, n_trials=1,
+                         metric={'invalid': 'prune'}, jax_platforms='cpu', executor={'show_progress': False})
+    assert config.run() == 0
+    study = optuna.load_study(study_name=config.study_name, storage=journal_storage(config.root / 'study.journal'))
+    assert study.trials[0].state == optuna.trial.TrialState.COMPLETE
+    assert study.trials[0].value == sys.float_info.max
+    assert study.trials[0].user_attrs['romjax_invalid_metrics'] == [
+        {'step': 1, 'kind': 'nan'}, {'step': 2, 'kind': 'nan'},
+    ]
 
 
 def test_final_only_training_without_diagnostics(base_train, tmp_path):

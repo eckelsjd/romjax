@@ -133,7 +133,7 @@ class MetricConfig(DictModel):
     name: Literal['loss', 'test_score'] = 'loss'
     reduction: Literal['last', 'best', 'mean'] = 'last'
     window: PositiveInt = 10
-    invalid: Literal['fail', 'skip'] = 'fail'
+    invalid: Literal['fail', 'skip', 'prune'] = 'fail'
 
     def reducer(self, direction: Literal['minimize', 'maximize']) -> _MetricReducer:
         """Create independent reduction state for one trial.
@@ -148,13 +148,26 @@ class _MetricReducer:
     def __init__(self, config: MetricConfig, direction: str) -> None:
         self.config, self.direction = config, direction
         self.values: dict[int, float] = {}
+        self.invalid_history: dict[int, str] = {}
+        self.final_invalid = False
 
     def observe(self, report: TrainingReport) -> float | None:
         value = report.metrics.get(self.config.name)
         if value is None or not math.isfinite(value):
             if self.config.invalid == 'fail':
                 raise ValueError(f'Missing or nonfinite {self.config.name} at step {report.step}.')
-            return None
+            if self.config.invalid == 'skip':
+                return None
+            value = math.nan if value is None else float(value)
+            self.values[report.step] = value
+            self.invalid_history[report.step] = (
+                'missing' if report.metrics.get(self.config.name) is None
+                else 'nan' if math.isnan(value)
+                else 'positive_infinity' if value > 0
+                else 'negative_infinity'
+            )
+            self.final_invalid = self.final_invalid or report.final
+            return value
         self.values[report.step] = float(value)
         return self.final_value()
 
@@ -163,9 +176,12 @@ class _MetricReducer:
             raise ValueError('Trial produced no finite objective metric.')
         values = list(self.values.values())
         if self.config.reduction == 'best':
-            return (min if self.direction == 'minimize' else max)(values)
+            finite = [value for value in values if math.isfinite(value)]
+            return (min if self.direction == 'minimize' else max)(finite) if finite else math.nan
         if self.config.reduction == 'mean':
             values = values[-self.config.window:]
+            if any(not math.isfinite(value) for value in values):
+                return math.nan
             return sum(values) / len(values)
         return values[-1]
 
@@ -627,7 +643,12 @@ class _StudyCoordinator:
             previous = self.report_steps.get(number, -1)
             if report.step < previous or report.step == previous and not report.final:
                 raise ValueError('Training reports must have increasing optimizer steps.')
-            value = self.reducers[number].observe(report)
+            reducer = self.reducers[number]
+            value = reducer.observe(report)
+            if reducer.invalid_history:
+                trial.set_user_attr('romjax_invalid_metrics', [
+                    {'step': step, 'kind': kind} for step, kind in reducer.invalid_history.items()
+                ])
             if value is not None and report.step > previous:
                 trial.report(value, report.step)
                 self.report_steps[number] = report.step
@@ -695,8 +716,15 @@ class _StudyCoordinator:
                         state = optuna.trial.TrialState.PRUNED
                     elif result.state == 'complete' and result.exit_code == 0:
                         try:
-                            value = self.reducers[number].final_value()
-                            if not math.isfinite(value):
+                            reducer = self.reducers[number]
+                            value = reducer.final_value()
+                            if (
+                                self.config.metric.invalid == 'prune'
+                                and (reducer.final_invalid or not math.isfinite(value))
+                            ):
+                                value = (sys.float_info.max if self.config.direction == 'minimize'
+                                         else -sys.float_info.max)
+                            elif not math.isfinite(value):
                                 raise ValueError('Final objective is nonfinite.')
                             state = optuna.trial.TrialState.COMPLETE
                         except Exception as exc:
