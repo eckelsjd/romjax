@@ -74,6 +74,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CompositeEdge": ("romjax.graph", "CompositeEdge"),
     "FunctionGraph": ("romjax.graph", "FunctionGraph"),
     "GridSearch": ("romjax.grid_search", "GridSearch"),
+    "CopyStudy": ("romjax.study", "CopyStudy"),
     "OptunaStudy": ("romjax.study", "OptunaStudy"),
     "ExecutorConfig": ("romjax.execution", "ExecutorConfig"),
     "mpi_context": ("romjax.mpi_runtime", "mpi_context"),

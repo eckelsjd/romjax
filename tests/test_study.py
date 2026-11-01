@@ -9,7 +9,7 @@ except ImportError:
     pytest.skip('requires the optuna extra', allow_module_level=True)
 
 import romjax
-from romjax.study import MetricConfig, OptunaStudy, ParameterConfig
+from romjax.study import CopyStudy, MetricConfig, OptunaStudy, ParameterConfig, StorageRef
 from romjax.train import TrainingReport
 
 
@@ -18,6 +18,32 @@ def journal_storage(path: Path) -> optuna.storages.JournalStorage:
     journal = str(path)
     lock = optuna.storages.journal.JournalFileOpenLock(journal) if sys.platform == 'win32' else None
     return optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
+
+
+def make_storage_with_studies(storage_ref: dict[str, object], studies: dict[str, int]) -> None:
+    """Populate an Optuna storage with completed trials for copying tests."""
+    storage = StorageRef.model_validate(storage_ref).open()
+    for name, count in studies.items():
+        study = optuna.create_study(study_name=name, storage=storage)
+        for number in range(count):
+            trial = study.ask()
+            study.tell(trial, float(number))
+
+
+def make_journal_with_studies(path: Path, studies: dict[str, int]) -> Path:
+    """Populate a journal storage and return its path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    make_storage_with_studies({'journal': path}, studies)
+    return path
+
+
+def study_trial_counts(storage_ref: dict[str, object]) -> dict[str, int]:
+    """Return copied study names and their trial counts."""
+    storage = StorageRef.model_validate(storage_ref).open()
+    return {
+        summary.study_name: len(optuna.load_study(study_name=summary.study_name, storage=storage).trials)
+        for summary in optuna.get_all_study_summaries(storage)
+    }
 
 
 def test_parameter_sampling_preserves_categories():
@@ -55,6 +81,16 @@ storage:
     assert not journal.exists() and not config.root.exists()
     restored = romjax.load(romjax.YamlLoader.dump(config, _preserve_model_types=True))
     assert isinstance(restored, OptunaStudy)
+
+
+def test_study_uses_custom_journal_storage(base_train, tmp_path):
+    journal = tmp_path / 'nested' / 'journals' / 'custom.journal'
+    config = OptunaStudy(root=tmp_path / 'output', base=base_train, n_trials=1,
+                         storage={'journal': journal}, jax_platforms='cpu', executor={'show_progress': False})
+    assert config.run() == 0
+    assert journal.is_file()
+    study = optuna.load_study(study_name=config.study_name, storage=journal_storage(journal))
+    assert len(study.trials) == 1
 
 
 def test_invalid_distribution_and_conflicts(tmp_path):
@@ -475,3 +511,153 @@ def test_generated_case_preserves_train_reporting_and_host_gate(base_train, tmp_
     assert diagnostics['show_progress'].value == 'false'
     manifest = yaml.safe_load((config.root / 'study_manifest.yml').read_text())
     assert manifest['trials'][0]['user_attrs']['romjax_config_sha256'] == hashlib.sha256(case.read_bytes()).hexdigest()
+
+
+def test_storage_ref_opens_journal_url_and_deferred_rdb(tmp_path):
+    assert isinstance(StorageRef(journal=tmp_path / 'study.journal').open(), optuna.storages.JournalStorage)
+    assert StorageRef(storage=f'sqlite:///{tmp_path / "study.db"}').open().startswith('sqlite:///')
+    deferred = StorageRef(storage={
+        'name': 'optuna.storages.RDBStorage',
+        'kwargs': {'url': f'sqlite:///{tmp_path / "configured.db"}'},
+    }).open()
+    assert isinstance(deferred, optuna.storages.RDBStorage)
+
+
+def test_storage_ref_requires_exactly_one_backend(tmp_path):
+    with pytest.raises(ValueError, match='exactly one'):
+        StorageRef()
+    with pytest.raises(ValueError, match='exactly one'):
+        StorageRef(journal=tmp_path / 'a.journal', storage='sqlite:///a.db')
+
+
+def test_copy_study_copies_all_explicit_journal_studies_to_sqlite(tmp_path):
+    source = make_journal_with_studies(tmp_path / 'source.journal', {'first': 1, 'second': 2})
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    assert CopyStudy(sources={'old': {'journal': source}}, destination=destination).run() == 0
+    assert study_trial_counts(destination) == {'first': 1, 'second': 2}
+
+
+def test_copy_study_copies_explicit_sqlite_to_journal(tmp_path):
+    source = {'storage': f'sqlite:///{tmp_path / "source.db"}'}
+    make_storage_with_studies(source, {'rdb': 3})
+    destination = {'journal': tmp_path / 'merged.journal'}
+    assert CopyStudy(sources={'rdb': source}, destination=destination).run() == 0
+    assert study_trial_counts(destination) == {'rdb': 3}
+
+
+def test_copy_study_namespaces_collisions_and_fail_policy_preserves_destination(tmp_path):
+    first = make_journal_with_studies(tmp_path / 'first.journal', {'shared': 1})
+    second = make_journal_with_studies(tmp_path / 'second.journal', {'shared': 2})
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    with pytest.raises(optuna.exceptions.DuplicatedStudyError):
+        CopyStudy(sources={'one': {'journal': first}, 'two': {'journal': second}}, destination=destination).run()
+    assert study_trial_counts(destination) == {'shared': 1}
+    namespaced = {'storage': f'sqlite:///{tmp_path / "namespaced.db"}'}
+    assert CopyStudy(sources={'one': {'journal': first}, 'two': {'journal': second}}, destination=namespaced,
+                     name_policy='namespace').run() == 0
+    assert study_trial_counts(namespaced) == {'one/shared': 1, 'two/shared': 2}
+
+
+@pytest.mark.parametrize(
+    ('write_policy', 'raises', 'shared_trials'),
+    [('error', True, 2), ('reuse', False, 2), ('overwrite', False, 1)],
+)
+def test_copy_study_write_policy_handles_duplicate_studies(tmp_path, write_policy, raises, shared_trials):
+    source = make_journal_with_studies(tmp_path / 'source.journal', {'new': 1, 'shared': 1})
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    make_storage_with_studies(destination, {'shared': 2})
+    routine = CopyStudy(sources={'source': {'journal': source}}, destination=destination, write_policy=write_policy)
+    if raises:
+        with pytest.raises(optuna.exceptions.DuplicatedStudyError):
+            routine.run()
+    else:
+        assert routine.run() == 0
+    assert study_trial_counts(destination) == {'new': 1, 'shared': shared_trials}
+
+
+def test_copy_study_rejects_destination_aliases(tmp_path):
+    source = make_journal_with_studies(tmp_path / 'source.journal', {'one': 1})
+    with pytest.raises(ValueError, match='destination must not alias'):
+        CopyStudy(sources={'one': {'journal': source}},
+                  destination={'journal': tmp_path / '.' / 'source.journal'}).run()
+    url = f'sqlite:///{tmp_path / "source.db"}'
+    make_storage_with_studies({'storage': url}, {'two': 1})
+    with pytest.raises(ValueError, match='destination must not alias'):
+        CopyStudy(sources={'two': {'storage': url}}, destination={'storage': url}).run()
+
+
+def test_copy_study_requires_existing_explicit_journal_sources(tmp_path):
+    source = tmp_path / 'typo.journal'
+    with pytest.raises(ValueError, match='existing journal file'):
+        CopyStudy(sources={'typo': {'journal': source}},
+                  destination={'storage': f'sqlite:///{tmp_path / "merged.db"}'}).run()
+    assert not source.exists()
+
+
+def test_copy_study_creates_nested_journal_and_sqlite_destinations(tmp_path):
+    source = make_journal_with_studies(tmp_path / 'source.journal', {'copied': 1})
+    journal_destination = {'journal': tmp_path / 'nested' / 'journals' / 'study.journal'}
+    assert CopyStudy(sources={'source': {'journal': source}}, destination=journal_destination).run() == 0
+    assert study_trial_counts(journal_destination) == {'copied': 1}
+    sqlite_path = tmp_path / 'nested' / 'databases' / 'study.db'
+    sqlite_destination = {'storage': f'sqlite:///{sqlite_path}'}
+    assert CopyStudy(sources={'source': {'journal': source}}, destination=sqlite_destination).run() == 0
+    assert sqlite_path.is_file()
+    assert study_trial_counts(sqlite_destination) == {'copied': 1}
+
+
+def test_copy_study_yaml_loads_as_public_routine(tmp_path):
+    config = romjax.load(f'''!romx:CopyStudy
+sources:
+  old:
+    journal: {tmp_path / "source.journal"}
+destination:
+  storage: sqlite:///{tmp_path / "merged.db"}
+''')
+    assert isinstance(config, CopyStudy)
+
+
+def test_copy_study_discovers_conventional_journals_with_globs(tmp_path):
+    make_journal_with_studies(tmp_path / 'first' / 'study.journal', {'shared': 1})
+    make_journal_with_studies(tmp_path / 'second' / 'study.journal', {'shared': 2})
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    routine = CopyStudy(destination=destination, journal_globs=[str(tmp_path / '*' / 'study.journal')],
+                        name_policy='namespace')
+    assert routine.run() == 0
+    assert study_trial_counts(destination) == {'first/shared': 1, 'second/shared': 2}
+
+
+def test_copy_study_namespaces_discovered_journals_by_relative_path(tmp_path):
+    make_journal_with_studies(tmp_path / 'left group' / 'run' / 'study.journal', {'shared': 1})
+    make_journal_with_studies(tmp_path / 'right group' / 'run' / 'study.journal', {'shared': 2})
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    routine = CopyStudy(destination=destination, journal_globs=[str(tmp_path / '*' / 'run' / 'study.journal')],
+                        name_policy='namespace')
+    assert routine.run() == 0
+    assert study_trial_counts(destination) == {'left-group/run/shared': 1, 'right-group/run/shared': 2}
+
+
+def test_copy_study_namespaces_symlinked_journals_by_matched_path(tmp_path):
+    outside = make_journal_with_studies(tmp_path / 'outside' / 'study.journal', {'shared': 1})
+    discovered = tmp_path / 'discovered'
+    discovered.mkdir()
+    (discovered / 'linked run').symlink_to(outside.parent, target_is_directory=True)
+    destination = {'storage': f'sqlite:///{tmp_path / "merged.db"}'}
+    routine = CopyStudy(destination=destination, journal_globs=[str(discovered / '*' / 'study.journal')],
+                        name_policy='namespace')
+    assert routine.run() == 0
+    assert study_trial_counts(destination) == {'linked-run/shared': 1}
+
+
+def test_copy_study_rejects_sanitized_discovery_label_collisions(tmp_path):
+    make_journal_with_studies(tmp_path / 'left group' / 'study.journal', {'one': 1})
+    make_journal_with_studies(tmp_path / 'left@group' / 'study.journal', {'two': 1})
+    with pytest.raises(ValueError, match='duplicate source label'):
+        CopyStudy(destination={'journal': tmp_path / 'out.journal'},
+                  journal_globs=[str(tmp_path / '*' / 'study.journal')]).run()
+
+
+def test_copy_study_rejects_empty_globs(tmp_path):
+    with pytest.raises(ValueError, match='matched no journal files'):
+        CopyStudy(destination={'journal': tmp_path / 'out.journal'},
+                  journal_globs=[str(tmp_path / '*.journal')]).run()

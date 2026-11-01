@@ -4,12 +4,14 @@ from __future__ import annotations
 import gc
 import hashlib
 import math
+import re
 import shutil
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
+from glob import glob, has_magic
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Any, Literal
@@ -178,6 +180,55 @@ type Pruner = Annotated[
 ]
 
 
+def _journal_storage(path: Path) -> optuna.storages.JournalStorage:
+    """Open a cross-platform Optuna journal storage.
+
+    :param path: journal file path
+    :return: Optuna storage backed by ``path``
+    """
+    journal = str(path)
+    lock = optuna.storages.journal.JournalFileOpenLock(journal) if sys.platform == 'win32' else None
+    return optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
+
+
+class StorageRef(DictModel):
+    """A YAML-friendly Optuna journal, URL, or constructed storage reference.
+
+    :param journal: Optuna journal file path
+    :param storage: Optuna storage URL, deferred ``BaseStorage`` constructor, or runtime storage
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra='forbid')
+    journal: Path | None = None
+    storage: str | DeferredThirdPartySpec | optuna.storages.BaseStorage | None = None
+
+    @model_validator(mode='after')
+    def _validate_reference(self) -> StorageRef:
+        if (self.journal is None) == (self.storage is None):
+            raise ValueError('StorageRef requires exactly one of journal or storage.')
+        return self
+
+    def open(self) -> str | optuna.storages.BaseStorage:
+        """Open or construct this storage reference.
+
+        :return: Optuna storage URL or object
+        :raises ValueError: if a deferred factory produces the wrong type
+        """
+        if self.journal is not None:
+            return _journal_storage(self.journal)
+        value = self.storage.build() if isinstance(self.storage, DeferredThirdPartySpec) else self.storage
+        if not isinstance(value, str | optuna.storages.BaseStorage):
+            raise ValueError('Storage factory must produce an Optuna BaseStorage.')
+        return value
+
+    def journal_path(self) -> Path | None:
+        """Return the resolved journal path when this is a journal reference.
+
+        :return: resolved journal path, or null for non-journal storage
+        """
+        return None if self.journal is None else self.journal.resolve()
+
+
 class OptunaStudy(Routine):
     """Run adaptive Train trials with YAML sampling and shared executor settings.
 
@@ -227,6 +278,10 @@ class OptunaStudy(Routine):
     def _storage(cls, value: Any) -> Any:
         if value is None or isinstance(value, str) and (value == 'journal' or '://' in value):
             return value
+        if isinstance(value, StorageRef):
+            return value
+        if isinstance(value, Mapping) and 'journal' in value:
+            return StorageRef.model_validate(value)
         if isinstance(value, optuna.storages.BaseStorage):
             return value
         return DeferredThirdPartySpec.model_validate(value)
@@ -257,6 +312,142 @@ class OptunaStudy(Routine):
     def run(self) -> int:
         """Run new trials, preserving study state and finalizing all owned attempts."""
         return _StudyCoordinator(self).run()
+
+
+class CopyStudy(Routine):
+    """Copy studies from several Optuna storages into one destination.
+
+    :param sources: stable labels and their source storage references
+    :param destination: destination storage reference
+    :param journal_globs: journal discovery patterns, processed when the routine runs
+    :param name_policy: fail on existing names or namespace copied study names by source label
+    :param write_policy: behavior when an individual destination study already exists
+    """
+
+    sources: dict[str, StorageRef] = Field(default_factory=dict)
+    destination: StorageRef
+    journal_globs: tuple[str, ...] = ()
+    name_policy: Literal['fail', 'namespace'] = 'fail'
+    write_policy: Literal['error', 'overwrite', 'reuse'] = 'error'
+
+    @model_validator(mode='after')
+    def _validate_sources(self) -> CopyStudy:
+        if any(not label.strip() for label in self.sources):
+            raise ValueError('Source labels must be nonempty.')
+        return self
+
+    @staticmethod
+    def _glob_root(pattern: str) -> Path:
+        """Return the static directory prefix of a journal glob pattern."""
+        path = Path(pattern)
+        root = Path(path.anchor) if path.anchor else Path()
+        parts = path.parts[1:] if path.anchor else path.parts
+        for part in parts:
+            if has_magic(part):
+                return root.absolute()
+            root /= part
+        return root.parent.absolute()
+
+    @staticmethod
+    def _discovery_label(path: Path, root: Path) -> str:
+        """Derive a sanitized Optuna namespace from a discovered journal path."""
+        relative = path.relative_to(root)
+        parts = relative.parts[:-1] if path.name == 'study.journal' else (*relative.parts[:-1], path.stem)
+        if not parts:
+            parts = (path.parent.name if path.name == 'study.journal' else path.stem,)
+        label = '/'.join(re.sub(r'[^A-Za-z0-9._-]+', '-', part).strip('._-') for part in parts)
+        if not label or any(not part for part in label.split('/')):
+            raise ValueError(f'Discovered journal has an invalid source path: {path}')
+        return label
+
+    def _source_refs(self) -> dict[str, StorageRef]:
+        """Return explicit and discovered source references.
+
+        :return: normalized source references keyed by stable labels
+        :raises ValueError: if a glob has no files or a discovered label is ambiguous
+        """
+        sources = dict(self.sources)
+        for label, reference in sources.items():
+            path = reference.journal_path()
+            if path is not None and not path.is_file():
+                raise ValueError(f'Explicit source {label!r} must be an existing journal file: {path}')
+        journals = {path for ref in sources.values() if (path := ref.journal_path()) is not None}
+        for pattern in self.journal_globs:
+            root = self._glob_root(pattern)
+            matches = sorted(
+                {Path(match).absolute() for match in glob(pattern, recursive=True) if Path(match).is_file()}
+            )
+            if not matches:
+                raise ValueError(f'Journal glob matched no journal files: {pattern}')
+            for matched in matches:
+                path = matched.resolve()
+                if path in journals:
+                    continue
+                label = self._discovery_label(matched, root)
+                if not label or label in sources:
+                    raise ValueError(f'Discovered journal has duplicate source label: {label!r}')
+                sources[label] = StorageRef(journal=path)
+                journals.add(path)
+        return sources
+
+    def _validate_destination(self, sources: dict[str, StorageRef]) -> None:
+        """Reject known source and destination aliases.
+
+        :param sources: normalized source references
+        :raises ValueError: if a source and destination share a known backend identity
+        """
+        journal = self.destination.journal_path()
+        if journal is not None and any(ref.journal_path() == journal for ref in sources.values()):
+            raise ValueError('CopyStudy destination must not alias a source journal.')
+        if isinstance(self.destination.storage, str) and any(
+            ref.storage == self.destination.storage for ref in sources.values()
+        ):
+            raise ValueError('CopyStudy destination must not alias a source storage URL.')
+
+    def _prepare_destination(self) -> None:
+        """Create parent directories for file-backed destination storage."""
+        journal = self.destination.journal_path()
+        if journal is not None:
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            return
+        storage = self.destination.storage
+        if isinstance(storage, str) and storage.startswith('sqlite:///'):
+            database = storage.removeprefix('sqlite:///').split('?', maxsplit=1)[0]
+            if database and database != ':memory:':
+                Path(database).parent.mkdir(parents=True, exist_ok=True)
+
+    def run(self) -> int:
+        """Copy all studies in each configured source storage.
+
+        :return: zero after every study is copied
+        :raises ValueError: if no sources are selected or a destination aliases a source
+        """
+        sources = self._source_refs()
+        if not sources:
+            raise ValueError('CopyStudy requires at least one source storage.')
+        self._validate_destination(sources)
+        self._prepare_destination()
+        destination = self.destination.open()
+        existing = {summary.study_name for summary in optuna.get_all_study_summaries(destination)}
+        for label, reference in sorted(sources.items()):
+            source = reference.open()
+            summaries = sorted(optuna.get_all_study_summaries(source), key=lambda summary: summary.study_name)
+            for summary in summaries:
+                target = None if self.name_policy == 'fail' else f'{label}/{summary.study_name}'
+                name = summary.study_name if target is None else target
+                if name in existing:
+                    if self.write_policy == 'reuse':
+                        continue
+                    if self.write_policy == 'overwrite':
+                        optuna.delete_study(study_name=name, storage=destination)
+                optuna.copy_study(
+                    from_study_name=summary.study_name,
+                    from_storage=source,
+                    to_storage=destination,
+                    to_study_name=target,
+                )
+                existing.add(name)
+        return 0
 
 
 class _ControllerStudy(optuna.study.Study):
@@ -333,10 +524,12 @@ class _StudyCoordinator:
     def _storage(self):
         value = self.config.storage
         if value == 'journal':
-            journal = str(self.root / 'study.journal')
-            lock = optuna.storages.journal.JournalFileOpenLock(journal) if sys.platform == 'win32' else None
-            value = optuna.storages.JournalStorage(
-                optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
+            value = _journal_storage(self.root / 'study.journal')
+        elif isinstance(value, StorageRef):
+            journal = value.journal_path()
+            if journal is not None:
+                journal.parent.mkdir(parents=True, exist_ok=True)
+            value = value.open()
         elif isinstance(value, DeferredThirdPartySpec):
             value = value.build()
         if value is None:
