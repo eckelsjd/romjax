@@ -89,6 +89,119 @@ class EnvironmentRoutine(Routine):
         return 0
 
 
+def test_runtime_root_repeated_runs_restore_config(tmp_path):
+    RootRoutine.observed = []
+    routine = RootRoutine(name="run", root="cases", runtime_root=str(tmp_path / "run_{{timestamp}}"))
+    assert not list(tmp_path.iterdir())
+    assert routine.run() == routine.run() == 0
+    roots = [item[1] for item in RootRoutine.observed]
+    assert roots[0] != roots[1]
+    assert all(root.parent.parent == tmp_path and root.name == "cases" for root in roots)
+    assert all(root.parent.is_dir() for root in roots)
+    assert routine.root == Path("cases")
+
+
+@pytest.mark.parametrize("kind", ["serial", "thread", "process"])
+def test_runtime_root_nested_composite_workers(tmp_path, kind):
+    base = tmp_path / "base.yml"
+    base.write_text(f'!pd:{MODULE_NAME}.EnvironmentRoutine\nroot: "cases/{{{{case_root}}}}"\n')
+    child = tmp_path / "child.yml"
+    child.write_text(f'''!romx:CompositeRoutine
+base: {base}
+overrides:
+  - name: mode
+    cases: [{{name: one, value: null}}, {{name: two, value: null}}]
+executor: {{show_progress: false}}
+''')
+    config = f'''!romx:CompositeRoutine
+runtime_root: "{tmp_path}/run_{{{{timestamp}}}}"
+executor: {{kind: {kind}, max_workers: 1, show_progress: false}}
+routines: [{child}]
+'''
+    if kind == "serial":
+        config = config.replace("max_workers: 1, ", "")
+    routine = romjax.load(config)
+    assert routine.run() == 0
+    runs = list(tmp_path.glob("run_*"))
+    assert len(runs) == 1
+    for name in ("one", "two"):
+        root = runs[0] / "cases" / f"mode={name}"
+        assert (root / "jax_env.txt").is_file()
+        assert romjax.load(root / "resolved.yml").root == root
+
+
+def test_runtime_root_yaml_template_isolation(tmp_path):
+    routine = romjax.load(f'''!pd:{MODULE_NAME}.RootRoutine
+name: run
+root: "{{{{extra.path}}}}"
+runtime_root: "{tmp_path}/{{{{extra.prefix}}}}_{{{{timestamp}}}}"
+extra: {{path: cases, prefix: run}}
+''')
+    assert routine.run() == 0
+    assert list(tmp_path.glob("run_*"))
+    assert romjax.load('timestamp: literal\nvalue: "{{timestamp}}"')["value"] == "literal"
+
+
+def test_runtime_root_exception_does_not_leak(tmp_path):
+    routine = ArrayRoutine(fail=True, root="cases", values=[], runtime_root=tmp_path / "failed")
+    with pytest.raises(RuntimeError, match="failed"):
+        routine.run()
+    assert routine.root == Path("cases")
+    RootRoutine.observed = []
+    RootRoutine(name="plain", root="cases").run()
+    assert RootRoutine.observed[0][1] == Path("cases")
+
+
+def test_runtime_root_siblings_inherit_parent_instead_of_child_template(tmp_path):
+    RootRoutine.observed = []
+    first = RootRoutine(name="data", root="data", runtime_root=tmp_path / "unused_{{timestamp}}")
+    second = RootRoutine(name="cases", root="cases")
+    parent = CompositeRoutine(
+        routines=[first, CompositeRoutine(routines=[second], executor={"show_progress": False})],
+        runtime_root=tmp_path / "run_{{timestamp}}", executor={"show_progress": False},
+    )
+    parent.run()
+    assert [item[1] for item in RootRoutine.observed] == [
+        parent.resolved_runtime_root / "data", parent.resolved_runtime_root / "cases",
+    ]
+    assert not list(tmp_path.glob("unused_*"))
+
+
+def test_runtime_root_preserves_absolute_artifact_root(tmp_path):
+    RootRoutine.observed = []
+    root = tmp_path / "absolute"
+    RootRoutine(name="absolute", root=root, runtime_root=tmp_path / "run").run()
+    assert RootRoutine.observed[0][1] == root
+
+
+def test_runtime_root_timestamp_collision_reserves_ancestor(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    import romjax.routine as module
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(module, "datetime", FixedDatetime)
+    existing = tmp_path / "run_20260102T030405_000000Z"
+    existing.mkdir()
+    routine = DemoRoutine(runtime_root=tmp_path / "run_{{timestamp}}" / "cases")
+    routine.run()
+    first = routine.resolved_runtime_root
+    routine.run()
+    assert first != routine.resolved_runtime_root
+    assert not (existing / "cases").exists()
+    assert first.is_dir() and routine.resolved_runtime_root.is_dir()
+
+
+@pytest.mark.parametrize("template", ["", "{{unknown}}", "run_{{timestamp}"])
+def test_runtime_root_rejects_invalid_templates(template):
+    with pytest.raises(ValueError, match="runtime_root"):
+        RoutineConfig(runtime_root=template)
+
+
 def test_logger_config(monkeypatch):
     captured: dict[str, object] = {}
 

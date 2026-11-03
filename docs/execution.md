@@ -1,5 +1,95 @@
 # Routine executors
 
+## Runtime directories
+
+Use `runtime_root` to place a routine's artifacts under a directory selected when
+execution starts. It is a shared `RoutineConfig` option, accepted either directly
+on a routine or under `routine_config`:
+
+```yaml
+!romx:CompositeRoutine
+runtime_root: "romjax_{{timestamp}}"
+routines:
+  - data.yml       # DataGeneration with root: data
+  - studies.yml    # May contain further CompositeRoutines
+```
+
+Each call to `run()` selects a fresh directory for a timestamped template, even
+when reusing the same Python object. `Train.fit()` supports the same behavior.
+Timestamps use UTC in `YYYYMMDDTHHMMSS_microsecondsZ` format. Directory reservation
+is atomic; a numeric suffix resolves collisions. A template without a timestamp
+uses a fixed directory, preserving the routines' existing artifact reuse policies.
+
+All descendants inherit the selected runtime directory, including through composites
+without an artifact `root` and through thread/process workers. An inherited runtime
+directory takes precedence over a child's own `runtime_root`. Relative artifact roots
+are prefixed by that directory; absolute artifact roots retain their meaning.
+For example, `root: "cases/{{case_root}}"` becomes
+`romjax_<timestamp>/cases/<case_root>`, and `root: data` becomes
+`romjax_<timestamp>/data`. Optuna trials continue nesting beneath the study root.
+Other paths, such as dataset sources and base configuration files, are unaffected.
+
+## Runtime artifact references
+
+YAML recipes can use two invocation-scoped path references. `{{runtime.root}}` is
+the absolute shared workflow directory; `{{runtime.artifact_root}}` is the current
+routine's effective artifact root. A relative `root: train` therefore gives
+`/runs/run_123/train`, while an absolute root remains absolute. A rootless routine
+has no artifact root, and `runtime.root` is unavailable when no shared runtime root
+was selected. These references are resolved before ordinary Pydantic construction,
+so eager readers receive ordinary concrete `Path` or string values:
+
+```yaml
+runtime_root: "romjax_{{timestamp}}"
+root: train
+dataloader: {root: "{{runtime.root}}/data"}
+plot: {savefig: {fname: "{{runtime.artifact_root}}/loss.pdf"}}
+```
+
+Runtime expressions are recipe syntax; ordinary eager `romjax.load()` retains its
+existing static lookup behavior, including mappings named `runtime` and the older
+`{{root}}` references. Expressions belong in values, not mapping keys. Serial
+composite children are materialized immediately before they run, so a producer may
+write an artifact for a later consumer. Parallel executors do not infer dependencies.
+
+For Python callers that need dynamic paths, preserve the YAML recipe and materialize
+it for each invocation:
+
+```python
+spec = romjax.RoutineSpec.from_yaml("workflow.yml")
+spec.run()
+print(spec.resolved_runtime_root)
+```
+
+`RoutineSpec` retains the original recipe and constructs fresh routines, avoiding
+stale private artifact caches on repeated runs. Resolved snapshots contain concrete
+paths and replay without allocating another timestamped directory. `__parent__/`
+paths remain relative to the source file that declared them. Consumers remain
+responsible for creating output directories; runtime references do not create input
+artifacts. A rootless composite can still own a shared runtime directory, and the
+CLI `--root` override takes precedence over YAML and inherited child settings.
+
+The `{{timestamp}}` expression is deferred only in `runtime_root` values. Existing
+YAML references and resolvers still work there, and `{{case_root}}` retains its
+composite expansion behavior. Artifact `root` fields do not interpret timestamps.
+
+Override the top-level runtime directory from the CLI with a quoted argument:
+
+```sh
+romx run config.yml --root 'romjax_{{timestamp}}'
+```
+
+The source configuration is copied into the resolved artifact root, or into the
+runtime directory for a rootless composite. In Python, `routine.resolved_runtime_root`
+reports the current or most recent runtime directory. The configured `root` is restored
+after execution, including after failures. Constructing Train/GridSearch configs no
+longer creates or clears artifact directories; their write policies apply at execution.
+Reuse an instance sequentially; concurrent runs should use separate routine instances.
+
+Custom `Routine` subclasses inherit this behavior automatically for `run()`.
+Use `with self.run_context():` for additional execution entry points. Artifact setup
+belongs in `_prepare_run()` or the execution method, rather than model validators.
+
 `DataGeneration`, `CompositeRoutine`, and `GridSearch` use one
 `romjax.execution.ExecutorConfig`. Serial execution is the default.
 

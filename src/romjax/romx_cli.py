@@ -16,12 +16,13 @@ import argparse
 import os
 import shutil
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import romjax
 from romjax.execution import ExecutionError
 from romjax.mpi_runtime import cli_context
-from romjax.routine import RoutineError
+from romjax.routine import Routine, RoutineError, RoutineSpec
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     
     gen = subparsers.add_parser("run", help="Run a romjax routine from yaml config file.")
     gen.add_argument("config", help=f"Path to config file. Provided routines: {romjax.routine.available}")
+    gen.add_argument("--root", type=Path, default=None,
+                     help="Override the runtime directory; quote templates, e.g. 'romjax_{{timestamp}}'.")
     gen.add_argument(
         "--profile",
         action="store_true",
@@ -82,20 +85,33 @@ def cli(argv: list[str] | None = None) -> int:
                     return 0
                 if not Path(args.config).exists():
                     raise RoutineError(f"Config file '{args.config}' not found")
-                routine = romjax.load(args.config)
-
-                if not hasattr(routine, "run") or not callable(getattr(routine, "run")):
-                    raise RoutineError(f"Top-level object loaded from '{args.config}' must implement `run()`.")
-
-                if hasattr(routine, "root"):
-                    if routine.root is not None:
-                        Path(routine.root).mkdir(exist_ok=True, parents=True)
+                config_text = Path(args.config).read_text(encoding="utf-8")
+                legacy_static = (
+                    args.root is None
+                    and "{{runtime." not in config_text
+                    and "runtime_root:" not in config_text
+                )
+                if legacy_static:
+                    routine = romjax.load(args.config)
+                    if not hasattr(routine, "run") or not callable(getattr(routine, "run")):
+                        raise RoutineError(f"Top-level object loaded from '{args.config}' must implement `run()`.")
+                    scope = routine.run_context() if isinstance(routine, Routine) else nullcontext()
+                else:
+                    spec = RoutineSpec.from_yaml(args.config, runtime_root=args.root)
+                    scope = spec.execution()
+                with scope as scoped_routine:
+                    routine = scoped_routine or routine
+                    root = getattr(routine, "root", None)
+                    if root is None and isinstance(routine, Routine):
+                        root = routine.resolved_runtime_root
+                    if root is not None:
+                        Path(root).mkdir(exist_ok=True, parents=True)
                         src = Path(args.config)
-                        dest = routine.root / Path(args.config).name
+                        dest = Path(root) / src.name
                         if src.resolve() != dest.resolve():
                             shutil.copy(src, dest)
 
-                return routine.run()
+                    return routine.run()
             
         except (RoutineError, ExecutionError) as exc:
             print(str(exc), file=sys.stderr)

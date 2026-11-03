@@ -112,6 +112,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "Routine": ("romjax.routine", "Routine"),
     "RoutineConfig": ("romjax.routine", "RoutineConfig"),
     "RoutineError": ("romjax.routine", "RoutineError"),
+    "RoutineSpec": ("romjax.routine", "RoutineSpec"),
+    "RuntimeContext": ("romjax.runtime", "RuntimeContext"),
     "load_h5": ("romjax.utils", "load_h5"),
     "save_h5": ("romjax.utils", "save_h5"),
     "DataGeneration": ("romjax.data_gen", "DataGeneration"),
@@ -171,7 +173,7 @@ if TYPE_CHECKING:
     from .transport import AdvectionDiffusion2D
     from .vlasov import Vlasov1D1V
     from .rng import CompressionSampler, NearSolutionSampler, PyTreeSampler, SolverSampler, gen_keys
-    from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError
+    from .routine import CompositeRoutine, Routine, RoutineConfig, RoutineError, RoutineSpec
     from .operators import AffineUnaryOp, BinaryOp, UnaryOp
     from .train import BatchLoader, OrbaxRef, Train, resolve_orbax_params
     from .tree import TreeRef
@@ -861,7 +863,7 @@ class YamlLoader(ConfigLoader):
         return value
 
     @classmethod
-    def _render_templates(cls, node: _yaml.Node | None) -> _yaml.Node | None:
+    def _render_templates(cls, node: _yaml.Node | None, runtime_context=None, defer_runtime: bool = False) -> _yaml.Node | None:
         """Render basic references and resolver calls in one composed YAML document.
 
         Rendering occurs on YAML nodes, after override composition and before Pydantic construction. This preserves
@@ -878,6 +880,23 @@ class YamlLoader(ConfigLoader):
         rendered: dict[int, _yaml.Node] = {}
         rendering: set[int] = set()
 
+        if runtime_context is not None and isinstance(root, _yaml.MappingNode):
+            runtime_mapping = next(
+                (
+                    value
+                    for key, value in root.value
+                    if isinstance(key, _yaml.ScalarNode)
+                    and key.value == "runtime"
+                    and isinstance(value, _yaml.MappingNode)
+                ),
+                None,
+            )
+            if runtime_mapping is not None and any(
+                isinstance(key, _yaml.ScalarNode) and key.value in {"root", "artifact_root"}
+                for key, _ in runtime_mapping.value
+            ):
+                raise ValueError("Recipe mapping named 'runtime' conflicts with reserved runtime references.")
+
         def fail(message: str, current: _yaml.Node, path: tuple[str, ...]) -> ValueError:
             return ValueError(f"{message} at {cls._template_location(current, path)}.")
 
@@ -887,6 +906,18 @@ class YamlLoader(ConfigLoader):
             resolver_path = resolver_path.strip()
             if not resolver_path:
                 raise fail(f"Invalid template expression {expression!r}", current, path)
+
+            if defer_runtime and (resolver_path.startswith("runtime.") or "{{runtime." in expression):
+                return current
+
+            if runtime_context is not None and resolver_path.startswith("runtime"):
+                if separator or resolver_path not in {"runtime.root", "runtime.artifact_root"}:
+                    raise fail(f"Unknown runtime reference {resolver_path!r}", current, path)
+                name = resolver_path.removeprefix("runtime.")
+                value = getattr(runtime_context, name)
+                if value is None:
+                    raise fail(f"Runtime reference {resolver_path!r} is unavailable", current, path)
+                return _yaml.ScalarNode(_yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG, str(value))
 
             if not separator:
                 try:
@@ -909,6 +940,12 @@ class YamlLoader(ConfigLoader):
                     argument = argument.strip()
                     if not argument:
                         raise fail(f"Invalid empty argument in template expression {expression!r}", current, path)
+                    if runtime_context is not None and argument in {"runtime.root", "runtime.artifact_root"}:
+                        value = getattr(runtime_context, argument.removeprefix("runtime."))
+                        if value is None:
+                            raise fail(f"Runtime reference {argument!r} is unavailable", current, path)
+                        arguments.append(value)
+                        continue
                     try:
                         argument_node, argument_path = cls._template_path_node(root, argument)
                     except _TemplatePathError:
@@ -922,7 +959,14 @@ class YamlLoader(ConfigLoader):
 
         def render_scalar(current: _yaml.ScalarNode, path: tuple[str, ...]) -> _yaml.Node:
             matches = list(_TEMPLATE_PATTERN.finditer(current.value))
+            if path and path[-1] == "runtime_root":
+                matches = [match for match in matches if match.group(1).strip() != "timestamp"]
+            if runtime_context is not None and "{{runtime" in current.value \
+                    and current.value.count("{{") != current.value.count("}}"): 
+                raise fail("Malformed runtime template expression", current, path)
             if not matches:
+                return current
+            if defer_runtime and any(match.group(1).strip().startswith("runtime.") for match in matches):
                 return current
             if len(matches) == 1 and matches[0].span() == (0, len(current.value)):
                 return resolve_expression(matches[0].group(1), current, path)
@@ -955,6 +999,9 @@ class YamlLoader(ConfigLoader):
                 elif isinstance(current, _yaml.MappingNode):
                     pairs: list[tuple[_yaml.Node, _yaml.Node]] = []
                     for key_node, value_node in current.value:
+                        if runtime_context is not None and isinstance(key_node, _yaml.ScalarNode) \
+                                and _TEMPLATE_PATTERN.search(key_node.value):
+                            raise fail("Runtime expressions are not supported in mapping keys", key_node, path)
                         value_path = path + (key_node.value,) if isinstance(key_node, _yaml.ScalarNode) else path
                         pairs.append((key_node, render_node(value_node, value_path)))
                     current.value = pairs

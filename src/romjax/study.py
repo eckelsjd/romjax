@@ -695,7 +695,7 @@ class _StudyCoordinator:
                         [dict(item) for item in assignments], _preserve_yaml_sources=True))
                     key = f'trial_{number:05d}'
                     self.server.register(key, partial(self._report, number))
-                    spec = TrialLaunchSpec(key, root, self.control, config.feedback, config.child_quiet)
+                    spec = TrialLaunchSpec(key, root, self.control, config.feedback, config.child_quiet, self.root)
                 yield TaskSpec(str(number), key, spec)
         except BaseException:
             self.server.cancel_all('Study preparation interrupted.')

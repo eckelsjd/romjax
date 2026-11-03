@@ -42,6 +42,20 @@ def scalar_quadratic_loss(params: dict[str, jax.Array], batch: object) -> jax.Ar
     return jnp.square(params["w"] - 1.0)
 
 
+def test_runtime_root_train_defers_artifacts_and_supports_fit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    train = Train(loss=scalar_quadratic_loss, init_params={"w": jnp.array(0.0)},
+                  optimizer=optax.sgd(0.2), termination=TerminationConfig(max_steps=1),
+                  root="train", runtime_root="run_{{timestamp}}")
+    assert not (tmp_path / "train").exists()
+    train.fit()
+    train.run()
+    runs = list(tmp_path.glob("run_*"))
+    assert len(runs) == 2
+    assert all((run / "train" / "loss.csv").exists() for run in runs)
+    assert train.root == Path("train")
+
+
 def scalar_zero_loss(params: dict[str, jax.Array], batch: object) -> jax.Array:
     del batch
     return jnp.square(params["w"])
@@ -639,10 +653,15 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
     )
     assert overwrite_root.joinpath("sentinel.txt").exists()
     assert overwrite_root.joinpath("notes").exists()
-    assert not overwrite_root.joinpath("loss.csv").exists()
+    assert overwrite_root.joinpath("loss.csv").exists()
+    assert overwrite_root.joinpath("history.pdf").exists()
+    assert overwrite_root.joinpath("train_999").exists()
+    assert overwrite.run() == 0
     assert not overwrite_root.joinpath("history.pdf").exists()
     assert not overwrite_root.joinpath("train_999").exists()
-    assert overwrite.run() == 0
+    assert overwrite_root.joinpath("sentinel.txt").exists()
+    assert overwrite_root.joinpath("notes").exists()
+    assert _history_csv(overwrite_root / "loss.csv")[0].tolist() == [0, 1, 2]
 
     error_root = tmp_path.resolve() / "error"
     error_root.mkdir(parents=True, exist_ok=True)
@@ -656,7 +675,7 @@ def test_checkpointer_and_restart(tmp_path: Path) -> None:
             root=error_root,
             write_policy="error",
             checkpointer=checkpointer,
-        )
+        ).run()
 
 
 # @pytest.mark.skipif(sys.platform == "win32", reason="Orbax checkpointer issues on Windows")

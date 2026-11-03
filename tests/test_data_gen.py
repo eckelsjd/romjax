@@ -393,6 +393,19 @@ def _get_graph():
     return graph
 
 
+def test_runtime_root_data_generation_repeated_runs(tmp_path):
+    generation = DataGeneration(
+        root="data", runtime_root=tmp_path / "run_{{timestamp}}",
+        graph=_get_graph(),
+        datasets={"low": {"input_samples": 1, "outputs_per_input": 1, "input_seed": 3, "output_seed": 5}},
+    )
+    for _ in range(2):
+        assert generation.run() == 0
+        root = generation.resolved_runtime_root / "data" / "low"
+        assert LoadImplicitModel().discover_sample_refs(root)
+    assert len(list(tmp_path.glob("run_*"))) == 2
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_generate_implicit_persists_and_loads_conditions(tmp_path, batch_size):
     graph = FunctionGraph(edges={"conditioned": _ConditionedSampleableEdge(source="inputs", target="conditioned")})

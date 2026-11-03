@@ -116,6 +116,13 @@ storage:
 #   kwargs: {host: storage-host, port: 13000}
 ```
 
+Study recipes can bind independent storage paths with `{{runtime.root}}`, while
+trial-local plots and checkpoints use `{{runtime.artifact_root}}`. The shared root
+is carried explicitly into each training subprocess; a trial directory is not
+mistaken for the workflow root. Emitted `case.yml` snapshots contain concrete
+context so they can be replayed from another working directory without selecting
+a new timestamped run.
+
 Install the chosen backend's drivers separately. Prefer an importable storage
 factory for credentials instead of embedding secrets in shared YAML. The library
 neither starts a database/proxy server nor deletes a whole external database.

@@ -872,9 +872,6 @@ class Train(Routine):
     @model_validator(mode="after")
     def _setup_extra_train_configs(self):
         """Do some assorted things after model validation."""
-        if self.root is not None:
-            self.root = self.root.resolve()
-
         # Pass graph object to loss, test, and dataloader if requested
         self.bind_graph(self.graph)    
 
@@ -885,18 +882,14 @@ class Train(Routine):
             load_orbax=self.load_orbax,
         )
         
-        # Start dataloader from current training step if applicable
-        if self.root is not None and hasattr(self.dataloader, "set_iterator"):
-            with _create_checkpointer(self.root, **dict(self.checkpointer)) as ckptr:
-                if ckptr.latest is not None:
-                    self.dataloader.set_iterator(ckptr.latest.step)
-        
         return self
 
-    @field_validator("write_policy", mode="after")
-    @classmethod
-    def _check_write_policy(cls, policy: bool, info):
-        root = info.data["root"]
+    def _prepare_run(self) -> None:
+        """Apply artifact policy and resume the loader under the resolved run root."""
+        if self.root is not None:
+            self.root = self.root.resolve()
+        root = self.root
+        policy = self.write_policy
         if root is not None:
             if root.exists() and any(root.iterdir()):
                 if policy == "error":
@@ -910,7 +903,10 @@ class Train(Routine):
                             path.unlink()
             root.mkdir(parents=True, exist_ok=True)
         
-        return policy
+        if root is not None and hasattr(self.dataloader, "set_iterator"):
+            with _create_checkpointer(root, **dict(self.checkpointer)) as ckptr:
+                if ckptr.latest is not None:
+                    self.dataloader.set_iterator(ckptr.latest.step)
 
     def _freeze_label(self, path: tuple[Any, ...]) -> str:
         """Return the Optax transform label selected for one parameter path."""
@@ -1011,6 +1007,13 @@ class Train(Routine):
         :param observer: host callback; STOP finalizes artifacts before returning
         :return: parameters, final metrics, and termination reason
         """
+        with self.run_context():
+            return self._fit(observer=observer)
+
+    def _fit(
+        self, *, observer: Callable[[TrainingReport], TrainingDecision] | None = None,
+    ) -> TrainingResult:
+        """Execute training inside an already prepared runtime scope."""
         if observer is not None and 'test_score' in self.diagnostics.report_metrics and self.test is None:
             raise ValueError('Reporting test_score requires Train.test.')
         stop_reason = 'max_steps'

@@ -31,6 +31,15 @@ class TemplateValueRoutine(Routine):
         return 0
 
 
+def test_runtime_root_grid_search_defers_artifacts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    base = tmp_path / "base.yml"
+    base.write_text("root: original\n")
+    search = GridSearch(root="grid", base=base, override=[], runtime_root="run_{{timestamp}}")
+    assert search.root == Path("grid")
+    assert not (tmp_path / "grid").exists()
+
+
 def test_sparse_override_sets_mapping_and_sequence_paths() -> None:
     tree = {}
     tree = _set_override_path(tree, ("loss", "terms", 1, "weight"), 0.3)

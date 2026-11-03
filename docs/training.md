@@ -42,6 +42,11 @@ def observe(report):
 result = train.fit(observer=observe)
 ```
 
+Training recipes may use `{{runtime.root}}` for shared datasets and
+`{{runtime.artifact_root}}` for checkpoints, histories, and figures. The paths are
+bound before `Train` validation, so `DataLoader` and checkpoint readers can load
+artifacts during construction without a framework-specific runtime-path type.
+
 `report_interval: null` disables periodic reports. An attached observer receives
 one final notification with `final=True`; its decision is ignored. A STOP decision
 on a periodic report stops training and saves the current state. Reporting

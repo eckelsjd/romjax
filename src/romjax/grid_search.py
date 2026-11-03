@@ -382,13 +382,16 @@ class GridSearch(Routine):
 
     @model_validator(mode="after")
     def _validate_paths(self) -> "GridSearch":
-        self.root = self.root.resolve()
         if isinstance(self.base, Path):
             self.base = self.base.resolve()
             if not self.base.exists():
                 raise RoutineError(f"GridSearch base config does not exist: {self.base}")
         self.executor.validate_environment(self.child_env)
-        
+        return self
+
+    def _prepare_run(self) -> None:
+        """Apply the artifact policy only after selecting the runtime directory."""
+        self.root = self.root.resolve()
         if self.root.exists() and any(self.root.iterdir()):
             if self.write_policy == "error":
                 raise RoutineError(f"GridSearch root already contains artifacts: {self.root}")
@@ -398,8 +401,6 @@ class GridSearch(Routine):
                         shutil.rmtree(artifact)
                 (self.root / "grid_search_manifest.yml").unlink(missing_ok=True)
         self.root.mkdir(parents=True, exist_ok=True)
-
-        return self
 
     def _case_values(self) -> list[tuple[Any, ...]]:
         """Return the Cartesian-product grid values."""
@@ -431,6 +432,8 @@ class GridSearch(Routine):
             tree = _set_override_path(tree, override.path, value)
         for root_path in self.case_root_path:
             tree = _set_override_path(tree, root_path, _yaml_path_text(case_root))
+        if self.resolved_runtime_root is not None:
+            tree = _set_override_path(tree, ("runtime_root",), _yaml_path_text(self.resolved_runtime_root))
 
         config_path = case_root / "case.yml"
         yaml_body = romjax.YamlLoader.dump(tree, sort_keys=False)

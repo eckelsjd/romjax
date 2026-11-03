@@ -169,6 +169,7 @@ class TrialLaunchSpec:
     control: Path
     feedback: FeedbackConfig
     quiet: bool = True
+    runtime_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,7 @@ class _StudyWorker(TaskWorker):
         mailbox = spec.control / spec.key
         launch = mailbox / 'launch.json'
         _Mailbox.write(launch, {'key': spec.key, 'root': str(spec.root), 'control': str(mailbox),
+                                'runtime_root': str(spec.runtime_root) if spec.runtime_root is not None else None,
                                 'feedback': spec.feedback.model_dump()})
         environment = {**os.environ, **self.environment, **context.environment, 'ROMJAX_MPI_CASE_CHILD': '1'}
         with ExitStack() as stack:
@@ -242,8 +244,6 @@ class _StudyWorker(TaskWorker):
 
     @staticmethod
     def main(launch_path: Path) -> int:
-        import romjax
-
         launch = _Mailbox.read(launch_path)
         root = Path(launch['control'])
         feedback = FeedbackConfig.model_validate(launch['feedback'])
@@ -263,10 +263,14 @@ class _StudyWorker(TaskWorker):
         thread.start()
         code = 0
         try:
-            routine = romjax.load(Path(launch['root']) / 'case.yml')
-            if not isinstance(routine, Train):
-                raise TypeError('OptunaStudy base must construct a Train routine.')
-            result = routine.fit(observer=client.observe)
+            from romjax.routine import RoutineSpec
+
+            spec = RoutineSpec.from_yaml(Path(launch['root']) / 'case.yml')
+            runtime_root = Path(launch['runtime_root']) if launch.get('runtime_root') else None
+            with spec.execution(parent_root=runtime_root) as routine:
+                if not isinstance(routine, Train):
+                    raise TypeError('OptunaStudy base must construct a Train routine.')
+                result = routine.fit(observer=client.observe)
             outcome = {'key': launch['key'], 'state': 'pruned' if client.pruned else 'complete',
                        'step': result.step, 'metrics': dict(result.metrics), 'stop_reason': result.stop_reason}
         except BaseException as exc:

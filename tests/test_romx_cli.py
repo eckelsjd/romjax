@@ -17,6 +17,20 @@ from romjax.routine import Routine
 MODULE_NAME = __name__
 
 
+def test_cli_runtime_root_override_and_config_copy(tmp_path):
+    config = tmp_path / "run.yml"
+    config.write_text(f'''!pd:{MODULE_NAME}.DemoRoutine
+root: cases
+runtime_root: unused
+''')
+    for _ in range(2):
+        assert cli(["run", str(config), "--root", str(tmp_path / "run_{{timestamp}}")]) == 0
+        root = DemoRoutine.observed["root"]
+        assert root.name == "cases"
+        assert (root / config.name).is_file()
+    assert len(list(tmp_path.glob("run_*"))) == 2
+
+
 class DemoRoutine(Routine):
     """Minimal routine used to exercise the CLI loader."""
 

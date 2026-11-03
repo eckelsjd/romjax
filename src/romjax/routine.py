@@ -2,13 +2,19 @@
 
 import ast
 import re
+import shutil
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import wraps
 from importlib import import_module as _import_module
 from itertools import product
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal, Mapping
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterator, Literal, Mapping
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -28,13 +34,18 @@ from pydantic import (
 
 from romjax.execution import ExecutionAction, ExecutorConfig, ProgressBarConfig, TaskContext, TaskSpec, TaskWorker
 from romjax.plotting import GridplotConfig
-from romjax.typing import WriteStream, from_yaml
+from romjax.runtime import RuntimeContext
+from romjax.typing import DictModel, WriteStream, from_yaml
+
+if TYPE_CHECKING:
+    from romjax import YamlSource
 
 __all__ = [
     "CompositeRoutine",
     "Routine",
     "RoutineConfig",
     "RoutineError",
+    "RoutineSpec",
     "LoggerConfig",
     "ProgressBarConfig",
 ]
@@ -47,6 +58,9 @@ _LAZY_EXPORTS = {
 }
 
 available = list(_LAZY_EXPORTS.keys())
+
+_RUNTIME_ROOT: ContextVar[Path | None] = ContextVar("romjax_runtime_root", default=None)
+_TIMESTAMP_PATTERN = re.compile(r"\{\{\s*timestamp\s*\}\}")
 
 def __getattr__(name: str) -> Any:
     if name not in _LAZY_EXPORTS:
@@ -120,6 +134,7 @@ class RoutineConfig(BaseModel):
     :ivar logger: loguru configuration
     :ivar progress_bar: alive_bar configuration
     :ivar extra: anything you want to write/reuse in yaml but don't want to exist on its own
+    :ivar runtime_root: execution directory inherited by descendants; supports ``{{timestamp}}``
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="forbid")
@@ -131,6 +146,18 @@ class RoutineConfig(BaseModel):
     logger: LoggerConfig | None = None
     progress_bar: ProgressBarConfig | None = None
     extra: Any | None = Field(exclude=True, default=None)
+    runtime_root: Path | None = None
+
+    @field_validator("runtime_root", mode="before")
+    @classmethod
+    def _validate_runtime_root(cls, value: Any) -> Any:
+        if value is not None:
+            if not str(value).strip():
+                raise ValueError("runtime_root must be a nonempty path.")
+            remaining = _TIMESTAMP_PATTERN.sub("timestamp", str(value))
+            if "{{" in remaining or "}}" in remaining:
+                raise ValueError("Unresolved runtime_root template; only {{timestamp}} is resolved at runtime.")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -175,11 +202,89 @@ class RoutineConfig(BaseModel):
 
     
 class Routine(BaseModel, ABC):
-    """Base class mixin that provides the `run()` method. Can only pass extra options for global configuration."""
+    """Base class providing shared configuration and runtime scopes for ``run()``."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_default=True, extra="allow")
     
     routine_config: Annotated[RoutineConfig | None, BeforeValidator(from_yaml)] = None
+    _runtime_active: bool = PrivateAttr(default=False)
+    _resolved_runtime_root: Path | None = PrivateAttr(default=None)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Apply the common execution scope to custom and built-in routines."""
+        super().__init_subclass__(**kwargs)
+        implementation = cls.__dict__.get("run")
+        if implementation is not None:
+            @wraps(implementation)
+            def scoped_run(self: "Routine", *args: Any, **kwargs: Any) -> int:
+                with self.run_context():
+                    return implementation(self, *args, **kwargs)
+            cls.run = scoped_run
+
+    @property
+    def resolved_runtime_root(self) -> Path | None:
+        """Runtime directory selected for the current or most recent invocation."""
+        return self._resolved_runtime_root
+
+    @staticmethod
+    def _create_runtime_root(template: Path) -> Path:
+        """Resolve and reserve a runtime directory without reusing timestamped runs."""
+        template = template.expanduser().absolute()
+        text = str(template)
+        if not _TIMESTAMP_PATTERN.search(text):
+            template.mkdir(parents=True, exist_ok=True)
+            return template
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        # Reserve the first timestamp-bearing ancestor, not just a trailing subdirectory.
+        index = next(i for i, part in enumerate(template.parts) if _TIMESTAMP_PATTERN.search(part))
+        counter = 0
+        while True:
+            stamp = timestamp if counter == 0 else f"{timestamp}-{counter}"
+            root = Path(_TIMESTAMP_PATTERN.sub(stamp, text))
+            reservation = Path(*root.parts[:index + 1])
+            try:
+                reservation.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                counter += 1
+                continue
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+
+    @contextmanager
+    def run_context(self, *, parent_root: Path | None = None) -> Iterator[None]:
+        """Resolve roots for one invocation, restoring configured paths on exit.
+
+        Nested calls on this instance reuse the active scope. Worker launchers may
+        explicitly carry the parent's scope across thread or process boundaries.
+
+        :param parent_root: resolved runtime directory inherited from a parent worker
+        :return: context manager covering artifact setup and execution
+        """
+        if self._runtime_active:
+            yield
+            return
+        runtime_root = parent_root if parent_root is not None else _RUNTIME_ROOT.get()
+        if runtime_root is None and self.routine_config is not None:
+            template = self.routine_config.runtime_root
+            if template is not None:
+                runtime_root = self._create_runtime_root(template)
+        configured_root = getattr(self, "root", None)
+        token = _RUNTIME_ROOT.set(runtime_root)
+        self._runtime_active = True
+        self._resolved_runtime_root = runtime_root
+        try:
+            if runtime_root is not None and configured_root is not None:
+                self.root = runtime_root / configured_root
+            self._prepare_run()
+            yield
+        finally:
+            if configured_root is not None:
+                self.root = configured_root
+            self._runtime_active = False
+            _RUNTIME_ROOT.reset(token)
+
+    def _prepare_run(self) -> None:
+        """Prepare artifacts after resolving roots and before executing the routine."""
 
     @model_validator(mode="wrap")
     @classmethod
@@ -245,6 +350,174 @@ class Routine(BaseModel, ABC):
         return env
 
 
+class RoutineSpec(DictModel):
+    """Immutable YAML recipe that materializes a fresh routine per invocation.
+
+    :param recipe: copied :class:`romjax.YamlSource` retained for repeatable runs
+    :param runtime_root: optional shared runtime-root override
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    recipe: Any
+    runtime_root: str | Path | None = None
+    _template: Any = PrivateAttr()
+    _resolved_runtime_root: Path | None = PrivateAttr(default=None)
+
+    @classmethod
+    def from_yaml(
+        cls,
+        source: str | Path | bytes | "YamlSource",
+        *,
+        runtime_root: str | Path | None = None,
+    ) -> "RoutineSpec":
+        """Capture YAML without constructing the configured routine.
+
+        :param source: YAML text, path, bytes, or a preserved YAML source
+        :param runtime_root: optional CLI-style shared-root override
+        :return: repeatable routine recipe
+        """
+        from romjax.configuration import YamlTemplate
+
+        template = YamlTemplate.from_source(source)
+        return cls(recipe=deepcopy(template.source), runtime_root=runtime_root)
+
+    @model_validator(mode="after")
+    def _capture_template(self) -> "RoutineSpec":
+        from romjax.configuration import YamlTemplate
+
+        self._template = YamlTemplate.from_source(deepcopy(self.recipe))
+        return self
+
+    @property
+    def resolved_runtime_root(self) -> Path | None:
+        """Return the most recently selected shared runtime directory."""
+        return self._resolved_runtime_root
+
+    @staticmethod
+    def _mapping_value(node: Any, key: str) -> Any | None:
+        import yaml
+
+        if not isinstance(node, yaml.MappingNode):
+            return None
+        return next((value for item, value in node.value
+                     if isinstance(item, yaml.ScalarNode) and item.value == key), None)
+
+    @staticmethod
+    def _node_value(node: Any) -> Any:
+        import romjax
+
+        return romjax.YamlLoader._template_node_value(node) if node is not None else None
+
+    def _static_template(self):
+        import romjax
+        from romjax.configuration import YamlTemplate
+
+        node = romjax.YamlLoader._render_templates(self._template.source.node, defer_runtime=True)
+        return YamlTemplate.from_source(romjax.YamlSource(node, self._template.source.source_path,
+                                                          self._template.source.label))
+
+    def _selected_root(self, parent_root: Path | None) -> tuple[Path | None, bool]:
+        static = self._static_template()
+        node = static.source.node
+        configured = self.runtime_root
+        if configured is None:
+            configured = self._node_value(self._mapping_value(node, "runtime_root"))
+        if configured is None:
+            return (parent_root.absolute() if parent_root is not None else None), False
+        text = str(configured)
+        if "{{runtime." in text:
+            raise ValueError("runtime_root cannot depend on runtime context.")
+        template = Path(text)
+        if parent_root is not None:
+            return parent_root.absolute(), False
+        root = Routine._create_runtime_root(template)
+        return root, "{{timestamp" in text
+
+    def _materialize(self, shared_root: Path | None) -> Routine:
+        import yaml
+
+        import romjax
+        from romjax.configuration import ConfigAssignment, YamlTemplate
+
+        static = self._static_template()
+        raw_root = self._node_value(self._mapping_value(static.source.node, "root"))
+        artifact_root: Path | None = None
+        if raw_root is not None:
+            root_source = static.render_runtime(RuntimeContext(shared_root, None))
+            resolved_root = self._node_value(self._mapping_value(root_source.source.node, "root"))
+            artifact_root = Path(resolved_root).expanduser()
+            if not artifact_root.is_absolute():
+                artifact_root = (shared_root / artifact_root if shared_root is not None else artifact_root.absolute())
+            artifact_root = artifact_root.absolute()
+
+        context = RuntimeContext(shared_root, artifact_root)
+        assignments: list[ConfigAssignment] = []
+        if artifact_root is not None:
+            assignments.append(ConfigAssignment(path=("root",), value=str(artifact_root)))
+        if shared_root is not None:
+            assignments.append(ConfigAssignment(path=("runtime_root",), value=str(shared_root)))
+        source = static.render(assignments) if assignments else static.source
+        source_node = deepcopy(source.node)
+
+        def defer_children(node: yaml.Node) -> None:
+            if not isinstance(node, yaml.MappingNode):
+                return
+            for key, value in node.value:
+                if (
+                    isinstance(key, yaml.ScalarNode)
+                    and key.value == "routines"
+                    and isinstance(value, yaml.SequenceNode)
+                ):
+                    for index, child in enumerate(value.value):
+                        if child.tag.startswith((romjax.YamlLoader.ROMX_TAG, romjax.YamlLoader.PYDANTIC_TAG)):
+                            payload = yaml.MappingNode(
+                                "tag:yaml.org,2002:map",
+                                [
+                                    (yaml.ScalarNode("tag:yaml.org,2002:str", "node"), child),
+                                    (yaml.ScalarNode("tag:yaml.org,2002:str", "source_path"),
+                                     yaml.ScalarNode("tag:yaml.org,2002:str", str(source.source_path or ""))),
+                                ],
+                            )
+                            payload.tag = romjax.YamlLoader.YAML_SOURCE_TAG
+                            value.value[index] = payload
+                elif isinstance(value, yaml.MappingNode):
+                    defer_children(value)
+
+        defer_children(source_node)
+        deferred = romjax.YamlSource(source_node, source.source_path, source.label)
+        rendered = YamlTemplate.from_source(deferred).render_runtime(context)
+        routine = romjax.load(rendered.source)
+        if not isinstance(routine, Routine):
+            raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(routine).__name__}.")
+        return routine
+
+    @contextmanager
+    def execution(self, *, parent_root: Path | None = None) -> Iterator[Routine]:
+        """Materialize and execute one fresh routine in its runtime scope.
+
+        :param parent_root: inherited shared runtime directory
+        :return: the concrete routine for this invocation
+        """
+        shared_root, owns_timestamp_root = self._selected_root(parent_root)
+        self._resolved_runtime_root = shared_root
+        started = False
+        try:
+            routine = self._materialize(shared_root)
+            with routine.run_context(parent_root=shared_root):
+                started = True
+                yield routine
+        except BaseException:
+            if not started and owns_timestamp_root and shared_root is not None:
+                shutil.rmtree(shared_root, ignore_errors=True)
+            raise
+
+    def run(self) -> int:
+        """Materialize one routine and call its ``run`` method once."""
+        with self.execution() as routine:
+            return routine.run()
+
+
 class CompositeOverrideCase(BaseModel):
     """One named configuration value in a composite override.
 
@@ -303,8 +576,23 @@ class _CompositeCaseResult:
     routine_name: str | None = None
 
 
+@contextmanager
+def _composite_execution(value: Any, parent_root: Path | None) -> Iterator[Routine]:
+    """Materialize one YAML child at the boundary immediately before execution."""
+    import romjax
+
+    if isinstance(value, romjax.YamlSource | str | Path | bytes):
+        with RoutineSpec.from_yaml(value).execution(parent_root=parent_root) as routine:
+            yield routine
+        return
+    if not isinstance(value, Routine):
+        raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(value).__name__}.")
+    with value.run_context(parent_root=parent_root):
+        yield value
+
+
 def _load_composite_routine(value: Any) -> Routine:
-    """Load a routine from an already-resolved composite child value."""
+    """Load a legacy child immediately for direct validation callers."""
     import romjax
 
     routine = romjax.load(value) if isinstance(value, romjax.YamlSource | str | Path | bytes) else value
@@ -314,26 +602,28 @@ def _load_composite_routine(value: Any) -> Routine:
 
 
 class _CompositeWorker(TaskWorker):
-    def __init__(self, cases: Sequence[_CompositeCase] = (), *, write_resolved: bool = False) -> None:
+    def __init__(self, cases: Sequence[_CompositeCase] = (), *, write_resolved: bool = False,
+                 runtime_root: Path | None = None) -> None:
         self.cases = cases
         self.write_resolved = write_resolved
+        self.runtime_root = runtime_root
 
     def prepare(self, *, remote: bool) -> "_CompositeWorker":
         if remote and any(isinstance(case.value, Routine) for case in self.cases):
             raise ValueError("Remote CompositeRoutine execution requires YAML-backed routine specifications.")
-        return _CompositeWorker(write_resolved=self.write_resolved)
+        return _CompositeWorker(write_resolved=self.write_resolved, runtime_root=self.runtime_root)
 
     def run(self, case: _CompositeCase, context: TaskContext) -> _CompositeCaseResult:
-        routine = _load_composite_routine(case.value)
-        root = getattr(routine, "root", None)
-        if self.write_resolved and root is not None:
-            import romjax
+        with _composite_execution(case.value, self.runtime_root) as routine:
+            root = getattr(routine, "root", None)
+            if self.write_resolved and root is not None:
+                import romjax
 
-            root_path = Path(root)
-            root_path.mkdir(parents=True, exist_ok=True)
-            romjax.dump(routine, root_path / "resolved.yml", sort_keys=False,
-                        _preserve_yaml_sources=True, _preserve_model_types=True)
-        return _CompositeCaseResult(case, exit_code=int(routine.run()), routine_name=type(routine).__name__)
+                root_path = Path(root)
+                root_path.mkdir(parents=True, exist_ok=True)
+                romjax.dump(routine, root_path / "resolved.yml", sort_keys=False,
+                            _preserve_yaml_sources=True, _preserve_model_types=True)
+            return _CompositeCaseResult(case, exit_code=int(routine.run()), routine_name=type(routine).__name__)
 
 
 _CASE_ROOT_PATTERN = re.compile(r"\{\{\s*case_root(?P<index>\s*\[[^\]]+\])?\s*\}\}")
@@ -548,7 +838,8 @@ class CompositeRoutine(Routine):
 
         tasks = [TaskSpec(str(index), case.label, case) for index, case in enumerate(cases)]
         write_resolved = self.write_resolved if self.write_resolved is not None else self.routines is None
-        self.executor.execute(tasks, _CompositeWorker(cases, write_resolved=write_resolved), on_result=handle,
+        worker = _CompositeWorker(cases, write_resolved=write_resolved, runtime_root=self.resolved_runtime_root)
+        self.executor.execute(tasks, worker, on_result=handle,
                               error_policy="collect" if self.failure_policy == "force" else "raise",
                               jax_env=self._jax_child_env(), collect_results=False)
         if failures:

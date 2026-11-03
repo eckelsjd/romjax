@@ -43,7 +43,7 @@ class YamlTemplate:
         self.source = source
 
     @classmethod
-    def from_source(cls, source: Path | romjax.YamlSource) -> YamlTemplate:
+    def from_source(cls, source: str | bytes | Path | romjax.YamlSource) -> YamlTemplate:
         """Resolve raw YAML without constructing user objects.
 
         :param source: YAML file or source node
@@ -52,8 +52,7 @@ class YamlTemplate:
         if isinstance(source, romjax.YamlSource):
             node, path = source.node, source.source_path
         else:
-            text, path = romjax.YamlLoader._read_stream(Path(source))
-            node = yaml.compose(text, Loader=yaml.SafeLoader)
+            node, path = romjax.YamlLoader._compose_resolved_node(source)
         if node is None:
             raise ValueError('Base YAML is empty.')
         return cls(romjax.YamlSource(cls._resolve(node, path), path))
@@ -127,6 +126,16 @@ class YamlTemplate:
                 else:
                     raise ValueError(f'Invalid target in path {assignment.path!r}.')
         return romjax.YamlSource(root, self.source.source_path)
+
+    def render_runtime(self, context: "romjax.RuntimeContext") -> "YamlTemplate":
+        """Render runtime expressions into an independent YAML source tree.
+
+        :param context: concrete shared and current artifact paths
+        :return: a new template containing the rendered source tree
+        :raises ValueError: if a runtime path is unavailable or malformed
+        """
+        node = romjax.YamlLoader._render_templates(self.source.node, runtime_context=context)
+        return type(self)(romjax.YamlSource(node, self.source.source_path, self.source.label))
 
     def _references(self, node: yaml.Node, seen: frozenset[Path] = frozenset()):
         if isinstance(node, yaml.MappingNode):

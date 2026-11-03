@@ -146,6 +146,38 @@ diagnostics: {show_progress: false, report_interval: 1, report_metrics: [loss, t
     return path
 
 
+def test_runtime_root_nested_composite_study_trials(base_train, tmp_path):
+    study_base = tmp_path / 'study.yml'
+    study_base.write_text(f'''!romx:OptunaStudy
+root: "cases/{{{{case_root}}}}"
+base: {base_train}
+n_trials: 1
+jax_platforms: cpu
+executor: {{show_progress: false}}
+''')
+    inner = tmp_path / 'inner.yml'
+    inner.write_text(f'''!romx:CompositeRoutine
+base: {study_base}
+overrides:
+  - name: method
+    cases: [{{name: one, value: null}}]
+executor: {{show_progress: false}}
+''')
+    routine = romjax.load(f'''!romx:CompositeRoutine
+runtime_root: "{tmp_path}/run_{{{{timestamp}}}}"
+routines: [{inner}]
+executor: {{show_progress: false}}
+''')
+    for _ in range(2):
+        assert routine.run() == 0
+        root = routine.resolved_runtime_root / 'cases' / 'method=one'
+        trial = root / 'trials' / 'trial_00000'
+        assert (trial / 'loss.csv').is_file()
+        assert romjax.load(trial / 'case.yml').root == trial
+        assert (root / 'study.journal').is_file()
+    assert len(list(tmp_path.glob('run_*'))) == 2
+
+
 @pytest.mark.parametrize('executor', ['serial', {'kind': 'process', 'max_workers': 2}])
 def test_study_runs_and_reuses_trials(base_train, tmp_path, executor):
     config = OptunaStudy(root=tmp_path / 'study', base=base_train, n_trials=2,
