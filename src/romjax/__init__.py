@@ -863,13 +863,20 @@ class YamlLoader(ConfigLoader):
         return value
 
     @classmethod
-    def _render_templates(cls, node: _yaml.Node | None, runtime_context=None, defer_runtime: bool = False) -> _yaml.Node | None:
+    def _render_templates(
+        cls,
+        node: _yaml.Node | None,
+        runtime_context=None,
+        defer_runtime: bool = False,
+        include_sources: bool = False,
+    ) -> _yaml.Node | None:
         """Render basic references and resolver calls in one composed YAML document.
 
         Rendering occurs on YAML nodes, after override composition and before Pydantic construction. This preserves
         standalone reference types and lets inline nested overrides receive values from their declaring document.
 
         :param node: composed YAML document to render
+        :param include_sources: render source-local YAML nodes while preserving their boundaries
         :return: rendered YAML document
         :raises ValueError: if a template is malformed, circular, or cannot be resolved
         """
@@ -989,7 +996,28 @@ class YamlLoader(ConfigLoader):
                 raise fail("Circular template reference", current, path)
             rendering.add(identifier)
             try:
-                if current.tag == cls.YAML_SOURCE_TAG:
+                if current.tag == cls.YAML_SOURCE_TAG and include_sources:
+                    result = _deepcopy(current)
+                    payload = next(
+                        (
+                            value
+                            for key, value in current.value
+                            if isinstance(key, _yaml.ScalarNode) and key.value == "node"
+                        ),
+                        None,
+                    )
+                    if payload is not None:
+                        rendered_payload = cls._render_templates(
+                            payload,
+                            runtime_context=runtime_context,
+                            defer_runtime=defer_runtime,
+                            include_sources=True,
+                        )
+                        result.value = [
+                            (key, rendered_payload if isinstance(key, _yaml.ScalarNode) and key.value == "node" else value)
+                            for key, value in result.value
+                        ]
+                elif current.tag == cls.YAML_SOURCE_TAG:
                     result = current
                 elif isinstance(current, _yaml.ScalarNode):
                     result = render_scalar(current, path)
@@ -1062,9 +1090,11 @@ class YamlLoader(ConfigLoader):
             node, source_path = stream.node, stream.source_path
         else:
             node, source_path = cls._compose_resolved_node(stream)
+        from romjax.runtime import current_runtime_context
+
         token = cls._SOURCE_PATH.set(source_path)
         try:
-            node = cls._render_templates(node)
+            node = cls._render_templates(node, runtime_context=current_runtime_context())
             node = cls._resolve_parent_refs(node, source_path)
             return _yaml.load(cls._node_to_yaml(node), **kwargs)
         finally:

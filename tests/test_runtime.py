@@ -1,12 +1,14 @@
 from pathlib import Path
+from typing import Annotated
 
 import pytest
 import yaml
-from pydantic import PrivateAttr
+from pydantic import BeforeValidator, PrivateAttr
 
 import romjax
 from romjax.configuration import YamlTemplate
 from romjax.runtime import RuntimeContext
+from romjax.typing import from_yaml
 
 
 class RecipeRoutine(romjax.Routine):
@@ -59,6 +61,25 @@ class FailingConstructorRoutine(romjax.Routine):
         raise RuntimeError("constructor failed")
 
     def run(self) -> int:
+        return 0
+
+
+class GraphRoutine(romjax.Routine):
+    graph: Annotated[dict, BeforeValidator(from_yaml)]
+    observed: list[dict] = []
+
+    def run(self) -> int:
+        type(self).observed.append(self.graph)
+        return 0
+
+
+class LateSourceRoutine(romjax.Routine):
+    root: Path
+    source: object
+    observed: list[object] = []
+
+    def run(self) -> int:
+        type(self).observed.append(romjax.load(self.source))
         return 0
 
 
@@ -172,3 +193,70 @@ def test_recipe_removes_timestamp_root_when_construction_fails(tmp_path: Path) -
     with pytest.raises(RuntimeError, match="constructor failed"):
         spec.run()
     assert not list(tmp_path.glob("run_*"))
+
+
+def test_runtime_recipe_preserves_nested_override_template_source(tmp_path: Path, monkeypatch) -> None:
+    GraphRoutine.observed = []
+    (tmp_path / "graph.yml").write_text(
+        "edges:\n  - grid: {shape: [2, 3]}\n"
+        "shape: '{{edges.0.grid.shape}}'\n"
+        "artifact: '{{runtime.root}}/data'\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "gen_data.yml"
+    config.write_text(
+        "!pd:tests.test_runtime.GraphRoutine\n"
+        "runtime_root: run_{{timestamp}}\n"
+        "graph: !overrides:graph.yml\n"
+        "  label: demo\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    spec = romjax.RoutineSpec.from_yaml(config)
+    assert spec.run() == 0
+    assert GraphRoutine.observed[0]["shape"] == [2, 3]
+    assert GraphRoutine.observed[0]["artifact"] == str(spec.resolved_runtime_root / "data")
+
+    direct = tmp_path / "direct.yml"
+    direct.write_text(
+        "!pd:tests.test_runtime.GraphRoutine\n"
+        "runtime_root: run_{{timestamp}}\n"
+        "graph: graph.yml\n",
+        encoding="utf-8",
+    )
+    direct_spec = romjax.RoutineSpec.from_yaml(direct)
+    assert direct_spec.run() == 0
+    assert GraphRoutine.observed[1]["artifact"] == str(direct_spec.resolved_runtime_root / "data")
+
+
+def test_composite_inline_override_child_is_not_double_deferred(tmp_path: Path) -> None:
+    child = tmp_path / "child.yml"
+    child.write_text(
+        "!pd:tests.test_runtime.InlineRoutine\nroot: child\nvalue: parent-value\n",
+        encoding="utf-8",
+    )
+    spec = romjax.RoutineSpec.from_yaml(
+        f"""!romx:CompositeRoutine
+runtime_root: {tmp_path.as_posix()}/run_{{{{timestamp}}}}
+executor: {{show_progress: false}}
+routines:
+  - !overrides:{child.as_posix()}
+    value: parent-value
+"""
+    )
+    assert spec.run() == 0
+
+
+def test_runtime_context_is_available_to_nested_loads_during_run(tmp_path: Path) -> None:
+    LateSourceRoutine.observed = []
+    graph = tmp_path / "late.yml"
+    graph.write_text("artifact: '{{runtime.root}}/data'\n", encoding="utf-8")
+    spec = romjax.RoutineSpec.from_yaml(
+        f"""!pd:tests.test_runtime.LateSourceRoutine
+runtime_root: {tmp_path.as_posix()}/run_{{{{timestamp}}}}
+root: output
+source: {graph.as_posix()}
+"""
+    )
+    assert spec.run() == 0
+    assert LateSourceRoutine.observed == [{"artifact": str(spec.resolved_runtime_root / "data")}]

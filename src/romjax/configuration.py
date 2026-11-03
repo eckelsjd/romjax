@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,7 +44,12 @@ class YamlTemplate:
         self.source = source
 
     @classmethod
-    def from_source(cls, source: str | bytes | Path | romjax.YamlSource) -> YamlTemplate:
+    def from_source(
+        cls,
+        source: str | bytes | Path | romjax.YamlSource,
+        *,
+        preserve_sources: bool = False,
+    ) -> YamlTemplate:
         """Resolve raw YAML without constructing user objects.
 
         :param source: YAML file or source node
@@ -55,21 +61,38 @@ class YamlTemplate:
             node, path = romjax.YamlLoader._compose_resolved_node(source)
         if node is None:
             raise ValueError('Base YAML is empty.')
-        return cls(romjax.YamlSource(cls._resolve(node, path), path))
+        return cls(romjax.YamlSource(cls._resolve(node, path, preserve_sources=preserve_sources), path))
 
     @classmethod
-    def _resolve(cls, node: yaml.Node, path: Path | None) -> yaml.Node:
+    def _resolve(cls, node: yaml.Node, path: Path | None, *, preserve_sources: bool = False) -> yaml.Node:
+        if node.tag == romjax.YamlLoader.YAML_SOURCE_TAG:
+            return deepcopy(node)
         # Resolve overrides at their declaring source, including nested fragments.
         loader = romjax.YamlLoader
         if loader._is_override_node(node):
             base_path = loader._resolve_override_path(node.tag[len(loader.OVERRIDES_TAG):], path)
-            base = cls.from_source(base_path).source.node
+            base = cls.from_source(base_path, preserve_sources=preserve_sources).source.node
             overlay = loader._copy_with_tag(node, loader._default_node_tag(node))
-            return loader._merge_nodes(base, cls._resolve(overlay, path))
+            merged = loader._merge_nodes(base, cls._resolve(overlay, path, preserve_sources=preserve_sources))
+            if preserve_sources:
+                pairs = [
+                    (yaml.ScalarNode('tag:yaml.org,2002:str', 'node'), merged),
+                    (yaml.ScalarNode('tag:yaml.org,2002:str', 'source_path'),
+                     yaml.ScalarNode('tag:yaml.org,2002:str', str(base_path))),
+                ]
+                return yaml.MappingNode(loader.YAML_SOURCE_TAG, pairs)
+            return merged
         if isinstance(node, yaml.MappingNode):
-            return yaml.MappingNode(node.tag, [(cls._resolve(k, path), cls._resolve(v, path)) for k, v in node.value])
+            return yaml.MappingNode(
+                node.tag,
+                [(cls._resolve(k, path, preserve_sources=preserve_sources),
+                  cls._resolve(v, path, preserve_sources=preserve_sources)) for k, v in node.value],
+            )
         if isinstance(node, yaml.SequenceNode):
-            return yaml.SequenceNode(node.tag, [cls._resolve(v, path) for v in node.value])
+            return yaml.SequenceNode(
+                node.tag,
+                [cls._resolve(v, path, preserve_sources=preserve_sources) for v in node.value],
+            )
         return loader._resolve_parent_refs(node, path)
 
     @staticmethod
@@ -127,14 +150,24 @@ class YamlTemplate:
                     raise ValueError(f'Invalid target in path {assignment.path!r}.')
         return romjax.YamlSource(root, self.source.source_path)
 
-    def render_runtime(self, context: "romjax.RuntimeContext") -> "YamlTemplate":
+    def render_runtime(
+        self,
+        context: "romjax.RuntimeContext",
+        *,
+        include_sources: bool = False,
+    ) -> "YamlTemplate":
         """Render runtime expressions into an independent YAML source tree.
 
         :param context: concrete shared and current artifact paths
+        :param include_sources: also render expressions inside preserved YAML source boundaries
         :return: a new template containing the rendered source tree
         :raises ValueError: if a runtime path is unavailable or malformed
         """
-        node = romjax.YamlLoader._render_templates(self.source.node, runtime_context=context)
+        node = romjax.YamlLoader._render_templates(
+            self.source.node,
+            runtime_context=context,
+            include_sources=include_sources,
+        )
         return type(self)(romjax.YamlSource(node, self.source.source_path, self.source.label))
 
     def _references(self, node: yaml.Node, seen: frozenset[Path] = frozenset()):

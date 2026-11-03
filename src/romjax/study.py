@@ -36,6 +36,7 @@ import romjax
 from romjax.configuration import ConfigAssignment, YamlTemplate
 from romjax.execution import ExecutionAction, ExecutorConfig, TaskSpec
 from romjax.routine import Routine
+from romjax.runtime import RuntimeContext
 from romjax.study_worker import FeedbackConfig, TrialLaunchSpec, _FeedbackServer, _Mailbox, _StudyWorker
 from romjax.train import TrainingReport
 from romjax.typing import CallableModel, DeferredThirdPartySpec, DictModel, ThirdPartyType, require_type
@@ -737,6 +738,11 @@ class _StudyCoordinator:
                         trial.set_user_attr('romjax_training_seed', seed)
                     source = self.template.render(assignments)
                     source = YamlTemplate.from_source(source).snapshot(root / 'sources').source
+                    if config.resolved_runtime_root is not None:
+                        source = YamlTemplate.from_source(source, preserve_sources=True).render_runtime(
+                            RuntimeContext(config.resolved_runtime_root, root),
+                            include_sources=True,
+                        ).source
                     text = romjax.YamlLoader._node_to_yaml(source.node)
                     case_path = root / 'case.yml'
                     case_path.write_text(text, encoding='utf-8')
@@ -746,7 +752,13 @@ class _StudyCoordinator:
                         [dict(item) for item in assignments], _preserve_yaml_sources=True))
                     key = f'trial_{number:05d}'
                     self.server.register(key, partial(self._report, number))
-                    spec = TrialLaunchSpec(key, root, self.control, config.feedback, config.child_quiet, self.root)
+                    # Trials inherit the workflow's shared runtime namespace. The
+                    # study root is only an artifact directory and must not become
+                    # the runtime root for templates in the child configuration.
+                    spec = TrialLaunchSpec(
+                        key, root, self.control, config.feedback, config.child_quiet,
+                        config.resolved_runtime_root,
+                    )
                 yield TaskSpec(str(number), key, spec)
         except BaseException:
             self.server.cancel_all('Study preparation interrupted.')

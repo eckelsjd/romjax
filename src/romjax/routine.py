@@ -34,7 +34,7 @@ from pydantic import (
 
 from romjax.execution import ExecutionAction, ExecutorConfig, ProgressBarConfig, TaskContext, TaskSpec, TaskWorker
 from romjax.plotting import GridplotConfig
-from romjax.runtime import RuntimeContext
+from romjax.runtime import RuntimeContext, runtime_context
 from romjax.typing import DictModel, WriteStream, from_yaml
 
 if TYPE_CHECKING:
@@ -272,11 +272,18 @@ class Routine(BaseModel, ABC):
         token = _RUNTIME_ROOT.set(runtime_root)
         self._runtime_active = True
         self._resolved_runtime_root = runtime_root
+        if configured_root is None:
+            artifact_root = None
+        elif runtime_root is None:
+            artifact_root = Path(configured_root).expanduser().absolute()
+        else:
+            artifact_root = (runtime_root / configured_root).absolute()
         try:
-            if runtime_root is not None and configured_root is not None:
-                self.root = runtime_root / configured_root
-            self._prepare_run()
-            yield
+            with runtime_context(RuntimeContext(runtime_root, artifact_root)):
+                if runtime_root is not None and configured_root is not None:
+                    self.root = runtime_root / configured_root
+                self._prepare_run()
+                yield
         finally:
             if configured_root is not None:
                 self.root = configured_root
@@ -379,14 +386,14 @@ class RoutineSpec(DictModel):
         """
         from romjax.configuration import YamlTemplate
 
-        template = YamlTemplate.from_source(source)
+        template = YamlTemplate.from_source(source, preserve_sources=True)
         return cls(recipe=deepcopy(template.source), runtime_root=runtime_root)
 
     @model_validator(mode="after")
     def _capture_template(self) -> "RoutineSpec":
         from romjax.configuration import YamlTemplate
 
-        self._template = YamlTemplate.from_source(deepcopy(self.recipe))
+        self._template = YamlTemplate.from_source(deepcopy(self.recipe), preserve_sources=True)
         return self
 
     @property
@@ -414,8 +421,10 @@ class RoutineSpec(DictModel):
         from romjax.configuration import YamlTemplate
 
         node = romjax.YamlLoader._render_templates(self._template.source.node, defer_runtime=True)
-        return YamlTemplate.from_source(romjax.YamlSource(node, self._template.source.source_path,
-                                                          self._template.source.label))
+        return YamlTemplate.from_source(
+            romjax.YamlSource(node, self._template.source.source_path, self._template.source.label),
+            preserve_sources=True,
+        )
 
     def _selected_root(self, parent_root: Path | None) -> tuple[Path | None, bool]:
         static = self._static_template()
@@ -470,7 +479,9 @@ class RoutineSpec(DictModel):
                     and isinstance(value, yaml.SequenceNode)
                 ):
                     for index, child in enumerate(value.value):
-                        if child.tag.startswith((romjax.YamlLoader.ROMX_TAG, romjax.YamlLoader.PYDANTIC_TAG)):
+                        if child.tag != romjax.YamlLoader.YAML_SOURCE_TAG and child.tag.startswith(
+                            (romjax.YamlLoader.ROMX_TAG, romjax.YamlLoader.PYDANTIC_TAG)
+                        ):
                             payload = yaml.MappingNode(
                                 "tag:yaml.org,2002:map",
                                 [
@@ -486,8 +497,9 @@ class RoutineSpec(DictModel):
 
         defer_children(source_node)
         deferred = romjax.YamlSource(source_node, source.source_path, source.label)
-        rendered = YamlTemplate.from_source(deferred).render_runtime(context)
-        routine = romjax.load(rendered.source)
+        rendered = YamlTemplate.from_source(deferred, preserve_sources=True).render_runtime(context)
+        with runtime_context(context):
+            routine = romjax.load(rendered.source)
         if not isinstance(routine, Routine):
             raise ValueError(f"CompositeRoutine child must validate to Routine, got {type(routine).__name__}.")
         return routine

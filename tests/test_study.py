@@ -159,7 +159,16 @@ diagnostics: {show_progress: false, report_interval: 1, report_metrics: [loss, t
     return path
 
 
-def test_runtime_root_nested_composite_study_trials(base_train, tmp_path):
+def test_runtime_root_nested_composite_study_trials(base_train, tmp_path, monkeypatch):
+    launch_runtime_roots = []
+    study_module = __import__('romjax.study', fromlist=['TrialLaunchSpec'])
+    original_launch_spec = study_module.TrialLaunchSpec
+
+    def record_launch_spec(*args, **kwargs):
+        launch_runtime_roots.append(args[-1] if args else kwargs['runtime_root'])
+        return original_launch_spec(*args, **kwargs)
+
+    monkeypatch.setattr(study_module, 'TrialLaunchSpec', record_launch_spec)
     study_base = tmp_path / 'study.yml'
     study_base.write_text(f'''!romx:OptunaStudy
 root: "cases/{{{{case_root}}}}"
@@ -181,14 +190,42 @@ runtime_root: "{tmp_path}/run_{{{{timestamp}}}}"
 routines: [{inner}]
 executor: {{show_progress: false}}
 ''')
+    expected_runtime_roots = []
     for _ in range(2):
         assert routine.run() == 0
+        expected_runtime_roots.append(routine.resolved_runtime_root)
         root = routine.resolved_runtime_root / 'cases' / 'method=one'
         trial = root / 'trials' / 'trial_00000'
         assert (trial / 'loss.csv').is_file()
         assert romjax.load(trial / 'case.yml').root == trial
         assert (root / 'study.journal').is_file()
+    assert launch_runtime_roots == expected_runtime_roots
     assert len(list(tmp_path.glob('run_*'))) == 2
+
+
+def test_study_trial_case_resolves_runtime_templates(base_train, tmp_path):
+    base_train.write_text(base_train.read_text().replace('root: unused', 'root: "{{runtime.root}}/train"'))
+    inner = tmp_path / 'inner.yml'
+    inner.write_text(f'''!romx:OptunaStudy
+root: "study"
+base: {base_train}
+case_root_path: []
+n_trials: 1
+jax_platforms: cpu
+executor: {{show_progress: false}}
+''')
+    routine = romjax.load(f'''!romx:CompositeRoutine
+runtime_root: "{tmp_path}/run"
+routines: [{inner}]
+executor: {{show_progress: false}}
+''')
+
+    assert routine.run() == 0
+    case_path = tmp_path / 'run' / 'study' / 'trials' / 'trial_00000' / 'case.yml'
+    case_text = case_path.read_text()
+    assert '{{runtime.root}}' not in case_text
+    rerun = romjax.load(case_path)
+    assert rerun.root == tmp_path / 'run' / 'train'
 
 
 @pytest.mark.parametrize('executor', ['serial', {'kind': 'process', 'max_workers': 2}])
