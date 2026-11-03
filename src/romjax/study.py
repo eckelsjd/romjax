@@ -207,6 +207,32 @@ def _journal_storage(path: Path) -> optuna.storages.JournalStorage:
     return optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(journal, lock_obj=lock))
 
 
+def _close_storage(storage: Any) -> None:
+    """Release database sessions and pooled connections owned by an Optuna storage.
+
+    :param storage: Optuna storage instance to close when it owns a database backend
+
+    Optuna exposes ``remove_session`` for thread-local sessions, but the SQLAlchemy engine
+    also retains pooled SQLite connections until it is disposed.  Both resources must be
+    released explicitly so they are not finalized by the garbage collector after a test or
+    study run has ended.
+    """
+    remove_session = getattr(storage, 'remove_session', None)
+    if callable(remove_session):
+        remove_session()
+    backend = getattr(storage, '_backend', None)
+    if backend is not None and backend is not storage:
+        _close_storage(backend)
+    engine = getattr(storage, 'engine', None)
+    if engine is not None:
+        engine.dispose()
+
+
+def _materialize_storage(storage: str | optuna.storages.BaseStorage) -> optuna.storages.BaseStorage:
+    """Turn a storage URL into an explicitly owned Optuna storage instance."""
+    return optuna.storages.RDBStorage(storage) if isinstance(storage, str) else storage
+
+
 class StorageRef(DictModel):
     """A YAML-friendly Optuna journal, URL, or constructed storage reference.
 
@@ -443,27 +469,36 @@ class CopyStudy(Routine):
             raise ValueError('CopyStudy requires at least one source storage.')
         self._validate_destination(sources)
         self._prepare_destination()
-        destination = self.destination.open()
-        existing = {summary.study_name for summary in optuna.get_all_study_summaries(destination)}
-        for label, reference in sorted(sources.items()):
-            source = reference.open()
-            summaries = sorted(optuna.get_all_study_summaries(source), key=lambda summary: summary.study_name)
-            for summary in summaries:
-                target = None if self.name_policy == 'fail' else f'{label}/{summary.study_name}'
-                name = summary.study_name if target is None else target
-                if name in existing:
-                    if self.write_policy == 'reuse':
-                        continue
-                    if self.write_policy == 'overwrite':
-                        optuna.delete_study(study_name=name, storage=destination)
-                optuna.copy_study(
-                    from_study_name=summary.study_name,
-                    from_storage=source,
-                    to_storage=destination,
-                    to_study_name=target,
-                )
-                existing.add(name)
-        return 0
+        opened: list[Any] = []
+        try:
+            destination = self.destination.open()
+            destination = _materialize_storage(destination)
+            opened.append(destination)
+            existing = {summary.study_name for summary in optuna.get_all_study_summaries(destination)}
+            for label, reference in sorted(sources.items()):
+                source = reference.open()
+                source = _materialize_storage(source)
+                opened.append(source)
+                summaries = sorted(optuna.get_all_study_summaries(source), key=lambda summary: summary.study_name)
+                for summary in summaries:
+                    target = None if self.name_policy == 'fail' else f'{label}/{summary.study_name}'
+                    name = summary.study_name if target is None else target
+                    if name in existing:
+                        if self.write_policy == 'reuse':
+                            continue
+                        if self.write_policy == 'overwrite':
+                            optuna.delete_study(study_name=name, storage=destination)
+                    optuna.copy_study(
+                        from_study_name=summary.study_name,
+                        from_storage=source,
+                        to_storage=destination,
+                        to_study_name=target,
+                    )
+                    existing.add(name)
+            return 0
+        finally:
+            for storage in opened:
+                _close_storage(storage)
 
 
 class _ControllerStudy(optuna.study.Study):
@@ -492,6 +527,19 @@ class _StudyCoordinator:
         self.finished = 0
         self.study: _ControllerStudy | None = None
         self.server: _FeedbackServer | None = None
+        self._storage_handles: list[Any] = []
+
+    def _remember_storage(self, storage: Any) -> Any:
+        """Track a storage object created by Optuna for later cleanup."""
+        if all(storage is not existing for existing in self._storage_handles):
+            self._storage_handles.append(storage)
+        return storage
+
+    def _close_storages(self) -> None:
+        """Release every database storage created during this controller invocation."""
+        for storage in self._storage_handles:
+            _close_storage(storage)
+        self._storage_handles.clear()
 
     @contextmanager
     def _ownership(self):
@@ -554,7 +602,7 @@ class _StudyCoordinator:
             raise ValueError('Storage factory must produce an Optuna BaseStorage.')
         if isinstance(value, optuna.storages.RDBStorage) and value.get_heartbeat_interval() is not None:
             raise ValueError('RDB heartbeat requires optimize, not ask/tell.')
-        return value
+        return _materialize_storage(value)
 
     def _fingerprint(self) -> str:
         fields = {'override', 'search_space', 'metric', 'direction', 'sampler', 'pruner',
@@ -586,6 +634,8 @@ class _StudyCoordinator:
             existing = optuna.load_study(study_name=config.study_name, storage=storage)
         except KeyError:
             existing = None
+        else:
+            self._remember_storage(existing._storage)
         if config.write_policy == 'error' and (existing is not None or manifest.exists()
                                                 or (self.root / 'trials').exists()):
             raise ValueError('Study or owned artifacts already exist.')
@@ -624,7 +674,8 @@ class _StudyCoordinator:
         created = optuna.create_study(study_name=config.study_name, storage=storage,
                                       sampler=config.sampler, pruner=config.pruner, direction=config.direction,
                                       load_if_exists=config.write_policy == 'reuse')
-        self.study = _ControllerStudy(created.study_name, storage, config.sampler, config.pruner)
+        self._remember_storage(created._storage)
+        self.study = _ControllerStudy(created.study_name, created._storage, config.sampler, config.pruner)
         self.study.active = True
         for key, value in config.user_attrs.items():
             if key.startswith('romjax_'):
@@ -806,40 +857,43 @@ class _StudyCoordinator:
 
     def run(self) -> int:
         self.template = YamlTemplate.from_source(self.config.base)
-        with self._ownership():
-            self._open_study()
-            self._manifest()
-            self._update_best()
-            self.server = _FeedbackServer(self.control, self.config.feedback)
-            try:
-                with self.server:
-                    try:
-                        self.config.executor.execute(self._tasks(),
-                            _StudyWorker({**self.config._jax_child_env(), **self.config.child_env}),
-                            total_units=self.config.n_trials, on_result=self._result,
-                            error_policy='collect', collect_results=False, jax_env=self.config._jax_child_env(),
-                            on_abort=lambda: self.server.cancel_all('Study execution interrupted.'))
-                    finally:
-                        self.server.cancel_all('Study controller stopped.')
-                    if self.server.error is not None:
-                        raise RuntimeError('Feedback service failed.') from self.server.error
-            finally:
-                with self.lock:
-                    original_error = sys.exception()
-                    cleanup_error = None
-                    for trial in list(self.live.values()):
-                        current = next(t for t in self.study.get_trials() if t.number == trial.number)
-                        if not current.state.is_finished():
-                            trial.set_user_attr('romjax_error', 'Trial canceled before terminal result.')
-                            trial.set_user_attr('romjax_stop_reason', 'canceled')
-                            try:
-                                self._finish(trial.number, optuna.trial.TrialState.FAIL)
-                            except BaseException as exc:
-                                cleanup_error = cleanup_error or exc
-                    self.study.active = False
-                    self._manifest()
-                    self._update_best()
-                    if cleanup_error is not None and original_error is None:
-                        raise cleanup_error
-            failed = self.failed > 0 if self.config.exit_policy == 'any' else self.failed == self.finished > 0
-            return int(failed and self.config.exit_policy != 'ignore')
+        try:
+            with self._ownership():
+                self._open_study()
+                self._manifest()
+                self._update_best()
+                self.server = _FeedbackServer(self.control, self.config.feedback)
+                try:
+                    with self.server:
+                        try:
+                            self.config.executor.execute(self._tasks(),
+                                _StudyWorker({**self.config._jax_child_env(), **self.config.child_env}),
+                                total_units=self.config.n_trials, on_result=self._result,
+                                error_policy='collect', collect_results=False, jax_env=self.config._jax_child_env(),
+                                on_abort=lambda: self.server.cancel_all('Study execution interrupted.'))
+                        finally:
+                            self.server.cancel_all('Study controller stopped.')
+                        if self.server.error is not None:
+                            raise RuntimeError('Feedback service failed.') from self.server.error
+                finally:
+                    with self.lock:
+                        original_error = sys.exception()
+                        cleanup_error = None
+                        for trial in list(self.live.values()):
+                            current = next(t for t in self.study.get_trials() if t.number == trial.number)
+                            if not current.state.is_finished():
+                                trial.set_user_attr('romjax_error', 'Trial canceled before terminal result.')
+                                trial.set_user_attr('romjax_stop_reason', 'canceled')
+                                try:
+                                    self._finish(trial.number, optuna.trial.TrialState.FAIL)
+                                except BaseException as exc:
+                                    cleanup_error = cleanup_error or exc
+                        self.study.active = False
+                        self._manifest()
+                        self._update_best()
+                        if cleanup_error is not None and original_error is None:
+                            raise cleanup_error
+                failed = self.failed > 0 if self.config.exit_policy == 'any' else self.failed == self.finished > 0
+                return int(failed and self.config.exit_policy != 'ignore')
+        finally:
+            self._close_storages()

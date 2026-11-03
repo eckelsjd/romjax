@@ -10,7 +10,7 @@ except ImportError:
     pytest.skip('requires the optuna extra', allow_module_level=True)
 
 import romjax
-from romjax.study import CopyStudy, MetricConfig, OptunaStudy, ParameterConfig, StorageRef
+from romjax.study import CopyStudy, MetricConfig, OptunaStudy, ParameterConfig, StorageRef, _close_storage
 from romjax.train import TrainingReport
 
 
@@ -24,11 +24,16 @@ def journal_storage(path: Path) -> optuna.storages.JournalStorage:
 def make_storage_with_studies(storage_ref: dict[str, object], studies: dict[str, int]) -> None:
     """Populate an Optuna storage with completed trials for copying tests."""
     storage = StorageRef.model_validate(storage_ref).open()
-    for name, count in studies.items():
-        study = optuna.create_study(study_name=name, storage=storage)
-        for number in range(count):
-            trial = study.ask()
-            study.tell(trial, float(number))
+    try:
+        for name, count in studies.items():
+            study = optuna.create_study(study_name=name, storage=storage)
+            for number in range(count):
+                trial = study.ask()
+                study.tell(trial, float(number))
+            _close_storage(study._storage)
+    finally:
+        if isinstance(storage, optuna.storages.BaseStorage):
+            _close_storage(storage)
 
 
 def make_journal_with_studies(path: Path, studies: dict[str, int]) -> Path:
@@ -41,10 +46,18 @@ def make_journal_with_studies(path: Path, studies: dict[str, int]) -> Path:
 def study_trial_counts(storage_ref: dict[str, object]) -> dict[str, int]:
     """Return copied study names and their trial counts."""
     storage = StorageRef.model_validate(storage_ref).open()
-    return {
-        summary.study_name: len(optuna.load_study(study_name=summary.study_name, storage=storage).trials)
-        for summary in optuna.get_all_study_summaries(storage)
-    }
+    if isinstance(storage, str):
+        storage = optuna.storages.RDBStorage(storage)
+    try:
+        counts = {}
+        for summary in optuna.get_all_study_summaries(storage):
+            study = optuna.load_study(study_name=summary.study_name, storage=storage)
+            counts[summary.study_name] = len(study.trials)
+            _close_storage(study._storage)
+        return counts
+    finally:
+        if isinstance(storage, optuna.storages.BaseStorage):
+            _close_storage(storage)
 
 
 def test_parameter_sampling_preserves_categories():
@@ -587,7 +600,10 @@ def test_storage_ref_opens_journal_url_and_deferred_rdb(tmp_path):
         'name': 'optuna.storages.RDBStorage',
         'kwargs': {'url': f'sqlite:///{tmp_path / "configured.db"}'},
     }).open()
-    assert isinstance(deferred, optuna.storages.RDBStorage)
+    try:
+        assert isinstance(deferred, optuna.storages.RDBStorage)
+    finally:
+        _close_storage(deferred)
 
 
 def test_storage_ref_requires_exactly_one_backend(tmp_path):
