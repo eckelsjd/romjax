@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import wraps
 from importlib import import_module as _import_module
 from itertools import product
@@ -234,7 +234,7 @@ class Routine(BaseModel, ABC):
         if not _TIMESTAMP_PATTERN.search(text):
             template.mkdir(parents=True, exist_ok=True)
             return template
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds").replace(":", ".")
         # Reserve the first timestamp-bearing ancestor, not just a trailing subdirectory.
         index = next(i for i, part in enumerate(template.parts) if _TIMESTAMP_PATTERN.search(part))
         counter = 0

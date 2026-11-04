@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, ClassVar
@@ -101,6 +102,14 @@ def test_runtime_root_repeated_runs_restore_config(tmp_path):
     assert routine.root == Path("cases")
 
 
+def test_runtime_root_timestamp_is_filename_safe_iso8601(tmp_path):
+    routine = RootRoutine(name="run", root="cases", runtime_root=tmp_path / "run_{{timestamp}}")
+
+    assert routine.run() == 0
+    timestamp = routine.resolved_runtime_root.name.removeprefix("run_")
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}[+-]\d{2}\.\d{2}", timestamp)
+
+
 @pytest.mark.parametrize("kind", ["serial", "thread", "process"])
 def test_runtime_root_nested_composite_workers(tmp_path, kind):
     base = tmp_path / "base.yml"
@@ -185,7 +194,7 @@ def test_runtime_root_timestamp_collision_reserves_ancestor(tmp_path, monkeypatc
             return cls(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
     monkeypatch.setattr(module, "datetime", FixedDatetime)
-    existing = tmp_path / "run_20260102T030405_000000Z"
+    existing = tmp_path / "run_2026-01-02T03.04.05+00.00"
     existing.mkdir()
     routine = DemoRoutine(runtime_root=tmp_path / "run_{{timestamp}}" / "cases")
     routine.run()
