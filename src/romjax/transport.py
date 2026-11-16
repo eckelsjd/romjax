@@ -501,6 +501,10 @@ class AdvectionDiffusion2D(ImplicitModel, ImplicitSampleable, SourceSampleable):
                 y0,
                 args,
                 options=args["inputs"]["solver"].get("options"),
+                structure=FivePointStencilStructure(
+                    shape=tuple(y0.shape),
+                    periodic_axes=self._periodic_axes(args["inputs"], y0),
+                ),
                 return_sol=return_sol,
             )
         else:

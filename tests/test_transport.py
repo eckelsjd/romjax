@@ -489,6 +489,33 @@ def test_transport_configured_block_jacobi_is_jittable() -> None:
     assert jnp.max(jnp.abs(residual)) < 1e-4
 
 
+def test_transport_newton_uses_configured_gmres_block_jacobi() -> None:
+    """Newton forwards its grid structure to the configured inner GMRES solve."""
+    model = AdvectionDiffusion2D(
+        grid=UniformGrid(bounds=((0.0, 1.0), (0.0, 1.0)), shape=(4, 4)),
+        solver={
+            "solver": {"name": "optimistix.Newton", "kwargs": {"rtol": 1e-5, "atol": 1e-6}},
+            "linear_solver": {
+                "solver": {"name": "lineax.GMRES", "kwargs": {"rtol": 1e-5, "atol": 1e-6}},
+                "preconditioner": {"name": "five_point_block_jacobi", "block_shape": [2, 2]},
+            },
+        },
+    )
+    solution = model.solve({"forcing": {"const": 1.0}})["phi"]
+    residual = model.evaluate({"forcing": {"const": 1.0}}, {"phi": solution})["phi_residual"]
+    assert jnp.max(jnp.abs(residual)) < 1e-4
+
+    solve_sum = jax.jit(jax.grad(lambda amplitude: jnp.sum(
+        model.solve({"forcing": {"const": amplitude}})["phi"]
+    )))
+    assert jnp.isfinite(solve_sum(jnp.asarray(1.0)))
+
+    batched = jax.jit(jax.vmap(
+        lambda amplitude: model.solve({"forcing": {"const": amplitude}})["phi"]
+    ))(jnp.asarray([0.5, 1.0]))
+    assert batched.shape == (2, 4, 4)
+
+
 def test_laplace_solve_jit_and_grad() -> None:
     laplace = get_laplace_solver()
 

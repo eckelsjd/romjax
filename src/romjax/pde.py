@@ -668,6 +668,7 @@ class IterativeSolver(DictModel):
     )
     initial: RegisteredForcing = Field(default_factory=ConstantForcing)
     options: dict[str, Any] = Field(default_factory=dict)
+    linear_solver: "LinearSolver | None" = None
     max_steps: PositiveInt = 100
     adjoint: AbstractAdjoint = Field(
         default_factory=lambda: dict(name='optimistix.ImplicitAdjoint'), 
@@ -681,6 +682,7 @@ class IterativeSolver(DictModel):
         y0: ArrayLike,
         args: Any | None = None,
         options: Mapping[str, Any] | None = None,
+        structure: LinearSystemStructure | None = None,
         return_sol: bool = False
     ) -> ArrayLike | optx.Solution:
         """Small wrapper around optimistix root find.
@@ -695,9 +697,14 @@ class IterativeSolver(DictModel):
         :return: the solution object or the result
         """
         runtime_options = pytree_merge(self.options, options or {})
+        solver = self.solver
+        if self.linear_solver is not None:
+            if not isinstance(solver, optx.Newton):
+                raise ValueError("Configured linear_solver is currently supported only with optimistix.Newton.")
+            solver = _PreconditionedNewton.from_newton(solver, self.linear_solver, structure)
         solution = optx.root_find(
             fn,
-            solver=self.solver,
+            solver=solver,
             y0=y0,
             args=args,
             options=runtime_options,
@@ -706,6 +713,56 @@ class IterativeSolver(DictModel):
             throw=self.throw
         )
         return solution if return_sol else solution.value
+
+
+class _PreconditionedNewton(_AbstractNewtonChord):
+    """Optimistix Newton variant routing each Jacobian solve through romjax LinearSolver (to enable preconditioners)."""
+
+    linear_solver: lx.AbstractLinearSolver
+    romjax_solver: Any = eqx.field(static=True)
+    structure: LinearSystemStructure | None = eqx.field(static=True)
+    _is_newton = True
+
+    @classmethod
+    def from_newton(
+        cls, solver: optx.Newton, linear_solver: "LinearSolver", structure: LinearSystemStructure | None
+    ) -> "_PreconditionedNewton":
+        return cls(
+            rtol=solver.rtol, atol=solver.atol, norm=solver.norm, kappa=solver.kappa,
+            linear_solver=linear_solver.solver, cauchy_termination=solver.cauchy_termination,
+            romjax_solver=linear_solver, structure=structure,
+        )
+
+    def __init__(self, *, rtol, atol, norm, kappa, linear_solver, cauchy_termination, romjax_solver, structure):
+        self.rtol, self.atol, self.norm, self.kappa = rtol, atol, norm, kappa
+        self.linear_solver, self.cauchy_termination = linear_solver, cauchy_termination
+        self.romjax_solver, self.structure = romjax_solver, structure
+
+    def step(self, fn, y, args, options, state, tags):
+        from optimistix._solver.newton_chord import _NewtonChordState
+
+        fx, lin_fn, aux = jax.linearize(lambda _y: fn(_y, args), y, has_aux=True)
+        jac = lx.FunctionLinearOperator(lin_fn, jax.eval_shape(lambda: y), tags=tags)
+        solution = self.romjax_solver.linear_solve(
+            jac, fx, structure=self.structure, return_sol=True
+        )
+        diff = solution.value
+        new_y = (y**ω - diff**ω).ω
+        lower, upper = options.get("lower"), options.get("upper")
+        if lower is not None:
+            new_y = jtu.tree_map(lambda a, b: jnp.clip(a, min=b), new_y, lower)
+        if upper is not None:
+            new_y = jtu.tree_map(lambda a, b: jnp.clip(a, max=b), new_y, upper)
+        diff = (y**ω - new_y**ω).ω
+        scale = (self.atol + self.rtol * ω(new_y).call(jnp.abs)).ω
+        with jax.numpy_dtype_promotion("standard"):
+            diffsize = self.norm((diff**ω / scale**ω).ω)
+        return new_y, _NewtonChordState(
+            f=fx if self.cauchy_termination else None, linear_state=None, diff=diff,
+            diffsize=jnp.asarray(diffsize, dtype=state.diffsize.dtype), diffsize_prev=state.diffsize,
+            result=optx.RESULTS.promote(solution.result),
+            step=state.step + 1,
+        ), aux
 
 
 class LinearSolver(DictModel):
