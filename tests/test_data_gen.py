@@ -1152,13 +1152,54 @@ def test_data_generation_benchmark_caches_total_and_amortized_timings(tmp_path: 
     benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
 
     entries = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)
-    assert len(entries) == 1 and next(iter(entries)).startswith("test.serial.")
+    assert set(entries) == {"test"}
     cached = next(iter(entries.values()))
     assert cached["total"].shape == (2,)
     assert np.all(cached["total"] > 0.0)
     np.testing.assert_allclose(cached["amortized"], cached["total"] / 6)
     assert cached["_benchmark"]["samples"] == 6
     assert not list((tmp_path / "sample").glob("seed_*"))
+
+
+def test_data_generation_benchmark_uses_explicit_hardware_as_full_cache_label(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=1,
+        warmup=0,
+        hardware="workstation.process.custom",
+    )
+    monkeypatch.setattr(benchmark, "_benchmark", lambda path, **kwargs: np.asarray([4.0]))
+
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
+
+    entries = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)
+    assert set(entries) == {"workstation.process.custom"}
+
+
+def test_data_generation_benchmark_infers_executor_label_when_hardware_is_omitted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    graph = FunctionGraph(edges={"sample": _ToySourceEdge(source="noise", target="sample")})
+    benchmark = GenDataBenchmark(
+        generator={"kind": "source", "graph": graph, "samples": 1, "seed": 0},
+        samples=2,
+        repeat=1,
+        warmup=0,
+    )
+    monkeypatch.setenv("DATA_GEN_HARDWARE", "workstation")
+    monkeypatch.setattr(benchmark, "_benchmark", lambda path, **kwargs: np.asarray([4.0]))
+
+    benchmark.generate(tmp_path / "sample", format="h5", write_policy="overwrite")
+
+    entries = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)
+    assert len(entries) == 1
+    assert next(iter(entries)).startswith("workstation.serial.")
 
 
 def test_data_generation_benchmark_honors_cache_write_policy(tmp_path: Path, monkeypatch) -> None:
@@ -1317,7 +1358,7 @@ def test_data_generation_benchmark_uses_executor(tmp_path, kind, executor):
     generation = DataGeneration(root=tmp_path, graph=graph, executor=config, datasets={"sample": benchmark})
     assert generation.run() == 0
     entries = load_h5({}, tmp_path / "sample" / "timings.h5", jax=False)
-    assert next(iter(entries)).startswith(f"test.{executor}.")
+    assert set(entries) == {"test"}
     entry = next(iter(entries.values()))
     assert entry["total"].shape == (repeat,) and np.all(entry["total"] > 0)
     np.testing.assert_allclose(entry["amortized"], entry["total"] / 5)
@@ -1331,7 +1372,6 @@ def test_data_generation_benchmark_cache_identity_and_leaf_override(tmp_path):
         samples=2,
         repeat=1,
         warmup=1,
-        hardware="test",
         show_progress=False,
     )
     generation = DataGeneration(root=tmp_path, graph=graph, executor="mpi", datasets={"sample": benchmark})

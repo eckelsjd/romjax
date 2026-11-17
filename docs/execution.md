@@ -157,13 +157,16 @@ before measurement. With `warmup: 0`, first-use compilation is measured. Progres
 is updated between passes; either `show_progress: false` on the benchmark or
 `executor.show_progress: false` suppresses it.
 
-The HDF5 cache groups use `<hardware>.<executor-kind>.<fingerprint>`, for example
-`workstation.process.<fingerprint>`. Explicit `hardware` and `DATA_GEN_HARDWARE`
-values supply the prefix. The fingerprint identifies execution settings,
-participating worker count, and inherited JAX settings; progress options are
-excluded. Each group stores `total` seconds per repeat and `amortized` seconds
-per input sample, plus compatibility metadata. Old cache groups are preserved
-but are not reused for the new full-pass measurement schema.
+The HDF5 cache groups use `<hardware>.<executor-kind>.<fingerprint>` when
+`hardware` is omitted, for example `workstation.process.<fingerprint>`. An
+explicit `hardware` value is used as the complete HDF5 group name; this allows
+selecting or sharing any named cache entry. `DATA_GEN_HARDWARE` supplies the
+inferred hardware prefix when `hardware` is omitted. The fingerprint identifies
+execution settings, participating worker count, and inherited JAX settings;
+progress options are excluded. Each group stores `total` seconds per repeat and
+`amortized` seconds per input sample, plus compatibility metadata. Old cache
+groups are preserved but are not reused for the new full-pass measurement
+schema.
 
 `ExecutorConfig.execute_passes(tasks, worker, warmup=1, repeat=5)` provides the
 shared pass driver and returns one duration per repeat. `TaskWorker.initialize`

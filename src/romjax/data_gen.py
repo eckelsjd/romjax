@@ -1037,7 +1037,7 @@ class GenDataBenchmark(GenDataConfig):
     :param repeat: number of complete timed passes over all batches
     :param warmup: number of untimed full passes on each participating worker
     :param filename: HDF5 timing-cache filename written below the dataset path
-    :param hardware: hardware-label prefix; inferred from JAX when omitted, then suffixed with executor identity
+    :param hardware: complete HDF5 cache-group label; when omitted, infer a hardware prefix and append executor identity
     """
 
     show_progress: bool = True
@@ -1056,21 +1056,27 @@ class GenDataBenchmark(GenDataConfig):
             raise ValueError("Benchmark filename must be a non-empty basename.")
         if not self.generator.throw:
             raise ValueError("Data-generation benchmarks require generator.throw=True.")
-        self.hardware = self._hardware_label(self.hardware)
+        if self.hardware is not None:
+            self._validate_hardware_label(self.hardware)
         return self
 
     @staticmethod
-    def _hardware_label(configured: str | None) -> str:
-        """Return a stable explicit or environment-derived cache label."""
-        label = configured or os.environ.get("DATA_GEN_HARDWARE")
+    def _validate_hardware_label(label: str) -> None:
+        """Validate one complete HDF5 cache-group label."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+            raise ValueError("Hardware labels may contain only letters, numbers, '_', '-', and '.'.")
+
+    @staticmethod
+    def _inferred_hardware() -> str:
+        """Return the hardware prefix used when no complete cache label is configured."""
+        label = os.environ.get("DATA_GEN_HARDWARE")
         if label is None:
             if jax.default_backend() == "gpu":
                 label = "gpu"
             else:
                 threads = os.environ.get("CPU_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
                 label = f"cpu_{threads}"
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
-            raise ValueError("Hardware labels may contain only letters, numbers, '_', '-', and '.'.")
+        GenDataBenchmark._validate_hardware_label(label)
         return label
 
     def bar_text(self, path: Path):
@@ -1209,10 +1215,11 @@ class GenDataBenchmark(GenDataConfig):
         path = Path(path)
         cache_path = path / self.filename
         cached = load_h5({}, cache_path, jax=False) if cache_path.exists() else {}
-        assert self.hardware is not None
         execution = self._executor_metadata(executor, jax_env)
         fingerprint = hashlib.sha256(execution.encode()).hexdigest()[:12]
-        label = f"{self.hardware}.{executor.kind}.{fingerprint}"
+        label = self.hardware
+        if label is None:
+            label = f"{self._inferred_hardware()}.{executor.kind}.{fingerprint}"
         exists = label in cached
         metadata = self._metadata()
         metadata["executor"] = np.bytes_(execution)

@@ -109,7 +109,7 @@ def test_mpi_benchmark_reuses_pool_and_writes_only_timings(tmp_path):
     result = launch(config, python_context=True)
     assert result.returncode == 0, result.stdout + result.stderr
     cached = load_h5({}, root / "bench" / "sample" / "timings.h5", jax=False)
-    assert next(iter(cached)).startswith("test.mpi.")
+    assert set(cached) == {"test"}
     entry = next(iter(cached.values()))
     assert entry["total"].shape == (2,) and np.all(entry["total"] > 0)
     np.testing.assert_allclose(entry["amortized"], entry["total"] / 5)
